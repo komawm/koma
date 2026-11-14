@@ -683,6 +683,7 @@ fn apply_pointer_motion(state: &mut KomaState, pt: LogicalPoint) {
         );
         pointer.frame(state);
     }
+    state.queue_redraw();
 }
 
 fn apply_pointer_button(state: &mut KomaState, button: u32, btn_state: ButtonState) {

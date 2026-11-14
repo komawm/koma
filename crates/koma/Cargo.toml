@@ -18,6 +18,7 @@ smithay-winit = [
     "dep:anyhow",
     "dep:base64",
     "dep:calloop",
+    "dep:cursor-icon",
     "dep:libc",
     "dep:regex",
     "dep:rustix",
@@ -25,6 +26,7 @@ smithay-winit = [
     "dep:serde_json",
     "dep:smithay",
     "dep:wayland-server",
+    "dep:xcursor",
 ]
 smithay-tty = [
     "smithay-winit",
@@ -47,6 +49,7 @@ tracing-subscriber.workspace = true
 anyhow = { workspace = true, optional = true }
 base64 = { workspace = true, optional = true }
 calloop = { workspace = true, optional = true }
+cursor-icon = { workspace = true, optional = true }
 libc = { workspace = true, optional = true }
 regex = { workspace = true, optional = true }
 rustix = { workspace = true, optional = true }
@@ -54,6 +57,7 @@ serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 smithay-drm-extras = { workspace = true, optional = true }
 wayland-server = { workspace = true, optional = true }
+xcursor = { workspace = true, optional = true }
 
 [dependencies.smithay]
 workspace = true

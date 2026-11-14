@@ -4,8 +4,8 @@
 //! 4-quadrant `smart_split` drop-zone previews, and multi-pass `Dual Kawase Blur` backdrops.
 
 use koma_model::{
-    BlurConfig, BorderConfig, DimConfig, LogicalRect, LogicalViewport, ShadowConfig,
-    WorkspaceLeaseState, parse_hex_color,
+    BlurConfig, BorderConfig, DimConfig, FocusRingConfig, LogicalRect, LogicalViewport,
+    ShadowConfig, WorkspaceLeaseState, parse_hex_color,
 };
 use koma_proto::OverlayKind;
 use smithay::{
@@ -24,8 +24,9 @@ use smithay::{
 use crate::{
     RenderTargetKind,
     elements::{
-        KomaBlurredBackdropElement, KomaClippedSurfaceElement, KomaRenderElement,
-        KomaRoundedBorderElement, KomaSolidColorElement, to_smithay_logical_rect,
+        KomaBlurredBackdropElement, KomaClippedSurfaceElement, KomaDropShadowElement,
+        KomaRenderElement, KomaRoundedBorderElement, KomaSolidColorElement,
+        to_smithay_logical_rect,
     },
     shaders::{KomaCompiledShaders, KomaGlesRenderer},
 };
@@ -46,6 +47,7 @@ pub const COLOR_DROP_PREVIEW_FILL: [f32; 4] = [0.345, 0.651, 1.0, 0.18];
 pub const COLOR_DROP_PREVIEW_BORDER: [f32; 4] = [0.345, 0.651, 1.0, 0.88];
 pub const COLOR_TAB_INDICATOR_ACTIVE: [f32; 4] = [0.345, 0.651, 1.0, 0.96]; // #58a6ff
 pub const COLOR_TAB_INDICATOR_INACTIVE: [f32; 4] = [0.282, 0.310, 0.345, 0.72]; // #484f58
+pub const COLOR_SHADOW_DEFAULT: [f32; 4] = [0.0, 0.0, 0.0, 0.451]; // #00000073
 
 /// Per-window descriptor passed into the scene assembler for a single frame.
 pub struct WindowSceneItem<'a> {
@@ -58,8 +60,142 @@ pub struct WindowSceneItem<'a> {
     pub corner_radius: f32,
     pub wants_blur: bool,
     pub border: BorderConfig,
+    pub focus_ring: FocusRingConfig,
     pub shadow: ShadowConfig,
     pub dim: DimConfig,
+}
+
+/// Resolved logical geometry and shader parameters for a rounded drop shadow.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DropShadowGeometry {
+    pub area: Rectangle<i32, Logical>,
+    pub shadow_box: Rectangle<f64, Logical>,
+    pub shadow_radii: [f32; 4],
+    pub sigma: f32,
+    pub sharp: bool,
+    pub color: [f32; 4],
+}
+
+/// Resolved outer rectangle and thickness for a Niri-style focus ring.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FocusRingGeometry {
+    pub ring_rect: Rectangle<f64, Logical>,
+    pub outer_radii: [f32; 4],
+    pub width: f32,
+}
+
+/// Resolves the normalized `[f32; 4]` RGBA drop-shadow color for active or inactive windows.
+#[must_use]
+pub fn resolve_shadow_rgba(shadow: &ShadowConfig, is_focused: bool) -> [f32; 4] {
+    let raw = if is_focused {
+        shadow.color.as_str()
+    } else {
+        shadow.inactive_color.as_deref().unwrap_or(&shadow.color)
+    };
+    parse_hex_color(raw, COLOR_SHADOW_DEFAULT)
+}
+
+/// Computes the padded drop-shadow draw area, scaled/offset shadow caster box, and blur sigma.
+#[must_use]
+pub fn compute_drop_shadow_geometry(
+    window_rect: Rectangle<f64, Logical>,
+    corner_radius: f32,
+    shadow: &ShadowConfig,
+    is_focused: bool,
+) -> Option<DropShadowGeometry> {
+    if !shadow.enabled || window_rect.size.w <= 0.0 || window_rect.size.h <= 0.0 {
+        return None;
+    }
+
+    let color = resolve_shadow_rgba(shadow, is_focused);
+    if color[3] <= 0.0 {
+        return None;
+    }
+
+    let scale = f64::from(shadow.scale.clamp(0.05, 4.0));
+    let sw = (window_rect.size.w * scale).max(1.0);
+    let sh = (window_rect.size.h * scale).max(1.0);
+    let sx = window_rect.loc.x + (window_rect.size.w - sw) * 0.5 + f64::from(shadow.offset_x);
+    let sy = window_rect.loc.y + (window_rect.size.h - sh) * 0.5 + f64::from(shadow.offset_y);
+    let shadow_box = Rectangle::new(Point::from((sx, sy)), Size::from((sw, sh)));
+
+    let max_corner = (sw.min(sh) as f32) * 0.5;
+    let r = (corner_radius.max(0.0) * scale as f32).min(max_corner);
+    let shadow_radii = [r; 4];
+
+    let sharp = shadow.sharp || shadow.range == 0;
+    let (sigma, pad) = if sharp {
+        (0.0_f32, 2.0_f64)
+    } else {
+        let range = shadow.range as f32;
+        let power = f32::from(shadow.render_power.clamp(1, 8));
+        let sigma = (range / (1.5 + 0.5 * power)).max(0.5);
+        let pad = f64::from((3.0 * sigma).ceil().max(range) + 2.0);
+        (sigma, pad)
+    };
+
+    let min_x = (shadow_box.loc.x - pad).floor() as i32;
+    let min_y = (shadow_box.loc.y - pad).floor() as i32;
+    let max_x = (shadow_box.loc.x + shadow_box.size.w + pad).ceil() as i32;
+    let max_y = (shadow_box.loc.y + shadow_box.size.h + pad).ceil() as i32;
+    let area = Rectangle::new(
+        Point::from((min_x, min_y)),
+        Size::from(((max_x - min_x).max(1), (max_y - min_y).max(1))),
+    );
+
+    Some(DropShadowGeometry {
+        area,
+        shadow_box,
+        shadow_radii,
+        sigma,
+        sharp,
+        color,
+    })
+}
+
+/// Resolves the normalized `[f32; 4]` RGBA focus-ring color for active or inactive windows.
+#[must_use]
+pub fn resolve_focus_ring_rgba(focus_ring: &FocusRingConfig, is_focused: bool) -> [f32; 4] {
+    if is_focused {
+        parse_hex_color(&focus_ring.active_color, COLOR_BORDER_FOCUSED)
+    } else {
+        parse_hex_color(&focus_ring.inactive_color, COLOR_BORDER_INACTIVE)
+    }
+}
+
+/// Computes outer ring bounds wrapped around `window_rect` when `focus_ring.enabled` is true.
+#[must_use]
+pub fn compute_focus_ring_geometry(
+    window_rect: Rectangle<f64, Logical>,
+    corner_radius: f32,
+    focus_ring: &FocusRingConfig,
+) -> Option<FocusRingGeometry> {
+    let width = focus_ring.width.max(0.0);
+    if !focus_ring.enabled || width <= 0.0 || window_rect.size.w <= 0.0 || window_rect.size.h <= 0.0
+    {
+        return None;
+    }
+
+    let w_f64 = f64::from(width);
+    let ring_rect = Rectangle::new(
+        Point::from((window_rect.loc.x - w_f64, window_rect.loc.y - w_f64)),
+        Size::from((
+            window_rect.size.w + w_f64 * 2.0,
+            window_rect.size.h + w_f64 * 2.0,
+        )),
+    );
+    let base_radius = corner_radius.max(0.0);
+    let outer_radius = if base_radius > 0.0 {
+        base_radius + width
+    } else {
+        0.0
+    };
+
+    Some(FocusRingGeometry {
+        ring_rect,
+        outer_radii: [outer_radius; 4],
+        width,
+    })
 }
 
 /// Computes the effective opacity/brightness multiplier for a window given `DimConfig`.
@@ -217,7 +353,30 @@ where
             }
         }
 
-        // 2b. Anti-aliased SDF rounded border ring (or solid fallback when radius == 0)
+        // 2b. Anti-aliased SDF rounded border ring + optional outer Niri-style focus ring
+        if let Some(ring_geom) = compute_focus_ring_geometry(outer_rect, radius, &item.focus_ring) {
+            let ring_rgba = resolve_focus_ring_rgba(&item.focus_ring, item.is_focused);
+            if ring_rgba[3] > 0.0
+                && let (Some(border_prog), Some(white_tex)) = (
+                    shaders.rounded_border.as_ref(),
+                    shaders.white_1x1_tex.as_ref(),
+                )
+            {
+                elements.push(KomaRenderElement::RoundedBorder(
+                    KomaRoundedBorderElement::new(
+                        ring_geom.ring_rect,
+                        ring_geom.outer_radii,
+                        ring_geom.width,
+                        ring_rgba,
+                        eff_opacity,
+                        output_scale,
+                        white_tex.clone(),
+                        border_prog.clone(),
+                    ),
+                ));
+            }
+        }
+
         if item.border.enabled
             && border_thickness > 0.0
             && let (Some(border_prog), Some(white_tex)) = (
@@ -301,6 +460,39 @@ where
             elements.push(KomaRenderElement::from(KomaSolidColorElement::oneshot(
                 outer_rect,
                 border_rgba,
+            )));
+        }
+
+        if shaders.rounded_border.is_none()
+            && let Some(ring_geom) =
+                compute_focus_ring_geometry(outer_rect, radius, &item.focus_ring)
+        {
+            let ring_rgba = resolve_focus_ring_rgba(&item.focus_ring, item.is_focused);
+            if ring_rgba[3] > 0.0 {
+                elements.push(KomaRenderElement::from(KomaSolidColorElement::oneshot(
+                    ring_geom.ring_rect,
+                    ring_rgba,
+                )));
+            }
+        }
+
+        // 2e. Rounded drop shadow behind window, border, focus ring, and blur backdrop
+        if let (Some(shadow_geom), Some(shadow_prog)) = (
+            compute_drop_shadow_geometry(outer_rect, radius, &item.shadow, item.is_focused),
+            shaders.rounded_shadow.as_ref(),
+        ) {
+            elements.push(KomaRenderElement::DropShadow(KomaDropShadowElement::new(
+                shadow_geom.area,
+                shadow_geom.shadow_box,
+                shadow_geom.shadow_radii,
+                shadow_geom.sigma,
+                shadow_geom.sharp,
+                shadow_geom.color,
+                outer_rect,
+                outer_radii,
+                eff_opacity,
+                output_scale,
+                shadow_prog.clone(),
             )));
         }
     }
@@ -513,5 +705,115 @@ mod tests {
 
         let inactive = resolve_border_rgba(&border, &WorkspaceLeaseState::Unheld, false);
         assert_eq!(inactive, [0.0, 1.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn compute_drop_shadow_geometry_respects_offsets_scale_range_sharp_and_colors() {
+        let win = Rectangle::new(Point::from((100.0, 200.0)), Size::from((800.0, 600.0)));
+        let cfg = ShadowConfig {
+            enabled: true,
+            range: 20,
+            render_power: 3,
+            sharp: false,
+            color: "#112233cc".to_owned(),
+            inactive_color: Some("#44556677".to_owned()),
+            offset_x: 6.0,
+            offset_y: -4.0,
+            scale: 0.9,
+        };
+
+        let active = compute_drop_shadow_geometry(win, 10.0, &cfg, true).expect("active shadow");
+        assert!((active.shadow_box.size.w - 720.0).abs() < 1e-4);
+        assert!((active.shadow_box.size.h - 540.0).abs() < 1e-4);
+        // Centered delta is +40/+30 plus offset (6, -4)
+        assert!((active.shadow_box.loc.x - 146.0).abs() < 1e-4);
+        assert!((active.shadow_box.loc.y - 226.0).abs() < 1e-4);
+        assert!(!active.sharp);
+        assert!(active.sigma > 0.0);
+        // Padded area must strictly enclose shadow_box
+        assert!(f64::from(active.area.loc.x) < active.shadow_box.loc.x);
+        assert!(f64::from(active.area.loc.y) < active.shadow_box.loc.y);
+        assert!(
+            f64::from(active.area.loc.x + active.area.size.w)
+                > active.shadow_box.loc.x + active.shadow_box.size.w
+        );
+        assert!(
+            f64::from(active.area.loc.y + active.area.size.h)
+                > active.shadow_box.loc.y + active.shadow_box.size.h
+        );
+        assert!((active.shadow_radii[0] - 9.0).abs() < 1e-5);
+        assert_eq!(
+            active.color,
+            [
+                f32::from(0x11_u8) / 255.0,
+                f32::from(0x22_u8) / 255.0,
+                f32::from(0x33_u8) / 255.0,
+                f32::from(0xcc_u8) / 255.0,
+            ]
+        );
+
+        let inactive =
+            compute_drop_shadow_geometry(win, 10.0, &cfg, false).expect("inactive shadow");
+        assert_eq!(
+            inactive.color,
+            [
+                f32::from(0x44_u8) / 255.0,
+                f32::from(0x55_u8) / 255.0,
+                f32::from(0x66_u8) / 255.0,
+                f32::from(0x77_u8) / 255.0,
+            ]
+        );
+
+        let fallback_inactive = ShadowConfig {
+            inactive_color: None,
+            ..cfg.clone()
+        };
+        assert_eq!(resolve_shadow_rgba(&fallback_inactive, false), active.color);
+
+        let sharp_cfg = ShadowConfig {
+            sharp: true,
+            ..cfg.clone()
+        };
+        let sharp = compute_drop_shadow_geometry(win, 10.0, &sharp_cfg, true).expect("sharp");
+        assert!(sharp.sharp);
+        assert_eq!(sharp.sigma, 0.0);
+
+        let disabled_cfg = ShadowConfig {
+            enabled: false,
+            ..cfg
+        };
+        assert!(compute_drop_shadow_geometry(win, 10.0, &disabled_cfg, true).is_none());
+    }
+
+    #[test]
+    fn compute_focus_ring_geometry_and_colors_behave_cleanly() {
+        let win = Rectangle::new(Point::from((50.0, 80.0)), Size::from((400.0, 300.0)));
+        let disabled = FocusRingConfig::default();
+        assert!(compute_focus_ring_geometry(win, 8.0, &disabled).is_none());
+
+        let enabled = FocusRingConfig {
+            enabled: true,
+            width: 3.0,
+            active_color: "#ff0000".to_owned(),
+            inactive_color: "#00ff0080".to_owned(),
+        };
+        let ring = compute_focus_ring_geometry(win, 8.0, &enabled).expect("enabled ring");
+        assert_eq!(ring.ring_rect.loc, Point::from((47.0, 77.0)));
+        assert_eq!(ring.ring_rect.size, Size::from((406.0, 306.0)));
+        assert_eq!(ring.outer_radii, [11.0; 4]);
+        assert_eq!(ring.width, 3.0);
+
+        // Square windows retain square outer focus ring corners
+        let square = compute_focus_ring_geometry(win, 0.0, &enabled).expect("square ring");
+        assert_eq!(square.outer_radii, [0.0; 4]);
+
+        assert_eq!(
+            resolve_focus_ring_rgba(&enabled, true),
+            [1.0, 0.0, 0.0, 1.0]
+        );
+        assert_eq!(
+            resolve_focus_ring_rgba(&enabled, false),
+            [0.0, 1.0, 0.0, f32::from(0x80_u8) / 255.0]
+        );
     }
 }

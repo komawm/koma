@@ -13,8 +13,8 @@ use smithay::{
         renderer::{
             ImportMem as _,
             gles::{
-                GlesFrame, GlesRenderer, GlesTexProgram, GlesTexture, Uniform, UniformName,
-                UniformType, UniformValue,
+                GlesFrame, GlesPixelProgram, GlesRenderer, GlesTexProgram, GlesTexture, Uniform,
+                UniformName, UniformType, UniformValue,
             },
             multigpu::{MultiFrame, MultiRenderer, gbm::GbmGlesBackend},
         },
@@ -270,12 +270,140 @@ void main() {
 }
 "#;
 
-/// Compiled custom `GlesTexProgram` suite + `1x1` solid carrier texture cached on `EGLContext::user_data()`.
+/// Analytical erf/Gaussian rounded-rectangle drop shadow fragment body for Smithay `GlesPixelProgram`.
+///
+/// Compiled via `GlesRenderer::compile_custom_pixel_shader`, which prepends `#version 100`
+/// and optional `#define DEBUG_FLAGS` and supplies `v_coords`, `size`, `alpha`, and `tint`.
+const ROUNDED_SHADOW_FRAG_BODY: &str = r#"
+precision highp float;
+
+#if defined(DEBUG_FLAGS)
+uniform float tint;
+#endif
+
+uniform float alpha;
+uniform vec2 size;
+varying vec2 v_coords;
+
+uniform float koma_scale;
+uniform vec4 shadow_color;
+uniform float shadow_sigma;
+uniform float shadow_sharp;
+uniform vec2 geo_size;
+uniform vec4 corner_radius;
+uniform mat3 input_to_geo;
+
+uniform vec2 window_geo_size;
+uniform vec4 window_corner_radius;
+uniform mat3 window_input_to_geo;
+
+float koma_rounding_alpha(vec2 coords, vec2 size, vec4 corner_radius, float scale);
+
+float koma_gaussian(float x, float sigma) {
+    const float pi = 3.141592653589793;
+    return exp(-(x * x) / (2.0 * sigma * sigma)) / (sqrt(2.0 * pi) * sigma);
+}
+
+// Abramowitz & Stegun 7.1.25 rational approximation of erf(x) in GLES2.
+vec2 koma_erf(vec2 x) {
+    vec2 s = sign(x);
+    vec2 a = abs(x);
+    vec2 t = 1.0 + (0.278393 + (0.230389 + 0.078108 * (a * a)) * a) * a;
+    t *= t;
+    return s - s / (t * t);
+}
+
+float koma_rounded_box_shadow_x(float x, float y, float sigma, float corner, vec2 half_size) {
+    float delta = min(half_size.y - corner - abs(y), 0.0);
+    float curved = half_size.x - corner + sqrt(max(0.0, corner * corner - delta * delta));
+    vec2 integral = 0.5 + 0.5 * koma_erf((x + vec2(-curved, curved)) * (sqrt(0.5) / sigma));
+    return integral.y - integral.x;
+}
+
+float koma_rounded_box_shadow(vec2 box_size, vec2 point, float sigma, float corner) {
+    vec2 half_size = box_size * 0.5;
+    float clamped_corner = clamp(corner, 0.0, min(half_size.x, half_size.y));
+    vec2 p = point - half_size;
+
+    float low = p.y - half_size.y;
+    float high = p.y + half_size.y;
+    float start = clamp(-3.0 * sigma, low, high);
+    float end = clamp(3.0 * sigma, low, high);
+
+    float step_y = (end - start) / 4.0;
+    if (step_y <= 0.0) {
+        return 0.0;
+    }
+
+    float y = start + step_y * 0.5;
+    float acc = 0.0;
+    for (int i = 0; i < 4; i++) {
+        acc += koma_rounded_box_shadow_x(p.x, p.y - y, sigma, clamped_corner, half_size)
+            * koma_gaussian(y, sigma)
+            * step_y;
+        y += step_y;
+    }
+    return clamp(acc, 0.0, 1.0);
+}
+
+void main() {
+    vec2 coords_geo = (input_to_geo * vec3(v_coords, 1.0)).xy;
+    float shadow_mask;
+
+    if (shadow_sharp > 0.5 || shadow_sigma < 0.1) {
+        if (0.0 <= coords_geo.x && coords_geo.x <= geo_size.x
+            && 0.0 <= coords_geo.y && coords_geo.y <= geo_size.y)
+        {
+            shadow_mask = koma_rounding_alpha(coords_geo, geo_size, corner_radius, koma_scale);
+        } else {
+            shadow_mask = 0.0;
+        }
+    } else {
+        shadow_mask = koma_rounded_box_shadow(geo_size, coords_geo, shadow_sigma, corner_radius.x);
+    }
+
+    if (window_geo_size.x > 0.0 && window_geo_size.y > 0.0) {
+        vec2 win_coords = (window_input_to_geo * vec3(v_coords, 1.0)).xy;
+        if (0.0 <= win_coords.x && win_coords.x <= window_geo_size.x
+            && 0.0 <= win_coords.y && win_coords.y <= window_geo_size.y)
+        {
+            float inside = koma_rounding_alpha(
+                win_coords,
+                window_geo_size,
+                window_corner_radius,
+                koma_scale
+            );
+            shadow_mask *= (1.0 - inside);
+        }
+    }
+
+    vec4 color = vec4(shadow_color.rgb * shadow_color.a, shadow_color.a);
+    color *= shadow_mask * alpha;
+
+#if defined(DEBUG_FLAGS)
+    if (tint == 1.0) {
+        color = vec4(0.0, 0.2, 0.0, 0.2) + color * 0.8;
+    }
+#endif
+
+    gl_FragColor = color;
+}
+"#;
+
+/// Returns the combined GLSL fragment source passed to `GlesRenderer::compile_custom_pixel_shader`.
+#[must_use]
+pub fn rounded_shadow_fragment_source() -> String {
+    format!("{ROUNDED_SHADOW_FRAG_BODY}\n{GLSL_ROUNDING_ALPHA_FN}")
+}
+
+/// Compiled custom `GlesTexProgram` / `GlesPixelProgram` suite + `1x1` solid carrier texture
+/// cached on `EGLContext::user_data()`.
 #[derive(Debug, Clone)]
 pub struct KomaCompiledShaders {
     pub clipped_surface: Option<GlesTexProgram>,
     pub rounded_border: Option<GlesTexProgram>,
     pub blur_finish_rounded: Option<GlesTexProgram>,
+    pub rounded_shadow: Option<GlesPixelProgram>,
     pub white_1x1_tex: Option<GlesTexture>,
 }
 
@@ -346,6 +474,26 @@ impl KomaCompiledShaders {
             .map_err(|e| warn!("failed compiling blur_finish_rounded GLSL shader: {e:?}"))
             .ok();
 
+        let shadow_src = rounded_shadow_fragment_source();
+        let rounded_shadow = renderer
+            .compile_custom_pixel_shader(
+                &shadow_src,
+                &[
+                    UniformName::new("koma_scale", UniformType::_1f),
+                    UniformName::new("shadow_color", UniformType::_4f),
+                    UniformName::new("shadow_sigma", UniformType::_1f),
+                    UniformName::new("shadow_sharp", UniformType::_1f),
+                    UniformName::new("geo_size", UniformType::_2f),
+                    UniformName::new("corner_radius", UniformType::_4f),
+                    UniformName::new("input_to_geo", UniformType::Matrix3x3),
+                    UniformName::new("window_geo_size", UniformType::_2f),
+                    UniformName::new("window_corner_radius", UniformType::_4f),
+                    UniformName::new("window_input_to_geo", UniformType::Matrix3x3),
+                ],
+            )
+            .map_err(|e| warn!("failed compiling rounded_shadow GLSL pixel shader: {e:?}"))
+            .ok();
+
         let white_1x1_tex = renderer
             .import_memory(
                 &[255_u8, 255, 255, 255],
@@ -360,6 +508,7 @@ impl KomaCompiledShaders {
             clipped_surface,
             rounded_border,
             blur_finish_rounded,
+            rounded_shadow,
             white_1x1_tex,
         };
 
@@ -416,4 +565,40 @@ pub fn mat3_uniform(name: &'static str, mat: Mat3f) -> Uniform<'static> {
             transpose: false,
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rounded_shadow_shader_omits_version_header_and_defines_required_uniforms() {
+        let src = rounded_shadow_fragment_source();
+        assert!(
+            !src.contains("#version"),
+            "Smithay compile_custom_pixel_shader prepends #version 100 itself"
+        );
+        for required in [
+            "varying vec2 v_coords;",
+            "uniform float alpha;",
+            "uniform float koma_scale;",
+            "uniform vec4 shadow_color;",
+            "uniform float shadow_sigma;",
+            "uniform float shadow_sharp;",
+            "uniform vec2 geo_size;",
+            "uniform vec4 corner_radius;",
+            "uniform mat3 input_to_geo;",
+            "uniform vec2 window_geo_size;",
+            "uniform vec4 window_corner_radius;",
+            "uniform mat3 window_input_to_geo;",
+            "koma_erf",
+            "koma_rounded_box_shadow",
+            "float koma_rounding_alpha(",
+        ] {
+            assert!(
+                src.contains(required),
+                "shadow shader missing expected symbol `{required}`"
+            );
+        }
+    }
 }

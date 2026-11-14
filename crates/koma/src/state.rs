@@ -46,6 +46,7 @@ use smithay::{
     utils::{Logical, Point, Size},
     wayland::{
         compositor::{CompositorClientState, CompositorState, with_states},
+        cursor_shape::CursorShapeManagerState,
         dmabuf::DmabufState,
         fractional_scale::FractionalScaleManagerState,
         output::OutputManagerState,
@@ -81,6 +82,7 @@ use crate::backend_tty::TtyBackendState;
 use crate::{
     backend_winit::WinitBackendState,
     config_watcher::{ConfigWatcherHandle, KomaConfigPath},
+    cursor::CursorManager,
     gesture_dispatcher::GestureTable,
     ipc_server::IpcClientConn,
     keybind_dispatcher::KeybindTable,
@@ -225,6 +227,8 @@ pub struct KomaState {
     #[allow(dead_code)]
     pub pointer_gestures_state: PointerGesturesState,
     #[allow(dead_code)]
+    pub cursor_shape_manager_state: CursorShapeManagerState,
+    #[allow(dead_code)]
     pub dmabuf_state: DmabufState,
     #[allow(dead_code)]
     pub viewporter_state: ViewporterState,
@@ -235,7 +239,8 @@ pub struct KomaState {
     // Physical/nested host seat (`seat0` / `libseat`)
     pub seat: Seat<Self>,
     pub pointer_location: Point<f64, Logical>,
-    pub cursor_status: CursorImageStatus,
+    pub cursor_manager: CursorManager,
+    pub cursor_anim_timer_token: Option<RegistrationToken>,
 
     // Koma pure domain model (`koma-model` + `koma-lua` + `koma-seat`)
     pub active_ws_id: WorkspaceId,
@@ -321,6 +326,7 @@ impl KomaState {
             VirtualKeyboardManagerState::new::<Self, _>(&display_handle, client_is_unrestricted);
 
         let pointer_gestures_state = PointerGesturesState::new::<Self>(&display_handle);
+        let cursor_shape_manager_state = CursorShapeManagerState::new::<Self>(&display_handle);
         let dmabuf_state = DmabufState::new();
         let viewporter_state = ViewporterState::new::<Self>(&display_handle);
         let fractional_scale_state = FractionalScaleManagerState::new::<Self>(&display_handle);
@@ -378,6 +384,7 @@ impl KomaState {
             security_context_state,
             virtual_keyboard_state,
             pointer_gestures_state,
+            cursor_shape_manager_state,
             dmabuf_state,
             viewporter_state,
             fractional_scale_state,
@@ -387,7 +394,8 @@ impl KomaState {
                 f64::from(initial_viewport.width) * 0.5,
                 f64::from(initial_viewport.height) * 0.5,
             )),
-            cursor_status: CursorImageStatus::default_named(),
+            cursor_manager: CursorManager::new(),
+            cursor_anim_timer_token: None,
             active_ws_id,
             active_special_ws_id: None,
             workspaces,
@@ -1221,6 +1229,7 @@ impl KomaState {
         let default_radius = appearance.corner_radius.unwrap_or(10);
         let blur_enabled = appearance.blur.enabled;
         let border_cfg = appearance.border.clone();
+        let focus_ring_cfg = appearance.focus_ring.clone();
         let shadow_cfg = appearance.shadow.clone();
         let dim_cfg = appearance.effective_dim();
 
@@ -1284,6 +1293,7 @@ impl KomaState {
                     corner_radius,
                     wants_blur: blur_enabled && !is_fs,
                     border: border_cfg.clone(),
+                    focus_ring: focus_ring_cfg.clone(),
                     shadow: shadow_cfg.clone(),
                     dim: dim_cfg,
                 });
@@ -1368,6 +1378,35 @@ impl KomaState {
         self.redraw_queued = true;
         if let Some(backend) = &mut self.backend {
             backend.request_redraw();
+        }
+    }
+
+    /// Updates active cursor status, clears any pending animation timer, and requests redraw.
+    pub fn set_cursor_status(&mut self, status: CursorImageStatus) {
+        self.cursor_manager.set_status(status);
+        if let Some(token) = self.cursor_anim_timer_token.take()
+            && let Some(handle) = &self.loop_handle
+        {
+            handle.remove(token);
+        }
+        self.queue_redraw();
+    }
+
+    /// Arms a one-shot timer to advance an animated XCursor to its next frame.
+    pub fn schedule_cursor_animation_redraw(&mut self, delay_ms: u64) {
+        if self.cursor_anim_timer_token.is_some() {
+            return;
+        }
+        let Some(handle) = self.loop_handle.clone() else {
+            return;
+        };
+        let timer = calloop::timer::Timer::from_duration(Duration::from_millis(delay_ms.max(8)));
+        if let Ok(token) = handle.insert_source(timer, |_, _, state| {
+            state.cursor_anim_timer_token = None;
+            state.queue_redraw();
+            calloop::timer::TimeoutAction::Drop
+        }) {
+            self.cursor_anim_timer_token = Some(token);
         }
     }
 }

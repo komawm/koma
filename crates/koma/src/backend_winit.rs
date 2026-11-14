@@ -26,10 +26,14 @@ use smithay::{
         winit::{self, WinitEvent, WinitGraphicsBackend},
     },
     desktop::{layer_map_for_output, utils::send_frames_surface_tree},
-    input::{keyboard::KeyboardSource, pointer::MotionEvent},
+    input::{
+        keyboard::KeyboardSource,
+        pointer::{CursorIcon, CursorImageStatus, MotionEvent},
+    },
     output::{Mode, Output, PhysicalProperties, Scale, Subpixel},
     reexports::winit::{
-        dpi::LogicalSize, platform::wayland::WindowAttributesWayland, window::WindowAttributes,
+        cursor::Cursor as WinitCursor, dpi::LogicalSize,
+        platform::wayland::WindowAttributesWayland, window::WindowAttributes,
     },
     utils::{Point, SERIAL_COUNTER},
     wayland::{
@@ -47,6 +51,8 @@ pub struct WinitBackendState {
     pub damage_tracker: OutputDamageTracker,
     pub render_node: Option<DrmNode>,
     pub dmabuf_global: Option<DmabufGlobal>,
+    last_host_cursor_visible: Option<bool>,
+    last_host_cursor_icon: Option<CursorIcon>,
 }
 
 impl WinitBackendState {
@@ -64,6 +70,9 @@ impl WinitBackendState {
 
         let (backend, winit_evt_loop) = winit::init_from_attributes::<GlesRenderer>(builder)
             .map_err(|e| anyhow::anyhow!("failed initializing Smithay Winit backend: {e:?}"))?;
+        // Hide the host OS cursor inside Koma's window while rendering our own cursor element
+        // at the front of the scene (clean interactive control + captured in screencasts).
+        backend.window().set_cursor_visible(false);
 
         let win_size = backend.window_size();
         let scale_factor = backend.scale_factor();
@@ -160,6 +169,8 @@ impl WinitBackendState {
                 damage_tracker,
                 render_node: None,
                 dmabuf_global: None,
+                last_host_cursor_visible: Some(false),
+                last_host_cursor_icon: None,
             },
             initial_viewport,
         ))
@@ -201,6 +212,20 @@ impl WinitBackendState {
     pub fn request_redraw(&self) {
         self.backend.window().request_redraw();
     }
+
+    /// Keeps host Winit cursor hidden inside Koma's framebuffer while syncing the host icon shape.
+    pub fn sync_host_cursor(&mut self, status: &CursorImageStatus) {
+        if self.last_host_cursor_visible != Some(false) {
+            self.backend.window().set_cursor_visible(false);
+            self.last_host_cursor_visible = Some(false);
+        }
+        if let CursorImageStatus::Named(icon) = status
+            && self.last_host_cursor_icon != Some(*icon)
+        {
+            self.backend.window().set_cursor(WinitCursor::Icon(*icon));
+            self.last_host_cursor_icon = Some(*icon);
+        }
+    }
 }
 
 /// Executes a complete single-frame render pass onto the Winit EGL swapchain (`Frame 1` & live updates).
@@ -219,6 +244,22 @@ pub fn render_winit_frame(state: &mut KomaState) -> anyhow::Result<()> {
     };
     let output_scale =
         smithay::utils::Scale::from(winit_state.output.current_scale().fractional_scale());
+
+    let pointer_loc = state.pointer_location;
+    let now_ms = state.elapsed_ms();
+    let cursor_elems = state.cursor_manager.render_elements(
+        winit_state.backend.renderer(),
+        pointer_loc,
+        output_scale,
+        now_ms,
+    );
+    if let Some(delay_ms) = state
+        .cursor_manager
+        .next_frame_delay_ms(output_scale.x, now_ms)
+    {
+        state.schedule_cursor_animation_redraw(delay_ms);
+    }
+    winit_state.sync_host_cursor(state.cursor_manager.status());
 
     // Build front-to-back scene items across optional `special:<name>` Scratchpad + `active_ws_id`
     let (base_scene_items, special_overlay) = state.collect_physical_scene_items();
@@ -351,6 +392,7 @@ pub fn render_winit_frame(state: &mut KomaState) -> anyhow::Result<()> {
         if state.config_error_banner.is_some() {
             prepend_config_error_banner(viewport, &mut elements);
         }
+        elements.splice(0..0, cursor_elems);
 
         let (renderer, mut framebuffer) = winit_state
             .backend
@@ -492,6 +534,7 @@ where
                 );
                 pointer.frame(state);
             }
+            state.queue_redraw();
         }
         InputEvent::PointerButton { event } => {
             crate::keybind_dispatcher::process_pointer_button_event(
