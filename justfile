@@ -49,6 +49,12 @@ test-core: lockfile-check
 gen-types: lockfile-check
     cargo run --locked -p komactl -- gen-types
 
+# Development-prerelease archive; publication happens only through the tag-triggered release workflow.
+# Accepts `just package-release 0.0.1` or `just package-release version=0.0.1`.
+[positional-arguments]
+package-release version target="x86_64-unknown-linux-gnu" out="/tmp/koma/release":
+    bash scripts/package-release.sh --version "${1#version=}" --target "${2#target=}" --out "${3#out=}"
+
 hooks-install:
     lefthook install pre-commit
     carryctx hooks install --compose

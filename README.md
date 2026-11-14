@@ -36,6 +36,10 @@ The incubation baseline is `0.0.1`. Use the `0.0.x` line while interfaces and ac
 
 The target development toolchain is Rust `1.100.0`, with Rust 2024 edition. The [official stable announcement](https://blog.rust-lang.org/2026/11/12/Rust-1.100.0/) is the version reference; the [toolchain file](https://github.com/komawm/koma/blob/main/rust-toolchain.toml) owns the exact repository pin. Dependencies should use the latest verified compatible versions, with lockfile review. The fixed Smithay revision remains an explicit architecture/API compatibility exception until its migration is tested.
 
+## Releases
+
+Tags matching `v0.0.x` publish **development prereleases** to [GitHub Releases](https://github.com/komawm/koma/releases) through the [release workflow](https://github.com/komawm/koma/blob/main/.github/workflows/release.yml) after the same gates as CI pass. Each release attaches `koma-<version>-x86_64-unknown-linux-gnu.tar.gz` and `SHA256SUMS`. The archive contains `bin/` (`koma`, `komactl`, `koma-mcp`, `koma-overview`), `resources/`, `examples/`, `LICENSE`, `README.md`, `CHANGELOG.md`, and `RELEASE-MANIFEST.toml` (version, git revision, toolchain, build date and per-binary SHA-256). Verify a download with `sha256sum -c SHA256SUMS` in the directory holding both files. Build the same archive locally with `just package-release 0.0.1`. See the [changelog](https://github.com/komawm/koma/blob/main/CHANGELOG.md) for contents and known limits. These prereleases carry no hardware, DRM/KMS, security or desktop-support claims; `v0.1.0` remains the first accepted release, as defined in the [release plan](https://github.com/komawm/.github/blob/main/docs/releases.md).
+
 ## Development
 
 Use the pinned Rust toolchain and the repository [justfile](https://github.com/komawm/koma/blob/main/justfile). Run commands from the Koma checkout:

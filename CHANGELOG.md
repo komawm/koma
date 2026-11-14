@@ -1,0 +1,59 @@
+# Changelog
+
+All notable changes to Koma are recorded here. The format follows
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Koma uses `0.0.x`
+incubation versions; `v0.1.0` will be the first independently accepted product
+release. A `0.0.x` tag is a development prerelease and does not claim a working
+desktop, hardware support, or security guarantees.
+
+## [Unreleased]
+
+## [0.0.1] - 2026-11-14
+
+Initial development prerelease of the imported incubation baseline.
+
+### Added
+
+- Nine-crate Rust 2024 workspace targeting Rust `1.100.0`: `koma-proto`,
+  `koma-model`, `koma-lua`, `koma-render`, `koma-seat`, the `koma` compositor
+  binary, `komactl`, `koma-mcp` and `koma-overview`.
+- Lua configuration through the Phodopus sandbox with configurable defaults:
+  - `Dwindle` is the default workspace layout; `koma.layout(...)`,
+    `koma.workspace({...})`, `koma.dwindle({...})` and `koma.scrolling({...})`
+    select and tune layouts globally or per workspace.
+  - Hyprland-compatible default keybinds loaded when
+    `inherit_default_binds = true`; `koma.bind(...)` overrides individual
+    chords in place and `koma.unbind(chord)` removes specific defaults.
+  - Typed appearance settings for borders, focus ring, shadow, dim, blur and
+    animations.
+- `komactl gen-types` emits LuaLS definitions for the configuration API;
+  `komactl validate` checks a configuration offline.
+- Session resources (desktop entry, systemd units, portals configuration,
+  greetd example) and example configuration under `examples/`.
+- Shared local/CI quality gates (`just check`: descriptor validation,
+  shellcheck, actionlint, rustfmt, cargo check, clippy with `-D warnings`,
+  tests), GitHub Actions CI and CodeQL workflows pinned by commit SHA.
+- Release tooling: `scripts/package-release.sh`, `just package-release`, and a
+  tag-triggered workflow that publishes development prereleases with a
+  release manifest and `SHA256SUMS`.
+
+### Changed
+
+- Reconciled core geometry/window identifiers, the Phodopus bridge, protocol
+  exports and Tier 2/3 geometry/lease APIs so the full workspace builds and
+  passes clippy and tests.
+- Dropped the redundant `license-file` manifest field; crates declare
+  `license = "GPL-3.0-or-later"` with the single root `LICENSE`.
+
+### Known limitations
+
+- No hardware, DRM/KMS, physical input or GPU acceptance has been performed.
+- Nested Wayland and isolated VM validation are still pending; passing CI
+  covers builds, lints and unit/state-machine tests only.
+- Koma is not yet a supported daily-driver desktop. Interfaces, configuration
+  and IPC may change without notice on the `0.0.x` line.
+- Only `x86_64-unknown-linux-gnu` archives are produced; BSD and other
+  architectures remain planned.
+
+[Unreleased]: https://github.com/komawm/koma/compare/v0.0.1...HEAD
+[0.0.1]: https://github.com/komawm/koma/releases/tag/v0.0.1
