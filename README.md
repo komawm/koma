@@ -4,7 +4,15 @@ Koma is a Wayland tiling compositor designed for keyboard-driven desktops and co
 
 The repository already contains substantial implementation; canonical architecture specifications live in [koma-docs](https://github.com/komawm/docs). It is an early development baseline: source presence and specification targets do not establish build, runtime, security, latency, or platform acceptance. Start with the [current-state inventory](https://github.com/komawm/docs/blob/main/docs/development/current-state.md) and [development guide](https://github.com/komawm/docs/blob/main/docs/development/README.md).
 
-[Jiku](https://github.com/komawm/jiku) is the separate GUI orchestration companion. Its repository currently contains non-runnable library scaffolding, configuration examples and a service template; it has no implemented daemon or CLI.
+[Jiku](https://github.com/komawm/jiku) is the separate GUI orchestration companion. Its repository defines pure-data contract types, the Three-Driver model routing architecture (`DecisionsDriver`, `TurnModelDriver`, and `LiveSessionDriver`), `DecisionCompiler` primitives, and configurable defaults with zero-error `EmulatedStructuredTextModel` fallback, while remaining a library-only scaffold prior to `v0.1.0`.
+
+## Configurable defaults and Lua customization
+
+Koma avoids hardcoded behavior in favor of sensible defaults that can be overridden in `~/.config/koma/init.lua`:
+
+- **Default layout (`Dwindle`)**: Headed workspaces default to `LayoutMode::Dwindle` and can be changed globally via `koma.layout("dwindle" | "scrolling" | "deck" | "bsp")` or per-workspace via `koma.workspace({ layout = "...", gaps = { inner = 8, outer = 12 } })`, with fine-grained tuning in `koma.dwindle({...})` and `koma.scrolling({...})`.
+- **Hyprland-compatible default keybinds with selective override**: When `inherit_default_binds = true` (default in `koma.input({...})`), Koma loads the built-in Hyprland-style default keymap (`Mod + Return`, `Mod + Q`, `Mod + M`, `Mod + V`, `Mod + F`, `Mod + P`, `Mod + E`, `Mod + S`, `Mod + H/J/K/L`, `Mod + Shift + H/J/K/L`, `Mod + 1..9`, `Mod + Shift + 1..9`, `Mod + MouseLeft/Right`, `Mod + WheelScrollDown/Up`). Individual `koma.bind(...)` definitions override matching chords in-place without discarding other defaults, and `koma.unbind(chord)` removes specific default bindings.
+- **Appearance, shaders, and spring animations**: `koma.appearance({...})` exposes typed, default-backed configuration tables for `border` (`BorderConfig`), `focus_ring` (`FocusRingConfig`), `shadow` (`ShadowConfig`), `dim` / `brightness` (`DimConfig`), Dual-Kawase `blur` (`BlurConfig`), and critically damped spring `animations` (`AnimationConfig`).
 
 ## Repository structure
 
