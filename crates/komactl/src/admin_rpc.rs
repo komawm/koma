@@ -17,6 +17,8 @@ use serde_json::{Value, json};
 
 #[derive(Debug, Clone)]
 pub struct DiscoveredInstance {
+    // Retained public discovery field for admin/CLI diagnostics.
+    #[allow(dead_code)]
     pub runtime_dir: PathBuf,
     pub admin_socket: PathBuf,
     pub agent_socket: PathBuf,
@@ -25,7 +27,11 @@ pub struct DiscoveredInstance {
 #[derive(Debug, Deserialize)]
 pub struct CreatedWorkspaceReply {
     pub ws_id: WorkspaceId,
+    // Deserialized from `workspace.create` RPC reply schema.
+    #[allow(dead_code)]
     pub epoch: u64,
+    // Deserialized from `workspace.create` RPC reply schema.
+    #[allow(dead_code)]
     pub vseat_id: String,
 }
 

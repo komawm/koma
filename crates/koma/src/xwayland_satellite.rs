@@ -52,6 +52,8 @@ const X11_TMP_UNIX_DIR: &str = "/tmp/.X11-unix";
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SatelliteTarget {
     Primary,
+    // Reserved for per-workspace headless X11 isolation (`ensure_workspace_satellite`).
+    #[allow(dead_code)]
     Workspace(WorkspaceId),
 }
 
@@ -69,6 +71,8 @@ impl Drop for UnlinkGuard {
 
 /// Passive X11 `:N` display lock & dual Unix/Abstract socket pair (`niri/src/utils/xwayland/mod.rs`).
 pub struct X11SocketSlot {
+    // Allocated `:N` display number retained alongside `display_name`.
+    #[allow(dead_code)]
     pub display_number: u32,
     pub display_name: String,
     pub abstract_fd: Option<OwnedFd>,
@@ -161,6 +165,7 @@ pub fn setup_primary_satellite(state: &mut KomaState) {
 
 /// Allocates (or returns the existing) isolated `xwayland-satellite` `:M` display slot for a
 /// `Headless` Agent workspace when `isolate_agent_workspaces` is enabled.
+#[allow(dead_code)] // Reserved per-workspace headless X11 isolation entry point.
 pub fn ensure_workspace_satellite(state: &mut KomaState, ws_id: &WorkspaceId) -> Option<String> {
     if let Some(existing) = state.workspace_satellites.get(ws_id) {
         return Some(existing.display_name().to_owned());
@@ -245,19 +250,19 @@ fn rearm_satellite_watch(state: &mut KomaState, target: &SatelliteTarget) {
         loop_handle.remove(tok);
     }
 
-    if let Some(abs_fd) = &satellite.x11.abstract_fd {
-        if let Ok(cloned) = abs_fd.try_clone() {
-            let drained = clear_out_pending_connections(cloned);
-            let target_cb = target.clone();
-            if let Ok(tok) = loop_handle.insert_source(
-                Generic::new(drained, Interest::READ, Mode::Level),
-                move |_, _, state| {
-                    trigger_satellite_on_demand(state, &target_cb, true);
-                    Ok(PostAction::Remove)
-                },
-            ) {
-                satellite.abstract_token = Some(tok);
-            }
+    if let Some(abs_fd) = &satellite.x11.abstract_fd
+        && let Ok(cloned) = abs_fd.try_clone()
+    {
+        let drained = clear_out_pending_connections(cloned);
+        let target_cb = target.clone();
+        if let Ok(tok) = loop_handle.insert_source(
+            Generic::new(drained, Interest::READ, Mode::Level),
+            move |_, _, state| {
+                trigger_satellite_on_demand(state, &target_cb, true);
+                Ok(PostAction::Remove)
+            },
+        ) {
+            satellite.abstract_token = Some(tok);
         }
     }
 
@@ -440,9 +445,10 @@ pub fn allocate_x11_socket_slot(start_display: u32) -> anyhow::Result<X11SocketS
                 });
             }
             Err(err) if attempt < 49 => {
+                let slot = display;
                 debug!(
-                    display,
-                    "X11 socket bind race on :{display}, retrying next ({err})"
+                    display = slot,
+                    "X11 socket bind race on :{slot}, retrying next ({err})"
                 );
                 n = display + 1;
             }
@@ -551,10 +557,10 @@ fn probe_listenfd_support(path: &Path) -> bool {
 }
 
 fn expand_tilde_path(raw: &str) -> PathBuf {
-    if let Some(rest) = raw.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
-            return PathBuf::from(home).join(rest);
-        }
+    if let Some(rest) = raw.strip_prefix("~/")
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        return PathBuf::from(home).join(rest);
     }
     PathBuf::from(raw)
 }

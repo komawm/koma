@@ -36,7 +36,7 @@ use smithay::{
     input::{Seat, SeatState, keyboard::XkbConfig, pointer::CursorImageStatus},
     output::Output,
     reexports::wayland_server::{
-        DisplayHandle, Resource as _,
+        DisplayHandle,
         backend::{ClientData, ClientId, DisconnectReason},
         protocol::wl_surface::WlSurface,
     },
@@ -84,6 +84,7 @@ use crate::{
 };
 
 /// Active Ring 0 display & input backend (`niri/src/backend/mod.rs` `Backend` enum).
+#[allow(clippy::large_enum_variant)] // Stored once on `KomaState`; avoids boxing churn across backend paths.
 pub enum ActiveBackend {
     Winit(WinitBackendState),
     #[cfg(feature = "smithay-tty")]
@@ -137,11 +138,16 @@ impl ActiveBackend {
 pub struct ClientState {
     pub compositor_state: CompositorClientState,
     pub restricted: bool,
+    // Security/audit client metadata populated at Wayland accept & security-context attach.
+    #[allow(dead_code)]
     pub credentials_unknown: bool,
     pub primary_selection_disabled: bool,
+    #[allow(dead_code)]
     pub peer_creds: Option<PeerSocketCredentials>,
+    #[allow(dead_code)]
     pub security_context: Option<SecurityContext>,
     pub jailed_workspace: Option<WorkspaceId>,
+    #[allow(dead_code)]
     pub sandbox_label: Option<String>,
 }
 
@@ -189,19 +195,30 @@ pub struct KomaState {
     pub layer_shell_state: WlrLayerShellState,
     pub session_lock_state: SessionLockManagerState,
     pub is_session_locked: bool,
+    // Preview capture subscription ledger retained for IPC/overview lifecycle.
+    #[allow(dead_code)]
     pub preview_refcounts: HashMap<WorkspaceId, u32>,
+    // RAII Wayland global/protocol state handles kept alive on `KomaState`.
+    #[allow(dead_code)]
     pub shm_state: ShmState,
+    #[allow(dead_code)]
     pub output_manager_state: OutputManagerState,
     pub seat_state: SeatState<Self>,
     pub data_device_state: DataDeviceState,
     pub primary_selection_state: PrimarySelectionState,
     pub wlr_data_control_state: WlrDataControlState,
     pub ext_data_control_state: ExtDataControlState,
+    #[allow(dead_code)]
     pub security_context_state: SecurityContextState,
+    #[allow(dead_code)]
     pub virtual_keyboard_state: VirtualKeyboardManagerState,
+    #[allow(dead_code)]
     pub pointer_gestures_state: PointerGesturesState,
+    #[allow(dead_code)]
     pub dmabuf_state: DmabufState,
+    #[allow(dead_code)]
     pub viewporter_state: ViewporterState,
+    #[allow(dead_code)]
     pub fractional_scale_state: FractionalScaleManagerState,
     pub popups: PopupManager,
 
@@ -358,7 +375,7 @@ impl KomaState {
                 f64::from(initial_viewport.width) * 0.5,
                 f64::from(initial_viewport.height) * 0.5,
             )),
-            cursor_status: CursorImageStatus::Default,
+            cursor_status: CursorImageStatus::default_named(),
             active_ws_id,
             active_special_ws_id: None,
             workspaces,
@@ -621,8 +638,7 @@ impl KomaState {
         for (win_id, target_rect, is_float) in visible {
             if let Some(mapped) = self.mapped_windows.iter_mut().find(|m| m.win_id == win_id) {
                 let rect_changed = mapped.rect != target_rect;
-                let size_changed = mapped.rect.width != target_rect.width
-                    || mapped.rect.height != target_rect.height;
+                let size_changed = mapped.rect.w != target_rect.w || mapped.rect.h != target_rect.h;
                 mapped.rect = target_rect;
                 mapped.is_floating = is_float;
                 let bypass = is_offscreen || all_instant || instant_win == Some(win_id);
@@ -636,8 +652,8 @@ impl KomaState {
                     );
                 }
                 if size_changed {
-                    let inner_w = target_rect.width.saturating_sub(4).max(48) as i32;
-                    let inner_h = target_rect.height.saturating_sub(4).max(48) as i32;
+                    let inner_w = target_rect.w.saturating_sub(4).max(48) as i32;
+                    let inner_h = target_rect.h.saturating_sub(4).max(48) as i32;
                     if let Some(toplevel) = mapped.window.toplevel() {
                         toplevel.with_pending_state(|st| {
                             st.size = Some(Size::from((inner_w, inner_h)));
@@ -729,20 +745,24 @@ impl KomaState {
             )
         };
 
-        let explicit_float_rect = initial_rules.default_floating_pos.map(|(anchor, dx, dy)| {
-            let pt = koma_model::AnchorPoint::AnchorOffset {
-                anchor,
-                dx: f64::from(dx),
-                dy: f64::from(dy),
-            }
-            .resolve_in_rect(viewport.full_rect());
-            LogicalRect::new(
-                pt.x.round() as i32,
-                pt.y.round() as i32,
-                preferred_size.0,
-                preferred_size.1,
-            )
-        });
+        let explicit_float_rect =
+            initial_rules
+                .default_floating_pos
+                .and_then(|(anchor, dx, dy)| {
+                    let pt = koma_model::AnchorPoint::AnchorOffset {
+                        anchor,
+                        dx: f64::from(dx),
+                        dy: f64::from(dy),
+                    }
+                    .resolve_in(viewport.full_rect())
+                    .ok()?;
+                    Some(LogicalRect::new(
+                        pt.x.round() as i32,
+                        pt.y.round() as i32,
+                        preferred_size.0,
+                        preferred_size.1,
+                    ))
+                });
 
         let opt_max_size = (max_sz.0 > 0 || max_sz.1 > 0).then_some(max_sz);
         let cursor_logical = LogicalPoint {
@@ -899,18 +919,11 @@ impl KomaState {
                     return Some((win_id, ws_id.clone(), surf, surf_offset.to_f64() + origin));
                 }
                 let in_frame = global_pos.x >= f64::from(rect.x)
-                    && global_pos.x <= f64::from(rect.x + rect.width as i32)
+                    && global_pos.x <= f64::from(rect.x + rect.w as i32)
                     && global_pos.y >= f64::from(rect.y)
-                    && global_pos.y <= f64::from(rect.y + rect.height as i32);
-                if in_frame {
-                    if let Some(toplevel) = mapped.window.toplevel() {
-                        return Some((
-                            win_id,
-                            ws_id.clone(),
-                            toplevel.wl_surface().clone(),
-                            origin,
-                        ));
-                    }
+                    && global_pos.y <= f64::from(rect.y + rect.h as i32);
+                if in_frame && let Some(toplevel) = mapped.window.toplevel() {
+                    return Some((win_id, ws_id.clone(), toplevel.wl_surface().clone(), origin));
                 }
             }
         }
@@ -981,23 +994,22 @@ impl KomaState {
             let _ = ws.scrolling.sample_camera_x(now_ms);
         }
 
-        if let Some((drag_ws_id, cursor_x)) = self.active_drag_edge_scroll.clone() {
-            if let Some(ws) = self.workspaces.get_mut(&drag_ws_id) {
-                if ws.layout_mode == LayoutMode::Scrolling {
-                    let vp = ws.viewport;
-                    let step = ws.scrolling.tick_edge_auto_scroll(cursor_x, vp, now_ms);
-                    self.edge_scroll_keep_alive = step.keeps_frame_loop_alive();
-                    if matches!(step, koma_model::EdgeScrollStep::Scrolled(_)) {
-                        let cursor = koma_model::LogicalPoint {
-                            x: cursor_x,
-                            y: self.pointer_location.y,
-                        };
-                        let dz = ws.scrolling.predict_drop_zone_2d(cursor, vp, now_ms);
-                        self.active_drop_preview = Some((drag_ws_id, dz.preview_rect));
-                    }
-                    return;
-                }
+        if let Some((drag_ws_id, cursor_x)) = self.active_drag_edge_scroll.clone()
+            && let Some(ws) = self.workspaces.get_mut(&drag_ws_id)
+            && ws.layout_mode == LayoutMode::Scrolling
+        {
+            let vp = ws.viewport;
+            let step = ws.scrolling.tick_edge_auto_scroll(cursor_x, vp, now_ms);
+            self.edge_scroll_keep_alive = step.keeps_frame_loop_alive();
+            if matches!(step, koma_model::EdgeScrollStep::Scrolled(_)) {
+                let cursor = koma_model::LogicalPoint {
+                    x: cursor_x,
+                    y: self.pointer_location.y,
+                };
+                let dz = ws.scrolling.predict_drop_zone_2d(cursor, vp, now_ms);
+                self.active_drop_preview = Some((drag_ws_id, dz.preview_rect));
             }
+            return;
         }
         self.edge_scroll_keep_alive = false;
     }
@@ -1061,7 +1073,7 @@ impl KomaState {
                     .block_out_from
                     .is_some_and(|p| p.blocks_agent_capture());
 
-                let base_opacity = dyn_rules.opacity.unwrap_or(1.0) as f32;
+                let base_opacity = dyn_rules.opacity.unwrap_or(1.0);
                 let is_fs = fullscreen_id == Some(win_id);
                 let corner_radius = if is_fs {
                     0.0
@@ -1086,7 +1098,7 @@ impl KomaState {
 
                 if is_scrolling_strip && !is_floating {
                     render_rect.x -= camera_shift_px;
-                    if render_rect.x + render_rect.width as i32 <= 0
+                    if render_rect.x + render_rect.w as i32 <= 0
                         || render_rect.x >= ws.viewport.width as i32
                     {
                         continue;
@@ -1138,10 +1150,10 @@ impl KomaState {
         {
             if let Some(ws) = self.workspaces.get(ws_id) {
                 for (win_id, _, _) in ws.compute_visible_geometries() {
-                    if let Some(m) = self.mapped_windows.iter().find(|m| m.win_id == win_id) {
-                        if let Some(t) = m.window.toplevel() {
-                            surfaces.push(t.wl_surface().clone());
-                        }
+                    if let Some(m) = self.mapped_windows.iter().find(|m| m.win_id == win_id)
+                        && let Some(t) = m.window.toplevel()
+                    {
+                        surfaces.push(t.wl_surface().clone());
                     }
                 }
             }
@@ -1202,7 +1214,7 @@ pub fn read_toplevel_metadata(wl_surface: &WlSurface) -> (String, String) {
             .as_ref()
             .and_then(|r| r.title.clone())
             .unwrap_or_else(String::new);
-        let _ = states.cached_state.get::<SurfaceCachedState>();
+        drop(states.cached_state.get::<SurfaceCachedState>());
         (app_id, title)
     })
 }

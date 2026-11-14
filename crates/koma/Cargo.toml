@@ -19,6 +19,7 @@ smithay-winit = [
     "dep:anyhow",
     "dep:base64",
     "dep:calloop",
+    "dep:libc",
     "dep:regex",
     "dep:rustix",
     "dep:serde",
@@ -28,7 +29,6 @@ smithay-winit = [
 ]
 smithay-tty = [
     "smithay-winit",
-    "dep:libc",
     "dep:smithay-drm-extras",
     "smithay/backend_libinput",
     "smithay/backend_session_libseat",

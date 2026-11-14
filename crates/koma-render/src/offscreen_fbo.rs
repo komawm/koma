@@ -129,7 +129,7 @@ pub fn duplicate_dmabuf_planes(
     let mut fds = Vec::new();
     let mut planes = Vec::new();
     for ((handle, stride), offset) in dmabuf.handles().zip(dmabuf.strides()).zip(dmabuf.offsets()) {
-        let dup_fd = handle.try_clone()?;
+        let dup_fd = handle.try_clone_to_owned()?;
         fds.push(dup_fd);
         planes.push(DmabufPlaneDescriptor {
             fourcc,

@@ -160,6 +160,29 @@ impl WindowRuleEngine {
     }
 
     #[must_use]
+    pub fn resolve_initial(&self, ctx: &WindowMatchContext<'_>) -> InitialWindowRules {
+        let mut out = InitialWindowRules::default();
+        for rule in &self.rules {
+            if !rule.applies_to(ctx) {
+                continue;
+            }
+            if let Some(ref ws) = rule.initial.open_on_workspace {
+                out.open_on_workspace = Some(ws.clone());
+            }
+            if let Some(mode) = rule.initial.open_mode {
+                out.open_mode = Some(mode);
+            }
+            if let Some(focused) = rule.initial.open_focused {
+                out.open_focused = Some(focused);
+            }
+            if let Some(pos) = rule.initial.default_floating_pos {
+                out.default_floating_pos = Some(pos);
+            }
+        }
+        out
+    }
+
+    #[must_use]
     pub fn resolve_dynamic(&self, ctx: &WindowMatchContext<'_>) -> DynamicWindowRules {
         let mut out = DynamicWindowRules::default();
         for rule in &self.rules {

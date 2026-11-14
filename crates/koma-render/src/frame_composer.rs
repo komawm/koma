@@ -36,6 +36,7 @@ pub const COLOR_BORDER_AGENT_LEASED: [f32; 4] = [0.824, 0.659, 1.0, 1.0]; // #d2
 pub const COLOR_BORDER_HUMAN_PREEMPT: [f32; 4] = [0.941, 0.533, 0.243, 1.0]; // #f0883e
 pub const COLOR_PROTECTED_BLACKOUT: [f32; 4] = [0.0, 0.0, 0.0, 1.0]; // #000000
 pub const COLOR_GRID_HAIRLINE: [f32; 4] = [0.345, 0.651, 1.0, 0.45];
+#[allow(clippy::approx_constant)] // #f85149 green channel 0x51/255 ≈ 0.318, not 1/pi.
 pub const COLOR_CONFIG_ERROR_BANNER: [f32; 4] = [0.973, 0.318, 0.286, 0.95]; // #f85149
 pub const COLOR_SCRATCHPAD_DIM_SCRIM: [f32; 4] = [0.035, 0.043, 0.063, 0.58];
 pub const COLOR_DROP_PREVIEW_FILL: [f32; 4] = [0.345, 0.651, 1.0, 0.18];
@@ -141,8 +142,8 @@ where
                 f64::from(item.rect.y) + border_thickness,
             )),
             Size::from((
-                (f64::from(item.rect.width) - border_thickness * 2.0).max(16.0),
-                (f64::from(item.rect.height) - border_thickness * 2.0).max(16.0),
+                (f64::from(item.rect.w) - border_thickness * 2.0).max(16.0),
+                (f64::from(item.rect.h) - border_thickness * 2.0).max(16.0),
             )),
         );
 
@@ -231,26 +232,26 @@ where
         }
 
         // 2d. Multi-Pass `Dual Kawase Blur` frosted-glass backdrop slice behind translucent windows
-        if target == RenderTargetKind::PhysicalOutput && item.wants_blur {
-            if let (Some(b_ctx), Some(blur_prog)) = (blur_ctx, shaders.blur_finish_rounded.as_ref())
-            {
-                let should_blur = b_ctx.config.ignore_opacity || eff_opacity < 0.999;
-                if should_blur {
-                    elements.push(KomaRenderElement::BlurredBackdrop(
-                        KomaBlurredBackdropElement::new(
-                            inner_rect,
-                            viewport_size,
-                            inner_radii,
-                            eff_opacity,
-                            output_scale,
-                            b_ctx.config.noise,
-                            b_ctx.config.contrast,
-                            b_ctx.config.brightness,
-                            b_ctx.texture.clone(),
-                            blur_prog.clone(),
-                        ),
-                    ));
-                }
+        if target == RenderTargetKind::PhysicalOutput
+            && item.wants_blur
+            && let (Some(b_ctx), Some(blur_prog)) = (blur_ctx, shaders.blur_finish_rounded.as_ref())
+        {
+            let should_blur = b_ctx.config.ignore_opacity || eff_opacity < 0.999;
+            if should_blur {
+                elements.push(KomaRenderElement::BlurredBackdrop(
+                    KomaBlurredBackdropElement::new(
+                        inner_rect,
+                        viewport_size,
+                        inner_radii,
+                        eff_opacity,
+                        output_scale,
+                        b_ctx.config.noise,
+                        b_ctx.config.contrast,
+                        b_ctx.config.brightness,
+                        b_ctx.texture.clone(),
+                        blur_prog.clone(),
+                    ),
+                ));
             }
         }
 
@@ -264,16 +265,14 @@ where
 
     // If the dragged window is the only window on the workspace (0 tiled windows below it),
     // emit the full-workarea drop preview right behind the floating drag card!
-    if !drop_preview_emitted {
-        if let Some(p_rect) = drop_preview_rect {
-            push_drop_preview_elements(
-                p_rect,
-                default_preview_radius,
-                output_scale,
-                &shaders,
-                &mut elements,
-            );
-        }
+    if !drop_preview_emitted && let Some(p_rect) = drop_preview_rect {
+        push_drop_preview_elements(
+            p_rect,
+            default_preview_radius,
+            output_scale,
+            &shaders,
+            &mut elements,
+        );
     }
 
     elements
@@ -313,8 +312,8 @@ fn push_drop_preview_elements<R>(
             f64::from(preview_rect.y) + 2.0,
         )),
         Size::from((
-            (f64::from(preview_rect.width) - 4.0).max(16.0),
-            (f64::from(preview_rect.height) - 4.0).max(16.0),
+            (f64::from(preview_rect.w) - 4.0).max(16.0),
+            (f64::from(preview_rect.h) - 4.0).max(16.0),
         )),
     );
     elements.push(KomaRenderElement::from(KomaSolidColorElement::oneshot(
@@ -408,26 +407,26 @@ pub fn append_tab_indicator_elements<R>(
         };
         let radius = seg.corner_radius.max(0.0);
 
-        if radius > 0.25 {
-            if let (Some(border_prog), Some(white_tex)) = (
+        if radius > 0.25
+            && let (Some(border_prog), Some(white_tex)) = (
                 shaders.rounded_border.as_ref(),
                 shaders.white_1x1_tex.as_ref(),
-            ) {
-                // `border_width = 0.0` fills the entire rounded SDF pill cleanly
-                elements.push(KomaRenderElement::RoundedBorder(
-                    KomaRoundedBorderElement::new(
-                        rect,
-                        [radius; 4],
-                        0.0,
-                        rgba,
-                        1.0,
-                        output_scale,
-                        white_tex.clone(),
-                        border_prog.clone(),
-                    ),
-                ));
-                continue;
-            }
+            )
+        {
+            // `border_width = 0.0` fills the entire rounded SDF pill cleanly
+            elements.push(KomaRenderElement::RoundedBorder(
+                KomaRoundedBorderElement::new(
+                    rect,
+                    [radius; 4],
+                    0.0,
+                    rgba,
+                    1.0,
+                    output_scale,
+                    white_tex.clone(),
+                    border_prog.clone(),
+                ),
+            ));
+            continue;
         }
         elements.push(KomaRenderElement::from(KomaSolidColorElement::oneshot(
             rect, rgba,

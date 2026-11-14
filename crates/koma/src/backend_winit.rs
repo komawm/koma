@@ -22,9 +22,7 @@ use smithay::{
             AbsolutePositionEvent as _, Event as _, InputBackend, InputEvent, InputTime,
             KeyboardKeyEvent as _, PointerButtonEvent as _,
         },
-        renderer::{
-            ImportDma as _, ImportEgl as _, damage::OutputDamageTracker, gles::GlesRenderer,
-        },
+        renderer::{ImportDma as _, damage::OutputDamageTracker, gles::GlesRenderer},
         winit::{self, WinitEvent, WinitGraphicsBackend},
     },
     desktop::{layer_map_for_output, utils::send_frames_surface_tree},
@@ -39,7 +37,7 @@ use smithay::{
         shell::wlr_layer::Layer,
     },
 };
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, info, warn};
 
 use crate::state::{ActiveBackend, KomaState};
 
@@ -170,10 +168,8 @@ impl WinitBackendState {
     /// Binds EGL/DMA-BUF globals onto `DisplayHandle` and advertises the `wl_output` global
     /// (`niri/src/backend/winit.rs` `Winit::init` & `create_dmabuf_global`).
     pub fn bind_wayland_globals(&mut self, state: &mut KomaState) {
+        // `zwp_linux_dmabuf_v1` below handles modern Mesa DMA-BUF without legacy `wl_drm` (`use_system_lib`).
         let renderer = self.backend.renderer();
-        if let Err(err) = renderer.bind_wl_display(&state.display_handle) {
-            trace!("legacy wl_drm EGL bind skipped (expected on modern Mesa): {err}");
-        }
 
         self.render_node = EGLDevice::device_for_display(renderer.egl_context().display())
             .ok()
@@ -325,18 +321,18 @@ pub fn render_winit_frame(state: &mut KomaState) -> anyhow::Result<()> {
             append_scratchpad_dim_scrim(viewport, &mut elements);
         }
 
-        if let Some(ws) = state.workspaces.get(&state.active_ws_id) {
-            if ws.layout_mode == koma_model::LayoutMode::Scrolling && ws.fullscreen_window.is_none()
-            {
-                let cam_x = ws.scrolling.peek_camera_x(state.elapsed_ms());
-                let tab_segs = ws.scrolling.tab_indicator_segments_at(viewport, cam_x);
-                append_tab_indicator_elements(
-                    winit_state.backend.renderer(),
-                    output_scale,
-                    &tab_segs,
-                    &mut elements,
-                );
-            }
+        if let Some(ws) = state.workspaces.get(&state.active_ws_id)
+            && ws.layout_mode == koma_model::LayoutMode::Scrolling
+            && ws.fullscreen_window.is_none()
+        {
+            let cam_x = ws.scrolling.peek_camera_x(state.elapsed_ms());
+            let tab_segs = ws.scrolling.tab_indicator_segments_at(viewport, cam_x);
+            append_tab_indicator_elements(
+                winit_state.backend.renderer(),
+                output_scale,
+                &tab_segs,
+                &mut elements,
+            );
         }
         let base_drop = state.drop_preview_for_workspace(&state.active_ws_id);
         let ws_elements = assemble_workspace_elements(
@@ -412,11 +408,11 @@ pub(crate) fn toggle_ring0_preempt_takeover(state: &mut KomaState, trigger_label
     if let Some(ws) = state.workspaces.get_mut(&ws_id) {
         let fx = ws.lease.human_toggle_takeover(60_000, now);
         let mut flushed_keys = Vec::new();
-        if fx.flush_virtual_seat {
-            if let Some(vseat) = state.vseats.get_mut(&ws.vseat_id) {
-                let (keys, _) = vseat.flush_all_held();
-                flushed_keys = keys;
-            }
+        if fx.flush_virtual_seat
+            && let Some(vseat) = state.vseats.get_mut(&ws.vseat_id)
+        {
+            let (keys, _) = vseat.flush_all_held();
+            flushed_keys = keys;
         }
         let mut cancelled_lua = false;
         if fx.cancel_lua_coroutines {

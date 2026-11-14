@@ -81,7 +81,7 @@ impl OverviewGridState {
         for (idx, ws_id) in workspaces.iter().enumerate() {
             let r = idx / cols;
             let c = idx % cols;
-            let cols_in_this_row = if r + 1 == rows && n % cols != 0 {
+            let cols_in_this_row = if r + 1 == rows && !n.is_multiple_of(cols) {
                 n % cols
             } else {
                 cols

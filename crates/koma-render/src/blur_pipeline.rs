@@ -5,7 +5,7 @@
 //!   perceived-luminance HSL `vibrancy` boost + 8-tap tent Kawase upsample), and
 //! - `niri/src/render_helpers/{blur.rs, effect_buffer.rs}` (`Offscreen::<GlesTexture>::create_buffer`
 //!   + `OutputDamageTracker` dirty-only re-blurring so static wallpapers consume 0% GPU across
-//!   240 Hz window spring animations!).
+//!     240 Hz window spring animations!).
 
 use std::{
     cmp::max,

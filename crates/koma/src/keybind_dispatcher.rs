@@ -128,6 +128,7 @@ impl MouseButtonTrigger {
     }
 
     #[must_use]
+    #[allow(dead_code)] // Public evdev button code accessor retained for mouse-bind introspection.
     pub const fn button_code(self) -> u32 {
         match self {
             Self::Left => BTN_LEFT,
@@ -250,6 +251,8 @@ pub struct CompiledBind {
     pub id: BindHandleId,
     pub mode: Option<String>,
     pub enabled: bool,
+    // Original chord string retained for diagnostics/introspection.
+    #[allow(dead_code)]
     pub raw_chord: String,
     pub chord: CompiledChord,
     pub press_action: Option<ActionDescriptor>,
@@ -460,8 +463,10 @@ impl KeybindTable {
         let mut binds = Vec::with_capacity(defaults.len());
         for (id_num, chord_str, act, cooldown_ms) in defaults {
             if let Ok(chord) = parse_chord_spec(chord_str) {
-                let mut options = BindOptions::default();
-                options.cooldown_ms = *cooldown_ms;
+                let options = BindOptions {
+                    cooldown_ms: *cooldown_ms,
+                    ..BindOptions::default()
+                };
                 binds.push(CompiledBind {
                     id: BindHandleId(*id_num),
                     mode: None,
@@ -1032,8 +1037,9 @@ pub fn process_keyboard_key_event(
             let phys_mod = state.keybinds.effective_mod_key(is_bare_metal_tty);
 
             // Gate 0b: Ring 0 Human Preemptive Takeover (`Mod + G`) — NEVER overridable!
+            let raw_syms = handle.raw_syms();
             let candidate_syms = std::iter::once((modified_sym, true))
-                .chain(handle.raw_syms().iter().copied().map(|s| (s, false)));
+                .chain(raw_syms.iter().copied().map(|s| (s, false)));
 
             if held_mask == phys_mod.bit() {
                 for (sym, _) in candidate_syms.clone() {
@@ -1101,19 +1107,18 @@ pub fn process_keyboard_key_event(
             let pass_through = bind.options.pass_through;
 
             // Enforce optional `cooldown_ms` rate-limiting (`niri/src/input/mod.rs` line 5082)
-            if let Some(cd_ms) = bind.options.cooldown_ms {
-                if let Some(&last_ms) = state.keybinds.cooldowns_ms.get(&bind_id) {
-                    if now_ms.saturating_sub(last_ms) < cd_ms {
-                        return if pass_through {
-                            FilterResult::Forward
-                        } else {
-                            FilterResult::Intercept(InterceptOutcome::FireAction {
-                                bind_id: None,
-                                action: ActionDescriptor::ModeExit,
-                            })
-                        };
-                    }
-                }
+            if let Some(cd_ms) = bind.options.cooldown_ms
+                && let Some(&last_ms) = state.keybinds.cooldowns_ms.get(&bind_id)
+                && now_ms.saturating_sub(last_ms) < cd_ms
+            {
+                return if pass_through {
+                    FilterResult::Forward
+                } else {
+                    FilterResult::Intercept(InterceptOutcome::FireAction {
+                        bind_id: None,
+                        action: ActionDescriptor::ModeExit,
+                    })
+                };
             }
 
             let press_act = bind.press_action.clone();
@@ -1148,8 +1153,7 @@ pub fn process_keyboard_key_event(
     );
 
     if !state.pending_passthrough_actions.is_empty() {
-        let passthrough: Vec<ActionDescriptor> =
-            state.pending_passthrough_actions.drain(..).collect();
+        let passthrough = std::mem::take(&mut state.pending_passthrough_actions);
         for act in passthrough {
             execute_action_descriptor(state, act, is_bare_metal_tty);
         }
@@ -1249,11 +1253,11 @@ pub fn process_pointer_axis_event<B: InputBackend>(
                     consume_axis =
                         fire_scroll_bind_ticks(state, idx, ticks as u8, is_bare_metal_tty);
                 }
-            } else if ticks < 0 {
-                if let Some(idx) = left_idx {
-                    consume_axis =
-                        fire_scroll_bind_ticks(state, idx, (-ticks) as u8, is_bare_metal_tty);
-                }
+            } else if ticks < 0
+                && let Some(idx) = left_idx
+            {
+                consume_axis =
+                    fire_scroll_bind_ticks(state, idx, (-ticks) as u8, is_bare_metal_tty);
             }
 
             if consume_axis {
@@ -1285,11 +1289,11 @@ pub fn process_pointer_axis_event<B: InputBackend>(
                     consume_axis =
                         fire_scroll_bind_ticks(state, idx, ticks as u8, is_bare_metal_tty);
                 }
-            } else if ticks < 0 {
-                if let Some(idx) = up_idx {
-                    consume_axis =
-                        fire_scroll_bind_ticks(state, idx, (-ticks) as u8, is_bare_metal_tty);
-                }
+            } else if ticks < 0
+                && let Some(idx) = up_idx
+            {
+                consume_axis =
+                    fire_scroll_bind_ticks(state, idx, (-ticks) as u8, is_bare_metal_tty);
             }
 
             if consume_axis {
@@ -1341,11 +1345,11 @@ pub fn process_pointer_axis_event<B: InputBackend>(
                     consume_axis =
                         fire_scroll_bind_ticks(state, idx, ticks as u8, is_bare_metal_tty);
                 }
-            } else if ticks < 0 {
-                if let Some(idx) = tp_left_idx {
-                    consume_axis =
-                        fire_scroll_bind_ticks(state, idx, (-ticks) as u8, is_bare_metal_tty);
-                }
+            } else if ticks < 0
+                && let Some(idx) = tp_left_idx
+            {
+                consume_axis =
+                    fire_scroll_bind_ticks(state, idx, (-ticks) as u8, is_bare_metal_tty);
             }
 
             if consume_axis {
@@ -1383,11 +1387,11 @@ pub fn process_pointer_axis_event<B: InputBackend>(
                     consume_axis =
                         fire_scroll_bind_ticks(state, idx, ticks as u8, is_bare_metal_tty);
                 }
-            } else if ticks < 0 {
-                if let Some(idx) = tp_up_idx {
-                    consume_axis =
-                        fire_scroll_bind_ticks(state, idx, (-ticks) as u8, is_bare_metal_tty);
-                }
+            } else if ticks < 0
+                && let Some(idx) = tp_up_idx
+            {
+                consume_axis =
+                    fire_scroll_bind_ticks(state, idx, (-ticks) as u8, is_bare_metal_tty);
             }
 
             if consume_axis {
@@ -1501,10 +1505,10 @@ fn fire_scroll_bind_ticks(
     for _ in 0..tick_count {
         let now_ms = state.elapsed_ms();
         if let Some(cd_ms) = bind.options.cooldown_ms {
-            if let Some(&last_ms) = state.keybinds.cooldowns_ms.get(&bind.id) {
-                if now_ms.saturating_sub(last_ms) < cd_ms {
-                    continue;
-                }
+            if let Some(&last_ms) = state.keybinds.cooldowns_ms.get(&bind.id)
+                && now_ms.saturating_sub(last_ms) < cd_ms
+            {
+                continue;
             }
             state.keybinds.cooldowns_ms.insert(bind.id, now_ms);
         }
@@ -1573,12 +1577,11 @@ pub fn execute_action_descriptor(
                 .workspaces
                 .get(&ws_id)
                 .and_then(WorkspaceState::active_window);
-            if let Some(id) = active_id {
-                if let Some(m) = state.mapped_windows.iter().find(|m| m.win_id == id) {
-                    if let Some(t) = m.window.toplevel() {
-                        t.send_close();
-                    }
-                }
+            if let Some(id) = active_id
+                && let Some(m) = state.mapped_windows.iter().find(|m| m.win_id == id)
+                && let Some(t) = m.window.toplevel()
+            {
+                t.send_close();
             }
         }
 
@@ -1679,11 +1682,11 @@ pub fn execute_action_descriptor(
                 return;
             };
             let ws_id = state.effective_interactive_ws_id();
-            if let Some(ws) = state.workspaces.get_mut(&ws_id) {
-                if let Some(cur) = ws.active_window() {
-                    let vp = ws.viewport;
-                    ws.dwindle.swap_in_direction(cur, dir, vp);
-                }
+            if let Some(ws) = state.workspaces.get_mut(&ws_id)
+                && let Some(cur) = ws.active_window()
+            {
+                let vp = ws.viewport;
+                ws.dwindle.swap_in_direction(cur, dir, vp);
             }
             state.sync_workspace_geometries(&ws_id);
             state.queue_redraw();
@@ -1705,11 +1708,11 @@ pub fn execute_action_descriptor(
         ActionDescriptor::ScrollingSwitchPresetWidth { forward } => {
             let ws_id = state.effective_interactive_ws_id();
             let now_ms = state.elapsed_ms();
-            if let Some(ws) = state.workspaces.get_mut(&ws_id) {
-                if ws.layout_mode == koma_model::LayoutMode::Scrolling {
-                    let vp = ws.viewport;
-                    let _ = ws.scrolling.switch_preset_column_width(forward, vp, now_ms);
-                }
+            if let Some(ws) = state.workspaces.get_mut(&ws_id)
+                && ws.layout_mode == koma_model::LayoutMode::Scrolling
+            {
+                let vp = ws.viewport;
+                let _ = ws.scrolling.switch_preset_column_width(forward, vp, now_ms);
             }
             state.sync_workspace_geometries(&ws_id);
             state.queue_redraw();
@@ -1718,11 +1721,11 @@ pub fn execute_action_descriptor(
         ActionDescriptor::ScrollingMaximizeColumn => {
             let ws_id = state.effective_interactive_ws_id();
             let now_ms = state.elapsed_ms();
-            if let Some(ws) = state.workspaces.get_mut(&ws_id) {
-                if ws.layout_mode == koma_model::LayoutMode::Scrolling {
-                    let vp = ws.viewport;
-                    let _ = ws.scrolling.toggle_maximize_column(vp, now_ms);
-                }
+            if let Some(ws) = state.workspaces.get_mut(&ws_id)
+                && ws.layout_mode == koma_model::LayoutMode::Scrolling
+            {
+                let vp = ws.viewport;
+                let _ = ws.scrolling.toggle_maximize_column(vp, now_ms);
             }
             state.sync_workspace_geometries(&ws_id);
             state.queue_redraw();
@@ -1731,11 +1734,11 @@ pub fn execute_action_descriptor(
         ActionDescriptor::ScrollingCenterColumn => {
             let ws_id = state.effective_interactive_ws_id();
             let now_ms = state.elapsed_ms();
-            if let Some(ws) = state.workspaces.get_mut(&ws_id) {
-                if ws.layout_mode == koma_model::LayoutMode::Scrolling {
-                    let vp = ws.viewport;
-                    let _ = ws.scrolling.center_active_column(vp, now_ms);
-                }
+            if let Some(ws) = state.workspaces.get_mut(&ws_id)
+                && ws.layout_mode == koma_model::LayoutMode::Scrolling
+            {
+                let vp = ws.viewport;
+                let _ = ws.scrolling.center_active_column(vp, now_ms);
             }
             state.sync_workspace_geometries(&ws_id);
             state.queue_redraw();
@@ -1765,11 +1768,11 @@ pub fn execute_action_descriptor(
 
         ActionDescriptor::ScrollingSwitchPresetHeight { forward } => {
             let ws_id = state.effective_interactive_ws_id();
-            if let Some(ws) = state.workspaces.get_mut(&ws_id) {
-                if ws.layout_mode == koma_model::LayoutMode::Scrolling {
-                    let vp = ws.viewport;
-                    let _ = ws.scrolling.switch_preset_window_height(forward, vp);
-                }
+            if let Some(ws) = state.workspaces.get_mut(&ws_id)
+                && ws.layout_mode == koma_model::LayoutMode::Scrolling
+            {
+                let vp = ws.viewport;
+                let _ = ws.scrolling.switch_preset_window_height(forward, vp);
             }
             state.sync_workspace_geometries(&ws_id);
             state.queue_redraw();
@@ -1777,10 +1780,10 @@ pub fn execute_action_descriptor(
 
         ActionDescriptor::ScrollingResetWindowHeight => {
             let ws_id = state.effective_interactive_ws_id();
-            if let Some(ws) = state.workspaces.get_mut(&ws_id) {
-                if ws.layout_mode == koma_model::LayoutMode::Scrolling {
-                    let _ = ws.scrolling.reset_window_height();
-                }
+            if let Some(ws) = state.workspaces.get_mut(&ws_id)
+                && ws.layout_mode == koma_model::LayoutMode::Scrolling
+            {
+                let _ = ws.scrolling.reset_window_height();
             }
             state.sync_workspace_geometries(&ws_id);
             state.queue_redraw();
@@ -1788,11 +1791,11 @@ pub fn execute_action_descriptor(
 
         ActionDescriptor::ScrollingToggleColumnTabbed => {
             let ws_id = state.effective_interactive_ws_id();
-            if let Some(ws) = state.workspaces.get_mut(&ws_id) {
-                if ws.layout_mode == koma_model::LayoutMode::Scrolling {
-                    let _ = ws.scrolling.toggle_column_tabbed_display();
-                    ws.focused_window = ws.scrolling.active_window();
-                }
+            if let Some(ws) = state.workspaces.get_mut(&ws_id)
+                && ws.layout_mode == koma_model::LayoutMode::Scrolling
+            {
+                let _ = ws.scrolling.toggle_column_tabbed_display();
+                ws.focused_window = ws.scrolling.active_window();
             }
             state.sync_workspace_geometries(&ws_id);
             state.focus_active_deck_window();
@@ -1802,12 +1805,12 @@ pub fn execute_action_descriptor(
         ActionDescriptor::ScrollingConsumeIntoColumn => {
             let ws_id = state.effective_interactive_ws_id();
             let now_ms = state.elapsed_ms();
-            if let Some(ws) = state.workspaces.get_mut(&ws_id) {
-                if ws.layout_mode == koma_model::LayoutMode::Scrolling {
-                    let vp = ws.viewport;
-                    if ws.scrolling.consume_window_into_column(vp, now_ms) {
-                        ws.focused_window = ws.scrolling.active_window();
-                    }
+            if let Some(ws) = state.workspaces.get_mut(&ws_id)
+                && ws.layout_mode == koma_model::LayoutMode::Scrolling
+            {
+                let vp = ws.viewport;
+                if ws.scrolling.consume_window_into_column(vp, now_ms) {
+                    ws.focused_window = ws.scrolling.active_window();
                 }
             }
             state.sync_workspace_geometries(&ws_id);
@@ -1818,12 +1821,12 @@ pub fn execute_action_descriptor(
         ActionDescriptor::ScrollingExpelFromColumn => {
             let ws_id = state.effective_interactive_ws_id();
             let now_ms = state.elapsed_ms();
-            if let Some(ws) = state.workspaces.get_mut(&ws_id) {
-                if ws.layout_mode == koma_model::LayoutMode::Scrolling {
-                    let vp = ws.viewport;
-                    if ws.scrolling.expel_window_from_column(vp, now_ms) {
-                        ws.focused_window = ws.scrolling.active_window();
-                    }
+            if let Some(ws) = state.workspaces.get_mut(&ws_id)
+                && ws.layout_mode == koma_model::LayoutMode::Scrolling
+            {
+                let vp = ws.viewport;
+                if ws.scrolling.expel_window_from_column(vp, now_ms) {
+                    ws.focused_window = ws.scrolling.active_window();
                 }
             }
             state.sync_workspace_geometries(&ws_id);
@@ -1881,11 +1884,11 @@ pub fn execute_action_descriptor(
 
         ActionDescriptor::DwindleToggleSplit => {
             let ws_id = state.effective_interactive_ws_id();
-            if let Some(ws) = state.workspaces.get_mut(&ws_id) {
-                if let Some(cur) = ws.active_window() {
-                    let vp = ws.viewport;
-                    ws.dwindle.toggle_split(cur, vp);
-                }
+            if let Some(ws) = state.workspaces.get_mut(&ws_id)
+                && let Some(cur) = ws.active_window()
+            {
+                let vp = ws.viewport;
+                ws.dwindle.toggle_split(cur, vp);
             }
             state.sync_workspace_geometries(&ws_id);
             state.queue_redraw();
@@ -1893,11 +1896,11 @@ pub fn execute_action_descriptor(
 
         ActionDescriptor::DwindleSwapSplit => {
             let ws_id = state.effective_interactive_ws_id();
-            if let Some(ws) = state.workspaces.get_mut(&ws_id) {
-                if let Some(cur) = ws.active_window() {
-                    let vp = ws.viewport;
-                    ws.dwindle.swap_split(cur, vp);
-                }
+            if let Some(ws) = state.workspaces.get_mut(&ws_id)
+                && let Some(cur) = ws.active_window()
+            {
+                let vp = ws.viewport;
+                ws.dwindle.swap_split(cur, vp);
             }
             state.sync_workspace_geometries(&ws_id);
             state.queue_redraw();
@@ -1905,11 +1908,11 @@ pub fn execute_action_descriptor(
 
         ActionDescriptor::DwindleSplitRatio(delta) => {
             let ws_id = state.effective_interactive_ws_id();
-            if let Some(ws) = state.workspaces.get_mut(&ws_id) {
-                if let Some(cur) = ws.active_window() {
-                    let vp = ws.viewport;
-                    ws.dwindle.adjust_split_ratio(cur, delta, vp);
-                }
+            if let Some(ws) = state.workspaces.get_mut(&ws_id)
+                && let Some(cur) = ws.active_window()
+            {
+                let vp = ws.viewport;
+                ws.dwindle.adjust_split_ratio(cur, delta, vp);
             }
             state.sync_workspace_geometries(&ws_id);
             state.queue_redraw();
@@ -2105,15 +2108,15 @@ pub fn execute_action_descriptor(
 
         ActionDescriptor::WindowResizeDelta { width, height } => {
             let ws_id = state.effective_interactive_ws_id();
-            if let Some(ws) = state.workspaces.get_mut(&ws_id) {
-                if let Some(cur) = ws.active_window() {
-                    let vp = ws.viewport;
-                    if ws.floating.contains(cur) {
-                        ws.floating.resize_by(cur, width, height, vp);
-                    } else {
-                        ws.dwindle
-                            .resize_target(cur, f64::from(width), f64::from(height), vp);
-                    }
+            if let Some(ws) = state.workspaces.get_mut(&ws_id)
+                && let Some(cur) = ws.active_window()
+            {
+                let vp = ws.viewport;
+                if ws.floating.contains(cur) {
+                    ws.floating.resize_by(cur, width, height, vp);
+                } else {
+                    ws.dwindle
+                        .resize_target(cur, f64::from(width), f64::from(height), vp);
                 }
             }
             state.sync_workspace_geometries(&ws_id);

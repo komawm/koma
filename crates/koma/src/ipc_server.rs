@@ -3,7 +3,7 @@
 //! and zero-copy sealed `memfd` `SCM_RIGHTS` frame transfer (`docs/IPC_SPEC.md`).
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashSet},
     env,
     ffi::OsStr,
     fs::{self, File},
@@ -17,11 +17,18 @@ use std::{
     },
     path::{Path, PathBuf},
     process,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use anyhow::Context as _;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use calloop::{Interest, LoopHandle, Mode, PostAction, RegistrationToken, generic::Generic};
+use calloop::{
+    EventSource, Interest, LoopHandle, Mode, Poll, PostAction, Readiness, RegistrationToken, Token,
+    TokenFactory, generic::Generic,
+};
 use koma_model::{
     LayoutMode, LogicalViewport, PresentationTarget, WindowMatchContext, WorkspaceState,
 };
@@ -59,7 +66,11 @@ pub enum SocketChannel {
 #[derive(Debug, Clone)]
 pub enum PeerAuthState {
     AdminVerified {
+        // `SO_PEERCRED` identity retained for admin audit diagnostics.
+        #[allow(dead_code)]
         uid: u32,
+        // `SO_PEERCRED` identity retained for admin audit diagnostics.
+        #[allow(dead_code)]
         gid: u32,
         session_id: SessionId,
     },
@@ -70,18 +81,72 @@ pub enum PeerAuthState {
     },
 }
 
+/// `Generic` socket wrapper whose `reregister` updates `EPOLLOUT` interest from an atomic flag,
+/// avoiding `Dispatcher::as_source_mut` `RefCell` re-entrancy inside its own callback.
+struct IpcClientSource {
+    inner: Generic<UnixStream, io::Error>,
+    want_write: Arc<AtomicBool>,
+}
+
+impl EventSource for IpcClientSource {
+    type Event = Readiness;
+    type Metadata = calloop::generic::NoIoDrop<UnixStream>;
+    type Ret = Result<PostAction, io::Error>;
+    type Error = io::Error;
+
+    fn process_events<F>(
+        &mut self,
+        readiness: Readiness,
+        token: Token,
+        callback: F,
+    ) -> Result<PostAction, Self::Error>
+    where
+        F: FnMut(Self::Event, &mut Self::Metadata) -> Self::Ret,
+    {
+        self.inner.process_events(readiness, token, callback)
+    }
+
+    fn register(
+        &mut self,
+        poll: &mut Poll,
+        token_factory: &mut TokenFactory,
+    ) -> calloop::Result<()> {
+        self.inner.register(poll, token_factory)
+    }
+
+    fn reregister(
+        &mut self,
+        poll: &mut Poll,
+        token_factory: &mut TokenFactory,
+    ) -> calloop::Result<()> {
+        self.inner.interest = if self.want_write.load(Ordering::Relaxed) {
+            Interest::BOTH
+        } else {
+            Interest::READ
+        };
+        self.inner.reregister(poll, token_factory)
+    }
+
+    fn unregister(&mut self, poll: &mut Poll) -> calloop::Result<()> {
+        self.inner.unregister(poll)
+    }
+}
+
 /// Per-connection non-blocking state registered on `calloop` (`Interest::READ` or `Interest::BOTH`).
 pub struct IpcClientConn {
+    // Connection ID and calloop token retained for IPC lifecycle/diagnostics.
+    #[allow(dead_code)]
     pub conn_id: u64,
     pub stream: UnixStream,
     pub channel: SocketChannel,
     pub auth: PeerAuthState,
+    #[allow(dead_code)]
     pub reg_token: Option<RegistrationToken>,
     pub inbox: FrameInbox,
     pub outbox: FrameOutbox,
     pub event_ring: EventRingBuffer,
     pub subscribed_workspaces: BTreeSet<WorkspaceId>,
-    pub subscribed_topics: BTreeSet<EventTopic>,
+    pub subscribed_topics: HashSet<EventTopic>,
     pub armed_writable: bool,
 }
 
@@ -96,8 +161,12 @@ impl IpcClientConn {
 
 pub struct IpcServerPaths {
     pub instance_signature: String,
+    // Resolved IPC runtime paths retained on startup handle for admin/diagnostics.
+    #[allow(dead_code)]
     pub runtime_dir: PathBuf,
+    #[allow(dead_code)]
     pub admin_socket: PathBuf,
+    #[allow(dead_code)]
     pub agent_socket: PathBuf,
 }
 
@@ -171,7 +240,7 @@ fn bind_nonblocking_listener(
             Generic::new(listener, Interest::READ, Mode::Level),
             move |_, listener, state| {
                 loop {
-                    match listener.get_ref().accept() {
+                    match listener.accept() {
                         Ok((stream, _addr)) => {
                             if let Err(err) =
                                 accept_ipc_peer(&handle_for_accept, state, stream, channel)
@@ -223,15 +292,20 @@ fn accept_ipc_peer(
 
     let stream_clone = stream.try_clone()?;
     let loop_for_io = loop_handle.clone();
+    let want_write_flag = Arc::new(AtomicBool::new(false));
+    let want_write_cb = Arc::clone(&want_write_flag);
     let reg_token = loop_handle
         .insert_source(
-            Generic::new(stream, Interest::READ, Mode::Level),
+            IpcClientSource {
+                inner: Generic::new(stream, Interest::READ, Mode::Level),
+                want_write: want_write_flag,
+            },
             move |readiness, generic_stream, state| {
                 let disconnect = drive_client_io(
                     &loop_for_io,
                     state,
                     conn_id,
-                    generic_stream.get_ref(),
+                    generic_stream.as_ref(),
                     readiness.readable,
                     readiness.writable,
                 );
@@ -245,11 +319,7 @@ fn accept_ipc_peer(
                     let want_write = !conn.outbox.is_empty();
                     if want_write != conn.armed_writable {
                         conn.armed_writable = want_write;
-                        generic_stream.interest = if want_write {
-                            Interest::BOTH
-                        } else {
-                            Interest::READ
-                        };
+                        want_write_cb.store(want_write, Ordering::Relaxed);
                         return Ok(PostAction::Reregister);
                     }
                 }
@@ -270,7 +340,7 @@ fn accept_ipc_peer(
             outbox: FrameOutbox::default(),
             event_ring: EventRingBuffer::default(),
             subscribed_workspaces: BTreeSet::new(),
-            subscribed_topics: BTreeSet::new(),
+            subscribed_topics: HashSet::new(),
             armed_writable: false,
         },
     );
@@ -309,11 +379,11 @@ fn drive_client_io(
             match next {
                 Some(Ok(InboxPoll::Frame { json_bytes, fds })) => {
                     let (resp, resp_fds) = handle_raw_frame(state, conn_id, &json_bytes, fds);
-                    if let Some(conn) = state.ipc_clients.get_mut(&conn_id) {
-                        if let Err(err) = conn.outbox.enqueue(&resp, resp_fds) {
-                            warn!(conn_id, "dropping wedged IPC peer ({err})");
-                            return true;
-                        }
+                    if let Some(conn) = state.ipc_clients.get_mut(&conn_id)
+                        && let Err(err) = conn.outbox.enqueue(&resp, resp_fds)
+                    {
+                        warn!(conn_id, "dropping wedged IPC peer ({err})");
+                        return true;
                     }
                 }
                 Some(Ok(InboxPoll::NeedMoreData)) => break,
@@ -337,23 +407,22 @@ fn drive_client_io(
         }
     }
 
-    if writable
+    if (writable
         || state
             .ipc_clients
             .get(&conn_id)
-            .is_some_and(|c| !c.outbox.is_empty())
+            .is_some_and(|c| !c.outbox.is_empty()))
+        && let Some(conn) = state.ipc_clients.get_mut(&conn_id)
     {
-        if let Some(conn) = state.ipc_clients.get_mut(&conn_id) {
-            if conn.drain_event_ring_into_outbox().is_err() {
+        if conn.drain_event_ring_into_outbox().is_err() {
+            return true;
+        }
+        match conn.outbox.try_flush(stream) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+            Err(e) => {
+                debug!(conn_id, "IPC write closed: {e}");
                 return true;
-            }
-            match conn.outbox.try_flush(stream) {
-                Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
-                Err(e) => {
-                    debug!(conn_id, "IPC write closed: {e}");
-                    return true;
-                }
             }
         }
     }
@@ -583,12 +652,12 @@ fn dispatch_rpc(
                 .insert(vseat_id.clone(), VirtualSeatLedger::new(vseat_id.clone()));
             state.workspaces.insert(ws_id.clone(), ws);
 
-            if let Some(tok) = agent_token {
-                if let Some(claims) = state.token_store.get_mut(&tok) {
-                    claims
-                        .workspace_grants
-                        .insert(ws_id.clone(), PrivilegeLevel::Owner);
-                }
+            if let Some(tok) = agent_token
+                && let Some(claims) = state.token_store.get_mut(&tok)
+            {
+                claims
+                    .workspace_grants
+                    .insert(ws_id.clone(), PrivilegeLevel::Owner);
             }
 
             state.broadcast_workspace_event(
@@ -1370,6 +1439,10 @@ fn execute_zero_copy_capture_frame(
         (ws.viewport, ws.lease.epoch(), ws.lease.state().clone())
     };
 
+    // Temporarily move out `backend` and `offscreen_surfaces` (matching `render_pending_tty_outputs`)
+    // so `scene_items` can borrow `&*state` without aliasing mutable renderer/FBO state.
+    let mut backend = state.backend.take();
+    let mut offscreen_surfaces = std::mem::take(&mut state.offscreen_surfaces);
     let scene_items: Vec<WindowSceneItem<'_>> = if let Some(wid) = params.win_id {
         state
             .mapped_windows
@@ -1407,9 +1480,8 @@ fn execute_zero_copy_capture_frame(
     };
     let has_protected_blackout = scene_items.iter().any(|it| it.is_protected_surface);
 
-    let gpu_readout = state.backend.as_mut().and_then(|active_backend| {
-        let offscreen = state
-            .offscreen_surfaces
+    let gpu_readout = backend.as_mut().and_then(|active_backend| {
+        let offscreen = offscreen_surfaces
             .entry(params.ws_id.clone())
             .or_insert_with(|| {
                 LazyOffscreenSurface::new(
@@ -1434,6 +1506,9 @@ fn execute_zero_copy_capture_frame(
             offscreen.capture_rgba8_pixels(renderer, &elements)
         })
     });
+    drop(scene_items);
+    state.backend = backend;
+    state.offscreen_surfaces = offscreen_surfaces;
 
     let (width, height, raw_rgba) = if let Some(res) = gpu_readout {
         res.map_err(|e| {

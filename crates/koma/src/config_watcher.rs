@@ -6,8 +6,8 @@
 //!    - Combines Linux `inotify` directory watches (`IN_CLOSE_WRITE | IN_MOVED_TO | IN_CREATE |
 //!      IN_DELETE | IN_ATTRIB | IN_DELETE_SELF | IN_MOVE_SELF`) with Niri's canonical-path + `mtime`
 //!      + `byte_len` `FileProps` comparison and a `35 ms` settle debounce so atomic `rename(2)` saves
-//!      and symlink target swaps (even with frozen epoch `mtime = 0` on NixOS/Stow) trigger cleanly
-//!      exactly once without partial-write races (`niri` issue `#2226`).
+//!        and symlink target swaps (even with frozen epoch `mtime = 0` on NixOS/Stow) trigger cleanly
+//!        exactly once without partial-write races (`niri` issue `#2226`).
 //!    - Automatically tracks all `*.lua` modules inside `<config_dir>/lua/` so editing `lua/keys.lua`
 //!      reloads `init.lua` without touching the root file.
 //! 2. **Shadow-VM Transactional Hot-Reload (`Zero State Corruption`)**:
@@ -212,10 +212,10 @@ fn collect_lua_module_props(dir: &Path, out: &mut BTreeMap<PathBuf, FileProps>) 
         let p = entry.path();
         if p.is_dir() {
             collect_lua_module_props(&p, out);
-        } else if p.extension().and_then(|e| e.to_str()) == Some("lua") {
-            if let Ok(props) = FileProps::from_path(&p) {
-                out.insert(p, props);
-            }
+        } else if p.extension().and_then(|e| e.to_str()) == Some("lua")
+            && let Ok(props) = FileProps::from_path(&p)
+        {
+            out.insert(p, props);
         }
     }
 }
@@ -433,15 +433,16 @@ impl LinuxInotifyMonitor {
 
         for dir in cfg_path.candidate_watch_dirs() {
             for candidate in [Some(dir.as_path()), dir.parent()].into_iter().flatten() {
-                if candidate.is_dir() && !self.watched_dirs.iter().any(|d| d == candidate) {
-                    if let Ok(c_path) = CString::new(candidate.as_os_str().as_bytes()) {
-                        // SAFETY: `self.fd` is a valid inotify FD and `c_path` is NUL-terminated.
-                        let wd = unsafe {
-                            libc::inotify_add_watch(self.fd.as_raw_fd(), c_path.as_ptr(), mask)
-                        };
-                        if wd >= 0 {
-                            self.watched_dirs.push(candidate.to_path_buf());
-                        }
+                if candidate.is_dir()
+                    && !self.watched_dirs.iter().any(|d| d == candidate)
+                    && let Ok(c_path) = CString::new(candidate.as_os_str().as_bytes())
+                {
+                    // SAFETY: `self.fd` is a valid inotify FD and `c_path` is NUL-terminated.
+                    let wd = unsafe {
+                        libc::inotify_add_watch(self.fd.as_raw_fd(), c_path.as_ptr(), mask)
+                    };
+                    if wd >= 0 {
+                        self.watched_dirs.push(candidate.to_path_buf());
                     }
                 }
             }
@@ -623,14 +624,13 @@ pub fn reload_from_lua_source(
     state.rules.replace_rules(compiled_rules);
 
     // Preserve active submap mode across hot-reload if still defined in the new bind table
-    if let Some(cur_mode) = &state.keybinds.active_mode {
-        if compiled_binds
+    if let Some(cur_mode) = &state.keybinds.active_mode
+        && compiled_binds
             .binds
             .iter()
             .any(|b| b.mode.as_ref() == Some(cur_mode))
-        {
-            compiled_binds.active_mode = Some(cur_mode.clone());
-        }
+    {
+        compiled_binds.active_mode = Some(cur_mode.clone());
     }
     state.keybinds = compiled_binds;
     state.gestures = compiled_gestures;
@@ -710,14 +710,15 @@ pub fn reload_from_lua_source(
 /// Called from `macro_runtime::drive_macro_tick` once `active_txs` drains to 0 to complete any
 /// staged Shadow-VM swap.
 pub fn promote_deferred_sandbox_if_idle(state: &mut KomaState) {
-    if state.deferred_lua_sandbox.is_some() && !state.lua_sandbox.has_active_coroutines() {
-        if let Some(ready_vm) = state.deferred_lua_sandbox.take() {
-            state.lua_sandbox = ready_vm;
-            info!(
-                generation = state.config_generation,
-                "promoted staged Shadow PhodopusSandbox after in-flight coroutines finished"
-            );
-        }
+    if state.deferred_lua_sandbox.is_some()
+        && !state.lua_sandbox.has_active_coroutines()
+        && let Some(ready_vm) = state.deferred_lua_sandbox.take()
+    {
+        state.lua_sandbox = ready_vm;
+        info!(
+            generation = state.config_generation,
+            "promoted staged Shadow PhodopusSandbox after in-flight coroutines finished"
+        );
     }
 }
 

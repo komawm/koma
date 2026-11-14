@@ -30,6 +30,7 @@ use smithay::{
         dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier},
         fractional_scale::{FractionalScaleHandler, with_fractional_scale},
         output::OutputHandler,
+        pointer_constraints::PointerConstraintsHandler,
         selection::{
             SelectionHandler, SelectionTarget,
             data_device::{
@@ -438,13 +439,13 @@ impl SessionLockHandler for KomaState {
     }
 
     fn new_surface(&mut self, surface: LockSurface, _output: WlOutput) {
-        if let Some(out) = self.primary_output() {
-            if let Some(mode) = out.current_mode() {
-                surface.with_pending_state(|states| {
-                    states.size = Some((mode.size.w as u32, mode.size.h as u32).into());
-                });
-                surface.send_configure();
-            }
+        if let Some(out) = self.primary_output()
+            && let Some(mode) = out.current_mode()
+        {
+            surface.with_pending_state(|states| {
+                states.size = Some((mode.size.w as u32, mode.size.h as u32).into());
+            });
+            surface.send_configure();
         }
     }
 }
@@ -454,18 +455,18 @@ impl VirtualKeyboardHandler for KomaState {
         use smithay::backend::input::{Event as _, KeyboardKeyEvent as _};
         use smithay::input::keyboard::FilterResult;
 
-        if let InputEvent::Keyboard { event } = event {
-            if let Some(keyboard) = self.seat.get_keyboard() {
-                let serial = SERIAL_COUNTER.next_serial();
-                let _ = keyboard.input::<(), _>(
-                    self,
-                    event.key_code(),
-                    event.state(),
-                    serial,
-                    event.time(),
-                    |_, _, _| FilterResult::Forward,
-                );
-            }
+        if let InputEvent::Keyboard { event } = event
+            && let Some(keyboard) = self.seat.get_keyboard()
+        {
+            let serial = SERIAL_COUNTER.next_serial();
+            let _ = keyboard.input::<(), _>(
+                self,
+                event.key_code(),
+                event.state(),
+                serial,
+                event.time(),
+                |_, _, _| FilterResult::Forward,
+            );
         }
     }
 }
@@ -536,6 +537,8 @@ impl WlrLayerShellHandler for KomaState {
         self.queue_redraw();
     }
 }
+
+impl PointerConstraintsHandler for KomaState {}
 
 // Unified Smithay `Dispatch2` / `GlobalDispatch2` delegation (`niri/src/niri.rs` line 488,
 // pinned Smithay rev `65aa86fa5236e41775c313408102a5d5c2d1e2ca`).

@@ -287,6 +287,12 @@ impl GestureTable {
         })
     }
 
+    /// Clears any in-flight compositor gesture tracking (e.g. on VT switch or session resume).
+    pub fn reset_active_sessions(&mut self) {
+        self.active_swipe = None;
+        self.active_pinch = None;
+    }
+
     /// Returns `true` if any active compositor rule claims `fingers`-finger swipe gestures.
     #[must_use]
     pub fn claims_swipe_fingers(&self, fingers: u8, is_locked: bool, is_preempted: bool) -> bool {
@@ -318,6 +324,7 @@ impl GestureTable {
     /// Resolves a committed `(fingers, dir)` swipe, giving exact cardinal bindings priority over
     /// axis-level `"horizontal"` / `"vertical"` bindings.
     #[must_use]
+    #[allow(dead_code)] // Public GestureTable API retained alongside `resolve_swipe_in_slice`.
     pub fn resolve_swipe_gesture(
         &self,
         fingers: u8,
@@ -325,38 +332,7 @@ impl GestureTable {
         is_locked: bool,
         is_preempted: bool,
     ) -> Option<CompiledGesture> {
-        if let Some(exact) = self.gestures.iter().rev().find(|g| {
-            g.enabled
-                && (!is_locked || g.allow_when_locked)
-                && (!is_preempted || !g.ignore_when_preempted)
-                && g.trigger
-                    == CompiledGestureTrigger::Swipe {
-                        fingers,
-                        pattern: SwipeMatchPattern::Exact(dir),
-                    }
-        }) {
-            return Some(exact.clone());
-        }
-
-        let axis_pattern = match dir {
-            CardinalSwipeDir::Left | CardinalSwipeDir::Right => SwipeMatchPattern::Horizontal,
-            CardinalSwipeDir::Up | CardinalSwipeDir::Down => SwipeMatchPattern::Vertical,
-        };
-
-        self.gestures
-            .iter()
-            .rev()
-            .find(|g| {
-                g.enabled
-                    && (!is_locked || g.allow_when_locked)
-                    && (!is_preempted || !g.ignore_when_preempted)
-                    && g.trigger
-                        == CompiledGestureTrigger::Swipe {
-                            fingers,
-                            pattern: axis_pattern,
-                        }
-            })
-            .cloned()
+        resolve_swipe_in_slice(&self.gestures, fingers, dir, is_locked, is_preempted)
     }
 
     #[must_use]
@@ -382,6 +358,47 @@ impl GestureTable {
 
 /// Classifies cumulative `(cum_x, cum_y)` once squared distance reaches `SWIPE_DECISION_DIST_SQ` (`256.0`).
 #[must_use]
+fn resolve_swipe_in_slice(
+    gestures: &[CompiledGesture],
+    fingers: u8,
+    dir: CardinalSwipeDir,
+    is_locked: bool,
+    is_preempted: bool,
+) -> Option<CompiledGesture> {
+    if let Some(exact) = gestures.iter().rev().find(|g| {
+        g.enabled
+            && (!is_locked || g.allow_when_locked)
+            && (!is_preempted || !g.ignore_when_preempted)
+            && g.trigger
+                == CompiledGestureTrigger::Swipe {
+                    fingers,
+                    pattern: SwipeMatchPattern::Exact(dir),
+                }
+    }) {
+        return Some(exact.clone());
+    }
+
+    let axis_pattern = match dir {
+        CardinalSwipeDir::Left | CardinalSwipeDir::Right => SwipeMatchPattern::Horizontal,
+        CardinalSwipeDir::Up | CardinalSwipeDir::Down => SwipeMatchPattern::Vertical,
+    };
+
+    gestures
+        .iter()
+        .rev()
+        .find(|g| {
+            g.enabled
+                && (!is_locked || g.allow_when_locked)
+                && (!is_preempted || !g.ignore_when_preempted)
+                && g.trigger
+                    == CompiledGestureTrigger::Swipe {
+                        fingers,
+                        pattern: axis_pattern,
+                    }
+        })
+        .cloned()
+}
+
 pub fn classify_swipe_delta(cum_x: f64, cum_y: f64) -> Option<CardinalSwipeDir> {
     let dist_sq = cum_x * cum_x + cum_y * cum_y;
     if dist_sq < SWIPE_DECISION_DIST_SQ {
@@ -414,7 +431,7 @@ fn active_ws_is_preempted(state: &KomaState) -> bool {
     state
         .workspaces
         .get(&state.active_ws_id)
-        .is_some_and(|w| w.lease.is_preempted())
+        .is_some_and(|w| w.lease.is_human_preempted())
 }
 
 fn fire_compiled_gesture(
@@ -424,19 +441,19 @@ fn fire_compiled_gesture(
     is_bare_metal_tty: bool,
 ) {
     let now_ms = state.elapsed_ms();
-    if let Some(cd_ms) = gesture.cooldown_ms {
-        if cd_ms > 0 {
-            if let Some(&prev_ms) = state.gestures.cooldowns_ms.get(&gesture.slot_id) {
-                if now_ms.saturating_sub(prev_ms) < cd_ms {
-                    debug!(
-                        slot_id = gesture.slot_id,
-                        cd_ms, "suppressing multi-finger gesture within cooldown window"
-                    );
-                    return;
-                }
-            }
-            state.gestures.cooldowns_ms.insert(gesture.slot_id, now_ms);
+    if let Some(cd_ms) = gesture.cooldown_ms
+        && cd_ms > 0
+    {
+        if let Some(&prev_ms) = state.gestures.cooldowns_ms.get(&gesture.slot_id)
+            && now_ms.saturating_sub(prev_ms) < cd_ms
+        {
+            debug!(
+                slot_id = gesture.slot_id,
+                cd_ms, "suppressing multi-finger gesture within cooldown window"
+            );
+            return;
         }
+        state.gestures.cooldowns_ms.insert(gesture.slot_id, now_ms);
     }
 
     let effective_action = match (&gesture.action, resolved_swipe_dir) {
@@ -477,7 +494,7 @@ pub fn process_gesture_swipe_begin<B: InputBackend>(
         .claims_swipe_fingers(fingers, is_locked, is_preempted)
     {
         let mut tracker_x = SwipeTracker::new();
-        tracker_x.push(0.0, u64::from(event.time_msec()));
+        tracker_x.push(0.0, u64::from(event.time().millis()));
         state.gestures.active_swipe = Some(ActiveSwipeSession::Compositor {
             fingers,
             tracker_x,
@@ -512,25 +529,27 @@ pub fn process_gesture_swipe_update<B: InputBackend + 'static>(
 ) where
     B::Device: 'static,
 {
-    let mut raw_dx = event.delta_x();
-    let mut raw_dy = event.delta_y();
-
     // Extract unaccelerated `libinput` deltas and device natural-scroll state on bare-metal TTY
     // (`niri/src/input/mod.rs` lines 3886-3893).
-    let mut device_natural_scroll = false;
     #[cfg(feature = "smithay-tty")]
-    {
+    let (raw_dx, raw_dy, device_natural_scroll) = {
+        let mut dx = event.delta_x();
+        let mut dy = event.delta_y();
+        let mut nat = false;
         if let Some(libinput_ev) =
             (event as &dyn Any).downcast_ref::<input::event::gesture::GestureSwipeUpdateEvent>()
         {
-            raw_dx = libinput_ev.dx_unaccelerated();
-            raw_dy = libinput_ev.dy_unaccelerated();
+            dx = libinput_ev.dx_unaccelerated();
+            dy = libinput_ev.dy_unaccelerated();
         }
         let dev = event.device();
         if let Some(libinput_dev) = (&dev as &dyn Any).downcast_ref::<input::Device>() {
-            device_natural_scroll = libinput_dev.config_scroll_natural_scroll_enabled();
+            nat = libinput_dev.config_scroll_natural_scroll_enabled();
         }
-    }
+        (dx, dy, nat)
+    };
+    #[cfg(not(feature = "smithay-tty"))]
+    let (raw_dx, raw_dy, device_natural_scroll) = (event.delta_x(), event.delta_y(), false);
 
     let (natural_scroll, scroll_factor) = {
         let input_cfg = &state.lua_sandbox.config_snapshot().input;
@@ -550,7 +569,7 @@ pub fn process_gesture_swipe_update<B: InputBackend + 'static>(
     let view_scroll_dx = (if natural_scroll { -raw_dx } else { raw_dx }) * scroll_factor;
     let classify_dx = if natural_scroll { -raw_dx } else { raw_dx };
     let classify_dy = if natural_scroll { -raw_dy } else { raw_dy };
-    let event_time_ms = u64::from(event.time_msec());
+    let event_time_ms = u64::from(event.time().millis());
 
     enum PostSwipeStep {
         None,
@@ -577,11 +596,16 @@ pub fn process_gesture_swipe_update<B: InputBackend + 'static>(
     let mut next_step = PostSwipeStep::None;
     let mut promote_to_phase: Option<CompositorSwipePhase> = None;
 
+    let GestureTable {
+        gestures,
+        active_swipe,
+        ..
+    } = &mut state.gestures;
     if let Some(ActiveSwipeSession::Compositor {
         fingers,
         tracker_x,
         phase,
-    }) = &mut state.gestures.active_swipe
+    }) = active_swipe
     {
         let f_count = *fingers;
         match phase {
@@ -590,7 +614,8 @@ pub fn process_gesture_swipe_update<B: InputBackend + 'static>(
                 *cum_x += classify_dx;
                 *cum_y += classify_dy;
                 if let Some(cardinal) = classify_swipe_delta(*cum_x, *cum_y) {
-                    let matched = state.gestures.resolve_swipe_gesture(
+                    let matched = resolve_swipe_in_slice(
+                        gestures,
                         f_count,
                         cardinal,
                         is_locked,
@@ -687,7 +712,7 @@ pub fn process_gesture_swipe_end<B: InputBackend>(
             ..
         }) => {
             let cancelled = event.cancelled();
-            let event_time_ms = u64::from(event.time_msec());
+            let event_time_ms = u64::from(event.time().millis());
             let release_vel = if cancelled {
                 0.0
             } else {

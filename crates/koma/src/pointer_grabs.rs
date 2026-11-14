@@ -280,7 +280,7 @@ pub fn cancel_active_pointer_grab(state: &mut KomaState, serial: Serial, time: I
     for ws in state.workspaces.values_mut() {
         ws.scrolling.reset_edge_auto_scroll();
     }
-    state.cursor_status = CursorImageStatus::Default;
+    state.cursor_status = CursorImageStatus::default_named();
     state.queue_redraw();
     true
 }
@@ -291,6 +291,8 @@ pub struct MoveWindowGrab {
     start_data: PointerGrabStartData<KomaState>,
     win_id: WindowId,
     ws_id: WorkspaceId,
+    // Initial floating state retained on grab for move diagnostics.
+    #[allow(dead_code)]
     started_floating: bool,
     will_tile_on_drop: bool,
     drag_recognized: bool,
@@ -327,9 +329,9 @@ impl MoveWindowGrab {
 
         let grab_hotspot = Point::from((
             (start_data.location.x - f64::from(initial_rect.x))
-                .clamp(0.0, f64::from(initial_rect.width.max(1))),
+                .clamp(0.0, f64::from(initial_rect.w.max(1))),
             (start_data.location.y - f64::from(initial_rect.y))
-                .clamp(0.0, f64::from(initial_rect.height.max(1))),
+                .clamp(0.0, f64::from(initial_rect.h.max(1))),
         ));
 
         Some(Self {
@@ -508,7 +510,7 @@ impl MoveWindowGrab {
         if let Some(ws) = state.workspaces.get_mut(&self.ws_id) {
             ws.scrolling.reset_edge_auto_scroll();
         }
-        state.cursor_status = CursorImageStatus::Default;
+        state.cursor_status = CursorImageStatus::default_named();
 
         if !self.drag_recognized || !state.mapped_windows.iter().any(|m| m.win_id == self.win_id) {
             state.queue_redraw();
@@ -560,14 +562,12 @@ impl MoveWindowGrab {
                 .workspaces
                 .get(&self.ws_id)
                 .and_then(|ws| ws.floating.rect_of(self.win_id))
-            {
-                if let Some(m) = state
+                && let Some(m) = state
                     .mapped_windows
                     .iter_mut()
                     .find(|m| m.win_id == self.win_id)
-                {
-                    m.preferred_size = (float_rect.width, float_rect.height);
-                }
+            {
+                m.preferred_size = (float_rect.w, float_rect.h);
             }
             state.sync_workspace_geometries_with_instant_window(&self.ws_id, Some(self.win_id));
         }
@@ -835,14 +835,13 @@ impl ResizeWindowGrab {
                 ws.floating.set_rect(self.win_id, next_rect);
                 updated_rect = Some(next_rect);
             }
-            if let Some(r) = updated_rect {
-                if let Some(m) = state
+            if let Some(r) = updated_rect
+                && let Some(m) = state
                     .mapped_windows
                     .iter_mut()
                     .find(|m| m.win_id == self.win_id)
-                {
-                    m.preferred_size = (r.width, r.height);
-                }
+            {
+                m.preferred_size = (r.w, r.h);
             }
             state.sync_workspace_geometries_with_instant_window(&self.ws_id, Some(self.win_id));
         } else if let Some((init_pw, init_ph)) = self.initial_pseudotile_size {
@@ -903,7 +902,7 @@ impl ResizeWindowGrab {
     }
 
     fn on_ungrab(&mut self, state: &mut KomaState) {
-        state.cursor_status = CursorImageStatus::Default;
+        state.cursor_status = CursorImageStatus::default_named();
         state.queue_redraw();
     }
 }

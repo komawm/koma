@@ -29,13 +29,14 @@ pub struct RawRgbaFrame {
 /// Fills an entire `wl_shm::Format::Argb8888` canvas (`width * height * 4` little-endian bytes).
 pub fn clear_argb8888_canvas(canvas: &mut [u8], argb: u32) {
     let px = argb.to_le_bytes();
-    for chunk in canvas.chunks_exact_mut(4) {
+    for chunk in canvas.as_chunks_mut::<4>().0 {
         chunk.copy_from_slice(&px);
     }
 }
 
 /// Renders a single workspace preview card (background, semantic border, `5x7` header text, and
 /// scaled `SCM_RIGHTS` thumbnail) into an `Argb8888` shared-memory surface buffer.
+#[allow(clippy::too_many_arguments)] // Explicit card/header/thumb layout rects avoid per-frame struct wrapper.
 pub fn paint_workspace_card(
     canvas: &mut [u8],
     canvas_w: u32,
@@ -187,14 +188,13 @@ fn blit_scaled_rgba_to_argb(
             let r = src.pixels[s_idx];
             let g = src.pixels[s_idx + 1];
             let b = src.pixels[s_idx + 2];
-            let a = src.pixels[s_idx + 3];
 
             // Wayland `wl_shm::Format::Argb8888` in little-endian memory is `[B, G, R, A]`
             let d_idx = (dst_row + cx as usize) * 4;
             canvas[d_idx] = b;
             canvas[d_idx + 1] = g;
             canvas[d_idx + 2] = r;
-            canvas[d_idx + 3] = a.max(0xFF);
+            canvas[d_idx + 3] = 0xFF;
         }
     }
 }

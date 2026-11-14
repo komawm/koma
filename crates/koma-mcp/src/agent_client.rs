@@ -280,15 +280,14 @@ impl KomaAgentSession {
             Ok(ep) => ep,
             Err(pre_err) => {
                 // Local ledger knows workspace is unobserved or stale -> auto-observe right now!
-                if pre_err.symbol == ErrorSymbol::ErrStaleEpoch {
-                    if let Ok(fresh) =
+                if pre_err.symbol == ErrorSymbol::ErrStaleEpoch
+                    && let Ok(fresh) =
                         self.capture_png_observation(ws_id, OverlayKind::Grid225, 1920)
-                    {
-                        return MutateOutcome::StaleReobserved {
-                            rejected_error: pre_err,
-                            fresh_observation: fresh,
-                        };
-                    }
+                {
+                    return MutateOutcome::StaleReobserved {
+                        rejected_error: pre_err,
+                        fresh_observation: fresh,
+                    };
                 }
                 return MutateOutcome::Error(pre_err);
             }

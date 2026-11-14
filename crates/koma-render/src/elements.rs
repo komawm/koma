@@ -12,7 +12,7 @@ use smithay::{
             surface::WaylandSurfaceRenderElement,
         },
         gles::{GlesError, GlesFrame, GlesRenderer, GlesTexProgram, GlesTexture, Uniform},
-        multigpu::{MultiError, MultiFrame, MultiRenderer, gbm::GbmGlesBackend},
+        multigpu::{Error as MultiError, MultiRenderer, gbm::GbmGlesBackend},
         utils::{CommitCounter, DamageSet, OpaqueRegions},
     },
     utils::{
@@ -30,24 +30,60 @@ type TtyMultiRenderer<'render> = MultiRenderer<
     GbmGlesBackend<GlesRenderer, DeviceFd>,
 >;
 
-type TtyMultiFrame<'a, 'render, 'frame, 'buffer> = MultiFrame<
-    'a,
-    'render,
-    'frame,
-    'buffer,
-    GbmGlesBackend<GlesRenderer, DeviceFd>,
-    GbmGlesBackend<GlesRenderer, DeviceFd>,
->;
-
-type TtyMultiError<'render> =
+type TtyMultiError =
     MultiError<GbmGlesBackend<GlesRenderer, DeviceFd>, GbmGlesBackend<GlesRenderer, DeviceFd>>;
+
+/// Bridges `GlesRenderer` (nested Winit / offscreen FBO) and `TtyMultiRenderer` (DRM/KMS)
+/// so `KomaRenderElement<R>` can implement `RenderElement<R>` uniformly under `render_elements!`.
+pub trait KomaRenderTarget: Renderer + ImportAll {
+    fn gles_frame_mut<'a, 'frame, 'buffer>(
+        frame: &'a mut Self::Frame<'frame, 'buffer>,
+    ) -> &'a mut GlesFrame<'frame, 'buffer>
+    where
+        'buffer: 'frame,
+        Self: 'frame;
+
+    fn map_gles_error(err: GlesError) -> Self::Error;
+}
+
+impl KomaRenderTarget for GlesRenderer {
+    fn gles_frame_mut<'a, 'frame, 'buffer>(
+        frame: &'a mut Self::Frame<'frame, 'buffer>,
+    ) -> &'a mut GlesFrame<'frame, 'buffer>
+    where
+        'buffer: 'frame,
+        Self: 'frame,
+    {
+        frame.as_gles_frame()
+    }
+
+    fn map_gles_error(err: GlesError) -> Self::Error {
+        err
+    }
+}
+
+impl<'render> KomaRenderTarget for TtyMultiRenderer<'render> {
+    fn gles_frame_mut<'a, 'frame, 'buffer>(
+        frame: &'a mut Self::Frame<'frame, 'buffer>,
+    ) -> &'a mut GlesFrame<'frame, 'buffer>
+    where
+        'buffer: 'frame,
+        Self: 'frame,
+    {
+        frame.as_gles_frame()
+    }
+
+    fn map_gles_error(err: GlesError) -> Self::Error {
+        TtyMultiError::Render(err)
+    }
+}
 
 // ==============================================================================
 // 1. `KomaClippedSurfaceElement<R>` (SDF Rounded-Corner Clipping + Opacity)
 // ==============================================================================
 
 #[derive(Debug)]
-pub struct KomaClippedSurfaceElement<R: Renderer + ImportAll> {
+pub struct KomaClippedSurfaceElement<R: Renderer> {
     inner: WaylandSurfaceRenderElement<R>,
     program: GlesTexProgram,
     clip_geo: Rectangle<f64, Logical>,
@@ -79,7 +115,7 @@ impl<R: Renderer + ImportAll> KomaClippedSurfaceElement<R> {
     fn compute_uniforms(&self) -> Vec<Uniform<'static>> {
         let scale = Scale::from(f64::from(self.scale));
         let elem_geo = self.inner.geometry(scale);
-        let clip_phys = self.clip_geo.to_physical_precise_round(scale);
+        let clip_phys: Rectangle<i32, Physical> = self.clip_geo.to_physical_precise_round(scale);
 
         let ew = (elem_geo.size.w.max(1)) as f32;
         let eh = (elem_geo.size.h.max(1)) as f32;
@@ -172,59 +208,29 @@ impl<R: Renderer + ImportAll> Element for KomaClippedSurfaceElement<R> {
     }
 }
 
-impl RenderElement<GlesRenderer> for KomaClippedSurfaceElement<GlesRenderer> {
-    fn draw(
-        &self,
-        frame: &mut GlesFrame<'_, '_>,
-        src: Rectangle<f64, Buffer>,
-        dst: Rectangle<i32, Physical>,
-        damage: &[Rectangle<i32, Physical>],
-        opaque_regions: &[Rectangle<i32, Physical>],
-        cache: Option<&UserDataMap>,
-    ) -> Result<(), GlesError> {
-        frame.override_default_tex_program(self.program.clone(), self.compute_uniforms());
-        let res = RenderElement::<GlesRenderer>::draw(
-            &self.inner,
-            frame,
-            src,
-            dst,
-            damage,
-            opaque_regions,
-            cache,
-        );
-        frame.clear_tex_program_override();
-        res
-    }
-
-    fn underlying_storage(&self, _renderer: &mut GlesRenderer) -> Option<UnderlyingStorage<'_>> {
-        None
-    }
-}
-
-impl<'render> RenderElement<TtyMultiRenderer<'render>>
-    for KomaClippedSurfaceElement<TtyMultiRenderer<'render>>
+impl<R> RenderElement<R> for KomaClippedSurfaceElement<R>
+where
+    R: KomaRenderTarget,
+    R::TextureId: smithay::backend::renderer::Texture + 'static,
 {
     fn draw(
         &self,
-        frame: &mut TtyMultiFrame<'_, 'render, '_, '_>,
+        frame: &mut R::Frame<'_, '_>,
         src: Rectangle<f64, Buffer>,
         dst: Rectangle<i32, Physical>,
         damage: &[Rectangle<i32, Physical>],
         opaque_regions: &[Rectangle<i32, Physical>],
         cache: Option<&UserDataMap>,
-    ) -> Result<(), TtyMultiError<'render>> {
-        frame
-            .as_gles_frame()
+    ) -> Result<(), R::Error> {
+        R::gles_frame_mut(frame)
             .override_default_tex_program(self.program.clone(), self.compute_uniforms());
-        let res = RenderElement::draw(&self.inner, frame, src, dst, damage, opaque_regions, cache);
-        frame.as_gles_frame().clear_tex_program_override();
+        let res =
+            RenderElement::<R>::draw(&self.inner, frame, src, dst, damage, opaque_regions, cache);
+        R::gles_frame_mut(frame).clear_tex_program_override();
         res
     }
 
-    fn underlying_storage(
-        &self,
-        _renderer: &mut TtyMultiRenderer<'render>,
-    ) -> Option<UnderlyingStorage<'_>> {
+    fn underlying_storage(&self, _renderer: &mut R) -> Option<UnderlyingStorage<'_>> {
         None
     }
 }
@@ -312,61 +318,33 @@ impl Element for KomaRoundedBorderElement {
     }
 }
 
-impl RenderElement<GlesRenderer> for KomaRoundedBorderElement {
+impl<R: KomaRenderTarget> RenderElement<R> for KomaRoundedBorderElement {
     fn draw(
         &self,
-        frame: &mut GlesFrame<'_, '_>,
+        frame: &mut R::Frame<'_, '_>,
         src: Rectangle<f64, Buffer>,
         dst: Rectangle<i32, Physical>,
         damage: &[Rectangle<i32, Physical>],
         _opaque_regions: &[Rectangle<i32, Physical>],
         _cache: Option<&UserDataMap>,
-    ) -> Result<(), GlesError> {
+    ) -> Result<(), R::Error> {
         let uniforms = self.uniforms();
-        frame.render_texture_from_to(
-            &self.carrier_tex,
-            src,
-            dst,
-            damage,
-            &[],
-            Transform::Normal,
-            self.opacity,
-            Some(&self.program),
-            &uniforms,
-        )
+        R::gles_frame_mut(frame)
+            .render_texture_from_to(
+                &self.carrier_tex,
+                src,
+                dst,
+                damage,
+                &[],
+                Transform::Normal,
+                self.opacity,
+                Some(&self.program),
+                &uniforms,
+            )
+            .map_err(R::map_gles_error)
     }
 
-    fn underlying_storage(&self, _renderer: &mut GlesRenderer) -> Option<UnderlyingStorage<'_>> {
-        None
-    }
-}
-
-impl<'render> RenderElement<TtyMultiRenderer<'render>> for KomaRoundedBorderElement {
-    fn draw(
-        &self,
-        frame: &mut TtyMultiFrame<'_, 'render, '_, '_>,
-        src: Rectangle<f64, Buffer>,
-        dst: Rectangle<i32, Physical>,
-        damage: &[Rectangle<i32, Physical>],
-        opaque_regions: &[Rectangle<i32, Physical>],
-        cache: Option<&UserDataMap>,
-    ) -> Result<(), TtyMultiError<'render>> {
-        RenderElement::<GlesRenderer>::draw(
-            self,
-            frame.as_gles_frame(),
-            src,
-            dst,
-            damage,
-            opaque_regions,
-            cache,
-        )
-        .map_err(TtyMultiError::Render)
-    }
-
-    fn underlying_storage(
-        &self,
-        _renderer: &mut TtyMultiRenderer<'render>,
-    ) -> Option<UnderlyingStorage<'_>> {
+    fn underlying_storage(&self, _renderer: &mut R) -> Option<UnderlyingStorage<'_>> {
         None
     }
 }
@@ -452,7 +430,7 @@ impl Element for KomaBlurredBackdropElement {
 
     fn src(&self) -> Rectangle<f64, Buffer> {
         let scale = Scale::from(f64::from(self.scale));
-        let phys = self.geometry.to_physical_precise_round(scale);
+        let phys: Rectangle<i32, Physical> = self.geometry.to_physical_precise_round(scale);
         Rectangle::new(
             Point::from((f64::from(phys.loc.x), f64::from(phys.loc.y))),
             Size::from((f64::from(phys.size.w), f64::from(phys.size.h))),
@@ -472,61 +450,33 @@ impl Element for KomaBlurredBackdropElement {
     }
 }
 
-impl RenderElement<GlesRenderer> for KomaBlurredBackdropElement {
+impl<R: KomaRenderTarget> RenderElement<R> for KomaBlurredBackdropElement {
     fn draw(
         &self,
-        frame: &mut GlesFrame<'_, '_>,
+        frame: &mut R::Frame<'_, '_>,
         src: Rectangle<f64, Buffer>,
         dst: Rectangle<i32, Physical>,
         damage: &[Rectangle<i32, Physical>],
         _opaque_regions: &[Rectangle<i32, Physical>],
         _cache: Option<&UserDataMap>,
-    ) -> Result<(), GlesError> {
+    ) -> Result<(), R::Error> {
         let uniforms = self.uniforms();
-        frame.render_texture_from_to(
-            &self.blurred_tex,
-            src,
-            dst,
-            damage,
-            &[],
-            Transform::Normal,
-            self.opacity,
-            Some(&self.program),
-            &uniforms,
-        )
+        R::gles_frame_mut(frame)
+            .render_texture_from_to(
+                &self.blurred_tex,
+                src,
+                dst,
+                damage,
+                &[],
+                Transform::Normal,
+                self.opacity,
+                Some(&self.program),
+                &uniforms,
+            )
+            .map_err(R::map_gles_error)
     }
 
-    fn underlying_storage(&self, _renderer: &mut GlesRenderer) -> Option<UnderlyingStorage<'_>> {
-        None
-    }
-}
-
-impl<'render> RenderElement<TtyMultiRenderer<'render>> for KomaBlurredBackdropElement {
-    fn draw(
-        &self,
-        frame: &mut TtyMultiFrame<'_, 'render, '_, '_>,
-        src: Rectangle<f64, Buffer>,
-        dst: Rectangle<i32, Physical>,
-        damage: &[Rectangle<i32, Physical>],
-        opaque_regions: &[Rectangle<i32, Physical>],
-        cache: Option<&UserDataMap>,
-    ) -> Result<(), TtyMultiError<'render>> {
-        RenderElement::<GlesRenderer>::draw(
-            self,
-            frame.as_gles_frame(),
-            src,
-            dst,
-            damage,
-            opaque_regions,
-            cache,
-        )
-        .map_err(TtyMultiError::Render)
-    }
-
-    fn underlying_storage(
-        &self,
-        _renderer: &mut TtyMultiRenderer<'render>,
-    ) -> Option<UnderlyingStorage<'_>> {
+    fn underlying_storage(&self, _renderer: &mut R) -> Option<UnderlyingStorage<'_>> {
         None
     }
 }
@@ -628,7 +578,7 @@ impl<R: Renderer> RenderElement<R> for KomaSolidColorElement {
 }
 
 render_elements! {
-    pub KomaRenderElement<R> where R: smithay::backend::renderer::ImportAll;
+    pub KomaRenderElement<R> where R: KomaRenderTarget;
     Surface = WaylandSurfaceRenderElement<R>,
     ClippedSurface = KomaClippedSurfaceElement<R>,
     RoundedBorder = KomaRoundedBorderElement,
@@ -641,6 +591,6 @@ render_elements! {
 pub fn to_smithay_logical_rect(rect: koma_model::LogicalRect) -> Rectangle<f64, Logical> {
     Rectangle::new(
         Point::from((f64::from(rect.x), f64::from(rect.y))),
-        Size::from((f64::from(rect.width), f64::from(rect.height))),
+        Size::from((f64::from(rect.w), f64::from(rect.h))),
     )
 }

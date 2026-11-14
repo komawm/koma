@@ -71,10 +71,10 @@ impl EpochObservationTracker {
 
         match *status {
             ObservationStatus::Fresh { epoch: observed } => {
-                if let Some(exp) = explicit_expected {
-                    if exp != observed {
-                        return Err(IpcError::stale_epoch(exp, observed));
-                    }
+                if let Some(exp) = explicit_expected
+                    && exp != observed
+                {
+                    return Err(IpcError::stale_epoch(exp, observed));
                 }
                 Ok(observed)
             }

@@ -95,7 +95,7 @@ fn notify_service_manager_ready() {
         let addr_res = if let Some(abstract_name) = sock_str.strip_prefix('@') {
             SocketAddr::from_abstract_name(abstract_name.as_bytes())
         } else {
-            SocketAddr::from_pathname(raw_sock.as_ref())
+            SocketAddr::from_pathname(std::path::Path::new(&raw_sock))
         };
 
         match (UnixDatagram::unbound(), addr_res) {
@@ -412,7 +412,6 @@ fn main() {
                     eprintln!("koma bare-metal TTY fatal error: {err:#}");
                     std::process::exit(1);
                 }
-                return;
             }
             #[cfg(not(feature = "smithay-tty"))]
             {
@@ -428,7 +427,6 @@ fn main() {
                     eprintln!("koma nested Winit fatal error: {err:#}");
                     std::process::exit(1);
                 }
-                return;
             }
             #[cfg(not(feature = "smithay-winit"))]
             {

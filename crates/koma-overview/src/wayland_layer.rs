@@ -11,7 +11,7 @@ use std::{
     collections::HashMap,
     ffi::CString,
     fs::{self, File},
-    io::{self, Read as _, Seek as _, SeekFrom, Write as _},
+    io::{Read as _, Seek as _, SeekFrom, Write as _},
     os::{
         fd::AsFd as _,
         unix::{fs::PermissionsExt as _, net::UnixListener},
@@ -125,10 +125,10 @@ impl OverviewDaemon {
     }
 
     fn refresh_inventory(&mut self) {
-        if let Some(ipc) = self.ensure_ipc() {
-            if let Ok(items) = ipc.fetch_inventory() {
-                self.inventory_cache = items;
-            }
+        if let Some(ipc) = self.ensure_ipc()
+            && let Ok(items) = ipc.fetch_inventory()
+        {
+            self.inventory_cache = items;
         }
     }
 
@@ -173,10 +173,10 @@ impl OverviewDaemon {
                 margin_left,
                 margin_top,
             } => {
-                if let Some(prev) = unsubscribe_prev {
-                    if let Some(ipc) = self.ensure_ipc() {
-                        let _ = ipc.set_preview_subscribe(&prev, false);
-                    }
+                if let Some(prev) = unsubscribe_prev
+                    && let Some(ipc) = self.ensure_ipc()
+                {
+                    let _ = ipc.set_preview_subscribe(&prev, false);
                 }
                 if let Some(ipc) = self.ensure_ipc() {
                     let _ = ipc.set_preview_subscribe(&subscribe_new, true);
@@ -234,10 +234,10 @@ impl OverviewDaemon {
 
     fn capture_and_draw_popup(&mut self, ws_id: &WorkspaceId) {
         self.refresh_inventory();
-        if let Some(ipc) = self.ensure_ipc() {
-            if let Ok(frame) = ipc.capture_zero_copy_frame(ws_id, THUMBNAIL_WIDTH) {
-                self.frame_cache.insert(ws_id.clone(), frame);
-            }
+        if let Some(ipc) = self.ensure_ipc()
+            && let Ok(frame) = ipc.capture_zero_copy_frame(ws_id, THUMBNAIL_WIDTH)
+        {
+            self.frame_cache.insert(ws_id.clone(), frame);
         }
         let Some(popup) = &self.popup_win else {
             return;
@@ -365,18 +365,17 @@ impl OverviewDaemon {
             .collect();
         self.grid.recompute_layout(w, h, &ws_ids);
 
-        for slot in &self.grid.slots {
-            if let Some(ipc) = self.ensure_ipc() {
-                if let Ok(frame) = ipc.capture_zero_copy_frame(&slot.ws_id, slot.thumb_rect.w) {
-                    self.frame_cache.insert(slot.ws_id.clone(), frame);
-                }
+        let slots_snapshot = self.grid.slots.clone();
+        for slot in &slots_snapshot {
+            if let Some(ipc) = self.ensure_ipc()
+                && let Ok(frame) = ipc.capture_zero_copy_frame(&slot.ws_id, slot.thumb_rect.w)
+            {
+                self.frame_cache.insert(slot.ws_id.clone(), frame);
             }
         }
 
         let mut canvas = vec![0_u8; (w * h * 4) as usize];
         clear_argb8888_canvas(&mut canvas, ARGB_BACKDROP_DIM);
-
-        let slots_snapshot = self.grid.slots.clone();
         for slot in &slots_snapshot {
             let meta = self.build_card_meta(&slot.ws_id, slot.is_selected);
             paint_workspace_card(
@@ -509,7 +508,7 @@ pub fn run_overview_daemon() -> anyhow::Result<()> {
             .insert_source(
                 Generic::new(listener, Interest::READ, Mode::Level),
                 |_, listener, state| {
-                    while let Ok((mut stream, _)) = listener.get_ref().accept() {
+                    while let Ok((mut stream, _)) = listener.accept() {
                         let mut cmd = String::new();
                         let _ = stream.read_to_string(&mut cmd);
                         for line in cmd.lines() {
@@ -764,13 +763,13 @@ impl Dispatch<WlPointer, ()> for OverviewDaemon {
                 ..
             } => {
                 state.pointer_xy = (surface_x, surface_y);
-                if state.grid.is_open {
-                    if let Some(slot) = state.grid.hit_test(surface_x, surface_y) {
-                        let idx = slot.index;
-                        if idx != state.grid.selected_idx {
-                            state.grid.set_selected(idx);
-                            state.capture_and_draw_grid();
-                        }
+                if state.grid.is_open
+                    && let Some(slot) = state.grid.hit_test(surface_x, surface_y)
+                {
+                    let idx = slot.index;
+                    if idx != state.grid.selected_idx {
+                        state.grid.set_selected(idx);
+                        state.capture_and_draw_grid();
                     }
                 }
             }
@@ -778,17 +777,15 @@ impl Dispatch<WlPointer, ()> for OverviewDaemon {
                 button: 0x110, // BTN_LEFT
                 state: WEnum::Value(wl_pointer::ButtonState::Pressed),
                 ..
-            } => {
-                if state.grid.is_open {
-                    let (px, py) = state.pointer_xy;
-                    if let Some(ws_id) = state.grid.hit_test(px, py).map(|s| s.ws_id.clone()) {
-                        if let Some(ipc) = state.ensure_ipc() {
-                            let _ = ipc.set_workspace_mode(&ws_id, WorkspaceModeSpec::Peek);
-                        }
-                        state.close_fullscreen_grid();
-                    } else {
-                        state.close_fullscreen_grid();
+            } if state.grid.is_open => {
+                let (px, py) = state.pointer_xy;
+                if let Some(ws_id) = state.grid.hit_test(px, py).map(|s| s.ws_id.clone()) {
+                    if let Some(ipc) = state.ensure_ipc() {
+                        let _ = ipc.set_workspace_mode(&ws_id, WorkspaceModeSpec::Peek);
                     }
+                    state.close_fullscreen_grid();
+                } else {
+                    state.close_fullscreen_grid();
                 }
             }
             _ => {}
@@ -805,14 +802,15 @@ impl Dispatch<WlOutput, ()> for OverviewDaemon {
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
     ) {
-        if let wl_output::Event::Mode { width, height, .. } = event {
-            if width > 0 && height > 0 {
-                state.output_size = (width as u32, height as u32);
-                debug!(
-                    width,
-                    height, "updated host output resolution for koma-overview"
-                );
-            }
+        if let wl_output::Event::Mode { width, height, .. } = event
+            && width > 0
+            && height > 0
+        {
+            state.output_size = (width as u32, height as u32);
+            debug!(
+                width,
+                height, "updated host output resolution for koma-overview"
+            );
         }
     }
 }

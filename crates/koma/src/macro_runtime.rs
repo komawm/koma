@@ -4,7 +4,7 @@
 use std::{process::Command, sync::Arc, time::Duration};
 
 use calloop::{
-    LoopHandle, RegistrationToken,
+    RegistrationToken,
     timer::{TimeoutAction, Timer},
 };
 use koma_lua::{HostBridge, phodopus_bridge::QueuedHostAction, schema::LuaKinematicsInput};
@@ -34,21 +34,11 @@ const KINEMATIC_TICK_MS: u64 = 8; // ~125 Hz smooth pointer interpolation step
 const DEFAULT_SETTLE_QUIET_MS: u64 = 40;
 
 /// Per-workspace surface damage tracker driving `window.settled` events and `WaitDamageSettle` wakes.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct WorkspaceDamageTracker {
     pub last_commit_ms: u64,
     pub dirty_unsettled: bool,
     pub settle_timer_token: Option<RegistrationToken>,
-}
-
-impl Default for WorkspaceDamageTracker {
-    fn default() -> Self {
-        Self {
-            last_commit_ms: 0,
-            dirty_unsettled: false,
-            settle_timer_token: None,
-        }
-    }
 }
 
 /// In-flight smooth `vSeat` pointer animation (`minimum_jerk` or `spring`).
@@ -245,7 +235,7 @@ pub fn execute_queued_host_actions(state: &mut KomaState) {
     rearm_trampoline_timer(state);
 }
 
-fn dispatch_single_host_action(state: &mut KomaState, action: QueuedHostAction) {
+pub(crate) fn dispatch_single_host_action(state: &mut KomaState, action: QueuedHostAction) {
     match action {
         QueuedHostAction::SpawnProcess { argv } => {
             if let Some((prog, args)) = argv.split_first() {
@@ -305,10 +295,10 @@ fn dispatch_single_host_action(state: &mut KomaState, action: QueuedHostAction) 
             if !verify_action_epoch_and_protection(state, &ws_id, expected_epoch) {
                 return;
             }
-            if let Some(ws) = state.workspaces.get(&ws_id) {
-                if let Some(ledger) = state.vseats.get_mut(&ws.vseat_id) {
-                    ledger.record_key_down(&key);
-                }
+            if let Some(ws) = state.workspaces.get(&ws_id)
+                && let Some(ledger) = state.vseats.get_mut(&ws.vseat_id)
+            {
+                ledger.record_key_down(&key);
             }
             synthesize_single_key_edge(state, &key, KeyState::Pressed);
         }
@@ -321,10 +311,10 @@ fn dispatch_single_host_action(state: &mut KomaState, action: QueuedHostAction) 
             if !verify_action_epoch_and_protection(state, &ws_id, expected_epoch) {
                 return;
             }
-            if let Some(ws) = state.workspaces.get(&ws_id) {
-                if let Some(ledger) = state.vseats.get_mut(&ws.vseat_id) {
-                    ledger.record_key_up(&key);
-                }
+            if let Some(ws) = state.workspaces.get(&ws_id)
+                && let Some(ledger) = state.vseats.get_mut(&ws.vseat_id)
+            {
+                ledger.record_key_up(&key);
             }
             synthesize_single_key_edge(state, &key, KeyState::Released);
         }
@@ -375,13 +365,13 @@ fn dispatch_single_host_action(state: &mut KomaState, action: QueuedHostAction) 
                 return;
             }
             let btn_code = linux_button_code(&button);
-            if let Some(ws) = state.workspaces.get(&ws_id) {
-                if let Some(ledger) = state.vseats.get_mut(&ws.vseat_id) {
-                    if pressed {
-                        ledger.record_button_down(btn_code);
-                    } else {
-                        ledger.record_button_up(btn_code);
-                    }
+            if let Some(ws) = state.workspaces.get(&ws_id)
+                && let Some(ledger) = state.vseats.get_mut(&ws.vseat_id)
+            {
+                if pressed {
+                    ledger.record_button_down(btn_code);
+                } else {
+                    ledger.record_button_up(btn_code);
                 }
             }
             apply_pointer_button(

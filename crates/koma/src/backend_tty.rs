@@ -53,7 +53,7 @@ use smithay::{
         },
         libinput::{LibinputInputBackend, LibinputSessionInterface},
         renderer::{
-            ImportDma as _, ImportEgl as _,
+            ImportDma as _,
             element::{
                 Kind,
                 surface::{WaylandSurfaceRenderElement, render_elements_from_surface_tree},
@@ -68,7 +68,7 @@ use smithay::{
     input::{keyboard::KeyboardSource, pointer::MotionEvent},
     output::{Mode, Output, OutputModeSource, PhysicalProperties, Scale},
     reexports::{
-        drm::control::{self, Device as _, ModeFlags, ModeTypeFlags, connector, crtc},
+        drm::control::{self, ModeFlags, ModeTypeFlags, connector, crtc},
         gbm::Modifier,
         input::Libinput,
         rustix::fs::OFlags,
@@ -123,11 +123,15 @@ pub enum SurfaceRedrawState {
 
 /// Active KMS CRTC scanout surface managed by `DrmCompositor`.
 pub struct DrmOutputSurface {
+    // Physical connector handle retained for DRM hotplug/output lifecycle tracking.
+    #[allow(dead_code)]
     pub connector: connector::Handle,
     pub connector_name: String,
     pub output: Output,
     pub wl_global: Option<GlobalId>,
     pub compositor: GbmDrmCompositor,
+    // RAII per-surface DMA-BUF feedback handle kept alive for the surface lifetime.
+    #[allow(dead_code)]
     pub dmabuf_feedback: Option<DmabufFeedback>,
     pub redraw_state: SurfaceRedrawState,
     pub refresh_mhz: i32,
@@ -250,10 +254,9 @@ impl TtyBackendState {
         if let Some((prim_id, prim_path)) = snapshot
             .iter()
             .find(|(id, _)| *id == self.primary_node.dev_id())
+            && let Err(err) = self.device_added(*prim_id, prim_path, state)
         {
-            if let Err(err) = self.device_added(*prim_id, prim_path, state) {
-                warn!("failed initializing primary DRM node {prim_path:?}: {err:#}");
-            }
+            warn!("failed initializing primary DRM node {prim_path:?}: {err:#}");
         }
 
         for (dev_id, path) in &snapshot {
@@ -301,10 +304,10 @@ impl TtyBackendState {
     /// Returns the primary connected `Output` (preferring `primary_node` connectors such as `eDP-1`).
     #[must_use]
     pub fn primary_output(&self) -> Option<Output> {
-        if let Some(prim_dev) = self.devices.get(&self.primary_node) {
-            if let Some(surf) = prim_dev.surfaces.values().next() {
-                return Some(surf.output.clone());
-            }
+        if let Some(prim_dev) = self.devices.get(&self.primary_node)
+            && let Some(surf) = prim_dev.surfaces.values().next()
+        {
+            return Some(surf.output.clone());
         }
         self.devices
             .values()
@@ -422,15 +425,12 @@ impl TtyBackendState {
 
         // Advertise `zwp_linux_dmabuf_v1` global once the primary render node comes online
         if render_node == Some(self.primary_render_node) && self.dmabuf_global.is_none() {
-            let mut renderer = self
+            let renderer = self
                 .gpu_manager
                 .single_renderer(&self.primary_render_node)
                 .context("failed obtaining primary GlesRenderer")?;
 
-            if let Err(err) = renderer.bind_wl_display(&state.display_handle) {
-                trace!("legacy wl_drm EGL bind skipped: {err}");
-            }
-
+            // `zwp_linux_dmabuf_v1` below exposes GPU buffers directly without legacy `wl_drm` (`use_system_lib`).
             let primary_formats = renderer.dmabuf_formats();
             let default_feedback =
                 DmabufFeedbackBuilder::new(self.primary_render_node.dev_id(), primary_formats)
@@ -854,31 +854,31 @@ fn pick_connector_mode(
     connector: &connector::Info,
     requested_spec: Option<&str>,
 ) -> Option<control::Mode> {
-    if let Some(spec) = requested_spec {
-        if let Some((target_w, target_h, target_mhz)) = parse_mode_spec(spec) {
-            let mut best_match: Option<control::Mode> = None;
-            for m in connector.modes() {
-                if m.flags().contains(ModeFlags::INTERLACE) || m.size() != (target_w, target_h) {
-                    continue;
-                }
-                if let Some(mhz) = target_mhz {
-                    let wl_m = Mode::from(*m);
-                    if (wl_m.refresh - mhz).abs() <= 500 {
-                        best_match = Some(*m);
-                        break;
-                    }
-                } else if best_match.is_none_or(|curr| curr.vrefresh() < m.vrefresh()) {
+    if let Some(spec) = requested_spec
+        && let Some((target_w, target_h, target_mhz)) = parse_mode_spec(spec)
+    {
+        let mut best_match: Option<control::Mode> = None;
+        for m in connector.modes() {
+            if m.flags().contains(ModeFlags::INTERLACE) || m.size() != (target_w, target_h) {
+                continue;
+            }
+            if let Some(mhz) = target_mhz {
+                let wl_m = Mode::from(*m);
+                if (wl_m.refresh - mhz).abs() <= 500 {
                     best_match = Some(*m);
+                    break;
                 }
+            } else if best_match.is_none_or(|curr| curr.vrefresh() < m.vrefresh()) {
+                best_match = Some(*m);
             }
-            if best_match.is_some() {
-                return best_match;
-            }
-            warn!(
-                requested = %spec,
-                "configured output mode not advertised by EDID; falling back to preferred mode"
-            );
         }
+        if best_match.is_some() {
+            return best_match;
+        }
+        warn!(
+            requested = %spec,
+            "configured output mode not advertised by EDID; falling back to preferred mode"
+        );
     }
 
     // Prefer `ModeTypeFlags::PREFERRED` with the highest refresh rate (e.g. 2560x1600@240Hz)
@@ -985,7 +985,7 @@ fn on_session_event_callback(state: &mut KomaState, event: SessionEvent) {
                             warn!(?node, "DrmDevice::activate failed on resume: {err:?}");
                         }
                         for surf in device.surfaces.values_mut() {
-                            let _ = surf.compositor.reset_buffers();
+                            surf.compositor.reset_buffers();
                             surf.redraw_state = SurfaceRedrawState::Queued;
                         }
                     }
@@ -1022,33 +1022,31 @@ fn on_drm_vblank_callback(
     let mut output_for_callbacks: Option<(Output, Duration)> = None;
     let mut needs_immediate_redraw = false;
 
-    if let Some(ActiveBackend::Tty(tty)) = state.backend.as_mut() {
-        if let Some(device) = tty.devices.get_mut(&node) {
-            if let Some(surface) = device.surfaces.get_mut(&crtc) {
-                if let Err(err) = surface.compositor.frame_submitted() {
-                    warn!(
-                        connector = %surface.connector_name,
-                        "DrmCompositor::frame_submitted error: {err}"
-                    );
-                }
-
-                let redraw_again =
-                    match mem::replace(&mut surface.redraw_state, SurfaceRedrawState::Idle) {
-                        SurfaceRedrawState::WaitingForVBlank { redraw_needed } => redraw_needed,
-                        SurfaceRedrawState::Queued => true,
-                        SurfaceRedrawState::Idle => false,
-                    };
-
-                if redraw_again {
-                    surface.redraw_state = SurfaceRedrawState::Queued;
-                    needs_immediate_redraw = true;
-                }
-
-                let refresh_interval =
-                    Duration::from_secs_f64(1_000.0 / f64::from(surface.refresh_mhz.max(1_000)));
-                output_for_callbacks = Some((surface.output.clone(), refresh_interval));
-            }
+    if let Some(ActiveBackend::Tty(tty)) = state.backend.as_mut()
+        && let Some(device) = tty.devices.get_mut(&node)
+        && let Some(surface) = device.surfaces.get_mut(&crtc)
+    {
+        if let Err(err) = surface.compositor.frame_submitted() {
+            warn!(
+                connector = %surface.connector_name,
+                "DrmCompositor::frame_submitted error: {err}"
+            );
         }
+
+        let redraw_again = match mem::replace(&mut surface.redraw_state, SurfaceRedrawState::Idle) {
+            SurfaceRedrawState::WaitingForVBlank { redraw_needed } => redraw_needed,
+            SurfaceRedrawState::Queued => true,
+            SurfaceRedrawState::Idle => false,
+        };
+
+        if redraw_again {
+            surface.redraw_state = SurfaceRedrawState::Queued;
+            needs_immediate_redraw = true;
+        }
+
+        let refresh_interval =
+            Duration::from_secs_f64(1_000.0 / f64::from(surface.refresh_mhz.max(1_000)));
+        output_for_callbacks = Some((surface.output.clone(), refresh_interval));
     }
 
     // Dispatch `wl_surface.frame` callbacks synced to hardware VBlank so 240 Hz clients pace cleanly
@@ -1101,14 +1099,13 @@ pub fn render_pending_tty_outputs(state: &mut KomaState) {
 
 fn render_single_drm_surface(
     tty: &mut TtyBackendState,
-    state: &KomaState,
+    state: &mut KomaState,
     node: DrmNode,
     crtc: crtc::Handle,
 ) -> Option<(Output, Duration)> {
     let ws = state.workspaces.get(&state.active_ws_id)?;
     let viewport: LogicalViewport = ws.viewport;
     let lease_state = ws.lease.state().clone();
-    let active_deck_id = ws.deck.active();
 
     let device = tty.devices.get_mut(&node)?;
     if !device.drm.is_active() {
@@ -1232,12 +1229,13 @@ fn render_single_drm_surface(
         append_scratchpad_dim_scrim(viewport, &mut elements);
     }
 
-    if let Some(ws) = state.workspaces.get(&state.active_ws_id) {
-        if ws.layout_mode == koma_model::LayoutMode::Scrolling && ws.fullscreen_window.is_none() {
-            let cam_x = ws.scrolling.peek_camera_x(state.elapsed_ms());
-            let tab_segs = ws.scrolling.tab_indicator_segments_at(viewport, cam_x);
-            append_tab_indicator_elements(&mut renderer, output_scale, &tab_segs, &mut elements);
-        }
+    if let Some(ws) = state.workspaces.get(&state.active_ws_id)
+        && ws.layout_mode == koma_model::LayoutMode::Scrolling
+        && ws.fullscreen_window.is_none()
+    {
+        let cam_x = ws.scrolling.peek_camera_x(state.elapsed_ms());
+        let tab_segs = ws.scrolling.tab_indicator_segments_at(viewport, cam_x);
+        append_tab_indicator_elements(&mut renderer, output_scale, &tab_segs, &mut elements);
     }
     let base_drop = state.drop_preview_for_workspace(&state.active_ws_id);
     let ws_elements = assemble_workspace_elements(
@@ -1287,12 +1285,11 @@ fn render_single_drm_surface(
         scanout_flags,
     ) {
         Ok(res) => {
-            if res.needs_sync() {
-                if let PrimaryPlaneElement::Swapchain(elem) = res.primary_element {
-                    if let Err(err) = elem.sync.wait() {
-                        warn!("EGL swapchain sync fence wait error: {err:?}");
-                    }
-                }
+            if res.needs_sync()
+                && let PrimaryPlaneElement::Swapchain(elem) = res.primary_element
+                && let Err(err) = elem.sync.wait()
+            {
+                warn!("EGL swapchain sync fence wait error: {err:?}");
             }
 
             if !res.is_empty {

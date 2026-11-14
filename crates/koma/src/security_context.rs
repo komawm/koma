@@ -109,8 +109,11 @@ impl NewClient {
 
 /// Active per-workspace jailed Wayland socket registered on `calloop` for Podman/bwrap containers.
 pub struct JailedWaylandSocket {
+    // Workspace/sandbox ownership metadata retained on active jailed socket.
+    #[allow(dead_code)]
     pub ws_id: WorkspaceId,
     pub socket_path: PathBuf,
+    #[allow(dead_code)]
     pub label: String,
     pub reg_token: RegistrationToken,
 }
@@ -138,10 +141,7 @@ pub fn client_can_view_primary_selection(client: &Client) -> bool {
 pub fn query_peer_credentials(stream: &UnixStream) -> Option<PeerSocketCredentials> {
     let creds = socket_peercred(stream).ok()?;
     Some(PeerSocketCredentials {
-        pid: creds
-            .pid
-            .map(rustix::process::Pid::as_raw_nonzero)
-            .map(|n| n.get()),
+        pid: Some(creds.pid.as_raw_nonzero().get()),
         uid: creds.uid.as_raw(),
         gid: creds.gid.as_raw(),
     })
@@ -270,7 +270,7 @@ pub fn create_jailed_wayland_socket(
             Generic::new(listener, Interest::READ, Mode::Level),
             move |_, listener, state| {
                 loop {
-                    match listener.get_ref().accept() {
+                    match listener.accept() {
                         Ok((stream, _addr)) => {
                             debug!(
                                 ws_id = %ws_for_cb,

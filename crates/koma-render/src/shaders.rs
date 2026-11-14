@@ -293,10 +293,9 @@ impl KomaCompiledShaders {
             .egl_context()
             .user_data()
             .get::<CachedShadersSlot>()
+            && let Some(existing) = slot.0.lock().unwrap().clone()
         {
-            if let Some(existing) = slot.0.lock().unwrap().clone() {
-                return existing;
-            }
+            return existing;
         }
 
         let clipped_src = format!("{CLIPPED_SURFACE_FRAG_BODY}\n{GLSL_ROUNDING_ALPHA_FN}");
@@ -393,6 +392,7 @@ impl Mat3f {
     }
 
     #[must_use]
+    #[allow(clippy::should_implement_trait)] // Matrix composition helper called explicitly as `.mul(...)`.
     pub fn mul(self, rhs: Self) -> Self {
         let a = self.0;
         let b = rhs.0;
