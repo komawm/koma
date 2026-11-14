@@ -54,7 +54,6 @@
             libinput
             udev
             libxkbcommon
-            libdisplay-info
             libdrm
             mesa
             libglvnd

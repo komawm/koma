@@ -1,5 +1,6 @@
-//! Non-blocking Unix domain socket framing with `SCM_RIGHTS` FD passing, `SO_PEERCRED` UID
-//! verification, and write-sealed `memfd` creation (`IPC_SPEC.md` §2.1, §2.2, §5.4).
+//! Non-blocking Unix domain socket framing with `SCM_RIGHTS` FD passing, kernel peer credential
+//! verification (`SO_PEERCRED` / `LOCAL_PEERCRED` / `getpeereid`), and write-sealed `memfd` creation
+//! (`IPC_SPEC.md` §2.1, §2.2, §5.4).
 //!
 //! Uses `rustix`'s safe `OwnedFd`/`BorrowedFd` abstractions with zero raw `cmsg` pointer arithmetic.
 
@@ -10,9 +11,10 @@ use std::{
     io::{self, IoSlice, IoSliceMut, Seek as _, SeekFrom, Write as _},
     mem::MaybeUninit,
     os::{
-        fd::{AsFd as _, BorrowedFd, OwnedFd},
+        fd::{AsFd as _, AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd},
         unix::net::UnixStream,
     },
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use rustix::{
@@ -39,43 +41,225 @@ pub struct PeerCreds {
     pub gid: u32,
 }
 
-/// Verifies that a client connecting to `koma-admin.sock` runs under the exact same UID as `koma`.
-#[cfg(target_os = "linux")]
-pub fn verify_same_uid_peer(stream: &UnixStream) -> io::Result<PeerCreds> {
+/// Kernel-verified Unix socket peer identity (`pid` where reported by the kernel, plus `uid` and `gid`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SocketPeerCreds {
+    pub pid: Option<i32>,
+    pub uid: u32,
+    pub gid: u32,
+}
+
+/// Queries kernel-verified peer credentials (`pid`, `uid`, `gid`) for a connected Unix stream socket.
+///
+/// Uses `SO_PEERCRED` on Linux/Android/OpenBSD, `LOCAL_PEERCRED` (`xucred`) on FreeBSD, and
+/// `getpeereid` on other BSD/Darwin/Unix platforms. Fails closed (`Unsupported`) if an OS has no
+/// verified probe.
+pub fn query_socket_peer_creds(stream: &UnixStream) -> io::Result<SocketPeerCreds> {
+    query_socket_peer_creds_impl(stream)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn query_socket_peer_creds_impl(stream: &UnixStream) -> io::Result<SocketPeerCreds> {
     let ucred = rustix::net::sockopt::socket_peercred(stream)
         .map_err(|e| io::Error::from_raw_os_error(e.raw_os_error()))?;
-    let host_uid = getuid();
-    if ucred.uid != host_uid {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!(
-                "koma-admin.sock rejected foreign UID {} (compositor UID is {})",
-                ucred.uid.as_raw(),
-                host_uid.as_raw()
-            ),
-        ));
-    }
-    Ok(PeerCreds {
+    Ok(SocketPeerCreds {
+        pid: Some(ucred.pid.as_raw_nonzero().get()),
         uid: ucred.uid.as_raw(),
         gid: ucred.gid.as_raw(),
     })
 }
 
-#[cfg(not(target_os = "linux"))]
-pub fn verify_same_uid_peer(_stream: &UnixStream) -> io::Result<PeerCreds> {
-    Ok(PeerCreds {
-        uid: getuid().as_raw(),
-        gid: 0,
+#[cfg(target_os = "freebsd")]
+fn query_socket_peer_creds_impl(stream: &UnixStream) -> io::Result<SocketPeerCreds> {
+    use std::os::fd::AsRawFd as _;
+
+    let mut cred = MaybeUninit::<libc::xucred>::zeroed();
+    let mut len = std::mem::size_of::<libc::xucred>() as libc::socklen_t;
+    // SAFETY: `stream` is a live Unix stream FD and `cred` points to writable `xucred` storage.
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERCRED,
+            cred.as_mut_ptr().cast::<libc::c_void>(),
+            &raw mut len,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if (len as usize) < std::mem::size_of::<libc::xucred>() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "truncated FreeBSD LOCAL_PEERCRED xucred payload",
+        ));
+    }
+    // SAFETY: `getsockopt` succeeded and populated the entire `libc::xucred` struct.
+    let cred = unsafe { cred.assume_init() };
+    if cred.cr_version != libc::XUCRED_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unsupported FreeBSD xucred version {}", cred.cr_version),
+        ));
+    }
+    let gid = if cred.cr_ngroups > 0 {
+        cred.cr_groups[0]
+    } else {
+        0
+    };
+    // SAFETY: On FreeBSD 13+, the kernel writes `cr_pid` into this union; earlier kernels leave
+    // the pointer slot zeroed, so non-positive values map to `None`.
+    let raw_pid = unsafe { cred.cr_pid__c_anonymous_union.cr_pid };
+    Ok(SocketPeerCreds {
+        pid: (raw_pid > 0).then_some(raw_pid),
+        uid: cred.cr_uid,
+        gid,
     })
 }
 
-/// Allocates an anonymous RAM-backed `memfd`, writes `payload`, rewinds to offset `0`, and applies
-/// `F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE | F_SEAL_SEAL` so untrusted IPC peers can `mmap`
-/// `PROT_READ` zero-copy without ever mutating or truncating the buffer (`IPC_SPEC.md` §5.4).
-#[cfg(target_os = "linux")]
-pub fn create_sealed_readonly_memfd(label: &str, payload: &[u8]) -> io::Result<OwnedFd> {
-    use rustix::fs::{MemfdFlags, SealFlags, fcntl_add_seals, memfd_create};
+#[cfg(target_os = "openbsd")]
+fn query_socket_peer_creds_impl(stream: &UnixStream) -> io::Result<SocketPeerCreds> {
+    use std::os::fd::AsRawFd as _;
 
+    let mut cred = MaybeUninit::<libc::sockpeercred>::zeroed();
+    let mut len = std::mem::size_of::<libc::sockpeercred>() as libc::socklen_t;
+    // SAFETY: `stream` is a live Unix stream FD and `cred` points to writable `sockpeercred` storage.
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            cred.as_mut_ptr().cast::<libc::c_void>(),
+            &raw mut len,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if (len as usize) < std::mem::size_of::<libc::sockpeercred>() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "truncated OpenBSD SO_PEERCRED sockpeercred payload",
+        ));
+    }
+    // SAFETY: `getsockopt` succeeded and populated the entire `libc::sockpeercred` struct.
+    let cred = unsafe { cred.assume_init() };
+    Ok(SocketPeerCreds {
+        pid: (cred.pid > 0).then_some(cred.pid),
+        uid: cred.uid,
+        gid: cred.gid,
+    })
+}
+
+#[cfg(any(
+    target_os = "dragonfly",
+    target_os = "netbsd",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "aix",
+    target_os = "cygwin",
+    target_os = "nto"
+))]
+fn query_socket_peer_creds_impl(stream: &UnixStream) -> io::Result<SocketPeerCreds> {
+    use std::os::fd::AsRawFd as _;
+
+    let mut uid: libc::uid_t = 0;
+    let mut gid: libc::gid_t = 0;
+    // SAFETY: `stream` is a live Unix stream FD and `uid`/`gid` are valid out-pointers.
+    let rc = unsafe { libc::getpeereid(stream.as_raw_fd(), &raw mut uid, &raw mut gid) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(SocketPeerCreds {
+        pid: None,
+        uid: uid as u32,
+        gid: gid as u32,
+    })
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "dragonfly",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "aix",
+    target_os = "cygwin",
+    target_os = "nto"
+)))]
+fn query_socket_peer_creds_impl(_stream: &UnixStream) -> io::Result<SocketPeerCreds> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "kernel Unix socket peer credential verification is unsupported on this OS",
+    ))
+}
+
+fn ensure_same_uid(peer: SocketPeerCreds, host_uid: u32) -> io::Result<PeerCreds> {
+    if peer.uid != host_uid {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "koma-admin.sock rejected foreign UID {} (compositor UID is {})",
+                peer.uid, host_uid
+            ),
+        ));
+    }
+    Ok(PeerCreds {
+        uid: peer.uid,
+        gid: peer.gid,
+    })
+}
+
+/// Verifies that a client connecting to `koma-admin.sock` runs under the exact same UID as `koma`.
+pub fn verify_same_uid_peer(stream: &UnixStream) -> io::Result<PeerCreds> {
+    let creds = query_socket_peer_creds(stream)?;
+    ensure_same_uid(creds, getuid().as_raw())
+}
+
+static SHM_SEQ: AtomicU64 = AtomicU64::new(0);
+const POSIX_SHM_MAX_ATTEMPTS: usize = 8;
+// OpenBSD and macOS cap POSIX SHM names at 31 bytes (`PSHMNAMLEN` / `SHM_NAME_MAX`), leaving 30 non-NUL bytes.
+const POSIX_SHM_MAX_NAME_LEN: usize = 30;
+
+#[cfg_attr(any(target_os = "linux", target_os = "freebsd"), allow(dead_code))]
+struct ShmUnlinkGuard(Option<CString>);
+
+impl ShmUnlinkGuard {
+    #[cfg_attr(any(target_os = "linux", target_os = "freebsd"), allow(dead_code))]
+    fn as_ptr(&self) -> *const libc::c_char {
+        self.0
+            .as_ref()
+            .expect("ShmUnlinkGuard path still present")
+            .as_ptr()
+    }
+
+    #[cfg_attr(any(target_os = "linux", target_os = "freebsd"), allow(dead_code))]
+    fn unlink(mut self) -> io::Result<()> {
+        if let Some(cname) = self.0.take() {
+            // SAFETY: `cname` is a NUL-terminated POSIX SHM name created by `open_populated_posix_shm_rw`.
+            let rc = unsafe { libc::shm_unlink(cname.as_ptr()) };
+            if rc != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ShmUnlinkGuard {
+    fn drop(&mut self) {
+        if let Some(cname) = self.0.take() {
+            // SAFETY: Best-effort cleanup of the SHM directory entry on early error or unwind.
+            let _ = unsafe { libc::shm_unlink(cname.as_ptr()) };
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+fn sanitize_memfd_cname(label: &str) -> CString {
     let clean_name: String = label
         .chars()
         .map(|c| {
@@ -87,21 +271,136 @@ pub fn create_sealed_readonly_memfd(label: &str, payload: &[u8]) -> io::Result<O
         })
         .take(48)
         .collect();
-    let cname = CString::new(if clean_name.is_empty() {
+    CString::new(if clean_name.is_empty() {
         "koma_frame".to_owned()
     } else {
         clean_name
     })
-    .expect("sanitized ASCII CString");
+    .expect("sanitized ASCII CString")
+}
 
-    let fd = memfd_create(&cname, MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING)
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+fn create_memfd_with_flags(
+    label: &str,
+    payload: &[u8],
+    flags: rustix::fs::MemfdFlags,
+) -> io::Result<OwnedFd> {
+    let cname = sanitize_memfd_cname(label);
+    let fd = rustix::fs::memfd_create(&cname, flags)
         .map_err(|e| io::Error::from_raw_os_error(e.raw_os_error()))?;
 
     let mut file = File::from(fd);
     file.write_all(payload)?;
     file.seek(SeekFrom::Start(0))?;
-    let fd = OwnedFd::from(file);
+    Ok(OwnedFd::from(file))
+}
 
+#[cfg_attr(any(target_os = "linux", target_os = "freebsd"), allow(dead_code))]
+fn open_populated_posix_shm_rw(payload: &[u8]) -> io::Result<(File, ShmUnlinkGuard)> {
+    let pid = std::process::id();
+    for attempt in 0..POSIX_SHM_MAX_ATTEMPTS {
+        let seq = SHM_SEQ.fetch_add(1, Ordering::Relaxed);
+        let name = format!("/km_{pid:x}_{seq:x}");
+        debug_assert!(
+            name.len() <= POSIX_SHM_MAX_NAME_LEN,
+            "POSIX SHM name exceeded {POSIX_SHM_MAX_NAME_LEN} bytes: {name}"
+        );
+        let cname =
+            CString::new(name).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+
+        // SAFETY: `cname` is NUL-terminated and flags open an exclusive read-write SHM object.
+        let raw_fd = unsafe {
+            libc::shm_open(
+                cname.as_ptr(),
+                libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC,
+                0o600 as libc::mode_t,
+            )
+        };
+        if raw_fd < 0 {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EEXIST) && attempt + 1 < POSIX_SHM_MAX_ATTEMPTS {
+                continue;
+            }
+            return Err(err);
+        }
+
+        let guard = ShmUnlinkGuard(Some(cname));
+        // SAFETY: `shm_open` returned a fresh, unowned file descriptor on success.
+        let rw_file = File::from(unsafe { OwnedFd::from_raw_fd(raw_fd) });
+        let len_off = libc::off_t::try_from(payload.len()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "POSIX SHM payload exceeds off_t range",
+            )
+        })?;
+        // POSIX `shm_open` objects start at 0 bytes; FreeBSD/POSIX do not extend them via `write()`.
+        // SAFETY: `rw_file` is an open `O_RDWR` SHM descriptor and `len_off >= 0`.
+        if unsafe { libc::ftruncate(rw_file.as_raw_fd(), len_off) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if !payload.is_empty() {
+            // SAFETY: `rw_file` was resized to `payload.len()` bytes with `O_RDWR`, so shared
+            // writable mapping and initialization over `payload.len()` bytes remain in bounds.
+            unsafe {
+                let mapped = libc::mmap(
+                    std::ptr::null_mut(),
+                    payload.len(),
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED,
+                    rw_file.as_raw_fd(),
+                    0,
+                );
+                if mapped == libc::MAP_FAILED {
+                    return Err(io::Error::last_os_error());
+                }
+                std::ptr::copy_nonoverlapping(payload.as_ptr(), mapped.cast::<u8>(), payload.len());
+                if libc::munmap(mapped, payload.len()) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+        }
+        return Ok((rw_file, guard));
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "exhausted unique POSIX SHM name retries",
+    ))
+}
+
+#[cfg_attr(any(target_os = "linux", target_os = "freebsd"), allow(dead_code))]
+fn create_shm_readonly_fd(_label: &str, payload: &[u8]) -> io::Result<OwnedFd> {
+    let (rw_file, guard) = open_populated_posix_shm_rw(payload)?;
+
+    // Keep `rw_file` alive across the `O_RDONLY` reopen so the kernel retains the object before unlink.
+    // SAFETY: `guard.as_ptr()` names the live SHM object created above.
+    let ro_raw = unsafe { libc::shm_open(guard.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC, 0) };
+    if ro_raw < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `shm_open` returned a fresh, unowned `O_RDONLY` descriptor on success.
+    let mut ro_file = File::from(unsafe { OwnedFd::from_raw_fd(ro_raw) });
+    guard.unlink()?;
+    drop(rw_file);
+    ro_file.seek(SeekFrom::Start(0))?;
+    Ok(OwnedFd::from(ro_file))
+}
+
+/// Allocates an anonymous RAM-backed buffer, writes `payload`, rewinds to offset `0`, and returns
+/// a read-only descriptor so untrusted IPC peers can `mmap` `PROT_READ` zero-copy without ever
+/// mutating or truncating the buffer (`IPC_SPEC.md` §5.4).
+///
+/// Uses `memfd_create` + `F_SEAL_*` on Linux and FreeBSD, and an unlinked `O_RDONLY` POSIX SHM
+/// descriptor on other Unix targets (such as OpenBSD, NetBSD, and macOS).
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+pub fn create_sealed_readonly_memfd(label: &str, payload: &[u8]) -> io::Result<OwnedFd> {
+    use rustix::fs::{MemfdFlags, SealFlags, fcntl_add_seals};
+
+    let fd = create_memfd_with_flags(
+        label,
+        payload,
+        MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING,
+    )?;
     fcntl_add_seals(
         &fd,
         SealFlags::SHRINK | SealFlags::GROW | SealFlags::WRITE | SealFlags::SEAL,
@@ -109,6 +408,25 @@ pub fn create_sealed_readonly_memfd(label: &str, payload: &[u8]) -> io::Result<O
     .map_err(|e| io::Error::from_raw_os_error(e.raw_os_error()))?;
 
     Ok(fd)
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "freebsd"))))]
+pub fn create_sealed_readonly_memfd(label: &str, payload: &[u8]) -> io::Result<OwnedFd> {
+    create_shm_readonly_fd(label, payload)
+}
+
+/// Allocates an anonymous RAM-backed shared memory descriptor, writes `payload`, and rewinds to
+/// offset `0` for `wl_shm` clients (`memfd_create` on Linux/FreeBSD, unlinked `shm_open` elsewhere).
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+pub fn create_writable_shm_fd(label: &str, payload: &[u8]) -> io::Result<OwnedFd> {
+    create_memfd_with_flags(label, payload, rustix::fs::MemfdFlags::CLOEXEC)
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "freebsd"))))]
+pub fn create_writable_shm_fd(_label: &str, payload: &[u8]) -> io::Result<OwnedFd> {
+    let (rw_file, guard) = open_populated_posix_shm_rw(payload)?;
+    guard.unlink()?;
+    Ok(OwnedFd::from(rw_file))
 }
 
 /// Sends a byte slice over a `UnixStream`, attaching up to `MAX_SCM_FDS` (`4`) descriptors via `SCM_RIGHTS`.
@@ -376,34 +694,55 @@ pub fn sync_roundtrip<Req: Serialize, Resp: DeserializeOwned>(
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(test)]
 mod tests {
-    use std::io::Read as _;
-
     use super::*;
-    use crate::frame::{IpcRequest, IpcResponse};
 
     #[test]
-    fn transfers_sealed_readonly_memfd_over_scm_rights() {
+    fn ensure_same_uid_rejects_foreign_uid_fail_closed() {
+        let foreign = SocketPeerCreds {
+            pid: Some(4242),
+            uid: 1001,
+            gid: 1001,
+        };
+        let err = ensure_same_uid(foreign, 1000).expect_err("foreign UID must be rejected");
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+
+        let same = SocketPeerCreds {
+            pid: None,
+            uid: 1000,
+            gid: 100,
+        };
+        assert_eq!(
+            ensure_same_uid(same, 1000).unwrap(),
+            PeerCreds {
+                uid: 1000,
+                gid: 100
+            }
+        );
+    }
+
+    #[cfg(unix)]
+    fn assert_readonly_fd_transfers_over_scm_rights(fd: OwnedFd, expected_payload: &[u8]) -> File {
+        use std::io::Read as _;
+
+        use crate::frame::{IpcRequest, IpcResponse};
+
         let (server, client) = UnixStream::pair().unwrap();
         server.set_nonblocking(true).unwrap();
 
         let creds = verify_same_uid_peer(&server).unwrap();
         assert_eq!(creds.uid, rustix::process::getuid().as_raw());
 
-        // Create sealed read-only memfd simulating a 1920x1080 RGBA frame
-        let pixels = b"KOMA_ZERO_COPY_RGBA8_SCANLINE_DATA";
-        let memfd = create_sealed_readonly_memfd("ws_01_cap", pixels).unwrap();
-
         let resp = IpcResponse::ok(
             1,
-            serde_json::json!({ "fd_index": 0, "byte_len": pixels.len() }),
+            serde_json::json!({ "fd_index": 0, "byte_len": expected_payload.len() }),
         );
         let mut outbox = FrameOutbox::default();
-        outbox.enqueue(&resp, vec![memfd]).unwrap();
+        outbox.enqueue(&resp, vec![fd]).unwrap();
         outbox.try_flush(&server).unwrap();
 
-        // Client receives JSON + sealed memfd via SCM_RIGHTS
+        // Client receives JSON + read-only FD via SCM_RIGHTS
         client.set_nonblocking(true).unwrap();
         let mut inbox = FrameInbox::default();
         let eof = inbox.read_available(&client).unwrap();
@@ -421,18 +760,69 @@ mod tests {
         let mut received_file = File::from(fds.pop().unwrap());
         let mut read_back = Vec::new();
         received_file.read_to_end(&mut read_back).unwrap();
-        assert_eq!(read_back, pixels);
+        assert_eq!(read_back, expected_payload);
 
-        // Verify write-seal blocks mutation by untrusted peer!
+        // Verify read-only sealing or O_RDONLY permissions block peer mutation!
         let write_err = received_file.write_all(b"corrupt");
         assert!(
             write_err.is_err(),
-            "F_SEAL_WRITE must block peer writes to shared frame memfd"
+            "read-only IPC FD must block peer writes to shared frame memory"
         );
         let _ = IpcRequest {
             id: 1,
             method: "ping".into(),
             params: serde_json::Value::Null,
         };
+        received_file
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transfers_sealed_readonly_memfd_over_scm_rights() {
+        let pixels = b"KOMA_ZERO_COPY_RGBA8_SCANLINE_DATA";
+        let memfd = create_sealed_readonly_memfd("ws_01_cap", pixels).unwrap();
+        let _received = assert_readonly_fd_transfers_over_scm_rights(memfd, pixels);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shm_readonly_fallback_blocks_writes_and_prot_write_mmap() {
+        use std::os::fd::AsRawFd as _;
+
+        let pixels = b"KOMA_ZERO_COPY_POSIX_SHM_RGBA8_DATA";
+        let shm_fd = create_shm_readonly_fd("ws_01_bsd", pixels).unwrap();
+        let received_file = assert_readonly_fd_transfers_over_scm_rights(shm_fd, pixels);
+
+        // SAFETY: Testing that `mmap(..., PROT_WRITE, MAP_SHARED)` fails on an `O_RDONLY` SHM FD.
+        let mapped = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                pixels.len(),
+                libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                received_file.as_raw_fd(),
+                0,
+            )
+        };
+        if mapped != libc::MAP_FAILED {
+            // SAFETY: Clean up mapping before panicking if the kernel unexpectedly allowed it.
+            unsafe {
+                let _ = libc::munmap(mapped, pixels.len());
+            }
+            panic!("POSIX SHM O_RDONLY fallback must reject PROT_WRITE + MAP_SHARED mmap");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writable_shm_fd_preserves_payload_at_offset_zero() {
+        use std::io::Read as _;
+
+        let pixels = b"KOMA_OVERVIEW_SHM_PIXELS";
+        let fd = create_writable_shm_fd("koma_overview_shm", pixels).unwrap();
+        let mut file = File::from(fd);
+        let mut read_back = Vec::new();
+        file.read_to_end(&mut read_back).unwrap();
+        assert_eq!(read_back, pixels);
     }
 }

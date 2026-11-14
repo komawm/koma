@@ -125,6 +125,30 @@ fn import_session_environment() {
     }
 }
 
+/// Parses `$NOTIFY_SOCKET`, supporting Linux `@` abstract sockets and pathname sockets on Unix.
+#[cfg(feature = "smithay-winit")]
+fn parse_notify_socket_addr(
+    raw_sock: &std::ffi::OsStr,
+) -> std::io::Result<std::os::unix::net::SocketAddr> {
+    let sock_str = raw_sock.to_string_lossy();
+    if let Some(abstract_name) = sock_str.strip_prefix('@') {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::linux::net::SocketAddrExt as _;
+            return std::os::unix::net::SocketAddr::from_abstract_name(abstract_name.as_bytes());
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = abstract_name;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "abstract NOTIFY_SOCKET (@name) is only supported on Linux",
+            ));
+        }
+    }
+    std::os::unix::net::SocketAddr::from_pathname(std::path::Path::new(raw_sock))
+}
+
 /// Sends `READY=1\n` over `$NOTIFY_SOCKET` (`sd_notify` protocol, supporting both path & abstract
 /// `@` Linux sockets) and `$NOTIFY_FD` (`dinit` readiness pipe) with zero external crate bloat.
 #[cfg(feature = "smithay-winit")]
@@ -132,11 +156,7 @@ fn notify_service_manager_ready() {
     use std::{
         fs::File,
         io::Write as _,
-        os::{
-            fd::FromRawFd as _,
-            linux::net::SocketAddrExt as _,
-            unix::net::{SocketAddr, UnixDatagram},
-        },
+        os::{fd::FromRawFd as _, unix::net::UnixDatagram},
     };
     use tracing::{debug, warn};
 
@@ -146,11 +166,7 @@ fn notify_service_manager_ready() {
 
     if let Some(raw_sock) = env::var_os("NOTIFY_SOCKET") {
         let sock_str = raw_sock.to_string_lossy();
-        let addr_res = if let Some(abstract_name) = sock_str.strip_prefix('@') {
-            SocketAddr::from_abstract_name(abstract_name.as_bytes())
-        } else {
-            SocketAddr::from_pathname(std::path::Path::new(&raw_sock))
-        };
+        let addr_res = parse_notify_socket_addr(&raw_sock);
 
         match (UnixDatagram::unbound(), addr_res) {
             (Ok(dgram), Ok(addr)) => {

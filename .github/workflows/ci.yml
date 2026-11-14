@@ -59,7 +59,7 @@ jobs:
           sudo apt-get install --no-install-recommends -y \
             pkg-config libudev-dev libinput-dev libseat-dev libgbm-dev \
             libegl1-mesa-dev libgles2-mesa-dev libwayland-dev libxkbcommon-dev \
-            libdbus-1-dev libfontconfig1-dev libdisplay-info-dev
+            libdbus-1-dev libfontconfig1-dev
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: linux-${{ steps.rust.outputs.channel }}
@@ -68,6 +68,35 @@ jobs:
         env:
           GATE: ${{ matrix.gate }}
         run: just "$GATE"
+
+  linux-arm64:
+    name: Rust (aarch64-linux)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
+        with:
+          just-version: "1.58.0"
+      - name: Resolve pinned Rust channel
+        id: rust
+        run: echo "channel=$(bash scripts/rust-channel.sh)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: ${{ steps.rust.outputs.channel }}
+          components: rustfmt, clippy
+      - name: Install Linux compositor build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            pkg-config libudev-dev libinput-dev libseat-dev libgbm-dev \
+            libegl1-mesa-dev libgles2-mesa-dev libwayland-dev libxkbcommon-dev \
+            libdbus-1-dev libfontconfig1-dev
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: linux-arm64-${{ steps.rust.outputs.channel }}
+      - name: Run repository gates
+        run: just typecheck test
 
   supply-chain:
     name: Supply chain (cargo-deny)

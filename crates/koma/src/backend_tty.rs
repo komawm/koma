@@ -980,7 +980,19 @@ fn is_truthy_env_value(value: Option<&str>) -> bool {
 }
 
 /// `DRM_IOCTL_AUTH_MAGIC` (`_IOW('d', 0x11, struct drm_auth)`).
+///
+/// Linux encodes `_IOC_WRITE` as `1 << 30` (`0x4000_0000`), whereas BSD `<sys/ioccom.h>` defines
+/// `IOC_IN` as `0x8000_0000`.
+#[cfg(target_os = "linux")]
 const DRM_IOCTL_AUTH_MAGIC: libc::c_ulong = 0x4004_6411;
+/// `DRM_IOCTL_AUTH_MAGIC` (`_IOW('d', 0x11, struct drm_auth)`) for BSD targets (`IOC_IN`).
+#[cfg(any(
+    target_os = "freebsd",
+    target_os = "dragonfly",
+    target_os = "netbsd",
+    target_os = "openbsd"
+))]
+const DRM_IOCTL_AUTH_MAGIC: libc::c_ulong = 0x8004_6411;
 
 /// Mirrors libdrm's `drmIsMaster`: authenticating magic `0` fails with `EINVAL` for a master
 /// (unknown token) and with `EACCES` for a non-master, without changing any state.

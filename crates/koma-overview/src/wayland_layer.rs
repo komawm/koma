@@ -9,9 +9,8 @@
 
 use std::{
     collections::HashMap,
-    ffi::CString,
     fs::{self, File},
-    io::{Read as _, Seek as _, SeekFrom, Write as _},
+    io::Read as _,
     os::{
         fd::AsFd as _,
         unix::{fs::PermissionsExt as _, net::UnixListener},
@@ -27,8 +26,7 @@ use calloop::{
 };
 use calloop_wayland_source::WaylandSource;
 use koma_model::LogicalRect;
-use koma_proto::{WorkspaceId, rpc::WorkspaceModeSpec};
-use rustix::fs::{MemfdFlags, memfd_create};
+use koma_proto::{WorkspaceId, rpc::WorkspaceModeSpec, scm_unix::create_writable_shm_fd};
 use tracing::{debug, info, warn};
 use wayland_client::{
     Connection, Dispatch, QueueHandle, WEnum,
@@ -416,14 +414,10 @@ impl OverviewDaemon {
         let Some(shm) = &self.shm else {
             return;
         };
-        let cname = CString::new("koma_overview_shm").unwrap();
-        let Ok(fd) = memfd_create(&cname, MemfdFlags::CLOEXEC) else {
+        let Ok(fd) = create_writable_shm_fd("koma_overview_shm", pixels) else {
             return;
         };
-        let mut file = File::from(fd);
-        if file.write_all(pixels).is_err() || file.seek(SeekFrom::Start(0)).is_err() {
-            return;
-        }
+        let file = File::from(fd);
 
         let stride = (w * 4) as i32;
         let pool = shm.create_pool(file.as_fd(), pixels.len() as i32, &self.qh, ());

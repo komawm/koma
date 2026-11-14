@@ -23,10 +23,11 @@
 //!      reload succeeds, declarative rules/monitors/workspaces update immediately while the Shadow VM
 //!      is staged in `deferred_lua_sandbox` and promoted automatically the instant `active_txs == 0`.
 
+#[cfg(target_os = "linux")]
+use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::{
     collections::BTreeMap,
     env, fs, io,
-    os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd},
     path::{Path, PathBuf},
     process::Command,
     sync::mpsc,
@@ -54,6 +55,7 @@ use crate::state::ActiveBackend;
 use crate::{gesture_dispatcher::GestureTable, keybind_dispatcher::KeybindTable, state::KomaState};
 
 const POLL_FALLBACK_MS: i32 = 350;
+#[cfg(target_os = "linux")]
 const WRITE_SETTLE_DEBOUNCE: Duration = Duration::from_millis(35);
 
 /// Resolved configuration path strategy (`niri/src/main.rs` `ConfigPath`).
@@ -336,10 +338,8 @@ fn run_watcher_thread(
     out_tx: SyncSender<PreloadedConfigEvent>,
 ) {
     let mut snapshotter = ConfigTreeSnapshotter::new(initial_path);
-    let mut inotify = LinuxInotifyMonitor::new().ok();
-    if let Some(ino) = inotify.as_mut() {
-        ino.sync_watches(&snapshotter.config_path);
-    }
+    let mut fs_monitor = ConfigFsMonitor::new();
+    fs_monitor.sync_watches(&snapshotter.config_path);
 
     loop {
         let mut force_reload = false;
@@ -349,9 +349,7 @@ fn run_watcher_thread(
             match cmd_rx.try_recv() {
                 Ok(WatcherCommand::ReloadNow(Some(override_p))) => {
                     snapshotter = ConfigTreeSnapshotter::new(KomaConfigPath::Explicit(override_p));
-                    if let Some(ino) = inotify.as_mut() {
-                        ino.sync_watches(&snapshotter.config_path);
-                    }
+                    fs_monitor.sync_watches(&snapshotter.config_path);
                     force_reload = true;
                 }
                 Ok(WatcherCommand::ReloadNow(None)) => {
@@ -363,16 +361,7 @@ fn run_watcher_thread(
         }
 
         if !force_reload {
-            if let Some(ino) = inotify.as_mut() {
-                if ino.wait_for_activity(POLL_FALLBACK_MS) {
-                    // Debounce multi-step editor writes (`truncate` + `write` + `rename`)
-                    thread::sleep(WRITE_SETTLE_DEBOUNCE);
-                    ino.drain_events();
-                }
-                ino.sync_watches(&snapshotter.config_path);
-            } else {
-                thread::sleep(Duration::from_millis(POLL_FALLBACK_MS as u64));
-            }
+            fs_monitor.wait_for_poll_tick(&snapshotter.config_path);
         }
 
         if force_reload || snapshotter.poll_changed() {
@@ -397,13 +386,55 @@ fn run_watcher_thread(
     }
 }
 
+/// Platform filesystem event monitor (`inotify` on Linux, periodic snapshot polling elsewhere).
+struct ConfigFsMonitor {
+    #[cfg(target_os = "linux")]
+    inotify: Option<LinuxInotifyMonitor>,
+}
+
+impl ConfigFsMonitor {
+    fn new() -> Self {
+        Self {
+            #[cfg(target_os = "linux")]
+            inotify: LinuxInotifyMonitor::new().ok(),
+        }
+    }
+
+    fn sync_watches(&mut self, cfg_path: &KomaConfigPath) {
+        #[cfg(target_os = "linux")]
+        if let Some(ino) = self.inotify.as_mut() {
+            ino.sync_watches(cfg_path);
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = cfg_path;
+    }
+
+    fn wait_for_poll_tick(&mut self, cfg_path: &KomaConfigPath) {
+        #[cfg(target_os = "linux")]
+        if let Some(ino) = self.inotify.as_mut() {
+            if ino.wait_for_activity(POLL_FALLBACK_MS) {
+                // Debounce multi-step editor writes (`truncate` + `write` + `rename`)
+                thread::sleep(WRITE_SETTLE_DEBOUNCE);
+                ino.drain_events();
+            }
+            ino.sync_watches(cfg_path);
+            return;
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = cfg_path;
+        thread::sleep(Duration::from_millis(POLL_FALLBACK_MS as u64));
+    }
+}
+
 /// Minimal zero-dependency Linux `inotify` wrapper using `libc` watching config & parent directories
 /// so atomic `rename(2)` saves in Neovim wake immediately (< 1 ms) without waiting for polling.
+#[cfg(target_os = "linux")]
 struct LinuxInotifyMonitor {
     fd: OwnedFd,
     watched_dirs: Vec<PathBuf>,
 }
 
+#[cfg(target_os = "linux")]
 impl LinuxInotifyMonitor {
     fn new() -> io::Result<Self> {
         // SAFETY: `inotify_init1` with `IN_NONBLOCK | IN_CLOEXEC` returns a fresh owned file descriptor or -1.
