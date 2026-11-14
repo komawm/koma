@@ -1,0 +1,5 @@
+# Clippy configuration for Koma
+
+msrv = "1.100"
+cognitive-complexity-threshold = 25
+upper-case-acronyms-aggressive = true

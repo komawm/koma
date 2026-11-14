@@ -39,6 +39,9 @@ clippy: lockfile-check
 test: lockfile-check
     cargo test --workspace --all-targets --locked
 
+deny: lockfile-check
+    cargo deny --locked check
+
 check-core: lockfile-check
     cargo check -p koma-proto -p koma-model -p koma-seat -p koma-lua --all-targets --no-default-features --locked
 

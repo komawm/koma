@@ -69,3 +69,25 @@ jobs:
           GATE: ${{ matrix.gate }}
         run: just "$GATE"
 
+  supply-chain:
+    name: Supply chain (cargo-deny)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
+        with:
+          just-version: "1.58.0"
+      - name: Resolve pinned Rust channel
+        id: rust
+        run: echo "channel=$(bash scripts/rust-channel.sh)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: ${{ steps.rust.outputs.channel }}
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2.90.4
+        with:
+          tool: cargo-deny@0.20.2
+      - name: Check dependencies (advisories, bans, licenses, sources)
+        run: just deny
+
