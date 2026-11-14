@@ -1,0 +1,61 @@
+# Supply-chain and license policy for Koma (cargo-deny 0.20+).
+
+[graph]
+targets = []
+all-features = false
+no-default-features = false
+
+[output]
+feature-depth = 1
+
+[advisories]
+db-urls = ["https://github.com/rustsec/advisory-db"]
+ignore = []
+
+[bans]
+multiple-versions = "warn"
+# Git dependencies pinned by exact commit `rev` without a crates.io `version`
+# (such as `smithay` and `smithay-drm-extras`) report `req = "*"` in cargo metadata.
+wildcards = "allow"
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+allow = []
+allow-workspace = false
+deny = []
+skip = []
+skip-tree = []
+
+[licenses]
+# All nine Koma workspace crates use GPL-3.0-or-later under the single root LICENSE.
+# Third-party dependencies in Cargo.lock are restricted to reviewed permissive
+# OSI/FSF-compatible licenses present in the resolved graph.
+allow = [
+    "GPL-3.0-or-later",
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+]
+confidence-threshold = 0.8
+exceptions = []
+
+[licenses.private]
+ignore = false
+registries = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# Pinned upstream git dependencies in Cargo.toml / Cargo.lock:
+# - Xuepoo/phodopus: Lua 5.4 sandbox VM (pinned commit rev in Cargo.toml)
+# - Smithay/smithay.git: Wayland/DRM/KMS compositor stack (pinned commit rev in Cargo.toml)
+allow-git = [
+    "https://github.com/Xuepoo/phodopus",
+    "https://github.com/Smithay/smithay.git",
+]
