@@ -109,7 +109,9 @@ jobs:
           set -eux
           if [ "$(id -u)" -eq 0 ]; then
             AS_ROOT=""
-          elif command -v doas >/dev/null 2>&1; then
+          elif command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then
+            AS_ROOT="sudo"
+          elif command -v doas >/dev/null 2>&1 && [ -f /etc/doas.conf ] && doas -n true >/dev/null 2>&1; then
             AS_ROOT="doas"
           elif command -v sudo >/dev/null 2>&1; then
             AS_ROOT="sudo"
@@ -117,7 +119,7 @@ jobs:
             echo "no privilege escalation helper found for pkg_add" >&2
             exit 1
           fi
-          $AS_ROOT pkg_add -I rust pkgconf git sqlite3
+          $AS_ROOT pkg_add -I rust pkgconf git
           # Mesa, fontconfig, and pixman live in Xenocara (/usr/X11R6) on OpenBSD;
           # probe optional ports individually so unavailable names do not abort setup.
           for pkg in wayland libinput-openbsd libudev-openbsd seatd libxkbcommon mesa dbus fontconfig pixman; do

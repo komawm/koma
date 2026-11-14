@@ -11,7 +11,7 @@ use std::{
     io::{self, IoSlice, IoSliceMut, Seek as _, SeekFrom, Write as _},
     mem::MaybeUninit,
     os::{
-        fd::{AsFd as _, BorrowedFd, FromRawFd as _, OwnedFd},
+        fd::{AsFd as _, AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd},
         unix::net::UnixStream,
     },
     sync::atomic::{AtomicU64, Ordering},
@@ -326,9 +326,39 @@ fn open_populated_posix_shm_rw(payload: &[u8]) -> io::Result<(File, ShmUnlinkGua
 
         let guard = ShmUnlinkGuard(Some(cname));
         // SAFETY: `shm_open` returned a fresh, unowned file descriptor on success.
-        let mut rw_file = File::from(unsafe { OwnedFd::from_raw_fd(raw_fd) });
-        rw_file.write_all(payload)?;
-        rw_file.seek(SeekFrom::Start(0))?;
+        let rw_file = File::from(unsafe { OwnedFd::from_raw_fd(raw_fd) });
+        let len_off = libc::off_t::try_from(payload.len()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "POSIX SHM payload exceeds off_t range",
+            )
+        })?;
+        // POSIX `shm_open` objects start at 0 bytes; FreeBSD/POSIX do not extend them via `write()`.
+        // SAFETY: `rw_file` is an open `O_RDWR` SHM descriptor and `len_off >= 0`.
+        if unsafe { libc::ftruncate(rw_file.as_raw_fd(), len_off) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if !payload.is_empty() {
+            // SAFETY: `rw_file` was resized to `payload.len()` bytes with `O_RDWR`, so shared
+            // writable mapping and initialization over `payload.len()` bytes remain in bounds.
+            unsafe {
+                let mapped = libc::mmap(
+                    std::ptr::null_mut(),
+                    payload.len(),
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED,
+                    rw_file.as_raw_fd(),
+                    0,
+                );
+                if mapped == libc::MAP_FAILED {
+                    return Err(io::Error::last_os_error());
+                }
+                std::ptr::copy_nonoverlapping(payload.as_ptr(), mapped.cast::<u8>(), payload.len());
+                if libc::munmap(mapped, payload.len()) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+        }
         return Ok((rw_file, guard));
     }
 
