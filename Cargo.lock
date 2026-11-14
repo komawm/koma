@@ -765,7 +765,6 @@ dependencies = [
 name = "koma-seat"
 version = "0.0.1"
 dependencies = [
- "koma-model",
  "koma-proto",
 ]
 

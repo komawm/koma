@@ -257,19 +257,14 @@ impl ScrollingTile {
 
 /// Policy governing how the horizontal viewport camera aligns when focusing a column
 /// (`niri_config::CenterFocusedColumn`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CenterFocusedColumn {
+    #[default]
     Never,
     Always,
     #[serde(alias = "on-overflow")]
     OnOverflow,
-}
-
-impl Default for CenterFocusedColumn {
-    fn default() -> Self {
-        Self::Never
-    }
 }
 
 /// Column presentation mode (`niri/src/layout/scrolling.rs` `ColumnDisplay`).
@@ -954,21 +949,21 @@ impl ScrollingStrip {
             return center_col(col_x, col_w);
         }
 
-        if self.config.center_focused_column == CenterFocusedColumn::OnOverflow {
-            if let Some(p_idx) = prev_idx.filter(|&p| p != idx && p < self.columns.len()) {
-                let neighbor_idx = if p_idx > idx {
-                    (idx + 1).min(self.columns.len() - 1)
-                } else {
-                    idx.saturating_sub(1)
-                };
-                let (nx, nw) = spans[neighbor_idx];
-                let left_edge = col_x.min(nx);
-                let right_edge = (col_x + col_w).max(nx + nw);
-                let combined_with_padding =
-                    (right_edge - left_edge) + f64::from(self.config.inner_gap) * 2.0;
-                if combined_with_padding > usable_w {
-                    return center_col(col_x, col_w);
-                }
+        if self.config.center_focused_column == CenterFocusedColumn::OnOverflow
+            && let Some(p_idx) = prev_idx.filter(|&p| p != idx && p < self.columns.len())
+        {
+            let neighbor_idx = if p_idx > idx {
+                (idx + 1).min(self.columns.len() - 1)
+            } else {
+                idx.saturating_sub(1)
+            };
+            let (nx, nw) = spans[neighbor_idx];
+            let left_edge = col_x.min(nx);
+            let right_edge = (col_x + col_w).max(nx + nw);
+            let combined_with_padding =
+                (right_edge - left_edge) + f64::from(self.config.inner_gap) * 2.0;
+            if combined_with_padding > usable_w {
+                return center_col(col_x, col_w);
             }
         }
 
@@ -1306,17 +1301,17 @@ impl ScrollingStrip {
         match ind.position {
             TabIndicatorPosition::Left => {
                 rect.x += reserve as i32;
-                rect.width = rect.width.saturating_sub(reserve).max(48);
+                rect.w = rect.w.saturating_sub(reserve).max(48);
             }
             TabIndicatorPosition::Right => {
-                rect.width = rect.width.saturating_sub(reserve).max(48);
+                rect.w = rect.w.saturating_sub(reserve).max(48);
             }
             TabIndicatorPosition::Top => {
                 rect.y += reserve as i32;
-                rect.height = rect.height.saturating_sub(reserve).max(48);
+                rect.h = rect.h.saturating_sub(reserve).max(48);
             }
             TabIndicatorPosition::Bottom => {
-                rect.height = rect.height.saturating_sub(reserve).max(48);
+                rect.h = rect.h.saturating_sub(reserve).max(48);
             }
         }
         rect
@@ -1439,9 +1434,9 @@ impl ScrollingStrip {
         for seg in self.tab_indicator_segments_at(viewport, cam_x) {
             let pad = 3.0;
             let left = f64::from(seg.rect.x) - pad;
-            let right = f64::from(seg.rect.x + seg.rect.width as i32) + pad;
+            let right = f64::from(seg.rect.x + seg.rect.w as i32) + pad;
             let top = f64::from(seg.rect.y) - pad;
-            let bottom = f64::from(seg.rect.y + seg.rect.height as i32) + pad;
+            let bottom = f64::from(seg.rect.y + seg.rect.h as i32) + pad;
             if pt.x >= left && pt.x <= right && pt.y >= top && pt.y <= bottom {
                 return Some(seg.win_id);
             }
@@ -1639,9 +1634,9 @@ impl ScrollingStrip {
             };
 
             let col_center = cx + cw * 0.5;
-            let dir_bias = if swipe_delta > 24.0 && i > start_idx {
-                -8.0
-            } else if swipe_delta < -24.0 && i < start_idx {
+            let dir_bias = if (swipe_delta > 24.0 && i > start_idx)
+                || (swipe_delta < -24.0 && i < start_idx)
+            {
                 -8.0
             } else {
                 0.0
@@ -2331,54 +2326,62 @@ mod tests {
     fn consume_and_expel_weave_windows_cleanly_across_columns() {
         let mut strip = ScrollingStrip::new(ScrollingConfig::default(), true);
         let vp = vp_1920();
-        strip.insert_column(WindowId(1), None, vp, 0);
-        strip.insert_column(WindowId(2), None, vp, 0);
-        strip.insert_column(WindowId(3), None, vp, 0);
-        // Active is WindowId(3) alone in col 2: [1] [2] [3]
+        strip.insert_column(WindowId::new(1, 1), None, vp, 0);
+        strip.insert_column(WindowId::new(2, 1), None, vp, 0);
+        strip.insert_column(WindowId::new(3, 1), None, vp, 0);
+        // Active is WindowId::new(3, 1) alone in col 2: [1] [2] [3]
         assert_eq!(strip.len(), 3);
-        assert_eq!(strip.active_window(), Some(WindowId(3)));
+        assert_eq!(strip.active_window(), Some(WindowId::new(3, 1)));
 
         // 1. consume_or_expel_window_left on lone [3] -> consumed into bottom of [2]: [1] [2, 3]
         assert!(strip.consume_or_expel_window_left(vp, 10));
         assert_eq!(strip.len(), 2);
         assert_eq!(strip.columns[1].len(), 2);
-        assert_eq!(strip.active_window(), Some(WindowId(3)));
+        assert_eq!(strip.active_window(), Some(WindowId::new(3, 1)));
 
         // Verify vertical tile split geometry inside column 1 (2 equal tiles separated by 8px gap)
         let rects = strip.visible_geometries(vp);
-        let r2 = rects.iter().find(|(w, _)| *w == WindowId(2)).unwrap().1;
-        let r3 = rects.iter().find(|(w, _)| *w == WindowId(3)).unwrap().1;
+        let r2 = rects
+            .iter()
+            .find(|(w, _)| *w == WindowId::new(2, 1))
+            .unwrap()
+            .1;
+        let r3 = rects
+            .iter()
+            .find(|(w, _)| *w == WindowId::new(3, 1))
+            .unwrap()
+            .1;
         assert_eq!(r2.x, r3.x);
-        assert_eq!(r2.y + (r2.height as i32) + (strip.gap_px() as i32), r3.y);
+        assert_eq!(r2.y + (r2.h as i32) + (strip.gap_px() as i32), r3.y);
 
         // 2. consume_or_expel_window_left again on multi-tile [2, 3] -> expels [3] left: [1] [3] [2]
         assert!(strip.consume_or_expel_window_left(vp, 20));
         assert_eq!(strip.len(), 3);
-        assert_eq!(strip.columns[1].active_win_id(), Some(WindowId(3)));
-        assert_eq!(strip.columns[2].active_win_id(), Some(WindowId(2)));
+        assert_eq!(strip.columns[1].active_win_id(), Some(WindowId::new(3, 1)));
+        assert_eq!(strip.columns[2].active_win_id(), Some(WindowId::new(2, 1)));
 
         // 3. Explicit consume_window_into_column on [3] -> pulls [2] from right into [3, 2]!
         assert!(strip.consume_window_into_column(vp, 30));
         assert_eq!(strip.len(), 2);
         assert_eq!(strip.columns[1].len(), 2);
         // Focus stays on [3] during consume_window_into_column
-        assert_eq!(strip.active_window(), Some(WindowId(3)));
+        assert_eq!(strip.active_window(), Some(WindowId::new(3, 1)));
 
         // 4. Vertical focus_down -> [2], move_tile_up -> swaps to [2, 3], then expel_window_from_column!
-        assert_eq!(strip.focus_down(), Some(WindowId(2)));
+        assert_eq!(strip.focus_down(), Some(WindowId::new(2, 1)));
         assert!(strip.move_tile_up());
-        assert_eq!(strip.columns[1].tiles[0].win_id, WindowId(2));
+        assert_eq!(strip.columns[1].tiles[0].win_id, WindowId::new(2, 1));
         assert!(strip.expel_window_from_column(vp, 40));
         assert_eq!(strip.len(), 3);
-        assert_eq!(strip.active_window(), Some(WindowId(2)));
+        assert_eq!(strip.active_window(), Some(WindowId::new(2, 1)));
     }
 
     #[test]
     fn preset_window_heights_and_reset_distribute_vertical_space_accurately() {
         let mut strip = ScrollingStrip::new(ScrollingConfig::default(), true);
         let vp = vp_1920();
-        strip.insert_column(WindowId(1), None, vp, 0);
-        strip.insert_column(WindowId(2), None, vp, 0);
+        strip.insert_column(WindowId::new(1, 1), None, vp, 0);
+        strip.insert_column(WindowId::new(2, 1), None, vp, 0);
         // Focus col 0 and consume col 1 into it -> [1, 2]
         strip.focus_prev(vp, 0);
         assert!(strip.consume_window_into_column(vp, 0));
@@ -2387,24 +2390,32 @@ mod tests {
         let h_preset = strip.switch_preset_window_height(true, vp).unwrap();
         assert!(h_preset.approx_eq(PresetColumnWidth::Proportion(2.0 / 3.0)));
         let rects = strip.visible_geometries(vp);
-        let r1 = rects.iter().find(|(w, _)| *w == WindowId(1)).unwrap().1;
-        let r2 = rects.iter().find(|(w, _)| *w == WindowId(2)).unwrap().1;
-        assert!(r1.height > r2.height + 200);
+        let r1 = rects
+            .iter()
+            .find(|(w, _)| *w == WindowId::new(1, 1))
+            .unwrap()
+            .1;
+        let r2 = rects
+            .iter()
+            .find(|(w, _)| *w == WindowId::new(2, 1))
+            .unwrap()
+            .1;
+        assert!(r1.h > r2.h + 200);
 
         // Reset height back to Auto 50/50 split
         assert!(strip.reset_window_height());
         let rects_after = strip.visible_geometries(vp);
         let a1 = rects_after
             .iter()
-            .find(|(w, _)| *w == WindowId(1))
+            .find(|(w, _)| *w == WindowId::new(1, 1))
             .unwrap()
             .1;
         let a2 = rects_after
             .iter()
-            .find(|(w, _)| *w == WindowId(2))
+            .find(|(w, _)| *w == WindowId::new(2, 1))
             .unwrap()
             .1;
-        assert!((a1.height as i32 - a2.height as i32).abs() <= 2);
+        assert!((a1.h as i32 - a2.h as i32).abs() <= 2);
     }
 
     #[test]
@@ -2413,7 +2424,7 @@ mod tests {
         let vp = vp_1920();
         for id in 1..=4 {
             strip.insert_column(
-                WindowId(id),
+                WindowId::new(id, 1),
                 Some(PresetColumnWidth::Proportion(0.5)),
                 vp,
                 0,
@@ -2428,7 +2439,9 @@ mod tests {
         assert!((live_cam - 237.5).abs() < 2.0);
 
         let snapped_win = strip.end_view_offset_gesture(2600.0, false, vp, 240);
-        assert!(matches!(snapped_win, Some(WindowId(3) | WindowId(4))));
+        assert!(
+            snapped_win == Some(WindowId::new(3, 1)) || snapped_win == Some(WindowId::new(4, 1))
+        );
         assert!(strip.is_camera_animating(248));
     }
 
@@ -2436,20 +2449,20 @@ mod tests {
     fn toggle_column_tabbed_display_and_indicator_pills_work() {
         let mut strip = ScrollingStrip::new(ScrollingConfig::default(), true);
         let vp = vp_1920();
-        strip.insert_column(WindowId(1), None, vp, 0);
-        strip.insert_column(WindowId(2), None, vp, 0);
+        strip.insert_column(WindowId::new(1, 1), None, vp, 0);
+        strip.insert_column(WindowId::new(2, 1), None, vp, 0);
         assert!(strip.consume_or_expel_window_left(vp, 0));
         assert_eq!(strip.columns[0].len(), 2);
 
-        // Toggle into Tabbed mode -> only active window (WindowId(2)) is emitted at full column height
+        // Toggle into Tabbed mode -> only active window (WindowId::new(2, 1)) is emitted at full column height
         assert_eq!(
             strip.toggle_column_tabbed_display(),
             Some(ColumnDisplay::Tabbed)
         );
         let vis = strip.visible_geometries(vp);
         assert_eq!(vis.len(), 1);
-        assert_eq!(vis[0].0, WindowId(2));
-        assert_eq!(vis[0].1.height, vp.height - strip.outer_gap_px() * 2);
+        assert_eq!(vis[0].0, WindowId::new(2, 1));
+        assert_eq!(vis[0].1.h, vp.height - strip.outer_gap_px() * 2);
 
         // Two tab-indicator pill segments should be generated on the left edge
         let segs = strip.tab_indicator_segments_at(vp, strip.camera_x);
@@ -2457,14 +2470,14 @@ mod tests {
         assert!(!segs[0].is_active);
         assert!(segs[1].is_active);
 
-        // Clicking first pill hits WindowId(1)
+        // Clicking first pill hits WindowId::new(1, 1)
         let click_pt = LogicalPoint {
             x: f64::from(segs[0].rect.x) + 1.0,
             y: f64::from(segs[0].rect.y) + 4.0,
         };
         assert_eq!(
             strip.hit_test_tab_indicator(click_pt, vp, 0),
-            Some(WindowId(1))
+            Some(WindowId::new(1, 1))
         );
     }
 }

@@ -24,19 +24,14 @@ pub use crate::scrolling::{
 ///   tree (`general:layout = "dwindle"`, accepting `"bsp"` as a backwards-compatible alias).
 /// - **`Scrolling` (Optional per-workspace)**: Niri / Hyprland 0.54+ infinite horizontal column strip.
 /// - **`Deck` (Default for `Headless` Agent workspaces)**: 100% full-viewport active window + `Stash`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LayoutMode {
+    #[default]
     #[serde(alias = "bsp")]
     Dwindle,
     Scrolling,
     Deck,
-}
-
-impl Default for LayoutMode {
-    fn default() -> Self {
-        Self::Dwindle
-    }
 }
 
 /// Z-ordered floating window entry managed by `FloatingStack` (`Hyprland` `CDefaultFloatingAlgorithm`).
@@ -120,16 +115,12 @@ impl FloatingStack {
         scale_ratio: f64,
     ) -> (LogicalRect, LogicalPoint) {
         let ratio = scale_ratio.clamp(0.5, 1.0);
-        let new_w =
-            ((f64::from(old_tile_rect.width) * ratio).round() as u32).max(min_size.0.max(160));
-        let new_h =
-            ((f64::from(old_tile_rect.height) * ratio).round() as u32).max(min_size.1.max(120));
-        let rel_x = ((cursor.x - f64::from(old_tile_rect.x))
-            / f64::from(old_tile_rect.width.max(1)))
-        .clamp(0.0, 1.0);
-        let rel_y = ((cursor.y - f64::from(old_tile_rect.y))
-            / f64::from(old_tile_rect.height.max(1)))
-        .clamp(0.0, 1.0);
+        let new_w = ((f64::from(old_tile_rect.w) * ratio).round() as u32).max(min_size.0.max(160));
+        let new_h = ((f64::from(old_tile_rect.h) * ratio).round() as u32).max(min_size.1.max(120));
+        let rel_x = ((cursor.x - f64::from(old_tile_rect.x)) / f64::from(old_tile_rect.w.max(1)))
+            .clamp(0.0, 1.0);
+        let rel_y = ((cursor.y - f64::from(old_tile_rect.y)) / f64::from(old_tile_rect.h.max(1)))
+            .clamp(0.0, 1.0);
         let hotspot = LogicalPoint {
             x: rel_x * f64::from(new_w),
             y: rel_y * f64::from(new_h),
@@ -168,29 +159,29 @@ impl FloatingStack {
             viewport.height.max(72) as i32
         };
 
-        let right_edge = initial.x + initial.width as i32;
-        let bottom_edge = initial.y + initial.height as i32;
+        let right_edge = initial.x + initial.w as i32;
+        let bottom_edge = initial.y + initial.h as i32;
         let dx_i = total_dx.round() as i32;
         let dy_i = total_dy.round() as i32;
 
         let (new_x, new_w) = if corner.has_left() {
-            let w = (initial.width as i32 - dx_i).clamp(min_w, max_w);
+            let w = (initial.w as i32 - dx_i).clamp(min_w, max_w);
             (right_edge - w, w)
         } else if corner.has_right() {
-            let w = (initial.width as i32 + dx_i).clamp(min_w, max_w);
+            let w = (initial.w as i32 + dx_i).clamp(min_w, max_w);
             (initial.x, w)
         } else {
-            (initial.x, initial.width as i32)
+            (initial.x, initial.w as i32)
         };
 
         let (new_y, new_h) = if corner.has_top() {
-            let h = (initial.height as i32 - dy_i).clamp(min_h, max_h);
+            let h = (initial.h as i32 - dy_i).clamp(min_h, max_h);
             (bottom_edge - h, h)
         } else if corner.has_bottom() {
-            let h = (initial.height as i32 + dy_i).clamp(min_h, max_h);
+            let h = (initial.h as i32 + dy_i).clamp(min_h, max_h);
             (initial.y, h)
         } else {
-            (initial.y, initial.height as i32)
+            (initial.y, initial.h as i32)
         };
 
         LogicalRect::new(new_x, new_y, new_w as u32, new_h as u32)
@@ -232,8 +223,8 @@ impl FloatingStack {
         };
         let max_x = (viewport.width as i32 - 48).max(0);
         let max_y = (viewport.height as i32 - 48).max(0);
-        let min_x = -(entry.rect.width as i32 - 48);
-        let min_y = -(entry.rect.height as i32 - 48).min(0);
+        let min_x = -(entry.rect.w as i32 - 48);
+        let min_y = -(entry.rect.h as i32 - 48).min(0);
         entry.rect.x = x.clamp(min_x, max_x);
         entry.rect.y = y.clamp(min_y, max_y);
         true
@@ -251,7 +242,7 @@ impl FloatingStack {
         };
         let max_x = (viewport.width as i32 - 48).max(0);
         let max_y = (viewport.height as i32 - 48).max(0);
-        let min_x = -(entry.rect.width as i32 - 48);
+        let min_x = -(entry.rect.w as i32 - 48);
         entry.rect.x = (entry.rect.x + dx).clamp(min_x, max_x);
         entry.rect.y = (entry.rect.y + dy).clamp(0, max_y);
         true
@@ -267,18 +258,17 @@ impl FloatingStack {
         let Some(entry) = self.entries.iter_mut().find(|e| e.win_id == win_id) else {
             return false;
         };
-        entry.rect.width = (entry.rect.width as i32 + dw).clamp(96, viewport.width as i32) as u32;
-        entry.rect.height =
-            (entry.rect.height as i32 + dh).clamp(72, viewport.height as i32) as u32;
+        entry.rect.w = (entry.rect.w as i32 + dw).clamp(96, viewport.width as i32) as u32;
+        entry.rect.h = (entry.rect.h as i32 + dh).clamp(72, viewport.height as i32) as u32;
         true
     }
 
     pub fn clamp_to_viewport(&mut self, viewport: LogicalViewport) {
         for entry in &mut self.entries {
-            entry.rect.width = entry.rect.width.min(viewport.width.max(96));
-            entry.rect.height = entry.rect.height.min(viewport.height.max(72));
-            let max_x = viewport.width.saturating_sub(entry.rect.width) as i32;
-            let max_y = viewport.height.saturating_sub(entry.rect.height) as i32;
+            entry.rect.w = entry.rect.w.min(viewport.width.max(96));
+            entry.rect.h = entry.rect.h.min(viewport.height.max(72));
+            let max_x = viewport.width.saturating_sub(entry.rect.w) as i32;
+            let max_y = viewport.height.saturating_sub(entry.rect.h) as i32;
             entry.rect.x = entry.rect.x.clamp(0, max_x.max(0));
             entry.rect.y = entry.rect.y.clamp(0, max_y.max(0));
         }

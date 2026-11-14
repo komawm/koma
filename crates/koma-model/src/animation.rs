@@ -127,8 +127,8 @@ impl BlurConfig {
         }
         let x0 = (rect.x - r).max(0);
         let y0 = (rect.y - r).max(0);
-        let x1 = (rect.x + rect.width as i32 + r).min(viewport.width as i32);
-        let y1 = (rect.y + rect.height as i32 + r).min(viewport.height as i32);
+        let x1 = (rect.x + rect.w as i32 + r).min(viewport.width as i32);
+        let y1 = (rect.y + rect.h as i32 + r).min(viewport.height as i32);
         LogicalRect::new(x0, y0, (x1 - x0).max(0) as u32, (y1 - y0).max(0) as u32)
     }
 }
@@ -422,8 +422,8 @@ impl WindowAnimationTable {
                 WindowSpringEntry {
                     x: SpringTrack::settled_at(f64::from(target_rect.x), params),
                     y: SpringTrack::settled_at(f64::from(target_rect.y), params),
-                    w: SpringTrack::settled_at(f64::from(target_rect.width), params),
-                    h: SpringTrack::settled_at(f64::from(target_rect.height), params),
+                    w: SpringTrack::settled_at(f64::from(target_rect.w), params),
+                    h: SpringTrack::settled_at(f64::from(target_rect.h), params),
                     scale: SpringTrack::settled_at(1.0, params),
                     opacity: SpringTrack::settled_at(1.0, params),
                     closing: false,
@@ -438,8 +438,8 @@ impl WindowAnimationTable {
             WindowSpringEntry {
                 x: SpringTrack::settled_at(f64::from(target_rect.x), params),
                 y: SpringTrack::settled_at(f64::from(target_rect.y), params),
-                w: SpringTrack::settled_at(f64::from(target_rect.width), params),
-                h: SpringTrack::settled_at(f64::from(target_rect.height), params),
+                w: SpringTrack::settled_at(f64::from(target_rect.w), params),
+                h: SpringTrack::settled_at(f64::from(target_rect.h), params),
                 scale: SpringTrack::from_to(start_scale, 1.0, now_ms, params),
                 opacity: SpringTrack::from_to(0.0, 1.0, now_ms, params),
                 closing: false,
@@ -465,19 +465,15 @@ impl WindowAnimationTable {
         if !cfg.enabled || instant_bypass {
             entry.x.snap_to(f64::from(target_rect.x));
             entry.y.snap_to(f64::from(target_rect.y));
-            entry.w.snap_to(f64::from(target_rect.width));
-            entry.h.snap_to(f64::from(target_rect.height));
+            entry.w.snap_to(f64::from(target_rect.w));
+            entry.h.snap_to(f64::from(target_rect.h));
             return;
         }
 
         entry.x.retarget(f64::from(target_rect.x), now_ms, params);
         entry.y.retarget(f64::from(target_rect.y), now_ms, params);
-        entry
-            .w
-            .retarget(f64::from(target_rect.width), now_ms, params);
-        entry
-            .h
-            .retarget(f64::from(target_rect.height), now_ms, params);
+        entry.w.retarget(f64::from(target_rect.w), now_ms, params);
+        entry.h.retarget(f64::from(target_rect.h), now_ms, params);
     }
 
     /// Starts a close shrink/fade-out spring (`1.0 -> close_scale_to`, `opacity -> 0.0`), or

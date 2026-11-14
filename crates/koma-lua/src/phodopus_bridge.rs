@@ -355,22 +355,22 @@ impl PhodopusSandbox {
             let ex = ctx.fetch(&stashed_exec);
             (ex.mode(), ex.pending_host_op(ctx).map(HostOpHandle::raw))
         });
-        if mode == ExecutorMode::HostSuspended {
-            if let Some(raw_handle) = pending_raw {
-                let tx_id = self.next_tx_id;
-                self.next_tx_id += 1;
-                self.handle_to_tx.insert(raw_handle, tx_id);
-                self.active_txs.insert(
-                    tx_id,
-                    ActiveMacroInstance {
-                        ws_id: scope_ws_id,
-                        expected_epoch,
-                        macro_id: macro_id.clone(),
-                        stashed_exec: stashed_exec.clone(),
-                        parked_raw_handle: raw_handle,
-                    },
-                );
-            }
+        if mode == ExecutorMode::HostSuspended
+            && let Some(raw_handle) = pending_raw
+        {
+            let tx_id = self.next_tx_id;
+            self.next_tx_id += 1;
+            self.handle_to_tx.insert(raw_handle, tx_id);
+            self.active_txs.insert(
+                tx_id,
+                ActiveMacroInstance {
+                    ws_id: scope_ws_id,
+                    expected_epoch,
+                    macro_id: macro_id.clone(),
+                    stashed_exec: stashed_exec.clone(),
+                    parked_raw_handle: raw_handle,
+                },
+            );
         }
         Ok((stashed_exec, mode))
     }
@@ -448,22 +448,22 @@ impl PhodopusSandbox {
             let ex = ctx.fetch(&stashed_exec);
             (ex.mode(), ex.pending_host_op(ctx).map(HostOpHandle::raw))
         });
-        if mode == ExecutorMode::HostSuspended {
-            if let Some(raw_handle) = pending_raw {
-                let tx_id = self.next_tx_id;
-                self.next_tx_id += 1;
-                self.handle_to_tx.insert(raw_handle, tx_id);
-                self.active_txs.insert(
-                    tx_id,
-                    ActiveMacroInstance {
-                        ws_id: scope_ws_id,
-                        expected_epoch,
-                        macro_id,
-                        stashed_exec,
-                        parked_raw_handle: raw_handle,
-                    },
-                );
-            }
+        if mode == ExecutorMode::HostSuspended
+            && let Some(raw_handle) = pending_raw
+        {
+            let tx_id = self.next_tx_id;
+            self.next_tx_id += 1;
+            self.handle_to_tx.insert(raw_handle, tx_id);
+            self.active_txs.insert(
+                tx_id,
+                ActiveMacroInstance {
+                    ws_id: scope_ws_id,
+                    expected_epoch,
+                    macro_id,
+                    stashed_exec,
+                    parked_raw_handle: raw_handle,
+                },
+            );
         }
         Ok(mode)
     }
@@ -478,15 +478,13 @@ impl PhodopusSandbox {
     ) -> Result<ExecutorMode, HostOpError> {
         self.set_clock_ms(now_ms);
         let handle = HostOpHandle::from_raw(raw_handle);
-        self.lua
-            .try_enter(|ctx| {
-                let exec = ctx.fetch(stashed);
-                exec.resume_host_op(ctx, handle, result)?;
-                let mut fuel = Fuel::with(MACRO_SLICE_FUEL_BUDGET as i32);
-                let _ = exec.step(ctx, &mut fuel);
-                Ok(exec.mode())
-            })
-            .unwrap_or(Ok(ExecutorMode::Stopped))
+        self.lua.enter(|ctx| -> Result<ExecutorMode, HostOpError> {
+            let exec = ctx.fetch(stashed);
+            exec.resume_host_op(ctx, handle, result)?;
+            let mut fuel = Fuel::with(MACRO_SLICE_FUEL_BUDGET as i32);
+            let _ = exec.step(ctx, &mut fuel);
+            Ok(exec.mode())
+        })
     }
 
     /// Cancels a parked `HostOpHandle` coroutine with a catchable error string (e.g., on `Mod + G`).
@@ -497,15 +495,13 @@ impl PhodopusSandbox {
         reason: &str,
     ) -> Result<(), HostOpError> {
         let handle = HostOpHandle::from_raw(raw_handle);
-        self.lua
-            .try_enter(|ctx| {
-                let exec = ctx.fetch(stashed);
-                exec.cancel_host_op(ctx, handle, reason)?;
-                let mut fuel = Fuel::with(4_096);
-                let _ = exec.step(ctx, &mut fuel);
-                Ok(())
-            })
-            .unwrap_or(Ok(()))
+        self.lua.enter(|ctx| -> Result<(), HostOpError> {
+            let exec = ctx.fetch(stashed);
+            exec.cancel_host_op(ctx, handle, reason)?;
+            let mut fuel = Fuel::with(4_096);
+            let _ = exec.step(ctx, &mut fuel);
+            Ok(())
+        })
     }
 
     /// Runs incremental GC and sweeps any `HostOpRegistry` entries whose Lua thread was collected.
@@ -551,15 +547,15 @@ impl PhodopusSandbox {
 
         // 1. Deterministically abort stale-epoch coroutines (`IPC_SPEC.md` §4.2)
         for stale in stale_tasks {
-            if let Some(tx_id) = self.handle_to_tx.remove(&stale.raw_host_op_handle) {
-                if let Some(inst) = self.active_txs.remove(&tx_id) {
-                    let _ = self.cancel_parked(
-                        &inst.stashed_exec,
-                        stale.raw_host_op_handle,
-                        "ERR_STALE_EPOCH: workspace epoch changed while macro was suspended",
-                    );
-                    report.cancelled_stale += 1;
-                }
+            if let Some(tx_id) = self.handle_to_tx.remove(&stale.raw_host_op_handle)
+                && let Some(inst) = self.active_txs.remove(&tx_id)
+            {
+                let _ = self.cancel_parked(
+                    &inst.stashed_exec,
+                    stale.raw_host_op_handle,
+                    "ERR_STALE_EPOCH: workspace epoch changed while macro was suspended",
+                );
+                report.cancelled_stale += 1;
             }
         }
 
@@ -613,11 +609,11 @@ impl PhodopusSandbox {
             .cancel_workspace_tasks(ws_id);
         let mut cancelled = 0;
         for raw_h in handles {
-            if let Some(tx_id) = self.handle_to_tx.remove(&raw_h) {
-                if let Some(inst) = self.active_txs.remove(&tx_id) {
-                    let _ = self.cancel_parked(&inst.stashed_exec, raw_h, reason);
-                    cancelled += 1;
-                }
+            if let Some(tx_id) = self.handle_to_tx.remove(&raw_h)
+                && let Some(inst) = self.active_txs.remove(&tx_id)
+            {
+                let _ = self.cancel_parked(&inst.stashed_exec, raw_h, reason);
+                cancelled += 1;
             }
         }
         // Also sweep any orphaned active_txs matching ws_id
@@ -647,7 +643,6 @@ impl PhodopusSandbox {
         self.state.borrow().scheduler.pending_settle_quiet_ms(ws_id)
     }
 
-    #[must_use]
     /// Returns `true` if one or more `MacroContext` coroutines are currently suspended on `calloop`.
     #[must_use]
     pub fn has_active_coroutines(&self) -> bool {
@@ -925,7 +920,7 @@ fn install_koma_globals<'gc>(ctx: Context<'gc>, state: SharedState) -> Result<()
         koma.set_field(
             ctx,
             "bind",
-            Callback::from_fn(&ctx, move |ctx, _, mut stack| {
+            Callback::from_fn_with(&ctx, handle_mt, move |&handle_mt, ctx, _, mut stack| {
                 let (chord, target, opts_val): (std::string::String, Value, Option<Value>) =
                     stack.consume(ctx)?;
                 let options: BindOptions = match opts_val {
@@ -1010,7 +1005,7 @@ fn install_koma_globals<'gc>(ctx: Context<'gc>, state: SharedState) -> Result<()
         koma.set_field(
             ctx,
             "gesture",
-            Callback::from_fn(&ctx, move |ctx, _, mut stack| {
+            Callback::from_fn_with(&ctx, handle_mt, move |&handle_mt, ctx, _, mut stack| {
                 let tbl: Table = stack.consume(ctx)?;
                 let raw_fingers: i64 = tbl.get(ctx, "fingers")?;
                 let raw_direction: std::string::String = tbl.get(ctx, "direction")?;
@@ -1089,7 +1084,7 @@ fn install_koma_globals<'gc>(ctx: Context<'gc>, state: SharedState) -> Result<()
         rule_ns.set_field(
             ctx,
             "window",
-            Callback::from_fn(&ctx, move |ctx, _, mut stack| {
+            Callback::from_fn_with(&ctx, handle_mt, move |&handle_mt, ctx, _, mut stack| {
                 let val: Value = stack.consume(ctx)?;
                 let mut spec: LuaWindowRuleSpec = from_value(val).map_err(RuntimeError::new)?;
                 // Validate regex patterns upfront so invalid rules fail atomically during reload!
@@ -1121,7 +1116,7 @@ fn install_koma_globals<'gc>(ctx: Context<'gc>, state: SharedState) -> Result<()
         rule_ns.set_field(
             ctx,
             "layer",
-            Callback::from_fn(&ctx, move |ctx, _, mut stack| {
+            Callback::from_fn_with(&ctx, handle_mt, move |&handle_mt, ctx, _, mut stack| {
                 let val: Value = stack.consume(ctx)?;
                 let mut spec: LuaLayerRuleSpec = from_value(val).map_err(RuntimeError::new)?;
                 for m in spec.matches.iter().chain(spec.excludes.iter()) {
@@ -1153,7 +1148,7 @@ fn install_koma_globals<'gc>(ctx: Context<'gc>, state: SharedState) -> Result<()
         macro_ns.set_field(
             ctx,
             "define",
-            Callback::from_fn(&ctx, move |ctx, _, mut stack| {
+            Callback::from_fn_with(&ctx, handle_mt, move |&handle_mt, ctx, _, mut stack| {
                 let tbl: Table = stack.consume(ctx)?;
                 let id_str: std::string::String = tbl.get(ctx, "id")?;
                 let app_id_regex: std::string::String = tbl.get(ctx, "app_id")?;
@@ -1218,12 +1213,12 @@ fn parse_bind_target<'gc>(
     target: Value<'gc>,
     edge: TriggerEdge,
 ) -> Result<(ActionDescriptor, Option<ActionDescriptor>), LuaError<'gc>> {
-    if edge == TriggerEdge::Both {
-        if let Value::Table(tbl) = target {
-            let press_act = extract_action_descriptor(tbl.get_value(ctx, "press"))?;
-            let rel_act = extract_action_descriptor(tbl.get_value(ctx, "release"))?;
-            return Ok((press_act, Some(rel_act)));
-        }
+    if edge == TriggerEdge::Both
+        && let Value::Table(tbl) = target
+    {
+        let press_act = extract_action_descriptor(tbl.get_value(ctx, "press"))?;
+        let rel_act = extract_action_descriptor(tbl.get_value(ctx, "release"))?;
+        return Ok((press_act, Some(rel_act)));
     }
     match target {
         Value::Function(func) => {
@@ -1247,15 +1242,105 @@ fn extract_action_descriptor<'gc>(val: Value<'gc>) -> Result<ActionDescriptor, L
     }
 }
 
+fn unit_act<'gc>(ctx: Context<'gc>, desc: ActionDescriptor) -> Callback<'gc> {
+    Callback::from_fn(&ctx, move |ctx, _, mut stack| {
+        stack.replace(ctx, UserData::new_static(&ctx, desc.clone()));
+        Ok(CallbackReturn::Return)
+    })
+}
+
+fn populate_scrolling_ns<'gc>(ctx: Context<'gc>, tbl: &Table<'gc>) {
+    tbl.set_field(
+        ctx,
+        "swipe",
+        unit_act(ctx, ActionDescriptor::ScrollStripSwipe),
+    );
+    tbl.set_field(
+        ctx,
+        "switch_preset_column_width",
+        unit_act(
+            ctx,
+            ActionDescriptor::ScrollingSwitchPresetWidth { forward: true },
+        ),
+    );
+    tbl.set_field(
+        ctx,
+        "switch_preset_column_width_back",
+        unit_act(
+            ctx,
+            ActionDescriptor::ScrollingSwitchPresetWidth { forward: false },
+        ),
+    );
+    tbl.set_field(
+        ctx,
+        "maximize_column",
+        unit_act(ctx, ActionDescriptor::ScrollingMaximizeColumn),
+    );
+    tbl.set_field(
+        ctx,
+        "center_column",
+        unit_act(ctx, ActionDescriptor::ScrollingCenterColumn),
+    );
+    tbl.set_field(
+        ctx,
+        "move_column_left",
+        unit_act(ctx, ActionDescriptor::ScrollingMoveColumnLeft),
+    );
+    tbl.set_field(
+        ctx,
+        "move_column_right",
+        unit_act(ctx, ActionDescriptor::ScrollingMoveColumnRight),
+    );
+    tbl.set_field(
+        ctx,
+        "switch_preset_window_height",
+        unit_act(
+            ctx,
+            ActionDescriptor::ScrollingSwitchPresetHeight { forward: true },
+        ),
+    );
+    tbl.set_field(
+        ctx,
+        "switch_preset_window_height_back",
+        unit_act(
+            ctx,
+            ActionDescriptor::ScrollingSwitchPresetHeight { forward: false },
+        ),
+    );
+    tbl.set_field(
+        ctx,
+        "reset_window_height",
+        unit_act(ctx, ActionDescriptor::ScrollingResetWindowHeight),
+    );
+    tbl.set_field(
+        ctx,
+        "toggle_column_tabbed_display",
+        unit_act(ctx, ActionDescriptor::ScrollingToggleColumnTabbed),
+    );
+    tbl.set_field(
+        ctx,
+        "consume_window_into_column",
+        unit_act(ctx, ActionDescriptor::ScrollingConsumeIntoColumn),
+    );
+    tbl.set_field(
+        ctx,
+        "expel_window_from_column",
+        unit_act(ctx, ActionDescriptor::ScrollingExpelFromColumn),
+    );
+    tbl.set_field(
+        ctx,
+        "consume_or_expel_window_left",
+        unit_act(ctx, ActionDescriptor::ScrollingConsumeOrExpelLeft),
+    );
+    tbl.set_field(
+        ctx,
+        "consume_or_expel_window_right",
+        unit_act(ctx, ActionDescriptor::ScrollingConsumeOrExpelRight),
+    );
+}
+
 fn build_act_namespace<'gc>(ctx: Context<'gc>) -> Result<Table<'gc>, LuaError<'gc>> {
     let act = Table::new(&ctx);
-
-    let unit_act = |ctx: Context<'gc>, desc: ActionDescriptor| {
-        Callback::from_fn(&ctx, move |ctx, _, mut stack| {
-            stack.replace(ctx, UserData::new_static(&ctx, desc.clone()));
-            Ok(CallbackReturn::Return)
-        })
-    };
 
     // koma.act.spawn({ "ghostty", ... })
     act.set_field(
@@ -1451,100 +1536,11 @@ fn build_act_namespace<'gc>(ctx: Context<'gc>) -> Result<Table<'gc>, LuaError<'g
     overview.set_field(ctx, "open", unit_act(ctx, ActionDescriptor::OverviewOpen));
     act.set_field(ctx, "overview", overview);
 
-    let populate_scrolling_ns = |tbl: &Table<'_>| {
-        tbl.set_field(
-            ctx,
-            "swipe",
-            unit_act(ctx, ActionDescriptor::ScrollStripSwipe),
-        );
-        tbl.set_field(
-            ctx,
-            "switch_preset_column_width",
-            unit_act(
-                ctx,
-                ActionDescriptor::ScrollingSwitchPresetWidth { forward: true },
-            ),
-        );
-        tbl.set_field(
-            ctx,
-            "switch_preset_column_width_back",
-            unit_act(
-                ctx,
-                ActionDescriptor::ScrollingSwitchPresetWidth { forward: false },
-            ),
-        );
-        tbl.set_field(
-            ctx,
-            "maximize_column",
-            unit_act(ctx, ActionDescriptor::ScrollingMaximizeColumn),
-        );
-        tbl.set_field(
-            ctx,
-            "center_column",
-            unit_act(ctx, ActionDescriptor::ScrollingCenterColumn),
-        );
-        tbl.set_field(
-            ctx,
-            "move_column_left",
-            unit_act(ctx, ActionDescriptor::ScrollingMoveColumnLeft),
-        );
-        tbl.set_field(
-            ctx,
-            "move_column_right",
-            unit_act(ctx, ActionDescriptor::ScrollingMoveColumnRight),
-        );
-        tbl.set_field(
-            ctx,
-            "switch_preset_window_height",
-            unit_act(
-                ctx,
-                ActionDescriptor::ScrollingSwitchPresetHeight { forward: true },
-            ),
-        );
-        tbl.set_field(
-            ctx,
-            "switch_preset_window_height_back",
-            unit_act(
-                ctx,
-                ActionDescriptor::ScrollingSwitchPresetHeight { forward: false },
-            ),
-        );
-        tbl.set_field(
-            ctx,
-            "reset_window_height",
-            unit_act(ctx, ActionDescriptor::ScrollingResetWindowHeight),
-        );
-        tbl.set_field(
-            ctx,
-            "toggle_column_tabbed_display",
-            unit_act(ctx, ActionDescriptor::ScrollingToggleColumnTabbed),
-        );
-        tbl.set_field(
-            ctx,
-            "consume_window_into_column",
-            unit_act(ctx, ActionDescriptor::ScrollingConsumeIntoColumn),
-        );
-        tbl.set_field(
-            ctx,
-            "expel_window_from_column",
-            unit_act(ctx, ActionDescriptor::ScrollingExpelFromColumn),
-        );
-        tbl.set_field(
-            ctx,
-            "consume_or_expel_window_left",
-            unit_act(ctx, ActionDescriptor::ScrollingConsumeOrExpelLeft),
-        );
-        tbl.set_field(
-            ctx,
-            "consume_or_expel_window_right",
-            unit_act(ctx, ActionDescriptor::ScrollingConsumeOrExpelRight),
-        );
-    };
     let strip = Table::new(&ctx);
-    populate_scrolling_ns(&strip);
+    populate_scrolling_ns(ctx, &strip);
     act.set_field(ctx, "scroll_strip", strip);
     let scrolling_ns = Table::new(&ctx);
-    populate_scrolling_ns(&scrolling_ns);
+    populate_scrolling_ns(ctx, &scrolling_ns);
     act.set_field(ctx, "scrolling", scrolling_ns);
 
     // koma.act.workspace.*

@@ -92,18 +92,13 @@ pub enum ActionDescriptor {
     LuaCallback(BindHandleId),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TriggerEdge {
+    #[default]
     Press,
     Release,
     Both,
-}
-
-impl Default for TriggerEdge {
-    fn default() -> Self {
-        Self::Press
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

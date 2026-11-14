@@ -73,8 +73,8 @@ impl ResizeCorner {
     /// (`Hyprland/src/layout/supplementary/DragController.cpp` lines 204-223).
     #[must_use]
     pub fn nearest_quadrant(rect: LogicalRect, cursor: LogicalPoint) -> Self {
-        let mid_x = f64::from(rect.x) + f64::from(rect.width) * 0.5;
-        let mid_y = f64::from(rect.y) + f64::from(rect.height) * 0.5;
+        let mid_x = f64::from(rect.x) + f64::from(rect.w) * 0.5;
+        let mid_y = f64::from(rect.y) + f64::from(rect.h) * 0.5;
         match (cursor.x < mid_x, cursor.y < mid_y) {
             (true, true) => Self::TopLeft,
             (false, true) => Self::TopRight,
@@ -349,38 +349,38 @@ impl DwindleTree {
 
         let preview_rect = match split_dir {
             CardinalDir::Left => {
-                let w = ((f64::from(vis.width) * 0.5 * ratio).round() as u32)
+                let w = ((f64::from(vis.w) * 0.5 * ratio).round() as u32)
                     .saturating_sub(half_gap)
-                    .clamp(32, vis.width.max(32));
-                LogicalRect::new(vis.x, vis.y, w, vis.height)
+                    .clamp(32, vis.w.max(32));
+                LogicalRect::new(vis.x, vis.y, w, vis.h)
             }
             CardinalDir::Right => {
-                let first_w = ((f64::from(vis.width) * 0.5 * ratio).round() as u32)
-                    .clamp(32, vis.width.saturating_sub(32).max(32));
+                let first_w = ((f64::from(vis.w) * 0.5 * ratio).round() as u32)
+                    .clamp(32, vis.w.saturating_sub(32).max(32));
                 let w = vis
-                    .width
+                    .w
                     .saturating_sub(first_w)
                     .saturating_sub(half_gap)
                     .max(32);
-                let x = vis.x + vis.width as i32 - w as i32;
-                LogicalRect::new(x, vis.y, w, vis.height)
+                let x = vis.x + vis.w as i32 - w as i32;
+                LogicalRect::new(x, vis.y, w, vis.h)
             }
             CardinalDir::Up => {
-                let h = ((f64::from(vis.height) * 0.5 * ratio).round() as u32)
+                let h = ((f64::from(vis.h) * 0.5 * ratio).round() as u32)
                     .saturating_sub(half_gap)
-                    .clamp(32, vis.height.max(32));
-                LogicalRect::new(vis.x, vis.y, vis.width, h)
+                    .clamp(32, vis.h.max(32));
+                LogicalRect::new(vis.x, vis.y, vis.w, h)
             }
             CardinalDir::Down => {
-                let first_h = ((f64::from(vis.height) * 0.5 * ratio).round() as u32)
-                    .clamp(32, vis.height.saturating_sub(32).max(32));
+                let first_h = ((f64::from(vis.h) * 0.5 * ratio).round() as u32)
+                    .clamp(32, vis.h.saturating_sub(32).max(32));
                 let h = vis
-                    .height
+                    .h
                     .saturating_sub(first_h)
                     .saturating_sub(half_gap)
                     .max(32);
-                let y = vis.y + vis.height as i32 - h as i32;
-                LogicalRect::new(vis.x, y, vis.width, h)
+                let y = vis.y + vis.h as i32 - h as i32;
+                LogicalRect::new(vis.x, y, vis.w, h)
             }
         };
 
@@ -452,15 +452,15 @@ impl DwindleTree {
 
         // Predict tile dimensions to validate client `xdg_toplevel` `max_size` (`DwindleAlgorithm.cpp` lines 104-110)
         let predicted_size = match opening_on_id.and_then(|id| self.nodes.get(&id)) {
-            None => (work.width, work.height),
+            None => (work.w, work.h),
             Some(target_leaf) => {
                 let b = target_leaf.raw_box;
                 let mult = self.config.split_width_multiplier.max(0.1);
-                let side_by_side = f64::from(b.width) > f64::from(b.height) * mult;
+                let side_by_side = f64::from(b.w) > f64::from(b.h) * mult;
                 if side_by_side {
-                    ((b.width / 2).max(32), b.height)
+                    ((b.w / 2).max(32), b.h)
                 } else {
-                    (b.width, (b.height / 2).max(32))
+                    (b.w, (b.h / 2).max(32))
                 }
             }
         };
@@ -470,17 +470,17 @@ impl DwindleTree {
             let violates_h = max_h > 0 && max_h < predicted_size.1;
             if violates_w || violates_h {
                 let fw = if max_w > 0 {
-                    max_w.min(work.width).max(64)
+                    max_w.min(work.w).max(64)
                 } else {
-                    (work.width * 3 / 5).max(120)
+                    (work.w * 3 / 5).max(120)
                 };
                 let fh = if max_h > 0 {
-                    max_h.min(work.height).max(64)
+                    max_h.min(work.h).max(64)
                 } else {
-                    (work.height * 3 / 5).max(120)
+                    (work.h * 3 / 5).max(120)
                 };
-                let cx = work.x + ((work.width.saturating_sub(fw)) / 2) as i32;
-                let cy = work.y + ((work.height.saturating_sub(fh)) / 2) as i32;
+                let cx = work.x + ((work.w.saturating_sub(fw)) / 2) as i32;
+                let cy = work.y + ((work.h.saturating_sub(fh)) / 2) as i32;
                 return DwindleInsertOutcome::DowngradeToFloating {
                     centered_rect: LogicalRect::new(cx, cy, fw, fh),
                 };
@@ -533,8 +533,7 @@ impl DwindleTree {
         let split_parent_id = self.alloc_node_id();
 
         let mult = self.config.split_width_multiplier.max(0.1);
-        let default_side_by_side =
-            f64::from(target_box.width) > f64::from(target_box.height) * mult;
+        let default_side_by_side = f64::from(target_box.w) > f64::from(target_box.h) * mult;
         let mut split_top = !default_side_by_side;
         let mut locked_split = self.config.preserve_split;
         let new_first: bool;
@@ -542,8 +541,8 @@ impl DwindleTree {
         let resolved_dir = override_dir.or_else(|| {
             if self.config.smart_split {
                 let cursor = cursor_pos.unwrap_or(LogicalPoint {
-                    x: f64::from(target_box.x) + f64::from(target_box.width) * 0.75,
-                    y: f64::from(target_box.y) + f64::from(target_box.height) * 0.75,
+                    x: f64::from(target_box.x) + f64::from(target_box.w) * 0.75,
+                    y: f64::from(target_box.y) + f64::from(target_box.h) * 0.75,
                 });
                 Some(four_triangle_quadrant(target_box, cursor))
             } else {
@@ -574,19 +573,15 @@ impl DwindleTree {
         } else if self.config.force_split == 0 {
             if let Some(cursor) = cursor_pos {
                 if default_side_by_side {
-                    new_first =
-                        cursor.x < f64::from(target_box.x) + f64::from(target_box.width) * 0.5;
+                    new_first = cursor.x < f64::from(target_box.x) + f64::from(target_box.w) * 0.5;
                 } else {
-                    new_first =
-                        cursor.y < f64::from(target_box.y) + f64::from(target_box.height) * 0.5;
+                    new_first = cursor.y < f64::from(target_box.y) + f64::from(target_box.h) * 0.5;
                 }
             } else {
                 new_first = false;
             }
-        } else if self.config.force_split == 1 {
-            new_first = true;
         } else {
-            new_first = false;
+            new_first = self.config.force_split == 1;
         }
 
         let children = if new_first {
@@ -632,13 +627,13 @@ impl DwindleTree {
         }
 
         if let Some(parent_id) = old_parent {
-            if let Some(parent_node) = self.nodes.get_mut(&parent_id) {
-                if let DwindleNodeKind::Split { children: pc, .. } = &mut parent_node.kind {
-                    if pc[0] == target_leaf_id {
-                        pc[0] = split_parent_id;
-                    } else if pc[1] == target_leaf_id {
-                        pc[1] = split_parent_id;
-                    }
+            if let Some(parent_node) = self.nodes.get_mut(&parent_id)
+                && let DwindleNodeKind::Split { children: pc, .. } = &mut parent_node.kind
+            {
+                if pc[0] == target_leaf_id {
+                    pc[0] = split_parent_id;
+                } else if pc[1] == target_leaf_id {
+                    pc[1] = split_parent_id;
                 }
             }
         } else {
@@ -662,9 +657,7 @@ impl DwindleTree {
             return None;
         };
 
-        let Some(parent_node) = self.nodes.remove(&parent_id) else {
-            return None;
-        };
+        let parent_node = self.nodes.remove(&parent_id)?;
         let DwindleNodeKind::Split { children, .. } = parent_node.kind else {
             return None;
         };
@@ -679,13 +672,13 @@ impl DwindleTree {
         }
 
         if let Some(grand_id) = parent_node.parent {
-            if let Some(grand_node) = self.nodes.get_mut(&grand_id) {
-                if let DwindleNodeKind::Split { children: gc, .. } = &mut grand_node.kind {
-                    if gc[0] == parent_id {
-                        gc[0] = sibling_id;
-                    } else if gc[1] == parent_id {
-                        gc[1] = sibling_id;
-                    }
+            if let Some(grand_node) = self.nodes.get_mut(&grand_id)
+                && let DwindleNodeKind::Split { children: gc, .. } = &mut grand_node.kind
+            {
+                if gc[0] == parent_id {
+                    gc[0] = sibling_id;
+                } else if gc[1] == parent_id {
+                    gc[1] = sibling_id;
                 }
             }
         } else {
@@ -731,8 +724,8 @@ impl DwindleTree {
         let inset_top = if gap_top { half_gap } else { 0 };
         let inset_bottom = if gap_bottom { rem_gap } else { 0 };
 
-        let vis_w = (raw_box.width as i32 - inset_left - inset_right).max(32) as u32;
-        let vis_h = (raw_box.height as i32 - inset_top - inset_bottom).max(32) as u32;
+        let vis_w = (raw_box.w as i32 - inset_left - inset_right).max(32) as u32;
+        let vis_h = (raw_box.h as i32 - inset_top - inset_bottom).max(32) as u32;
         let cell_visual =
             LogicalRect::new(raw_box.x + inset_left, raw_box.y + inset_top, vis_w, vis_h);
 
@@ -745,15 +738,15 @@ impl DwindleTree {
             DwindleNodeKind::Leaf {
                 pseudotile_size, ..
             } => {
-                if cfg.pseudotile {
-                    if let Some((pw, ph)) = *pseudotile_size {
-                        let cw = pw.clamp(48, cell_visual.width);
-                        let ch = ph.clamp(48, cell_visual.height);
-                        let cx = cell_visual.x + ((cell_visual.width - cw) / 2) as i32;
-                        let cy = cell_visual.y + ((cell_visual.height - ch) / 2) as i32;
-                        node.visual_box = LogicalRect::new(cx, cy, cw, ch);
-                        return;
-                    }
+                if cfg.pseudotile
+                    && let Some((pw, ph)) = *pseudotile_size
+                {
+                    let cw = pw.clamp(48, cell_visual.w);
+                    let ch = ph.clamp(48, cell_visual.h);
+                    let cx = cell_visual.x + ((cell_visual.w - cw) / 2) as i32;
+                    let cy = cell_visual.y + ((cell_visual.h - ch) / 2) as i32;
+                    node.visual_box = LogicalRect::new(cx, cy, cw, ch);
+                    return;
                 }
                 node.visual_box = cell_visual;
             }
@@ -766,36 +759,36 @@ impl DwindleTree {
                 node.visual_box = cell_visual;
                 if !cfg.preserve_split && !*locked_split && !cfg.smart_split {
                     let mult = cfg.split_width_multiplier.max(0.1);
-                    *split_top = f64::from(raw_box.height) * mult > f64::from(raw_box.width);
+                    *split_top = f64::from(raw_box.h) * mult > f64::from(raw_box.w);
                 }
                 let is_top = *split_top;
                 let ratio = split_ratio.clamp(MIN_SPLIT_RATIO, MAX_SPLIT_RATIO);
                 let [c0, c1] = *children;
 
                 if !is_top {
-                    let first_w = ((f64::from(raw_box.width) * 0.5 * ratio).round() as i32)
-                        .clamp(32, (raw_box.width as i32 - 32).max(32))
+                    let first_w = ((f64::from(raw_box.w) * 0.5 * ratio).round() as i32)
+                        .clamp(32, (raw_box.w as i32 - 32).max(32))
                         as u32;
-                    let second_w = raw_box.width.saturating_sub(first_w).max(32);
-                    let box0 = LogicalRect::new(raw_box.x, raw_box.y, first_w, raw_box.height);
+                    let second_w = raw_box.w.saturating_sub(first_w).max(32);
+                    let box0 = LogicalRect::new(raw_box.x, raw_box.y, first_w, raw_box.h);
                     let box1 = LogicalRect::new(
                         raw_box.x + first_w as i32,
                         raw_box.y,
                         second_w,
-                        raw_box.height,
+                        raw_box.h,
                     );
                     self.recalc_node_recursive(c0, box0, gap_left, true, gap_top, gap_bottom);
                     self.recalc_node_recursive(c1, box1, true, gap_right, gap_top, gap_bottom);
                 } else {
-                    let first_h = ((f64::from(raw_box.height) * 0.5 * ratio).round() as i32)
-                        .clamp(32, (raw_box.height as i32 - 32).max(32))
+                    let first_h = ((f64::from(raw_box.h) * 0.5 * ratio).round() as i32)
+                        .clamp(32, (raw_box.h as i32 - 32).max(32))
                         as u32;
-                    let second_h = raw_box.height.saturating_sub(first_h).max(32);
-                    let box0 = LogicalRect::new(raw_box.x, raw_box.y, raw_box.width, first_h);
+                    let second_h = raw_box.h.saturating_sub(first_h).max(32);
+                    let box0 = LogicalRect::new(raw_box.x, raw_box.y, raw_box.w, first_h);
                     let box1 = LogicalRect::new(
                         raw_box.x,
                         raw_box.y + first_h as i32,
-                        raw_box.width,
+                        raw_box.w,
                         second_h,
                     );
                     self.recalc_node_recursive(c0, box0, gap_left, gap_right, gap_top, true);
@@ -890,31 +883,30 @@ impl DwindleTree {
 
         // Check immediate sibling split boundary (`DwindleAlgorithm.cpp` lines 587-596)
         let mut override_dir = None;
-        if let Some(parent_id) = self.nodes[&leaf_id].parent {
-            if let DwindleNodeKind::Split {
+        if let Some(parent_id) = self.nodes[&leaf_id].parent
+            && let DwindleNodeKind::Split {
                 children,
                 split_top,
                 ..
             } = self.nodes[&parent_id].kind
-            {
-                let sibling_id = if children[0] == leaf_id {
-                    children[1]
-                } else {
-                    children[0]
-                };
-                let sibling_is_leaf = matches!(
-                    self.nodes.get(&sibling_id).map(|n| &n.kind),
-                    Some(DwindleNodeKind::Leaf { .. })
-                );
-                if sibling_is_leaf {
-                    let crosses_immediate =
-                        (dir == CardinalDir::Up && split_top && children[1] == leaf_id)
-                            || (dir == CardinalDir::Down && split_top && children[0] == leaf_id)
-                            || (dir == CardinalDir::Left && !split_top && children[1] == leaf_id)
-                            || (dir == CardinalDir::Right && !split_top && children[0] == leaf_id);
-                    if crosses_immediate {
-                        override_dir = Some(dir);
-                    }
+        {
+            let sibling_id = if children[0] == leaf_id {
+                children[1]
+            } else {
+                children[0]
+            };
+            let sibling_is_leaf = matches!(
+                self.nodes.get(&sibling_id).map(|n| &n.kind),
+                Some(DwindleNodeKind::Leaf { .. })
+            );
+            if sibling_is_leaf {
+                let crosses_immediate =
+                    (dir == CardinalDir::Up && split_top && children[1] == leaf_id)
+                        || (dir == CardinalDir::Down && split_top && children[0] == leaf_id)
+                        || (dir == CardinalDir::Left && !split_top && children[1] == leaf_id)
+                        || (dir == CardinalDir::Right && !split_top && children[0] == leaf_id);
+                if crosses_immediate {
+                    override_dir = Some(dir);
                 }
             }
         }
@@ -936,18 +928,17 @@ impl DwindleTree {
         let Some(parent_id) = self.nodes.get(&leaf_id).and_then(|n| n.parent) else {
             return false;
         };
-        if let Some(parent_node) = self.nodes.get_mut(&parent_id) {
-            if let DwindleNodeKind::Split {
+        if let Some(parent_node) = self.nodes.get_mut(&parent_id)
+            && let DwindleNodeKind::Split {
                 split_top,
                 locked_split,
                 ..
             } = &mut parent_node.kind
-            {
-                *split_top = !*split_top;
-                *locked_split = true;
-                self.recalculate(viewport);
-                return true;
-            }
+        {
+            *split_top = !*split_top;
+            *locked_split = true;
+            self.recalculate(viewport);
+            return true;
         }
         false
     }
@@ -960,12 +951,12 @@ impl DwindleTree {
         let Some(parent_id) = self.nodes.get(&leaf_id).and_then(|n| n.parent) else {
             return false;
         };
-        if let Some(parent_node) = self.nodes.get_mut(&parent_id) {
-            if let DwindleNodeKind::Split { children, .. } = &mut parent_node.kind {
-                children.swap(0, 1);
-                self.recalculate(viewport);
-                return true;
-            }
+        if let Some(parent_node) = self.nodes.get_mut(&parent_id)
+            && let DwindleNodeKind::Split { children, .. } = &mut parent_node.kind
+        {
+            children.swap(0, 1);
+            self.recalculate(viewport);
+            return true;
         }
         false
     }
@@ -983,12 +974,12 @@ impl DwindleTree {
         let Some(parent_id) = self.nodes.get(&leaf_id).and_then(|n| n.parent) else {
             return false;
         };
-        if let Some(parent_node) = self.nodes.get_mut(&parent_id) {
-            if let DwindleNodeKind::Split { split_ratio, .. } = &mut parent_node.kind {
-                *split_ratio = (*split_ratio + delta).clamp(MIN_SPLIT_RATIO, MAX_SPLIT_RATIO);
-                self.recalculate(viewport);
-                return true;
-            }
+        if let Some(parent_node) = self.nodes.get_mut(&parent_id)
+            && let DwindleNodeKind::Split { split_ratio, .. } = &mut parent_node.kind
+        {
+            *split_ratio = (*split_ratio + delta).clamp(MIN_SPLIT_RATIO, MAX_SPLIT_RATIO);
+            self.recalculate(viewport);
+            return true;
         }
         false
     }
@@ -1021,15 +1012,9 @@ impl DwindleTree {
         let work = self.work_area(viewport);
         let sticks = |a: i32, b: i32| (a - b).abs() <= 2;
         let display_left = sticks(leaf_box.x, work.x);
-        let display_right = sticks(
-            leaf_box.x + leaf_box.width as i32,
-            work.x + work.width as i32,
-        );
+        let display_right = sticks(leaf_box.x + leaf_box.w as i32, work.x + work.w as i32);
         let display_top = sticks(leaf_box.y, work.y);
-        let display_bottom = sticks(
-            leaf_box.y + leaf_box.height as i32,
-            work.y + work.height as i32,
-        );
+        let display_bottom = sticks(leaf_box.y + leaf_box.h as i32, work.y + work.h as i32);
 
         let allowed_dx = if display_left && display_right {
             0.0
@@ -1106,79 +1091,79 @@ impl DwindleTree {
 
         let mut changed = false;
 
-        if allowed_dx.abs() > f64::EPSILON {
-            if let Some((_, outer_pid)) = h_outer {
-                let orig_inner_w = h_inner
-                    .and_then(|(in_cid, _)| self.nodes.get(&in_cid))
-                    .map(|n| f64::from(n.raw_box.width));
+        if allowed_dx.abs() > f64::EPSILON
+            && let Some((_, outer_pid)) = h_outer
+        {
+            let orig_inner_w = h_inner
+                .and_then(|(in_cid, _)| self.nodes.get(&in_cid))
+                .map(|n| f64::from(n.raw_box.w));
 
-                if let Some(pnode) = self.nodes.get_mut(&outer_pid) {
-                    let pw = f64::from(pnode.raw_box.width.max(64));
-                    if let DwindleNodeKind::Split { split_ratio, .. } = &mut pnode.kind {
-                        *split_ratio = (*split_ratio + allowed_dx * 2.0 / pw)
-                            .clamp(MIN_SPLIT_RATIO, MAX_SPLIT_RATIO);
-                        changed = true;
+            if let Some(pnode) = self.nodes.get_mut(&outer_pid) {
+                let pw = f64::from(pnode.raw_box.w.max(64));
+                if let DwindleNodeKind::Split { split_ratio, .. } = &mut pnode.kind {
+                    *split_ratio = (*split_ratio + allowed_dx * 2.0 / pw)
+                        .clamp(MIN_SPLIT_RATIO, MAX_SPLIT_RATIO);
+                    changed = true;
+                }
+            }
+            self.recalculate(viewport);
+
+            if let (Some((in_cid, in_pid)), Some(orig_w)) = (h_inner, orig_inner_w) {
+                if let Some(in_pnode) = self.nodes.get_mut(&in_pid) {
+                    let in_pw = f64::from(in_pnode.raw_box.w.max(64));
+                    if let DwindleNodeKind::Split {
+                        children,
+                        split_ratio,
+                        ..
+                    } = &mut in_pnode.kind
+                    {
+                        let compensated = if children[0] == in_cid {
+                            (orig_w - allowed_dx) / in_pw * 2.0
+                        } else {
+                            2.0 - (orig_w + allowed_dx) / in_pw * 2.0
+                        };
+                        *split_ratio = compensated.clamp(MIN_SPLIT_RATIO, MAX_SPLIT_RATIO);
                     }
                 }
                 self.recalculate(viewport);
-
-                if let (Some((in_cid, in_pid)), Some(orig_w)) = (h_inner, orig_inner_w) {
-                    if let Some(in_pnode) = self.nodes.get_mut(&in_pid) {
-                        let in_pw = f64::from(in_pnode.raw_box.width.max(64));
-                        if let DwindleNodeKind::Split {
-                            children,
-                            split_ratio,
-                            ..
-                        } = &mut in_pnode.kind
-                        {
-                            let compensated = if children[0] == in_cid {
-                                (orig_w - allowed_dx) / in_pw * 2.0
-                            } else {
-                                2.0 - (orig_w + allowed_dx) / in_pw * 2.0
-                            };
-                            *split_ratio = compensated.clamp(MIN_SPLIT_RATIO, MAX_SPLIT_RATIO);
-                        }
-                    }
-                    self.recalculate(viewport);
-                }
             }
         }
 
-        if allowed_dy.abs() > f64::EPSILON {
-            if let Some((_, outer_pid)) = v_outer {
-                let orig_inner_h = v_inner
-                    .and_then(|(in_cid, _)| self.nodes.get(&in_cid))
-                    .map(|n| f64::from(n.raw_box.height));
+        if allowed_dy.abs() > f64::EPSILON
+            && let Some((_, outer_pid)) = v_outer
+        {
+            let orig_inner_h = v_inner
+                .and_then(|(in_cid, _)| self.nodes.get(&in_cid))
+                .map(|n| f64::from(n.raw_box.h));
 
-                if let Some(pnode) = self.nodes.get_mut(&outer_pid) {
-                    let ph = f64::from(pnode.raw_box.height.max(64));
-                    if let DwindleNodeKind::Split { split_ratio, .. } = &mut pnode.kind {
-                        *split_ratio = (*split_ratio + allowed_dy * 2.0 / ph)
-                            .clamp(MIN_SPLIT_RATIO, MAX_SPLIT_RATIO);
-                        changed = true;
+            if let Some(pnode) = self.nodes.get_mut(&outer_pid) {
+                let ph = f64::from(pnode.raw_box.h.max(64));
+                if let DwindleNodeKind::Split { split_ratio, .. } = &mut pnode.kind {
+                    *split_ratio = (*split_ratio + allowed_dy * 2.0 / ph)
+                        .clamp(MIN_SPLIT_RATIO, MAX_SPLIT_RATIO);
+                    changed = true;
+                }
+            }
+            self.recalculate(viewport);
+
+            if let (Some((in_cid, in_pid)), Some(orig_h)) = (v_inner, orig_inner_h) {
+                if let Some(in_pnode) = self.nodes.get_mut(&in_pid) {
+                    let in_ph = f64::from(in_pnode.raw_box.h.max(64));
+                    if let DwindleNodeKind::Split {
+                        children,
+                        split_ratio,
+                        ..
+                    } = &mut in_pnode.kind
+                    {
+                        let compensated = if children[0] == in_cid {
+                            (orig_h - allowed_dy) / in_ph * 2.0
+                        } else {
+                            2.0 - (orig_h + allowed_dy) / in_ph * 2.0
+                        };
+                        *split_ratio = compensated.clamp(MIN_SPLIT_RATIO, MAX_SPLIT_RATIO);
                     }
                 }
                 self.recalculate(viewport);
-
-                if let (Some((in_cid, in_pid)), Some(orig_h)) = (v_inner, orig_inner_h) {
-                    if let Some(in_pnode) = self.nodes.get_mut(&in_pid) {
-                        let in_ph = f64::from(in_pnode.raw_box.height.max(64));
-                        if let DwindleNodeKind::Split {
-                            children,
-                            split_ratio,
-                            ..
-                        } = &mut in_pnode.kind
-                        {
-                            let compensated = if children[0] == in_cid {
-                                (orig_h - allowed_dy) / in_ph * 2.0
-                            } else {
-                                2.0 - (orig_h + allowed_dy) / in_ph * 2.0
-                            };
-                            *split_ratio = compensated.clamp(MIN_SPLIT_RATIO, MAX_SPLIT_RATIO);
-                        }
-                    }
-                    self.recalculate(viewport);
-                }
             }
         }
 
@@ -1226,30 +1211,28 @@ impl DwindleTree {
         }
 
         let mut changed = false;
-        if dx_px.abs() > f64::EPSILON {
-            if let Some((pid, is_first)) = h_split_ancestor {
-                if let Some(pnode) = self.nodes.get_mut(&pid) {
-                    let pw = f64::from(pnode.raw_box.width.max(64));
-                    let signed = if is_first { dx_px } else { -dx_px };
-                    if let DwindleNodeKind::Split { split_ratio, .. } = &mut pnode.kind {
-                        *split_ratio = (*split_ratio + signed * 2.0 / pw)
-                            .clamp(MIN_SPLIT_RATIO, MAX_SPLIT_RATIO);
-                        changed = true;
-                    }
-                }
+        if dx_px.abs() > f64::EPSILON
+            && let Some((pid, is_first)) = h_split_ancestor
+            && let Some(pnode) = self.nodes.get_mut(&pid)
+        {
+            let pw = f64::from(pnode.raw_box.w.max(64));
+            let signed = if is_first { dx_px } else { -dx_px };
+            if let DwindleNodeKind::Split { split_ratio, .. } = &mut pnode.kind {
+                *split_ratio =
+                    (*split_ratio + signed * 2.0 / pw).clamp(MIN_SPLIT_RATIO, MAX_SPLIT_RATIO);
+                changed = true;
             }
         }
-        if dy_px.abs() > f64::EPSILON {
-            if let Some((pid, is_first)) = v_split_ancestor {
-                if let Some(pnode) = self.nodes.get_mut(&pid) {
-                    let ph = f64::from(pnode.raw_box.height.max(64));
-                    let signed = if is_first { dy_px } else { -dy_px };
-                    if let DwindleNodeKind::Split { split_ratio, .. } = &mut pnode.kind {
-                        *split_ratio = (*split_ratio + signed * 2.0 / ph)
-                            .clamp(MIN_SPLIT_RATIO, MAX_SPLIT_RATIO);
-                        changed = true;
-                    }
-                }
+        if dy_px.abs() > f64::EPSILON
+            && let Some((pid, is_first)) = v_split_ancestor
+            && let Some(pnode) = self.nodes.get_mut(&pid)
+        {
+            let ph = f64::from(pnode.raw_box.h.max(64));
+            let signed = if is_first { dy_px } else { -dy_px };
+            if let DwindleNodeKind::Split { split_ratio, .. } = &mut pnode.kind {
+                *split_ratio =
+                    (*split_ratio + signed * 2.0 / ph).clamp(MIN_SPLIT_RATIO, MAX_SPLIT_RATIO);
+                changed = true;
             }
         }
 
@@ -1269,15 +1252,14 @@ impl DwindleTree {
         let Some(&leaf_id) = self.win_to_leaf.get(&win_id) else {
             return false;
         };
-        if let Some(node) = self.nodes.get_mut(&leaf_id) {
-            if let DwindleNodeKind::Leaf {
+        if let Some(node) = self.nodes.get_mut(&leaf_id)
+            && let DwindleNodeKind::Leaf {
                 pseudotile_size, ..
             } = &mut node.kind
-            {
-                *pseudotile_size = size;
-                self.recalculate(viewport);
-                return true;
-            }
+        {
+            *pseudotile_size = size;
+            self.recalculate(viewport);
+            return true;
         }
         false
     }
@@ -1340,12 +1322,12 @@ impl DwindleTree {
 
 /// Evaluates Hyprland's 4-triangle diagonal quadrant slope (`DwindleAlgorithm.cpp` lines 179-206).
 fn four_triangle_quadrant(target_box: LogicalRect, cursor: LogicalPoint) -> CardinalDir {
-    let center_x = f64::from(target_box.x) + f64::from(target_box.width) * 0.5;
-    let center_y = f64::from(target_box.y) + f64::from(target_box.height) * 0.5;
+    let center_x = f64::from(target_box.x) + f64::from(target_box.w) * 0.5;
+    let center_y = f64::from(target_box.y) + f64::from(target_box.h) * 0.5;
     let dx = cursor.x - center_x;
     let dy = cursor.y - center_y;
-    let w_f = f64::from(target_box.width.max(1));
-    let h_f = f64::from(target_box.height.max(1));
+    let w_f = f64::from(target_box.w.max(1));
+    let h_f = f64::from(target_box.h.max(1));
 
     if (dy * w_f).abs() < (dx * h_f).abs() {
         if dx < 0.0 {
@@ -1362,21 +1344,21 @@ fn four_triangle_quadrant(target_box: LogicalRect, cursor: LogicalPoint) -> Card
 
 fn rect_center(r: LogicalRect) -> LogicalPoint {
     LogicalPoint {
-        x: f64::from(r.x) + f64::from(r.width) * 0.5,
-        y: f64::from(r.y) + f64::from(r.height) * 0.5,
+        x: f64::from(r.x) + f64::from(r.w) * 0.5,
+        y: f64::from(r.y) + f64::from(r.h) * 0.5,
     }
 }
 
 fn focal_probe_point(r: LogicalRect, dir: CardinalDir) -> LogicalPoint {
-    let cx = f64::from(r.x) + f64::from(r.width) * 0.5;
-    let cy = f64::from(r.y) + f64::from(r.height) * 0.5;
+    let cx = f64::from(r.x) + f64::from(r.w) * 0.5;
+    let cy = f64::from(r.y) + f64::from(r.h) * 0.5;
     match dir {
         CardinalDir::Left => LogicalPoint {
             x: f64::from(r.x) - 4.0,
             y: cy,
         },
         CardinalDir::Right => LogicalPoint {
-            x: f64::from(r.x + r.width as i32) + 4.0,
+            x: f64::from(r.x + r.w as i32) + 4.0,
             y: cy,
         },
         CardinalDir::Up => LogicalPoint {
@@ -1385,16 +1367,16 @@ fn focal_probe_point(r: LogicalRect, dir: CardinalDir) -> LogicalPoint {
         },
         CardinalDir::Down => LogicalPoint {
             x: cx,
-            y: f64::from(r.y + r.height as i32) + 4.0,
+            y: f64::from(r.y + r.h as i32) + 4.0,
         },
     }
 }
 
 fn point_to_rect_dist_sq(pt: LogicalPoint, r: LogicalRect) -> f64 {
     let min_x = f64::from(r.x);
-    let max_x = f64::from(r.x + r.width as i32);
+    let max_x = f64::from(r.x + r.w as i32);
     let min_y = f64::from(r.y);
-    let max_y = f64::from(r.y + r.height as i32);
+    let max_y = f64::from(r.y + r.h as i32);
     let dx = if pt.x < min_x {
         min_x - pt.x
     } else if pt.x > max_x {
@@ -1426,10 +1408,12 @@ mod tests {
 
     #[test]
     fn fibonacci_dwindle_progression_splits_side_then_top_then_side() {
-        let mut cfg = DwindleConfig::default();
-        cfg.force_split = 2; // always right/bottom for deterministic Fibonacci dwindling
-        cfg.outer_gap = 0;
-        cfg.inner_gap = 0;
+        let cfg = DwindleConfig {
+            force_split: 2, // always right/bottom for deterministic Fibonacci dwindling
+            outer_gap: 0,
+            inner_gap: 0,
+            ..DwindleConfig::default()
+        };
 
         let mut tree = DwindleTree::new(cfg);
         let w1 = WindowId::new(1, 1);
@@ -1522,8 +1506,8 @@ mod tests {
         let res = tree.insert(dialog, vp(), Some(w1), None, Some((420, 260)), None);
         match res {
             DwindleInsertOutcome::DowngradeToFloating { centered_rect } => {
-                assert_eq!(centered_rect.width, 420);
-                assert_eq!(centered_rect.height, 260);
+                assert_eq!(centered_rect.w, 420);
+                assert_eq!(centered_rect.h, 260);
                 assert!(!tree.contains(dialog));
             }
             DwindleInsertOutcome::Tiled(_) => panic!("expected max_size dialog to auto-float"),
@@ -1532,10 +1516,12 @@ mod tests {
 
     #[test]
     fn smart_split_four_triangle_places_window_on_top_edge() {
-        let mut cfg = DwindleConfig::default();
-        cfg.smart_split = true;
-        cfg.outer_gap = 0;
-        cfg.inner_gap = 0;
+        let cfg = DwindleConfig {
+            smart_split: true,
+            outer_gap: 0,
+            inner_gap: 0,
+            ..DwindleConfig::default()
+        };
 
         let mut tree = DwindleTree::new(cfg);
         let w1 = WindowId::new(1, 1);
@@ -1560,9 +1546,11 @@ mod tests {
 
     #[test]
     fn drop_zone_preview_and_corner_smart_resizing_track_cursor_accurately() {
-        let mut cfg = DwindleConfig::default();
-        cfg.outer_gap = 0;
-        cfg.inner_gap = 0;
+        let cfg = DwindleConfig {
+            outer_gap: 0,
+            inner_gap: 0,
+            ..DwindleConfig::default()
+        };
 
         let mut tree = DwindleTree::new(cfg);
         let w1 = WindowId::new(1, 1);
@@ -1610,11 +1598,11 @@ mod tests {
 
         // Grab TopLeft corner of w3 and drag (-160, -100): divider moves left by 160 & up by 100!
         assert!(tree.resize_target_from_corner(w3, -160.0, -100.0, ResizeCorner::TopLeft, vp()));
-        assert_eq!(tree.rect_of(w1).unwrap().width, 800);
+        assert_eq!(tree.rect_of(w1).unwrap().w, 800);
         assert_eq!(tree.rect_of(w3).unwrap().x, 800);
-        assert_eq!(tree.rect_of(w3).unwrap().width, 1120);
-        assert_eq!(tree.rect_of(w2).unwrap().height, 440);
+        assert_eq!(tree.rect_of(w3).unwrap().w, 1120);
+        assert_eq!(tree.rect_of(w2).unwrap().h, 440);
         assert_eq!(tree.rect_of(w3).unwrap().y, 440);
-        assert_eq!(tree.rect_of(w3).unwrap().height, 640);
+        assert_eq!(tree.rect_of(w3).unwrap().h, 640);
     }
 }

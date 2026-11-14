@@ -12,5 +12,4 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
-koma-model.workspace = true
 koma-proto.workspace = true

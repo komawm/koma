@@ -20,4 +20,5 @@ pub use crate::{
         encode_frame,
     },
     ids::{Epoch, MacroId, OutputId, SeatId, SessionId, WindowId, WorkspaceId},
+    rpc::{KinematicProfileKind, OverlayKind, TextInjectStrategy, TransportKind},
 };

@@ -46,47 +46,22 @@ pub struct WindowMatchSpec {
 impl WindowMatchSpec {
     #[must_use]
     pub fn matches(&self, ctx: &WindowMatchContext<'_>) -> bool {
-        if let Some(re) = &self.app_id {
-            if !re.is_match(ctx.app_id) {
-                return false;
-            }
-        }
-        if let Some(re) = &self.title {
-            if !re.is_match(ctx.title) {
-                return false;
-            }
-        }
-        if let Some(v) = self.is_floating {
-            if v != ctx.is_floating {
-                return false;
-            }
-        }
-        if let Some(v) = self.is_focused {
-            if v != ctx.is_focused {
-                return false;
-            }
-        }
-        if let Some(v) = self.is_xwayland {
-            if v != ctx.is_xwayland {
-                return false;
-            }
-        }
-        if let Some(v) = self.is_modal_dialog {
-            if v != ctx.is_modal_dialog {
-                return false;
-            }
-        }
-        if let Some(v) = self.is_screencast_target {
-            if v != ctx.is_screencast_target {
-                return false;
-            }
-        }
-        if let Some(v) = self.is_agent_workspace {
-            if v != ctx.is_agent_workspace {
-                return false;
-            }
-        }
-        true
+        self.app_id
+            .as_ref()
+            .is_none_or(|re| re.is_match(ctx.app_id))
+            && self.title.as_ref().is_none_or(|re| re.is_match(ctx.title))
+            && self.is_floating.is_none_or(|v| v == ctx.is_floating)
+            && self.is_focused.is_none_or(|v| v == ctx.is_focused)
+            && self.is_xwayland.is_none_or(|v| v == ctx.is_xwayland)
+            && self
+                .is_modal_dialog
+                .is_none_or(|v| v == ctx.is_modal_dialog)
+            && self
+                .is_screencast_target
+                .is_none_or(|v| v == ctx.is_screencast_target)
+            && self
+                .is_agent_workspace
+                .is_none_or(|v| v == ctx.is_agent_workspace)
     }
 }
 

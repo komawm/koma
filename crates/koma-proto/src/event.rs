@@ -116,18 +116,17 @@ impl EventRingBuffer {
         self.next_seq += 1;
 
         // Rule 1: Coalesce consecutive or pending `window.settled` frames on the same workspace.
-        if event.is_coalesceable_settle() {
-            if let Some(existing) = self
+        if event.is_coalesceable_settle()
+            && let Some(existing) = self
                 .queue
                 .iter_mut()
                 .find(|e| e.ws_id == ws_id && e.event.is_coalesceable_settle())
-            {
-                existing.seq = seq;
-                existing.timestamp_ns = timestamp_ns;
-                existing.epoch = epoch;
-                existing.event = event;
-                return;
-            }
+        {
+            existing.seq = seq;
+            existing.timestamp_ns = timestamp_ns;
+            existing.epoch = epoch;
+            existing.event = event;
+            return;
         }
 
         // Rule 2 & 3: Evict oldest non-critical event when full; never drop critical lease barriers.
@@ -156,22 +155,22 @@ impl EventRingBuffer {
     }
 
     pub fn pop_next(&mut self) -> Option<IpcEventEnvelope> {
-        if self.dropped_count > 0 {
-            if let Some(front) = self.queue.front() {
-                let lagged = IpcEventEnvelope {
-                    seq: front.seq,
-                    timestamp_ns: front.timestamp_ns,
-                    topic: EventTopic::StreamControl,
-                    ws_id: front.ws_id.clone(),
-                    epoch: front.epoch,
-                    event: WorkspaceEvent::StreamLagged {
-                        dropped_count: self.dropped_count,
-                        latest_seq: self.next_seq.saturating_sub(1),
-                    },
-                };
-                self.dropped_count = 0;
-                return Some(lagged);
-            }
+        if self.dropped_count > 0
+            && let Some(front) = self.queue.front()
+        {
+            let lagged = IpcEventEnvelope {
+                seq: front.seq,
+                timestamp_ns: front.timestamp_ns,
+                topic: EventTopic::StreamControl,
+                ws_id: front.ws_id.clone(),
+                epoch: front.epoch,
+                event: WorkspaceEvent::StreamLagged {
+                    dropped_count: self.dropped_count,
+                    latest_seq: self.next_seq.saturating_sub(1),
+                },
+            };
+            self.dropped_count = 0;
+            return Some(lagged);
         }
         self.queue.pop_front()
     }

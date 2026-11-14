@@ -210,11 +210,11 @@ impl WorkspaceLease {
     }
 
     fn expire_if_needed(&mut self, now_ms: u64) {
-        if let WorkspaceLeaseState::AgentExclusive { expires_at_ms, .. } = self.state {
-            if now_ms >= expires_at_ms {
-                self.epoch = self.epoch.next();
-                self.state = WorkspaceLeaseState::Unheld;
-            }
+        if let WorkspaceLeaseState::AgentExclusive { expires_at_ms, .. } = self.state
+            && now_ms >= expires_at_ms
+        {
+            self.epoch = self.epoch.next();
+            self.state = WorkspaceLeaseState::Unheld;
         }
     }
 }

@@ -116,6 +116,7 @@ impl WorkspaceState {
 
     /// Inserts a newly mapped window into this workspace (`CSpace::add`), automatically applying
     /// `Dwindle`'s `max_size` auto-float downgrade check and returning `is_floating`.
+    #[allow(clippy::too_many_arguments)]
     pub fn insert_window(
         &mut self,
         win_id: WindowId,
@@ -380,10 +381,11 @@ impl WorkspaceState {
                 tiled_ids.push(wid);
             }
         }
-        if let Some(active_d) = self.deck.active() {
-            if !tiled_ids.contains(&active_d) && !self.floating.contains(active_d) {
-                tiled_ids.push(active_d);
-            }
+        if let Some(active_d) = self.deck.active()
+            && !tiled_ids.contains(&active_d)
+            && !self.floating.contains(active_d)
+        {
+            tiled_ids.push(active_d);
         }
         for &w in self.deck.stash_windows() {
             if !tiled_ids.contains(&w) && !self.floating.contains(w) {
