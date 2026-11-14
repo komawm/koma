@@ -38,7 +38,7 @@ this repository or commit local path overrides in `Cargo.toml`.
   [flake.nix](https://github.com/komawm/koma/blob/main/flake.nix)):
   `pkg-config`, `libudev`, `libinput`, `libseat` (`seatd`), `libgbm` / `mesa`,
   `libegl` / `libgles2`, `libdrm`, `wayland`, `libxkbcommon`, `pixman`, `dbus`,
-  `fontconfig`, and `libdisplay-info`
+  and `fontconfig`
 
 ## Setup
 

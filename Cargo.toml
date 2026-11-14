@@ -58,7 +58,7 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 # Wayland compositor & bare-metal KMS/DRM stack (pinned to exact Niri-tested Smithay rev)
 calloop = "0.14.5"
 smithay = { git = "https://github.com/Smithay/smithay.git", rev = "65aa86fa5236e41775c313408102a5d5c2d1e2ca", default-features = false }
-smithay-drm-extras = { git = "https://github.com/Smithay/smithay.git", rev = "65aa86fa5236e41775c313408102a5d5c2d1e2ca" }
+smithay-drm-extras = { git = "https://github.com/Smithay/smithay.git", rev = "65aa86fa5236e41775c313408102a5d5c2d1e2ca", default-features = false }
 wayland-server = "0.31.14"
 wayland-client = "0.31.15"
 wayland-protocols-wlr = { version = "0.3.12", features = ["client"] }

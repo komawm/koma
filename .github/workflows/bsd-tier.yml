@@ -58,7 +58,7 @@ jobs:
         run: |
           set -eux
           sh scripts/freebsd-pkg-bootstrap.sh \
-            --packages "git pkgconf ca_root_nss curl python3 wayland libdrm mesa-libs mesa-dri libxkbcommon libinput libudev-devd seatd libdisplay-info pixman dbus fontconfig sqlite3"
+            --packages "git pkgconf ca_root_nss curl python3 wayland libdrm mesa-libs mesa-dri libxkbcommon libinput libudev-devd seatd pixman dbus fontconfig sqlite3"
 
       - name: Install pinned Rust toolchain (rustup)
         run: |
