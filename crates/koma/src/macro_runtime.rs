@@ -258,8 +258,13 @@ pub fn execute_queued_host_actions(state: &mut KomaState) {
 }
 
 pub(crate) fn dispatch_single_host_action(state: &mut KomaState, action: QueuedHostAction) {
+    state.reconcile_session_lock();
     match action {
         QueuedHostAction::SpawnProcess { argv } => {
+            if state.is_locked_or_abandoned() {
+                warn!("blocked SpawnProcess action while session is locked");
+                return;
+            }
             if let Some((prog, args)) = argv.split_first() {
                 let active_ws = state.active_ws_id.clone();
                 let mut cmd = Command::new(prog);
@@ -511,6 +516,14 @@ fn verify_action_epoch_and_protection(
     ws_id: &WorkspaceId,
     expected_epoch: Epoch,
 ) -> bool {
+    state.reconcile_session_lock();
+    if state.is_locked_or_abandoned() {
+        let _ = state.lua_sandbox.cancel_workspace_coroutines(
+            ws_id,
+            "ERR_SESSION_LOCKED: macro action blocked while session is locked",
+        );
+        return false;
+    }
     let Some(ws) = state.workspaces.get(ws_id) else {
         return false;
     };
@@ -563,6 +576,11 @@ fn verify_action_epoch_and_protection(
 }
 
 fn step_pointer_animations(state: &mut KomaState, now_ms: u64) {
+    state.reconcile_session_lock();
+    if state.is_locked_or_abandoned() {
+        state.pointer_animations.clear();
+        return;
+    }
     if state.pointer_animations.is_empty() {
         return;
     }
@@ -666,9 +684,13 @@ fn target_window_rect(state: &KomaState, ws_id: &WorkspaceId) -> LogicalRect {
 }
 
 fn apply_pointer_motion(state: &mut KomaState, pt: LogicalPoint) {
+    state.reconcile_session_lock();
+    if state.is_locked_or_abandoned() {
+        return;
+    }
     let pos = Point::from((pt.x, pt.y));
     state.pointer_location = pos;
-    let under = crate::backend_winit::hit_test_active_deck_surface(state, pos);
+    let under = state.surface_under(pos);
     if let Some(pointer) = state.seat.get_pointer() {
         let serial = SERIAL_COUNTER.next_serial();
         let time = InputTime::now();
@@ -687,9 +709,13 @@ fn apply_pointer_motion(state: &mut KomaState, pt: LogicalPoint) {
 }
 
 fn apply_pointer_button(state: &mut KomaState, button: u32, btn_state: ButtonState) {
+    state.reconcile_session_lock();
+    if state.is_locked_or_abandoned() {
+        return;
+    }
     if btn_state == ButtonState::Pressed {
         let pos = state.pointer_location;
-        state.focus_window_at_point(pos);
+        state.handle_pointer_button_focus(pos);
     }
     if let Some(pointer) = state.seat.get_pointer() {
         let serial = SERIAL_COUNTER.next_serial();

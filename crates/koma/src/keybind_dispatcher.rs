@@ -28,7 +28,7 @@ use smithay::{
 use tracing::{debug, info, warn};
 
 use crate::{
-    backend_winit::{hit_test_active_deck_surface, toggle_ring0_preempt_takeover},
+    backend_winit::toggle_ring0_preempt_takeover,
     macro_runtime::{execute_queued_host_actions, rearm_trampoline_timer},
     pointer_grabs::{
         BTN_EXTRA, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, BTN_SIDE, cancel_active_pointer_grab,
@@ -260,6 +260,35 @@ pub struct CompiledBind {
     pub options: BindOptions,
 }
 
+#[derive(Debug, Clone)]
+pub struct PendingRelease {
+    pub action: ActionDescriptor,
+    pub allow_when_locked: bool,
+}
+
+/// Pure lock-screen filter: blocks non-`allow_when_locked` key/mouse/scroll binds while
+/// `Locked` or `Abandoned`, allowing only explicitly opted-in lock-screen binds.
+#[must_use]
+pub const fn is_keybind_allowed_for_lock_state(
+    is_locked_or_abandoned: bool,
+    allow_when_locked: bool,
+) -> bool {
+    !is_locked_or_abandoned || allow_when_locked
+}
+
+/// Recognizes hardware VT switch keysyms (`XF86Switch_VT_1..=12`, e.g. `Ctrl+Alt+F1..F12`),
+/// which remain enabled even on locked TTY sessions.
+#[must_use]
+pub const fn parse_vt_switch_keysym(raw_sym: u32) -> Option<i32> {
+    #[allow(non_upper_case_globals)]
+    match raw_sym {
+        keysyms::KEY_XF86Switch_VT_1..=keysyms::KEY_XF86Switch_VT_12 => {
+            Some((raw_sym - keysyms::KEY_XF86Switch_VT_1 + 1) as i32)
+        }
+        _ => None,
+    }
+}
+
 /// Runtime keybind, mouse-button & scroll-bind table stored on `KomaState` and atomically swapped on hot-reload.
 #[derive(Debug)]
 pub struct KeybindTable {
@@ -267,8 +296,8 @@ pub struct KeybindTable {
     pub mod_key_override: Option<PhysicalModKey>,
     pub active_mode: Option<String>,
     pub cooldowns_ms: HashMap<BindHandleId, u64>,
-    pub pending_releases: HashMap<u32, ActionDescriptor>,
-    pub pending_mouse_releases: HashMap<u32, ActionDescriptor>,
+    pub pending_releases: HashMap<u32, PendingRelease>,
+    pub pending_mouse_releases: HashMap<u32, PendingRelease>,
     pub suppressed_buttons: HashSet<u32>,
     pub horizontal_wheel_tracker: ScrollTracker,
     pub vertical_wheel_tracker: ScrollTracker,
@@ -886,6 +915,7 @@ pub fn process_pointer_button_event(
     time: InputTime,
     is_bare_metal_tty: bool,
 ) {
+    state.reconcile_session_lock();
     let serial = SERIAL_COUNTER.next_serial();
     let Some(pointer) = state.seat.get_pointer() else {
         return;
@@ -910,8 +940,13 @@ pub fn process_pointer_button_event(
     if btn_state == ButtonState::Released {
         let was_suppressed = state.keybinds.suppressed_buttons.remove(&button_code);
         let release_act = state.keybinds.pending_mouse_releases.remove(&button_code);
-        if let Some(act) = release_act {
-            execute_action_descriptor(state, act, is_bare_metal_tty);
+        if let Some(rel) = release_act
+            && is_keybind_allowed_for_lock_state(
+                state.is_locked_or_abandoned(),
+                rel.allow_when_locked,
+            )
+        {
+            execute_action_descriptor(state, rel.action, is_bare_metal_tty);
         }
         if was_suppressed {
             return;
@@ -954,10 +989,13 @@ pub fn process_pointer_button_event(
                     state.keybinds.cooldowns_ms.insert(bind.id, now_ms);
                 }
                 if let Some(rel) = bind.release_action.clone() {
-                    state
-                        .keybinds
-                        .pending_mouse_releases
-                        .insert(button_code, rel);
+                    state.keybinds.pending_mouse_releases.insert(
+                        button_code,
+                        PendingRelease {
+                            action: rel,
+                            allow_when_locked: bind.options.allow_when_locked,
+                        },
+                    );
                 }
 
                 match bind.press_action {
@@ -1013,10 +1051,10 @@ pub fn process_pointer_button_event(
         }
     }
 
-    // 4. Normal unintercepted click: clear any stale suppression, focus window, and forward!
+    // 4. Normal unintercepted click: clear any stale suppression, apply layer/window focus, and forward!
     state.keybinds.suppressed_buttons.remove(&button_code);
     let cursor_pos = state.pointer_location;
-    state.focus_window_at_point(cursor_pos);
+    state.handle_pointer_button_focus(cursor_pos);
     refresh_pointer_hover_focus(state, time);
 
     pointer.button(
@@ -1038,7 +1076,7 @@ fn find_mouse_button_bind_idx(
     phys_mod: PhysicalModKey,
 ) -> Option<usize> {
     let active_mode = &state.keybinds.active_mode;
-    let is_locked = state.is_session_locked;
+    let is_locked = state.is_locked_or_abandoned();
     let is_preempted = state
         .workspaces
         .get(&state.active_ws_id)
@@ -1048,7 +1086,7 @@ fn find_mouse_button_bind_idx(
         if !bind.enabled || &bind.mode != active_mode {
             return false;
         }
-        if is_locked && !bind.options.allow_when_locked {
+        if !is_keybind_allowed_for_lock_state(is_locked, bind.options.allow_when_locked) {
             return false;
         }
         if is_preempted && bind.options.when_preempted == "ignore" {
@@ -1067,6 +1105,7 @@ pub fn process_keyboard_key_event(
     time: InputTime,
     is_bare_metal_tty: bool,
 ) {
+    state.reconcile_session_lock();
     let serial = SERIAL_COUNTER.next_serial();
     let Some(keyboard) = state.seat.get_keyboard() else {
         return;
@@ -1098,8 +1137,13 @@ pub fn process_keyboard_key_event(
         if prev_mask != next_mask {
             state.keybinds.reset_scroll_trackers();
         }
-        if let Some(action) = release_act {
-            execute_action_descriptor(state, action, is_bare_metal_tty);
+        if let Some(rel) = release_act
+            && is_keybind_allowed_for_lock_state(
+                state.is_locked_or_abandoned(),
+                rel.allow_when_locked,
+            )
+        {
+            execute_action_descriptor(state, rel.action, is_bare_metal_tty);
         }
         return;
     }
@@ -1114,18 +1158,16 @@ pub fn process_keyboard_key_event(
         |state, modifiers, handle| {
             let modified_sym = handle.modified_sym();
             let mod_raw = modified_sym.raw();
+            let is_locked = state.is_locked_or_abandoned();
 
             // Gate 0a: Hardware Linux VT switch (`Ctrl + Alt + F1..F12` -> `XF86Switch_VT_1..12`)
-            if is_bare_metal_tty {
-                #[allow(non_upper_case_globals)]
-                if let keysyms::KEY_XF86Switch_VT_1..=keysyms::KEY_XF86Switch_VT_12 = mod_raw {
-                    let vt = (mod_raw - keysyms::KEY_XF86Switch_VT_1 + 1) as i32;
-                    return FilterResult::Intercept(InterceptOutcome::SwitchVt(vt));
-                }
+            if is_bare_metal_tty && let Some(vt) = parse_vt_switch_keysym(mod_raw) {
+                return FilterResult::Intercept(InterceptOutcome::SwitchVt(vt));
             }
 
             // Gate 0a2: Cancel active interactive Move/Resize grab on `Escape` (`niri/src/input/mod.rs` line 688)
-            if mod_raw == keysyms::KEY_Escape
+            if !is_locked
+                && mod_raw == keysyms::KEY_Escape
                 && state.seat.get_pointer().is_some_and(|p| p.is_grabbed())
             {
                 return FilterResult::Intercept(InterceptOutcome::CancelPointerGrab);
@@ -1134,12 +1176,12 @@ pub fn process_keyboard_key_event(
             let held_mask = modifiers_mask_from_smithay(modifiers);
             let phys_mod = state.keybinds.effective_mod_key(is_bare_metal_tty);
 
-            // Gate 0b: Ring 0 Human Preemptive Takeover (`Mod + G`) — NEVER overridable!
+            // Gate 0b: Ring 0 Human Preemptive Takeover (`Mod + G`) — blocked when locked!
             let raw_syms = handle.raw_syms();
             let candidate_syms = std::iter::once((modified_sym, true))
                 .chain(raw_syms.iter().copied().map(|s| (s, false)));
 
-            if held_mask == phys_mod.bit() {
+            if !is_locked && held_mask == phys_mod.bit() {
                 for (sym, _) in candidate_syms.clone() {
                     if matches!(sym.raw(), keysyms::KEY_g | keysyms::KEY_G) {
                         return FilterResult::Intercept(InterceptOutcome::TogglePreempt);
@@ -1149,7 +1191,6 @@ pub fn process_keyboard_key_event(
 
             // Gate 1: Match user-configured XKB keysym binds (`modified_sym` -> `raw_syms` fallback)
             let active_mode = state.keybinds.active_mode.clone();
-            let is_locked = state.is_session_locked;
             let is_preempted = state
                 .workspaces
                 .get(&state.active_ws_id)
@@ -1162,7 +1203,8 @@ pub fn process_keyboard_key_event(
                     if !bind.enabled || bind.mode != active_mode {
                         continue;
                     }
-                    if is_locked && !bind.options.allow_when_locked {
+                    if !is_keybind_allowed_for_lock_state(is_locked, bind.options.allow_when_locked)
+                    {
                         continue;
                     }
                     if is_preempted && bind.options.when_preempted == "ignore" {
@@ -1194,7 +1236,11 @@ pub fn process_keyboard_key_event(
             }
 
             let Some(idx) = matched_idx else {
-                if active_mode.is_some() && mod_raw == keysyms::KEY_Escape && held_mask == 0 {
+                if !is_locked
+                    && active_mode.is_some()
+                    && mod_raw == keysyms::KEY_Escape
+                    && held_mask == 0
+                {
                     return FilterResult::Intercept(InterceptOutcome::ExitSubmapMode);
                 }
                 return FilterResult::Forward;
@@ -1221,12 +1267,19 @@ pub fn process_keyboard_key_event(
 
             let press_act = bind.press_action.clone();
             let release_act = bind.release_action.clone();
+            let allow_when_locked = bind.options.allow_when_locked;
 
             if bind.options.cooldown_ms.is_some() {
                 state.keybinds.cooldowns_ms.insert(bind_id, now_ms);
             }
             if let Some(rel) = release_act {
-                state.keybinds.pending_releases.insert(raw_keycode, rel);
+                state.keybinds.pending_releases.insert(
+                    raw_keycode,
+                    PendingRelease {
+                        action: rel,
+                        allow_when_locked,
+                    },
+                );
             }
 
             if let Some(action) = press_act {
@@ -1301,6 +1354,7 @@ pub fn process_pointer_axis_event<B: InputBackend>(
     event: &B::PointerAxisEvent,
     is_bare_metal_tty: bool,
 ) {
+    state.reconcile_session_lock();
     let source = event.source();
     let time = event.time();
 
@@ -1560,7 +1614,7 @@ fn find_scroll_bind_idx(
     phys_mod: PhysicalModKey,
 ) -> Option<usize> {
     let active_mode = &state.keybinds.active_mode;
-    let is_locked = state.is_session_locked;
+    let is_locked = state.is_locked_or_abandoned();
     let is_preempted = state
         .workspaces
         .get(&state.active_ws_id)
@@ -1570,7 +1624,7 @@ fn find_scroll_bind_idx(
         if !bind.enabled || &bind.mode != active_mode {
             return false;
         }
-        if is_locked && !bind.options.allow_when_locked {
+        if !is_keybind_allowed_for_lock_state(is_locked, bind.options.allow_when_locked) {
             return false;
         }
         if is_preempted && bind.options.when_preempted == "ignore" {
@@ -1616,8 +1670,8 @@ fn fire_scroll_bind_ticks(
     consumed
 }
 
-/// Ensures Smithay's `PointerHandle` hover target matches the current active-Deck window surface
-/// before forwarding pointer button, scroll, or touchpad gesture events.
+/// Ensures Smithay's `PointerHandle` hover target matches the current Z-order hit-tested surface
+/// (LockSurface > Overlay > Top > windows > Bottom > Background) before forwarding pointer events.
 pub(crate) fn refresh_pointer_hover_focus(state: &mut KomaState, time: InputTime) {
     let Some(pointer) = state.seat.get_pointer() else {
         return;
@@ -1626,7 +1680,7 @@ pub(crate) fn refresh_pointer_hover_focus(state: &mut KomaState, time: InputTime
         return;
     }
     let pos = state.pointer_location;
-    let under = hit_test_active_deck_surface(state, pos);
+    let under = state.surface_under(pos);
     let current_ok = match (&under, pointer.current_focus()) {
         (Some((surf_a, _)), Some(surf_b)) => surf_a == &surf_b,
         (None, None) => true,
@@ -2420,5 +2474,80 @@ mod tests {
         let minimal =
             KeybindTable::compile_with_options(&[custom_spec], &[], false, Some("Super")).unwrap();
         assert_eq!(minimal.binds.len(), 3);
+    }
+
+    #[test]
+    fn locked_session_allows_only_allow_when_locked_and_vt_switch() {
+        assert!(is_keybind_allowed_for_lock_state(false, false));
+        assert!(is_keybind_allowed_for_lock_state(false, true));
+        assert!(!is_keybind_allowed_for_lock_state(true, false));
+        assert!(is_keybind_allowed_for_lock_state(true, true));
+
+        assert_eq!(
+            parse_vt_switch_keysym(keysyms::KEY_XF86Switch_VT_1),
+            Some(1)
+        );
+        assert_eq!(
+            parse_vt_switch_keysym(keysyms::KEY_XF86Switch_VT_12),
+            Some(12)
+        );
+        assert_eq!(parse_vt_switch_keysym(keysyms::KEY_Return), None);
+        assert_eq!(parse_vt_switch_keysym(keysyms::KEY_g), None);
+
+        let allowed_opts: BindOptions =
+            serde_json::from_str(r#"{"allow_when_locked": true}"#).expect("valid BindOptions JSON");
+        assert!(allowed_opts.allow_when_locked);
+        let default_opts: BindOptions =
+            serde_json::from_str(r#"{}"#).expect("default BindOptions JSON");
+        assert!(!default_opts.allow_when_locked);
+
+        let specs = vec![
+            BindSpec {
+                id: BindHandleId(700),
+                mode: None,
+                enabled: true,
+                chord: "XF86AudioRaiseVolume".to_owned(),
+                action: ActionDescriptor::Spawn {
+                    argv: vec!["wpctl".to_owned(), "set-volume".to_owned()],
+                },
+                release_action: None,
+                options: allowed_opts,
+            },
+            BindSpec {
+                id: BindHandleId(701),
+                mode: None,
+                enabled: true,
+                chord: "Mod + Return".to_owned(),
+                action: ActionDescriptor::Spawn {
+                    argv: vec!["foot".to_owned()],
+                },
+                release_action: None,
+                options: default_opts,
+            },
+        ];
+        let table = KeybindTable::compile_with_options(&specs, &[], false, Some("Super"))
+            .expect("keybind compilation succeeds");
+
+        let vol = table
+            .binds
+            .iter()
+            .find(|b| b.id == BindHandleId(700))
+            .expect("volume bind present");
+        assert!(vol.options.allow_when_locked);
+        assert!(is_keybind_allowed_for_lock_state(
+            true,
+            vol.options.allow_when_locked
+        ));
+
+        let term = table
+            .binds
+            .iter()
+            .find(|b| b.id == BindHandleId(701))
+            .expect("terminal bind present");
+        assert!(!term.options.allow_when_locked);
+        assert!(!is_keybind_allowed_for_lock_state(
+            true,
+            term.options.allow_when_locked
+        ));
     }
 }

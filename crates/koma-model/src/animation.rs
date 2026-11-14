@@ -856,11 +856,7 @@ mod tests {
         };
         // 6 * 2^3 = 48 px expansion radius
         assert_eq!(blur.damage_expansion_radius_px(), 48);
-        let vp = LogicalViewport {
-            width: 1920,
-            height: 1080,
-            scale: 1.0,
-        };
+        let vp = LogicalViewport::new(1920, 1080, 1.0);
         let expanded = blur.expand_damage_rect(LogicalRect::new(100, 100, 200, 150), vp);
         assert_eq!(expanded, LogicalRect::new(52, 52, 296, 246));
     }

@@ -302,10 +302,18 @@ impl DwindleTree {
     }
 
     fn work_area(&self, viewport: LogicalViewport) -> LogicalRect {
+        let wa = viewport.work_area_rect();
         let og = self.config.outer_gap;
-        let w = viewport.width.saturating_sub(og.saturating_mul(2)).max(64);
-        let h = viewport.height.saturating_sub(og.saturating_mul(2)).max(64);
-        LogicalRect::new(og as i32, og as i32, w, h)
+        let w = wa.w.saturating_sub(og.saturating_mul(2)).max(64);
+        let h = wa.h.saturating_sub(og.saturating_mul(2)).max(64);
+        let max_x = wa.x.saturating_add((wa.w as i32 - w as i32).max(0));
+        let max_y = wa.y.saturating_add((wa.h as i32 - h as i32).max(0));
+        LogicalRect::new(
+            (wa.x + og as i32).min(max_x),
+            (wa.y + og as i32).min(max_y),
+            w,
+            h,
+        )
     }
 
     /// Predicts the exact 4-quadrant `smart_split` drop zone (`Left`, `Right`, `Up`, `Down`) and
@@ -1399,11 +1407,7 @@ mod tests {
     use super::*;
 
     fn vp() -> LogicalViewport {
-        LogicalViewport {
-            width: 1920,
-            height: 1080,
-            scale: 1.0,
-        }
+        LogicalViewport::new(1920, 1080, 1.0)
     }
 
     #[test]

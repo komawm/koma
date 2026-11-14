@@ -841,20 +841,14 @@ impl ScrollingStrip {
 
     #[must_use]
     fn usable_width(&self, viewport: LogicalViewport) -> f64 {
-        f64::from(
-            viewport
-                .width
-                .saturating_sub(self.config.outer_gap * 2)
-                .max(64),
-        )
+        let wa = viewport.work_area_rect();
+        f64::from(wa.w.saturating_sub(self.config.outer_gap * 2).max(64))
     }
 
     #[must_use]
     fn usable_height(&self, viewport: LogicalViewport) -> u32 {
-        viewport
-            .height
-            .saturating_sub(self.config.outer_gap * 2)
-            .max(64)
+        let wa = viewport.work_area_rect();
+        wa.h.saturating_sub(self.config.outer_gap * 2).max(64)
     }
 
     #[must_use]
@@ -1330,7 +1324,10 @@ impl ScrollingStrip {
             return Vec::new();
         }
 
+        let wa = viewport.work_area_rect();
         let og = f64::from(self.config.outer_gap);
+        let left_og = f64::from(wa.x) + og;
+        let top_og = f64::from(wa.y) + og;
         let usable_w = self.usable_width(viewport);
         let usable_h = f64::from(self.usable_height(viewport));
         let spans = self.column_spans(usable_w);
@@ -1345,9 +1342,11 @@ impl ScrollingStrip {
                 continue;
             }
 
-            let screen_x = og + (strip_x - cam_x);
+            let screen_x = left_og + (strip_x - cam_x);
             let margin = ind.width + ind.gap + 4.0;
-            if screen_x + col_w + margin <= 0.0 || screen_x - margin >= f64::from(viewport.width) {
+            if screen_x + col_w + margin <= f64::from(wa.x)
+                || screen_x - margin >= f64::from(wa.x + wa.w as i32)
+            {
                 continue;
             }
 
@@ -1358,7 +1357,7 @@ impl ScrollingStrip {
             match ind.position {
                 TabIndicatorPosition::Left | TabIndicatorPosition::Right => {
                     let total_bar_h = (usable_h * ind.length_proportion.clamp(0.1, 1.0)).max(24.0);
-                    let start_y = og + (usable_h - total_bar_h) * 0.5;
+                    let start_y = top_og + (usable_h - total_bar_h) * 0.5;
                     let total_gaps = seg_gap * ((n - 1) as f64);
                     let seg_h = ((total_bar_h - total_gaps) / (n as f64)).max(6.0);
 
@@ -1394,10 +1393,12 @@ impl ScrollingStrip {
                     let seg_w = ((total_bar_w - total_gaps) / (n as f64)).max(6.0);
 
                     let bar_y = match (ind.position, ind.place_within_column) {
-                        (TabIndicatorPosition::Top, false) => og - ind.gap - ind.width,
-                        (TabIndicatorPosition::Top, true) => og + ind.gap,
-                        (TabIndicatorPosition::Bottom, false) => og + usable_h + ind.gap,
-                        (TabIndicatorPosition::Bottom, true) => og + usable_h - ind.gap - ind.width,
+                        (TabIndicatorPosition::Top, false) => top_og - ind.gap - ind.width,
+                        (TabIndicatorPosition::Top, true) => top_og + ind.gap,
+                        (TabIndicatorPosition::Bottom, false) => top_og + usable_h + ind.gap,
+                        (TabIndicatorPosition::Bottom, true) => {
+                            top_og + usable_h - ind.gap - ind.width
+                        }
                         _ => unreachable!(),
                     };
 
@@ -1715,7 +1716,10 @@ impl ScrollingStrip {
         viewport: LogicalViewport,
         now_ms: u64,
     ) -> ScrollingDropZone {
+        let wa = viewport.work_area_rect();
         let og = self.config.outer_gap as i32;
+        let origin_x = wa.x + og;
+        let origin_y = wa.y + og;
         let usable_w = self.usable_width(viewport);
         let usable_h = self.usable_height(viewport);
         let preview_w = (self
@@ -1729,13 +1733,13 @@ impl ScrollingStrip {
             let px = if self.config.center_focused_column == CenterFocusedColumn::Always
                 || self.config.always_center_single_column
             {
-                og + ((usable_w.round() as i32 - preview_w as i32) / 2).max(0)
+                origin_x + ((usable_w.round() as i32 - preview_w as i32) / 2).max(0)
             } else {
-                og
+                origin_x
             };
             return ScrollingDropZone {
                 target: ScrollingDropTarget::NewColumn { insert_idx: 0 },
-                preview_rect: LogicalRect::new(px, og, preview_w, usable_h),
+                preview_rect: LogicalRect::new(px, origin_y, preview_w, usable_h),
             };
         }
 
@@ -1745,7 +1749,7 @@ impl ScrollingStrip {
 
         // 1. Check if cursor is inside the central `[0.25..0.75]` X band of a visible column -> stack vertically!
         for (c_idx, &(strip_x, col_w)) in spans.iter().enumerate() {
-            let screen_x = f64::from(og) + (strip_x - cam_now);
+            let screen_x = f64::from(origin_x) + (strip_x - cam_now);
             let inner_left = screen_x + col_w * 0.25;
             let inner_right = screen_x + col_w * 0.75;
             if cursor.x >= inner_left && cursor.x <= inner_right {
@@ -1755,7 +1759,8 @@ impl ScrollingStrip {
                     self.config.inner_gap,
                     usable_h,
                 );
-                for (t_idx, &(_, ty, th)) in v_spans.iter().enumerate() {
+                for (t_idx, &(_, ty_rel, th)) in v_spans.iter().enumerate() {
+                    let ty = wa.y + ty_rel;
                     let t_bottom = ty + th as i32;
                     if cursor.y <= f64::from(t_bottom) || t_idx + 1 == v_spans.len() {
                         let mid_y = f64::from(ty) + f64::from(th) * 0.5;
@@ -1765,10 +1770,10 @@ impl ScrollingStrip {
                         } else {
                             (t_idx + 1, ty + (th as i32 - half_h as i32).max(0))
                         };
-                        let clamped_x =
-                            (screen_x.round() as i32).clamp(0, (viewport.width as i32 - 64).max(0));
-                        let clamped_w = (col_w.round() as u32)
-                            .min(viewport.width.saturating_sub(clamped_x as u32).max(64));
+                        let max_cx = wa.x + (wa.w as i32 - 64).max(0);
+                        let clamped_x = (screen_x.round() as i32).clamp(wa.x, max_cx.max(wa.x));
+                        let avail_w = (wa.x + wa.w as i32 - clamped_x).max(64) as u32;
+                        let clamped_w = (col_w.round() as u32).min(avail_w);
                         return ScrollingDropZone {
                             target: ScrollingDropTarget::StackIntoColumn {
                                 col_idx: c_idx,
@@ -1783,26 +1788,27 @@ impl ScrollingStrip {
 
         // 2. Otherwise insert as a standalone column at the nearest column boundary!
         let mut insert_idx = self.columns.len();
-        let mut slot_screen_x =
-            f64::from(og) + spans.last().map_or(0.0, |&(lx, lw)| lx + lw + gap * 0.5) - cam_now;
+        let mut slot_screen_x = f64::from(origin_x)
+            + spans.last().map_or(0.0, |&(lx, lw)| lx + lw + gap * 0.5)
+            - cam_now;
 
         for (idx, &(strip_x, col_w)) in spans.iter().enumerate() {
-            let screen_mid = f64::from(og) + (strip_x - cam_now) + col_w * 0.5;
+            let screen_mid = f64::from(origin_x) + (strip_x - cam_now) + col_w * 0.5;
             if cursor.x < screen_mid {
                 insert_idx = idx;
-                slot_screen_x = f64::from(og) + (strip_x - cam_now);
+                slot_screen_x = f64::from(origin_x) + (strip_x - cam_now);
                 break;
             }
         }
 
-        let min_px = og;
-        let max_px = og + (usable_w.round() as i32 - preview_w as i32).max(0);
+        let min_px = origin_x;
+        let max_px = origin_x + (usable_w.round() as i32 - preview_w as i32).max(0);
         let clamped_px =
             (slot_screen_x.round() as i32 - (preview_w as i32 / 4)).clamp(min_px, max_px);
 
         ScrollingDropZone {
             target: ScrollingDropTarget::NewColumn { insert_idx },
-            preview_rect: LogicalRect::new(clamped_px, og, preview_w, usable_h),
+            preview_rect: LogicalRect::new(clamped_px, origin_y, preview_w, usable_h),
         }
     }
 
@@ -2248,6 +2254,7 @@ impl ScrollingStrip {
         if self.columns.is_empty() {
             return Vec::new();
         }
+        let wa = viewport.work_area_rect();
         let og = self.config.outer_gap as i32;
         let usable_w = self.usable_width(viewport);
         let usable_h = self.usable_height(viewport);
@@ -2255,14 +2262,15 @@ impl ScrollingStrip {
         let mut out = Vec::with_capacity(self.window_count());
 
         for (col, (strip_x, col_w)) in self.columns.iter().zip(spans) {
-            let cx = og + strip_x.round() as i32;
+            let cx = wa.x + og + strip_x.round() as i32;
             let cw = col_w.round() as u32;
             for (win_id, ty, th) in col.compute_vertical_tile_spans(
                 self.config.outer_gap,
                 self.config.inner_gap,
                 usable_h,
             ) {
-                let r = self.apply_within_column_tab_inset(col, LogicalRect::new(cx, ty, cw, th));
+                let r = self
+                    .apply_within_column_tab_inset(col, LogicalRect::new(cx, wa.y + ty, cw, th));
                 out.push((win_id, r));
             }
         }
@@ -2280,13 +2288,14 @@ impl ScrollingStrip {
         if self.columns.is_empty() {
             return out;
         }
+        let wa = viewport.work_area_rect();
         let og = self.config.outer_gap as i32;
         let usable_w = self.usable_width(viewport);
         let usable_h = self.usable_height(viewport);
         let spans = self.column_spans(usable_w);
 
         for (col, (strip_x, col_w)) in self.columns.iter().zip(spans) {
-            let screen_x = f64::from(og) + (strip_x - cam_x);
+            let screen_x = f64::from(wa.x + og) + (strip_x - cam_x);
             if screen_x + col_w > 0.0 && screen_x < f64::from(viewport.width) {
                 let rx = screen_x.round() as i32;
                 let rw = col_w.round() as u32;
@@ -2295,8 +2304,10 @@ impl ScrollingStrip {
                     self.config.inner_gap,
                     usable_h,
                 ) {
-                    let r =
-                        self.apply_within_column_tab_inset(col, LogicalRect::new(rx, ty, rw, th));
+                    let r = self.apply_within_column_tab_inset(
+                        col,
+                        LogicalRect::new(rx, wa.y + ty, rw, th),
+                    );
                     out.push((win_id, r));
                 }
             }
@@ -2315,11 +2326,7 @@ mod tests {
     use super::*;
 
     fn vp_1920() -> LogicalViewport {
-        LogicalViewport {
-            width: 1920,
-            height: 1080,
-            scale: 1.0,
-        }
+        LogicalViewport::new(1920, 1080, 1.0)
     }
 
     #[test]

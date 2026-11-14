@@ -469,6 +469,21 @@ fn handle_raw_frame(
     }
 }
 
+/// Fail-closed IPC gate: blocks frame capture, scene introspection, and state mutation
+/// whenever the compositor is `Locked` or `Abandoned`, permitting only read-only `config.status`.
+pub(crate) fn check_ipc_lock_gate(
+    is_locked_or_abandoned: bool,
+    method: &str,
+) -> Result<(), IpcError> {
+    if is_locked_or_abandoned && method != "config.status" {
+        return Err(IpcError::new(
+            ErrorSymbol::ErrCapabilityDenied,
+            "session is locked",
+        ));
+    }
+    Ok(())
+}
+
 /// Authorizes and executes a parsed `IpcRequest` against `KomaState`.
 fn dispatch_rpc(
     state: &mut KomaState,
@@ -476,6 +491,7 @@ fn dispatch_rpc(
     req: IpcRequest,
     _inbound_fds: Vec<OwnedFd>,
 ) -> Result<(Value, Vec<OwnedFd>), IpcError> {
+    state.reconcile_session_lock();
     let now_ms = state.elapsed_ms();
     let (channel, auth_snapshot) = {
         let conn = state
@@ -494,6 +510,9 @@ fn dispatch_rpc(
             "first frame on koma-agent.sock must be auth.authenticate",
         ));
     }
+
+    // Gate 1: Fail-closed session lock gate blocks capture/inventory/mutation in `Locked`/`Abandoned`.
+    check_ipc_lock_gate(state.is_locked_or_abandoned(), &req.method)?;
 
     match req.method.as_str() {
         "auth.mint_token" => {
@@ -1425,6 +1444,8 @@ fn dispatch_rpc(
                     "active_path": active_path,
                     "last_error": state.config_error_banner,
                     "deferred_vm_pending": state.deferred_lua_sandbox.is_some(),
+                    "locked": state.is_locked_or_abandoned(),
+                    "lock_phase": state.session_lock.phase_label(),
                 }),
                 Vec::new(),
             ))
@@ -1444,6 +1465,13 @@ fn execute_zero_copy_capture_frame(
     state: &mut KomaState,
     params: &CaptureFrameParams,
 ) -> Result<(Value, Vec<OwnedFd>), IpcError> {
+    state.reconcile_session_lock();
+    if state.is_locked_or_abandoned() {
+        return Err(IpcError::new(
+            ErrorSymbol::ErrCapabilityDenied,
+            "session is locked",
+        ));
+    }
     let (viewport, epoch, lease_state) = {
         let ws = state
             .workspaces
@@ -1654,4 +1682,36 @@ fn generate_ephemeral_capability_token() -> Result<CapabilityToken, IpcError> {
         CapabilityToken::PREFIX,
         URL_SAFE_NO_PAD.encode(raw)
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ipc_lock_gate_denies_capture_and_sensitive_methods_when_locked_or_abandoned() {
+        assert!(check_ipc_lock_gate(false, "capture.frame").is_ok());
+        assert!(check_ipc_lock_gate(false, "scene.inventory").is_ok());
+        assert!(check_ipc_lock_gate(true, "config.status").is_ok());
+
+        for blocked_method in [
+            "capture.frame",
+            "scene.inventory",
+            "win.activate",
+            "win.close",
+            "ws.focus",
+            "ws.create",
+            "lease.acquire",
+            "macro.run",
+            "events.subscribe",
+            "vseat.key",
+            "lua.exec_tx",
+            "config.reload",
+        ] {
+            let err = check_ipc_lock_gate(true, blocked_method)
+                .expect_err("sensitive IPC method must fail closed when locked");
+            assert_eq!(err.symbol, ErrorSymbol::ErrCapabilityDenied);
+            assert_eq!(err.message, "session is locked");
+        }
+    }
 }

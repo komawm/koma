@@ -252,6 +252,7 @@ fn bind_wayland_listening_socket(
                         .dispatch_clients(state)
                         .expect("Wayland client dispatch error");
                 }
+                state.reconcile_session_lock();
                 Ok(PostAction::Continue)
             },
         )
@@ -374,11 +375,7 @@ fn run_bare_metal_tty(
         event_loop.get_signal(),
         socket_name.clone(),
         &seat_name,
-        LogicalViewport {
-            width: 1920,
-            height: 1080,
-            scale: 1.0,
-        },
+        LogicalViewport::new(1920, 1080, 1.0),
     );
     state.loop_handle = Some(event_loop.handle());
 
