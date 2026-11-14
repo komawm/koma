@@ -54,11 +54,7 @@ use smithay::{
         },
         libinput::{LibinputInputBackend, LibinputSessionInterface},
         renderer::{
-            ImportDma as _,
-            element::{
-                Kind,
-                surface::{WaylandSurfaceRenderElement, render_elements_from_surface_tree},
-            },
+            Color32F, ImportDma as _,
             gles::GlesRenderer,
             multigpu::{GpuManager, MultiRenderer, gbm::GbmGlesBackend},
         },
@@ -68,7 +64,6 @@ use smithay::{
         },
         udev::{self, UdevBackend, UdevEvent},
     },
-    desktop::{layer_map_for_output, utils::send_frames_surface_tree},
     input::{keyboard::KeyboardSource, pointer::MotionEvent},
     output::{Mode, Output, OutputModeSource, PhysicalProperties, Scale},
     reexports::{
@@ -88,7 +83,10 @@ use smithay_drm_extras::drm_scanner::{DrmScanEvent, DrmScanner};
 use tracing::{debug, info, trace, warn};
 
 use crate::{
-    backend_winit::hit_test_active_deck_surface,
+    backend_winit::{
+        append_layer_tier_elements, assemble_locked_frame_elements,
+        dispatch_output_frame_callbacks_filtered,
+    },
     state::{ActiveBackend, KomaState},
 };
 
@@ -369,6 +367,16 @@ impl TtyBackendState {
             .flat_map(|d| d.surfaces.values())
             .next()
             .map(|s| s.output.clone())
+    }
+
+    /// Returns all active KMS `Output`s across all DRM devices.
+    #[must_use]
+    pub fn all_outputs(&self) -> Vec<Output> {
+        self.devices
+            .values()
+            .flat_map(|d| d.surfaces.values())
+            .map(|s| s.output.clone())
+            .collect()
     }
 
     /// Marks all active KMS surfaces dirty so the next `calloop` iteration renders or schedules after VBlank.
@@ -1275,6 +1283,7 @@ fn on_drm_vblank_callback(
 /// Renders every `SurfaceRedrawState::Queued` KMS surface that is not currently awaiting VBlank.
 pub fn render_pending_tty_outputs(state: &mut KomaState) {
     state.redraw_queued = false;
+    state.reconcile_session_lock();
 
     let Some(ActiveBackend::Tty(mut tty)) = state.backend.take() else {
         return;
@@ -1344,7 +1353,10 @@ fn render_single_drm_surface(
         }
     };
 
-    state.tick_frame_animations_and_edge_scroll();
+    let locked = state.is_locked_or_abandoned();
+    if !locked {
+        state.tick_frame_animations_and_edge_scroll();
+    }
     let pointer_loc = state.pointer_location;
     let now_ms = state.elapsed_ms();
     let cursor_elems =
@@ -1357,160 +1369,134 @@ fn render_single_drm_surface(
     {
         state.schedule_cursor_animation_redraw(delay_ms);
     }
-    let (base_scene_items, special_overlay) = state.collect_physical_scene_items();
-    let blur_cfg = state.lua_sandbox.config_snapshot().appearance.blur;
-    let any_window_needs_blur = blur_cfg.enabled
-        && base_scene_items
-            .iter()
-            .chain(special_overlay.iter().flat_map(|(_, v)| v.iter()))
-            .any(|it| it.wants_blur && (blur_cfg.ignore_opacity || it.opacity < 0.999));
 
-    let frame_blur_ctx = if any_window_needs_blur {
-        let phys_sz = surface
-            .output
-            .current_mode()
-            .map(|m| m.size)
-            .unwrap_or_else(|| (1920, 1080).into());
-        let mut gles_bg_elems: Vec<KomaRenderElement<GlesRenderer>> = Vec::new();
-        {
-            let map = layer_map_for_output(&surface.output);
-            for tier in [Layer::Bottom, Layer::Background] {
-                for layer in map.layers_on(tier) {
-                    if let Some(geo) = map.layer_geometry(layer) {
-                        let loc_phys = geo.loc.to_f64().to_physical_precise_round(output_scale);
-                        let l_elems: Vec<WaylandSurfaceRenderElement<GlesRenderer>> =
-                            render_elements_from_surface_tree(
-                                renderer.as_mut(),
-                                layer.wl_surface(),
-                                loc_phys,
-                                output_scale,
-                                1.0,
-                                Kind::Unspecified,
-                            );
-                        gles_bg_elems.extend(l_elems.into_iter().map(KomaRenderElement::from));
-                    }
-                }
-            }
-        }
-        state
-            .backdrop_blur_cache
-            .borrow_mut()
-            .update_and_blur(
-                renderer.as_mut(),
-                phys_sz,
+    let (elements, clear_color): (Vec<KomaRenderElement<TtyRenderer<'_>>>, Color32F) = if locked {
+        (
+            assemble_locked_frame_elements(
+                &mut renderer,
+                state,
+                &surface.output,
                 output_scale,
-                DEFAULT_BACKDROP_CLEAR,
-                &gles_bg_elems,
-                blur_cfg,
-            )
-            .map(|texture| FrameBlurContext {
-                texture,
-                config: blur_cfg,
-            })
+                cursor_elems,
+            ),
+            Color32F::new(0.0, 0.0, 0.0, 1.0),
+        )
     } else {
-        None
-    };
+        let (base_scene_items, special_overlay) = state.collect_physical_scene_items();
+        let blur_cfg = state.lua_sandbox.config_snapshot().appearance.blur;
+        let any_window_needs_blur = blur_cfg.enabled
+            && base_scene_items
+                .iter()
+                .chain(special_overlay.iter().flat_map(|(_, v)| v.iter()))
+                .any(|it| it.wants_blur && (blur_cfg.ignore_opacity || it.opacity < 0.999));
 
-    // Assemble front-to-back elements: Overlay/Top layer-shell -> Scratchpad -> Base Space -> Bottom/Bg layers
-    let mut elements: Vec<KomaRenderElement<TtyRenderer<'_>>> = Vec::new();
-    {
-        let map = layer_map_for_output(&surface.output);
-        for tier in [Layer::Overlay, Layer::Top] {
-            for layer in map.layers_on(tier) {
-                if let Some(geo) = map.layer_geometry(layer) {
-                    let loc_phys = geo.loc.to_f64().to_physical_precise_round(output_scale);
-                    let l_elems: Vec<WaylandSurfaceRenderElement<TtyRenderer<'_>>> =
-                        render_elements_from_surface_tree(
-                            &mut renderer,
-                            layer.wl_surface(),
-                            loc_phys,
-                            output_scale,
-                            1.0,
-                            Kind::Unspecified,
-                        );
-                    elements.extend(l_elems.into_iter().map(KomaRenderElement::from));
-                }
-            }
+        let frame_blur_ctx = if any_window_needs_blur {
+            let phys_sz = surface
+                .output
+                .current_mode()
+                .map(|m| m.size)
+                .unwrap_or_else(|| (1920, 1080).into());
+            let mut gles_bg_elems: Vec<KomaRenderElement<GlesRenderer>> = Vec::new();
+            append_layer_tier_elements(
+                renderer.as_mut(),
+                &surface.output,
+                output_scale,
+                [Layer::Bottom, Layer::Background],
+                &mut gles_bg_elems,
+            );
+            state
+                .backdrop_blur_cache
+                .borrow_mut()
+                .update_and_blur(
+                    renderer.as_mut(),
+                    phys_sz,
+                    output_scale,
+                    DEFAULT_BACKDROP_CLEAR,
+                    &gles_bg_elems,
+                    blur_cfg,
+                )
+                .map(|texture| FrameBlurContext {
+                    texture,
+                    config: blur_cfg,
+                })
+        } else {
+            None
+        };
+
+        // Assemble front-to-back elements: Overlay/Top layer-shell -> Scratchpad -> Base Space -> Bottom/Bg layers
+        let mut elements: Vec<KomaRenderElement<TtyRenderer<'_>>> = Vec::new();
+        append_layer_tier_elements(
+            &mut renderer,
+            &surface.output,
+            output_scale,
+            [Layer::Overlay, Layer::Top],
+            &mut elements,
+        );
+
+        if let Some((sp_lease, sp_items)) = &special_overlay {
+            let sp_drop = state
+                .active_special_ws_id
+                .as_ref()
+                .and_then(|sp_id| state.drop_preview_for_workspace(sp_id));
+            let sp_elems = assemble_workspace_elements(
+                &mut renderer,
+                viewport,
+                output_scale,
+                sp_lease,
+                RenderTargetKind::PhysicalOutput,
+                OverlayKind::None,
+                frame_blur_ctx.as_ref(),
+                sp_drop,
+                sp_items,
+            );
+            elements.extend(sp_elems);
+            append_scratchpad_dim_scrim(viewport, &mut elements);
         }
-    }
 
-    if let Some((sp_lease, sp_items)) = &special_overlay {
-        let sp_drop = state
-            .active_special_ws_id
-            .as_ref()
-            .and_then(|sp_id| state.drop_preview_for_workspace(sp_id));
-        let sp_elems = assemble_workspace_elements(
+        if let Some(ws) = state.workspaces.get(&state.active_ws_id)
+            && ws.layout_mode == koma_model::LayoutMode::Scrolling
+            && ws.fullscreen_window.is_none()
+        {
+            let cam_x = ws.scrolling.peek_camera_x(state.elapsed_ms());
+            let tab_segs = ws.scrolling.tab_indicator_segments_at(viewport, cam_x);
+            append_tab_indicator_elements(&mut renderer, output_scale, &tab_segs, &mut elements);
+        }
+        let base_drop = state.drop_preview_for_workspace(&state.active_ws_id);
+        let ws_elements = assemble_workspace_elements(
             &mut renderer,
             viewport,
             output_scale,
-            sp_lease,
+            &lease_state,
             RenderTargetKind::PhysicalOutput,
             OverlayKind::None,
             frame_blur_ctx.as_ref(),
-            sp_drop,
-            sp_items,
+            base_drop,
+            &base_scene_items,
         );
-        elements.extend(sp_elems);
-        append_scratchpad_dim_scrim(viewport, &mut elements);
-    }
-
-    if let Some(ws) = state.workspaces.get(&state.active_ws_id)
-        && ws.layout_mode == koma_model::LayoutMode::Scrolling
-        && ws.fullscreen_window.is_none()
-    {
-        let cam_x = ws.scrolling.peek_camera_x(state.elapsed_ms());
-        let tab_segs = ws.scrolling.tab_indicator_segments_at(viewport, cam_x);
-        append_tab_indicator_elements(&mut renderer, output_scale, &tab_segs, &mut elements);
-    }
-    let base_drop = state.drop_preview_for_workspace(&state.active_ws_id);
-    let ws_elements = assemble_workspace_elements(
-        &mut renderer,
-        viewport,
-        output_scale,
-        &lease_state,
-        RenderTargetKind::PhysicalOutput,
-        OverlayKind::None,
-        frame_blur_ctx.as_ref(),
-        base_drop,
-        &base_scene_items,
-    );
-    elements.extend(ws_elements);
-    if state.config_error_banner.is_some() {
-        prepend_config_error_banner(viewport, &mut elements);
-    }
-
-    {
-        let map = layer_map_for_output(&surface.output);
-        for tier in [Layer::Bottom, Layer::Background] {
-            for layer in map.layers_on(tier) {
-                if let Some(geo) = map.layer_geometry(layer) {
-                    let loc_phys = geo.loc.to_f64().to_physical_precise_round(output_scale);
-                    let l_elems: Vec<WaylandSurfaceRenderElement<TtyRenderer<'_>>> =
-                        render_elements_from_surface_tree(
-                            &mut renderer,
-                            layer.wl_surface(),
-                            loc_phys,
-                            output_scale,
-                            1.0,
-                            Kind::Unspecified,
-                        );
-                    elements.extend(l_elems.into_iter().map(KomaRenderElement::from));
-                }
-            }
+        elements.extend(ws_elements);
+        if state.config_error_banner.is_some() {
+            prepend_config_error_banner(viewport, &mut elements);
         }
-    }
 
-    elements.splice(0..0, cursor_elems);
+        append_layer_tier_elements(
+            &mut renderer,
+            &surface.output,
+            output_scale,
+            [Layer::Bottom, Layer::Background],
+            &mut elements,
+        );
+
+        elements.splice(0..0, cursor_elems);
+        (elements, DEFAULT_BACKDROP_CLEAR)
+    };
 
     let scanout_flags =
         FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY | FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT;
 
-    match surface.compositor.render_frame(
-        &mut renderer,
-        &elements,
-        DEFAULT_BACKDROP_CLEAR,
-        scanout_flags,
-    ) {
+    match surface
+        .compositor
+        .render_frame(&mut renderer, &elements, clear_color, scanout_flags)
+    {
         Ok(res) => {
             if res.needs_sync()
                 && let PrimaryPlaneElement::Swapchain(elem) = res.primary_element
@@ -1523,7 +1509,7 @@ fn render_single_drm_surface(
                 match surface.compositor.queue_frame(()) {
                     Ok(()) => {
                         surface.redraw_state = SurfaceRedrawState::WaitingForVBlank {
-                            redraw_needed: state.has_active_animations(),
+                            redraw_needed: !locked && state.has_active_animations(),
                         };
                         return None;
                     }
@@ -1557,23 +1543,7 @@ fn render_single_drm_surface(
 }
 
 fn dispatch_output_frame_callbacks(state: &KomaState, output: &Output, refresh_interval: Duration) {
-    let elapsed = state.elapsed_duration();
-    for wl_surf in state.visible_physical_toplevel_surfaces() {
-        send_frames_surface_tree(&wl_surf, output, elapsed, Some(refresh_interval), |_, _| {
-            Some(output.clone())
-        });
-    }
-
-    let map = layer_map_for_output(output);
-    for layer in map.layers() {
-        send_frames_surface_tree(
-            layer.wl_surface(),
-            output,
-            elapsed,
-            Some(refresh_interval),
-            |_, _| Some(output.clone()),
-        );
-    }
+    dispatch_output_frame_callbacks_filtered(state, output, Some(refresh_interval));
 }
 
 /// Processes physical bare-metal `libinput` keyboard, pointer scroll (`Mod+WheelScroll*` /
@@ -1608,8 +1578,9 @@ where
             let next_y = (state.pointer_location.y + delta.y).clamp(0.0, (max_h - 1.0).max(0.0));
             let pos = Point::from((next_x, next_y));
             state.pointer_location = pos;
+            state.reconcile_session_lock();
 
-            let under = hit_test_active_deck_surface(state, pos);
+            let under = state.surface_under(pos);
             if let Some(pointer) = state.seat.get_pointer() {
                 let serial = SERIAL_COUNTER.next_serial();
                 pointer.motion(
@@ -1635,8 +1606,9 @@ where
                 .unwrap_or((1920, 1080));
             let pos: Point<f64, _> = event.position_transformed(out_geo_size.into());
             state.pointer_location = pos;
+            state.reconcile_session_lock();
 
-            let under = hit_test_active_deck_surface(state, pos);
+            let under = state.surface_under(pos);
             if let Some(pointer) = state.seat.get_pointer() {
                 let serial = SERIAL_COUNTER.next_serial();
                 pointer.motion(

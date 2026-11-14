@@ -30,20 +30,26 @@ use koma_seat::VirtualSeatLedger;
 use smithay::{
     backend::{
         allocator::dmabuf::Dmabuf,
-        renderer::{ImportDma as _, gles::GlesRenderer},
+        renderer::{ImportDma as _, gles::GlesRenderer, utils::with_renderer_surface_state},
     },
-    desktop::{PopupManager, Window, WindowSurfaceType},
+    desktop::{
+        LayerMap, PopupManager, Window, WindowSurfaceType, layer_map_for_output,
+        utils::under_from_surface_tree,
+    },
     input::{Seat, SeatState, keyboard::XkbConfig, pointer::CursorImageStatus},
     output::Output,
     reexports::{
-        wayland_protocols::xdg::shell::server::xdg_toplevel,
+        wayland_protocols::{
+            ext::session_lock::v1::server::ext_session_lock_v1::ExtSessionLockV1,
+            xdg::shell::server::xdg_toplevel,
+        },
         wayland_server::{
-            DisplayHandle,
+            DisplayHandle, Resource as _,
             backend::{ClientData, ClientId, DisconnectReason},
             protocol::wl_surface::WlSurface,
         },
     },
-    utils::{Logical, Point, Size},
+    utils::{IsAlive as _, Logical, Point, SERIAL_COUNTER, Size},
     wayland::{
         compositor::{CompositorClientState, CompositorState, with_states},
         cursor_shape::CursorShapeManagerState,
@@ -58,9 +64,9 @@ use smithay::{
             primary_selection::PrimarySelectionState,
             wlr_data_control::DataControlState as WlrDataControlState,
         },
-        session_lock::SessionLockManagerState,
+        session_lock::{LockSurface, SessionLockManagerState},
         shell::{
-            wlr_layer::WlrLayerShellState,
+            wlr_layer::{KeyboardInteractivity, Layer, WlrLayerShellState},
             xdg::{SurfaceCachedState, ToplevelSurface, XdgShellState, XdgToplevelSurfaceData},
         },
         shm::ShmState,
@@ -95,6 +101,266 @@ use crate::{
     xwayland_satellite::SatelliteSlot,
 };
 
+/// Fail-closed state machine for `ext-session-lock-v1`.
+///
+/// Once locked, client disconnect or locker destruction without `unlock_and_destroy` moves
+/// the session into [`Self::Abandoned`] rather than unlocking, keeping blackout rendering and
+/// input/IPC denials enforced until a new lock client locks and cleanly unlocks.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum SessionLockPhase {
+    #[default]
+    Unlocked,
+    Locked(Option<ExtSessionLockV1>),
+    Abandoned,
+}
+
+/// Coordinates fail-closed session lock state and per-output `LockSurface` handles.
+#[derive(Debug, Default)]
+pub struct SessionLockCoordinator {
+    pub phase: SessionLockPhase,
+    pub surfaces: HashMap<Output, LockSurface>,
+}
+
+impl SessionLockCoordinator {
+    /// Resolves the effective lock phase, detecting a dead `ExtSessionLockV1` even before mutation.
+    #[must_use]
+    pub fn effective_phase(&self) -> SessionLockPhase {
+        match &self.phase {
+            SessionLockPhase::Unlocked => SessionLockPhase::Unlocked,
+            SessionLockPhase::Abandoned => SessionLockPhase::Abandoned,
+            SessionLockPhase::Locked(Some(locker)) if !locker.is_alive() => {
+                SessionLockPhase::Abandoned
+            }
+            SessionLockPhase::Locked(opt) => SessionLockPhase::Locked(opt.clone()),
+        }
+    }
+
+    #[must_use]
+    pub fn is_locked_or_abandoned(&self) -> bool {
+        !matches!(self.effective_phase(), SessionLockPhase::Unlocked)
+    }
+
+    #[must_use]
+    pub fn phase_label(&self) -> &'static str {
+        match self.effective_phase() {
+            SessionLockPhase::Unlocked => "unlocked",
+            SessionLockPhase::Locked(_) => "locked",
+            SessionLockPhase::Abandoned => "abandoned",
+        }
+    }
+
+    /// Transitions `Locked` -> `Abandoned` when the active locker resource/client dies and purges dead surfaces.
+    pub fn reconcile_liveness(&mut self) -> bool {
+        let before = self.surfaces.len();
+        self.surfaces.retain(|_, surf| surf.alive());
+        let pruned_surface = self.surfaces.len() != before;
+
+        let became_abandoned = matches!(
+            &self.phase,
+            SessionLockPhase::Locked(Some(locker)) if !locker.is_alive()
+        );
+        if became_abandoned {
+            self.phase = SessionLockPhase::Abandoned;
+            self.surfaces.clear();
+        }
+        pruned_surface || became_abandoned
+    }
+
+    #[must_use]
+    pub fn can_accept_new_lock(&mut self) -> bool {
+        self.reconcile_liveness();
+        matches!(
+            self.phase,
+            SessionLockPhase::Unlocked | SessionLockPhase::Abandoned
+        )
+    }
+
+    /// Acquires the lock if currently `Unlocked` or `Abandoned`, rejecting racing second lockers.
+    pub fn try_lock(&mut self, locker: Option<ExtSessionLockV1>) -> bool {
+        if !self.can_accept_new_lock() {
+            return false;
+        }
+        self.surfaces.clear();
+        self.phase = SessionLockPhase::Locked(locker);
+        true
+    }
+
+    /// Unlocks ONLY when actively `Locked`; refuses unlocking an `Abandoned` session directly.
+    pub fn unlock(&mut self) -> bool {
+        self.reconcile_liveness();
+        if !matches!(self.phase, SessionLockPhase::Locked(_)) {
+            return false;
+        }
+        self.phase = SessionLockPhase::Unlocked;
+        self.surfaces.clear();
+        true
+    }
+
+    /// Explicitly marks an active `Locked` session as `Abandoned` (e.g., on locker drop/crash).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn abandon_active_lock(&mut self) -> bool {
+        if matches!(self.phase, SessionLockPhase::Locked(_)) {
+            self.phase = SessionLockPhase::Abandoned;
+            self.surfaces.clear();
+            true
+        } else {
+            false
+        }
+    }
+
+    #[must_use]
+    pub fn lock_matches_active(&self, locker: &ExtSessionLockV1) -> bool {
+        matches!(
+            &self.phase,
+            SessionLockPhase::Locked(Some(active)) if active == locker && active.is_alive()
+        )
+    }
+
+    pub fn insert_surface(&mut self, output: Output, surface: LockSurface) {
+        self.surfaces.insert(output, surface);
+    }
+
+    pub fn remove_wl_surface(&mut self, wl_surface: &WlSurface) -> bool {
+        let before = self.surfaces.len();
+        self.surfaces
+            .retain(|_, surf| surf.wl_surface() != wl_surface);
+        self.surfaces.len() != before
+    }
+
+    #[must_use]
+    pub fn active_lock_surface_for_output(&self, output: &Output) -> Option<&LockSurface> {
+        match self.effective_phase() {
+            SessionLockPhase::Locked(_) => self.surfaces.get(output).filter(|s| s.alive()),
+            SessionLockPhase::Unlocked | SessionLockPhase::Abandoned => None,
+        }
+    }
+
+    #[must_use]
+    pub fn first_active_lock_surface(&self) -> Option<&LockSurface> {
+        match self.effective_phase() {
+            SessionLockPhase::Locked(_) => self.surfaces.values().find(|s| s.alive()),
+            SessionLockPhase::Unlocked | SessionLockPhase::Abandoned => None,
+        }
+    }
+}
+
+/// Canonical front-to-back hit-testing result across lock, layer-shell, and workspace windows.
+#[derive(Debug, Clone)]
+pub enum PointerHitTarget {
+    LockSurface {
+        surface: WlSurface,
+        origin: Point<f64, Logical>,
+    },
+    Layer {
+        surface: WlSurface,
+        origin: Point<f64, Logical>,
+        layer_root: WlSurface,
+        interactivity: KeyboardInteractivity,
+    },
+    Window {
+        surface: WlSurface,
+        origin: Point<f64, Logical>,
+    },
+}
+
+/// Front-to-back scene tiers ranked cleanly from lock surface down to background layers.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ZOrderTier {
+    LockSurface = 0,
+    OverlayLayer = 1,
+    TopLayer = 2,
+    FloatingOrSpecialWindow = 3,
+    TiledWindow = 4,
+    BottomLayer = 5,
+    BackgroundLayer = 6,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ZOrderCandidate<T> {
+    pub tier: ZOrderTier,
+    pub rect: LogicalRect,
+    pub payload: T,
+}
+
+/// Pure front-to-back hit-test resolver honoring Z-order tiers and session lock preemption.
+#[cfg_attr(not(test), allow(dead_code))]
+#[must_use]
+pub fn resolve_z_order_hit<T: Copy>(
+    is_locked_or_abandoned: bool,
+    pt: LogicalPoint,
+    candidates: &[ZOrderCandidate<T>],
+) -> Option<(ZOrderTier, T)> {
+    candidates
+        .iter()
+        .filter(|c| {
+            if is_locked_or_abandoned {
+                c.tier == ZOrderTier::LockSurface && c.rect.contains_point(pt)
+            } else {
+                c.tier != ZOrderTier::LockSurface && c.rect.contains_point(pt)
+            }
+        })
+        .min_by_key(|c| c.tier)
+        .map(|c| (c.tier, c.payload))
+}
+
+/// Effective keyboard focus owner ranked cleanly by security and `KeyboardInteractivity`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyboardFocusSource {
+    LockSurface,
+    LockBlackoutNone,
+    ExclusiveLayer,
+    OnDemandLayer,
+    ActiveWindow,
+}
+
+/// Pure keyboard focus priority resolver: SessionLock > Exclusive > OnDemand > ActiveWindow.
+#[must_use]
+pub const fn resolve_keyboard_focus_source(
+    is_locked_or_abandoned: bool,
+    has_active_lock_surface: bool,
+    has_exclusive_layer: bool,
+    has_ondemand_layer: bool,
+) -> KeyboardFocusSource {
+    if is_locked_or_abandoned {
+        if has_active_lock_surface {
+            KeyboardFocusSource::LockSurface
+        } else {
+            KeyboardFocusSource::LockBlackoutNone
+        }
+    } else if has_exclusive_layer {
+        KeyboardFocusSource::ExclusiveLayer
+    } else if has_ondemand_layer {
+        KeyboardFocusSource::OnDemandLayer
+    } else {
+        KeyboardFocusSource::ActiveWindow
+    }
+}
+
+/// Computes logical output width, height, and scale from a Smithay `Output`.
+#[must_use]
+pub fn output_logical_viewport(output: &Output) -> (u32, u32, f64) {
+    let scale = output.current_scale().fractional_scale();
+    let (w, h) = output
+        .current_mode()
+        .map(|mode| {
+            let logical_size = mode.size.to_f64().to_logical(scale).to_i32_round::<i32>();
+            let transformed = output.current_transform().transform_size(logical_size);
+            (transformed.w.max(64) as u32, transformed.h.max(64) as u32)
+        })
+        .unwrap_or((1920, 1080));
+    (w, h, scale)
+}
+
+/// Checks whether a surface currently holds a committed buffer in Smithay's renderer state.
+///
+/// Must be queried after `on_commit_buffer_handler`, which consumes `SurfaceAttributes::buffer`.
+#[must_use]
+pub fn is_surface_mapped(surface: &WlSurface) -> bool {
+    with_renderer_surface_state(surface, |state| state.buffer().is_some()).unwrap_or(false)
+}
+
 /// Active Ring 0 display & input backend (`niri/src/backend/mod.rs` `Backend` enum).
 #[allow(clippy::large_enum_variant)] // Stored once on `KomaState`; avoids boxing churn across backend paths.
 pub enum ActiveBackend {
@@ -111,6 +377,16 @@ impl ActiveBackend {
             Self::Winit(w) => Some(w.output.clone()),
             #[cfg(feature = "smithay-tty")]
             Self::Tty(tty) => tty.primary_output(),
+        }
+    }
+
+    /// Returns all active physical/nested `Output`s.
+    #[must_use]
+    pub fn all_outputs(&self) -> Vec<Output> {
+        match self {
+            Self::Winit(w) => vec![w.output.clone()],
+            #[cfg(feature = "smithay-tty")]
+            Self::Tty(tty) => tty.all_outputs(),
         }
     }
 
@@ -206,7 +482,8 @@ pub struct KomaState {
     pub xdg_shell_state: XdgShellState,
     pub layer_shell_state: WlrLayerShellState,
     pub session_lock_state: SessionLockManagerState,
-    pub is_session_locked: bool,
+    pub session_lock: SessionLockCoordinator,
+    pub focused_ondemand_layer: Option<WlSurface>,
     // Preview capture subscription ledger retained for IPC/overview lifecycle.
     #[allow(dead_code)]
     pub preview_refcounts: HashMap<WorkspaceId, u32>,
@@ -372,7 +649,8 @@ impl KomaState {
             xdg_shell_state,
             layer_shell_state,
             session_lock_state,
-            is_session_locked: false,
+            session_lock: SessionLockCoordinator::default(),
+            focused_ondemand_layer: None,
             preview_refcounts: HashMap::new(),
             shm_state,
             output_manager_state,
@@ -641,6 +919,71 @@ impl KomaState {
             .and_then(ActiveBackend::primary_output)
     }
 
+    #[must_use]
+    pub fn all_outputs(&self) -> Vec<Output> {
+        self.backend
+            .as_ref()
+            .map(ActiveBackend::all_outputs)
+            .unwrap_or_default()
+    }
+
+    #[must_use]
+    pub fn is_locked_or_abandoned(&self) -> bool {
+        self.session_lock.is_locked_or_abandoned()
+    }
+
+    /// Polls active locker/lock-surface liveness, transitioning dead lockers to `Abandoned`
+    /// and enforcing blackout/focus clearing immediately without ever auto-unlocking.
+    pub fn reconcile_session_lock(&mut self) -> bool {
+        let changed = self.session_lock.reconcile_liveness();
+        if changed {
+            if self.is_locked_or_abandoned() {
+                self.focused_ondemand_layer = None;
+            }
+            self.reconcile_keyboard_focus();
+            self.queue_redraw();
+        }
+        changed
+    }
+
+    /// Revokes client focus, grabs, and transient drags when entering `Locked` state.
+    pub fn clear_inputs_for_lock(&mut self) {
+        self.focused_ondemand_layer = None;
+        self.active_drop_preview = None;
+        self.active_drag_edge_scroll = None;
+        self.edge_scroll_keep_alive = false;
+        self.keybinds.pending_releases.clear();
+        self.keybinds.pending_mouse_releases.clear();
+        self.keybinds.suppressed_buttons.clear();
+        self.keybinds.active_mode = None;
+        self.keybinds.reset_scroll_trackers();
+        self.gestures.reset_active_sessions();
+
+        let now_input = smithay::backend::input::InputTime::now();
+        let _ = crate::pointer_grabs::cancel_active_pointer_grab(
+            self,
+            SERIAL_COUNTER.next_serial(),
+            now_input,
+        );
+        if let Some(pointer) = self.seat.get_pointer() {
+            let serial = SERIAL_COUNTER.next_serial();
+            pointer.motion(
+                self,
+                None,
+                &smithay::input::pointer::MotionEvent {
+                    location: self.pointer_location,
+                    serial,
+                    time: now_input,
+                },
+            );
+            pointer.frame(self);
+        }
+        if let Some(keyboard) = self.seat.get_keyboard() {
+            let serial = SERIAL_COUNTER.next_serial();
+            keyboard.set_focus(self, None, serial);
+        }
+    }
+
     pub fn import_client_dmabuf(&mut self, dmabuf: &Dmabuf) -> bool {
         self.backend
             .as_mut()
@@ -669,6 +1012,9 @@ impl KomaState {
         epoch: Epoch,
         event: WorkspaceEvent,
     ) {
+        if self.is_locked_or_abandoned() {
+            return;
+        }
         let ts_ns = self.start_time.elapsed().as_nanos() as u64;
         for conn in self.ipc_clients.values_mut() {
             let topic_ok =
@@ -719,8 +1065,9 @@ impl KomaState {
         let initial_size = if has_parent || (max_sz.0 > 0 && max_sz.1 > 0) {
             None
         } else {
-            let inner_w = viewport.width.saturating_sub(24) as i32;
-            let inner_h = viewport.height.saturating_sub(24) as i32;
+            let wa = viewport.work_area_rect();
+            let inner_w = wa.w.saturating_sub(24) as i32;
+            let inner_h = wa.h.saturating_sub(24) as i32;
             Some(Size::from((inner_w.max(64), inner_h.max(64))))
         };
 
@@ -887,15 +1234,13 @@ impl KomaState {
         let focus_new = initial_rules.open_focused.unwrap_or(true);
 
         let geom_bbox = unmapped.window.geometry();
+        let wa = viewport.work_area_rect();
         let preferred_size = if geom_bbox.size.w > 0 && geom_bbox.size.h > 0 {
             (geom_bbox.size.w as u32, geom_bbox.size.h as u32)
         } else if max_sz.0 > 0 && max_sz.1 > 0 {
             max_sz
         } else {
-            (
-                (viewport.width * 3 / 5).max(360),
-                (viewport.height * 3 / 5).max(260),
-            )
+            ((wa.w * 3 / 5).max(360), (wa.h * 3 / 5).max(260))
         };
 
         let explicit_float_rect =
@@ -907,7 +1252,7 @@ impl KomaState {
                         dx: f64::from(dx),
                         dy: f64::from(dy),
                     }
-                    .resolve_in(viewport.full_rect())
+                    .resolve_in(wa)
                     .ok()?;
                     Some(LogicalRect::new(
                         pt.x.round() as i32,
@@ -954,7 +1299,7 @@ impl KomaState {
             is_floating,
             is_sandboxed,
             preferred_size,
-            rect: viewport.full_rect(),
+            rect: wa,
         };
         info!(
             win_id = %mapped.win_id,
@@ -990,6 +1335,45 @@ impl KomaState {
         }
     }
 
+    /// Arranges `wlr-layer-shell` surfaces for `output` and syncs the non-exclusive workarea
+    /// into every matching physical workspace (`Dwindle` / `Scrolling` / `Deck` / `FloatingStack`).
+    pub fn sync_output_workarea(&mut self, output: &Output) {
+        let (logical_w, logical_h, scale) = output_logical_viewport(output);
+        let non_exclusive = {
+            let mut map = layer_map_for_output(output);
+            map.arrange();
+            map.non_exclusive_zone()
+        };
+        let viewport = LogicalViewport::new(logical_w, logical_h, scale).with_work_area_zone(
+            non_exclusive.loc.x,
+            non_exclusive.loc.y,
+            non_exclusive.size.w,
+            non_exclusive.size.h,
+        );
+        let single_output = self.all_outputs().len() <= 1;
+        let is_primary = self.primary_output().as_ref() == Some(output);
+        let now_ms = self.elapsed_ms();
+        let mut affected_ws = Vec::new();
+        for (ws_id, ws) in &mut self.workspaces {
+            let matches = match &ws.presentation {
+                PresentationTarget::Physical(out_id) => {
+                    single_output
+                        || out_id.as_str() == output.name()
+                        || (is_primary && out_id.as_str() == "primary")
+                }
+                PresentationTarget::Offscreen { .. } => false,
+            };
+            if matches && ws.viewport != viewport {
+                ws.viewport = viewport;
+                ws.recalculate(now_ms);
+                affected_ws.push(ws_id.clone());
+            }
+        }
+        for ws_id in affected_ws {
+            self.sync_workspace_geometries(&ws_id);
+        }
+    }
+
     /// Updates physical workspace & Scratchpad viewports on `WinitEvent::Resized` or KMS modeset.
     pub fn handle_output_resized(
         &mut self,
@@ -998,18 +1382,52 @@ impl KomaState {
         logical_h: u32,
         scale: f64,
     ) {
-        let viewport = LogicalViewport {
-            width: logical_w.max(64),
-            height: logical_h.max(64),
-            scale,
+        let non_exclusive = {
+            let mut map = layer_map_for_output(output);
+            map.arrange();
+            map.non_exclusive_zone()
         };
+        let viewport = LogicalViewport::new(logical_w.max(64), logical_h.max(64), scale)
+            .with_work_area_zone(
+                non_exclusive.loc.x,
+                non_exclusive.loc.y,
+                non_exclusive.size.w,
+                non_exclusive.size.h,
+            );
+        if let Some(lock_surface) = self.session_lock.active_lock_surface_for_output(output) {
+            let needs_configure = lock_surface.with_pending_state(|st| {
+                let target = Some((viewport.width, viewport.height).into());
+                if st.size != target {
+                    st.size = target;
+                    true
+                } else {
+                    false
+                }
+            });
+            if needs_configure {
+                lock_surface.send_configure();
+            }
+        }
 
+        let single_output = self.all_outputs().len() <= 1;
+        let is_primary = self.primary_output().as_ref() == Some(output);
+        let now_ms = self.elapsed_ms();
         let mut affected_ws: Vec<WorkspaceId> = Vec::new();
         for (ws_id, ws) in &mut self.workspaces {
-            if matches!(ws.presentation, PresentationTarget::Physical(_)) {
+            let matches = match &ws.presentation {
+                PresentationTarget::Physical(out_id) => {
+                    single_output
+                        || out_id.as_str() == output.name()
+                        || (is_primary && out_id.as_str() == "primary")
+                }
+                PresentationTarget::Offscreen { .. } => false,
+            };
+            if matches {
                 ws.viewport = viewport;
-                ws.presentation = PresentationTarget::Physical(OutputId::new(output.name()));
-                ws.recalculate(self.start_time.elapsed().as_millis() as u64);
+                if single_output || is_primary {
+                    ws.presentation = PresentationTarget::Physical(OutputId::new(output.name()));
+                }
+                ws.recalculate(now_ms);
                 affected_ws.push(ws_id.clone());
             }
         }
@@ -1017,22 +1435,140 @@ impl KomaState {
         for ws_id in affected_ws {
             self.sync_workspace_geometries(&ws_id);
         }
+        self.reconcile_keyboard_focus();
         self.queue_redraw();
     }
 
-    /// Focuses the active window of `effective_interactive_ws_id` (`special:<name>` when open, else `active_ws_id`).
+    #[must_use]
+    fn active_deck_wl_surface(&self) -> Option<WlSurface> {
+        let target_ws_id = self.effective_interactive_ws_id();
+        let active_id = self
+            .workspaces
+            .get(&target_ws_id)
+            .and_then(WorkspaceState::active_window)?;
+        self.mapped_windows
+            .iter()
+            .find(|m| m.win_id == active_id)
+            .and_then(|m| m.window.toplevel().map(|t| t.wl_surface().clone()))
+    }
+
+    #[must_use]
+    pub fn output_at_point(&self, global_pos: Point<f64, Logical>) -> Option<Output> {
+        let outputs = self.all_outputs();
+        for output in &outputs {
+            let origin = output.current_location().to_f64();
+            let (w, h, _) = output_logical_viewport(output);
+            let local = global_pos - origin;
+            if local.x >= 0.0 && local.y >= 0.0 && local.x < f64::from(w) && local.y < f64::from(h)
+            {
+                return Some(output.clone());
+            }
+        }
+        self.primary_output().or_else(|| outputs.into_iter().next())
+    }
+
+    #[must_use]
+    fn find_top_exclusive_layer_surface(&self) -> Option<WlSurface> {
+        const TIER_ORDER: [Layer; 4] =
+            [Layer::Overlay, Layer::Top, Layer::Bottom, Layer::Background];
+        let mut best: Option<(usize, WlSurface)> = None;
+        for output in self.all_outputs() {
+            let map = layer_map_for_output(&output);
+            for (rank, tier) in TIER_ORDER.iter().enumerate() {
+                if let Some(layer) = map.layers_on(*tier).rev().find(|l| {
+                    l.alive()
+                        && is_surface_mapped(l.wl_surface())
+                        && l.cached_state().keyboard_interactivity
+                            == KeyboardInteractivity::Exclusive
+                }) {
+                    if best.as_ref().is_none_or(|(best_rank, _)| rank < *best_rank) {
+                        best = Some((rank, layer.wl_surface().clone()));
+                    }
+                    break;
+                }
+            }
+        }
+        best.map(|(_, surf)| surf)
+    }
+
+    #[must_use]
+    fn active_ondemand_layer_surface(&self) -> Option<WlSurface> {
+        let target = self.focused_ondemand_layer.as_ref()?;
+        for output in self.all_outputs() {
+            let map = layer_map_for_output(&output);
+            if let Some(layer) = map.layers().find(|l| l.wl_surface() == target)
+                && layer.alive()
+                && is_surface_mapped(layer.wl_surface())
+                && layer.cached_state().keyboard_interactivity == KeyboardInteractivity::OnDemand
+            {
+                return Some(target.clone());
+            }
+        }
+        None
+    }
+
+    /// Reconciles seat keyboard focus respecting fail-closed priority:
+    /// `LockSurface` / `LockBlackoutNone` > `Exclusive` layer > `OnDemand` layer > Active window.
+    pub fn reconcile_keyboard_focus(&mut self) {
+        let is_locked = self.is_locked_or_abandoned();
+        let lock_target = if matches!(
+            self.session_lock.effective_phase(),
+            SessionLockPhase::Locked(_)
+        ) {
+            let pointer_output = self.output_at_point(self.pointer_location);
+            pointer_output
+                .as_ref()
+                .and_then(|out| self.session_lock.active_lock_surface_for_output(out))
+                .or_else(|| self.session_lock.first_active_lock_surface())
+                .map(|s| s.wl_surface().clone())
+        } else {
+            None
+        };
+
+        let exclusive_layer = if is_locked {
+            None
+        } else {
+            self.find_top_exclusive_layer_surface()
+        };
+        let ondemand_layer = if is_locked {
+            None
+        } else {
+            let candidate = self.active_ondemand_layer_surface();
+            if candidate.is_none() {
+                self.focused_ondemand_layer = None;
+            }
+            candidate
+        };
+
+        let target_surface = match resolve_keyboard_focus_source(
+            is_locked,
+            lock_target.is_some(),
+            exclusive_layer.is_some(),
+            ondemand_layer.is_some(),
+        ) {
+            KeyboardFocusSource::LockSurface => lock_target,
+            KeyboardFocusSource::LockBlackoutNone => None,
+            KeyboardFocusSource::ExclusiveLayer => exclusive_layer,
+            KeyboardFocusSource::OnDemandLayer => ondemand_layer,
+            KeyboardFocusSource::ActiveWindow => self.active_deck_wl_surface(),
+        };
+
+        if let Some(keyboard) = self.seat.get_keyboard()
+            && keyboard.current_focus() != target_surface
+        {
+            let serial = SERIAL_COUNTER.next_serial();
+            keyboard.set_focus(self, target_surface, serial);
+        }
+    }
+
+    /// Updates `Activated` toplevel state for `effective_interactive_ws_id` and reconciles
+    /// seat keyboard focus without bypassing lock-screen or layer-shell priority.
     pub fn focus_active_deck_window(&mut self) {
         let target_ws_id = self.effective_interactive_ws_id();
         let active_id = self
             .workspaces
             .get(&target_ws_id)
             .and_then(WorkspaceState::active_window);
-        let target_surface = active_id.and_then(|id| {
-            self.mapped_windows
-                .iter()
-                .find(|m| m.win_id == id)
-                .and_then(|m| m.window.toplevel().map(|t| t.wl_surface().clone()))
-        });
         for mapped in &self.mapped_windows {
             if mapped.ws_id == target_ws_id
                 && let Some(toplevel) = mapped.window.toplevel()
@@ -1048,10 +1584,114 @@ impl KomaState {
                 toplevel.send_pending_configure();
             }
         }
-        if let Some(keyboard) = self.seat.get_keyboard() {
-            let serial = smithay::utils::SERIAL_COUNTER.next_serial();
-            keyboard.set_focus(self, target_surface, serial);
+        self.reconcile_keyboard_focus();
+    }
+
+    #[must_use]
+    fn layer_surface_under_tiers(
+        &self,
+        global_pos: Point<f64, Logical>,
+        tiers: [Layer; 2],
+    ) -> Option<PointerHitTarget> {
+        let hit_layer = |layer: &smithay::desktop::LayerSurface,
+                         map: &LayerMap,
+                         output_origin: Point<f64, Logical>,
+                         output_local: Point<f64, Logical>|
+         -> Option<PointerHitTarget> {
+            let layer_geo = map.layer_geometry(layer)?;
+            let layer_loc = layer_geo.loc.to_f64();
+            let (surf, offset) =
+                layer.surface_under(output_local - layer_loc, WindowSurfaceType::ALL)?;
+            Some(PointerHitTarget::Layer {
+                surface: surf,
+                origin: offset.to_f64() + layer_loc + output_origin,
+                layer_root: layer.wl_surface().clone(),
+                interactivity: layer.cached_state().keyboard_interactivity,
+            })
+        };
+
+        for output in self.all_outputs() {
+            let output_origin = output.current_location().to_f64();
+            let output_local = global_pos - output_origin;
+            let map = layer_map_for_output(&output);
+            for tier in tiers {
+                if let Some(top_layer) = map.layer_under(tier, output_local)
+                    && let Some(hit) = hit_layer(top_layer, &map, output_origin, output_local)
+                {
+                    return Some(hit);
+                }
+                for layer in map.layers_on(tier).rev() {
+                    if let Some(hit) = hit_layer(layer, &map, output_origin, output_local) {
+                        return Some(hit);
+                    }
+                }
+            }
         }
+        None
+    }
+
+    /// Unified Z-order hit-testing across `LockSurface` -> `Overlay` -> `Top` -> windows -> `Bottom` -> `Background`.
+    #[must_use]
+    pub fn hit_test_target(&self, global_pos: Point<f64, Logical>) -> Option<PointerHitTarget> {
+        if self.is_locked_or_abandoned() {
+            for output in self.all_outputs() {
+                let output_origin = output.current_location().to_f64();
+                let output_local = global_pos - output_origin;
+                if let Some(lock_surf) = self.session_lock.active_lock_surface_for_output(&output) {
+                    let (w, h, _) = output_logical_viewport(&output);
+                    if output_local.x >= 0.0
+                        && output_local.y >= 0.0
+                        && output_local.x < f64::from(w)
+                        && output_local.y < f64::from(h)
+                    {
+                        if let Some((surf, offset)) = under_from_surface_tree(
+                            lock_surf.wl_surface(),
+                            output_local,
+                            (0, 0),
+                            WindowSurfaceType::ALL,
+                        ) {
+                            return Some(PointerHitTarget::LockSurface {
+                                surface: surf,
+                                origin: offset.to_f64() + output_origin,
+                            });
+                        }
+                        return Some(PointerHitTarget::LockSurface {
+                            surface: lock_surf.wl_surface().clone(),
+                            origin: output_origin,
+                        });
+                    }
+                }
+            }
+            return None;
+        }
+
+        if let Some(hit) = self.layer_surface_under_tiers(global_pos, [Layer::Overlay, Layer::Top])
+        {
+            return Some(hit);
+        }
+
+        if let Some((_, _, surface, origin)) = self.hit_test_visible_surface(global_pos) {
+            return Some(PointerHitTarget::Window { surface, origin });
+        }
+
+        self.layer_surface_under_tiers(global_pos, [Layer::Bottom, Layer::Background])
+    }
+
+    /// Unified surface hit-test returning the focused Wayland surface and logical origin.
+    #[must_use]
+    pub fn surface_under(
+        &self,
+        global_pos: Point<f64, Logical>,
+    ) -> Option<(WlSurface, Point<f64, Logical>)> {
+        self.hit_test_target(global_pos).map(|target| match target {
+            PointerHitTarget::LockSurface { surface, origin }
+            | PointerHitTarget::Layer {
+                surface, origin, ..
+            }
+            | PointerHitTarget::Window {
+                surface, origin, ..
+            } => (surface, origin),
+        })
     }
 
     /// Hit-tests `global_pos` across any open `special:<name>` Scratchpad first, then `active_ws_id`,
@@ -1104,13 +1744,14 @@ impl KomaState {
         None
     }
 
-    /// Activates & raises the window clicked at `global_pos` (and dismisses an open Scratchpad
-    /// if the user clicks outside Scratchpad windows onto a background window!).
-    pub fn focus_window_at_point(&mut self, global_pos: Point<f64, Logical>) {
-        // First check if the user clicked a Scrolling `tab-indicator` pill segment
+    #[must_use]
+    fn tab_indicator_window_at(
+        &self,
+        global_pos: Point<f64, Logical>,
+    ) -> Option<(WorkspaceId, WindowId)> {
         let target_ws_id = self.effective_interactive_ws_id();
         let now_ms = self.elapsed_ms();
-        let tab_hit = self.workspaces.get(&target_ws_id).and_then(|ws| {
+        let tab_win_id = self.workspaces.get(&target_ws_id).and_then(|ws| {
             if ws.layout_mode == LayoutMode::Scrolling && ws.fullscreen_window.is_none() {
                 ws.scrolling.hit_test_tab_indicator(
                     LogicalPoint {
@@ -1123,8 +1764,80 @@ impl KomaState {
             } else {
                 None
             }
-        });
-        if let Some(tab_win_id) = tab_hit {
+        })?;
+        Some((target_ws_id, tab_win_id))
+    }
+
+    fn apply_layer_click_interactivity(
+        &mut self,
+        layer_root: WlSurface,
+        interactivity: KeyboardInteractivity,
+    ) {
+        match interactivity {
+            KeyboardInteractivity::Exclusive => {
+                self.focused_ondemand_layer = None;
+                self.reconcile_keyboard_focus();
+            }
+            KeyboardInteractivity::OnDemand => {
+                self.focused_ondemand_layer = Some(layer_root);
+                self.reconcile_keyboard_focus();
+            }
+            _ => {}
+        }
+    }
+
+    /// Handles pointer press keyboard focus rules across layer shells (`Exclusive` / `OnDemand` / `None`),
+    /// windows, and session lock preemption.
+    pub fn handle_pointer_button_focus(&mut self, global_pos: Point<f64, Logical>) {
+        self.reconcile_session_lock();
+        if self.is_locked_or_abandoned() {
+            self.reconcile_keyboard_focus();
+            return;
+        }
+
+        if let Some(PointerHitTarget::Layer {
+            layer_root,
+            interactivity,
+            ..
+        }) = self.layer_surface_under_tiers(global_pos, [Layer::Overlay, Layer::Top])
+        {
+            self.apply_layer_click_interactivity(layer_root, interactivity);
+            return;
+        }
+
+        if self.tab_indicator_window_at(global_pos).is_some()
+            || self.hit_test_visible_surface(global_pos).is_some()
+        {
+            self.focus_window_at_point(global_pos);
+            return;
+        }
+
+        if let Some(PointerHitTarget::Layer {
+            layer_root,
+            interactivity,
+            ..
+        }) = self.layer_surface_under_tiers(global_pos, [Layer::Bottom, Layer::Background])
+        {
+            self.apply_layer_click_interactivity(layer_root, interactivity);
+            return;
+        }
+
+        if self.focused_ondemand_layer.take().is_some() {
+            self.reconcile_keyboard_focus();
+        }
+    }
+
+    /// Activates & raises the window clicked at `global_pos` (and dismisses an open Scratchpad
+    /// if the user clicks outside Scratchpad windows onto a background window!).
+    pub fn focus_window_at_point(&mut self, global_pos: Point<f64, Logical>) {
+        if self.is_locked_or_abandoned() {
+            self.reconcile_keyboard_focus();
+            return;
+        }
+
+        if let Some((target_ws_id, tab_win_id)) = self.tab_indicator_window_at(global_pos) {
+            let now_ms = self.elapsed_ms();
+            self.focused_ondemand_layer = None;
             if let Some(ws) = self.workspaces.get_mut(&target_ws_id) {
                 ws.activate_window(tab_win_id, now_ms);
             }
@@ -1135,6 +1848,7 @@ impl KomaState {
         }
 
         if let Some((win_id, hit_ws_id, _, _)) = self.hit_test_visible_surface(global_pos) {
+            self.focused_ondemand_layer = None;
             if self.active_special_ws_id.is_some()
                 && self.active_special_ws_id.as_ref() != Some(&hit_ws_id)
             {
@@ -1148,6 +1862,7 @@ impl KomaState {
             self.focus_active_deck_window();
             self.queue_redraw();
         } else {
+            self.focused_ondemand_layer = None;
             self.focus_active_deck_window();
         }
     }
@@ -1446,4 +2161,180 @@ pub fn read_toplevel_min_max_size(wl_surface: &WlSurface) -> ((u32, u32), (u32, 
         );
         (min_s, max_s)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use smithay::output::{Mode, PhysicalProperties, Scale, Subpixel};
+
+    fn test_output(name: &str) -> Output {
+        let out = Output::new(
+            name.to_owned(),
+            PhysicalProperties {
+                size: (0, 0).into(),
+                subpixel: Subpixel::Unknown,
+                make: "Koma".to_owned(),
+                model: "TestOutput".to_owned(),
+                serial_number: "test-0".to_owned(),
+            },
+        );
+        out.change_current_state(
+            Some(Mode {
+                size: (1920, 1080).into(),
+                refresh: 60_000,
+            }),
+            None,
+            Some(Scale::Integer(1)),
+            Some((0, 0).into()),
+        );
+        out
+    }
+
+    #[test]
+    fn session_lock_phase_transitions_and_blackout_fallback() {
+        let out = test_output("DP-1");
+        let mut coord = SessionLockCoordinator::default();
+
+        assert_eq!(coord.effective_phase(), SessionLockPhase::Unlocked);
+        assert_eq!(coord.phase_label(), "unlocked");
+        assert!(!coord.is_locked_or_abandoned());
+        assert!(!coord.unlock());
+        assert!(coord.active_lock_surface_for_output(&out).is_none());
+
+        // Unlocked -> Locked
+        assert!(coord.try_lock(None));
+        assert!(coord.is_locked_or_abandoned());
+        assert_eq!(coord.phase_label(), "locked");
+        // Racing second lock rejected while actively Locked
+        assert!(!coord.try_lock(None));
+        // Missing LockSurface falls back cleanly to blackout (None surface -> solid black)
+        assert!(coord.active_lock_surface_for_output(&out).is_none());
+        assert!(coord.first_active_lock_surface().is_none());
+
+        // Locked -> Abandoned (e.g. locker crash / disconnect): fail-closed, NEVER auto-unlocks!
+        assert!(coord.abandon_active_lock());
+        assert!(coord.is_locked_or_abandoned());
+        assert_eq!(coord.phase_label(), "abandoned");
+        assert!(!coord.unlock(), "abandoned lock must refuse direct unlock");
+        assert!(coord.is_locked_or_abandoned());
+        assert!(coord.active_lock_surface_for_output(&out).is_none());
+
+        // Abandoned -> Locked -> Unlocked via clean replacement locker
+        assert!(coord.can_accept_new_lock());
+        assert!(coord.try_lock(None));
+        assert_eq!(coord.phase_label(), "locked");
+        assert!(coord.unlock());
+        assert_eq!(coord.phase_label(), "unlocked");
+        assert!(!coord.is_locked_or_abandoned());
+    }
+
+    #[test]
+    fn z_order_hit_testing_ranks_layers_windows_and_lock_preemption() {
+        let full = LogicalRect::new(0, 0, 1920, 1080);
+        let pt = LogicalPoint { x: 200.0, y: 120.0 };
+
+        let all_layers = vec![
+            ZOrderCandidate {
+                tier: ZOrderTier::BackgroundLayer,
+                rect: full,
+                payload: "bg",
+            },
+            ZOrderCandidate {
+                tier: ZOrderTier::BottomLayer,
+                rect: full,
+                payload: "bottom",
+            },
+            ZOrderCandidate {
+                tier: ZOrderTier::TiledWindow,
+                rect: full,
+                payload: "tiled",
+            },
+            ZOrderCandidate {
+                tier: ZOrderTier::FloatingOrSpecialWindow,
+                rect: full,
+                payload: "floating",
+            },
+            ZOrderCandidate {
+                tier: ZOrderTier::TopLayer,
+                rect: full,
+                payload: "top",
+            },
+            ZOrderCandidate {
+                tier: ZOrderTier::OverlayLayer,
+                rect: full,
+                payload: "overlay",
+            },
+        ];
+
+        assert_eq!(
+            resolve_z_order_hit(false, pt, &all_layers),
+            Some((ZOrderTier::OverlayLayer, "overlay"))
+        );
+        assert_eq!(
+            resolve_z_order_hit(false, pt, &all_layers[..5]),
+            Some((ZOrderTier::TopLayer, "top"))
+        );
+        assert_eq!(
+            resolve_z_order_hit(false, pt, &all_layers[..4]),
+            Some((ZOrderTier::FloatingOrSpecialWindow, "floating"))
+        );
+        assert_eq!(
+            resolve_z_order_hit(false, pt, &all_layers[..3]),
+            Some((ZOrderTier::TiledWindow, "tiled"))
+        );
+        assert_eq!(
+            resolve_z_order_hit(false, pt, &all_layers[..2]),
+            Some((ZOrderTier::BottomLayer, "bottom"))
+        );
+        assert_eq!(
+            resolve_z_order_hit(false, pt, &all_layers[..1]),
+            Some((ZOrderTier::BackgroundLayer, "bg"))
+        );
+
+        // When Locked/Abandoned without a LockSurface, ALL normal layers/windows are unreachable
+        assert_eq!(resolve_z_order_hit(true, pt, &all_layers), None);
+
+        let mut with_lock = all_layers;
+        with_lock.push(ZOrderCandidate {
+            tier: ZOrderTier::LockSurface,
+            rect: full,
+            payload: "lock",
+        });
+        assert_eq!(
+            resolve_z_order_hit(true, pt, &with_lock),
+            Some((ZOrderTier::LockSurface, "lock"))
+        );
+        assert_eq!(
+            resolve_z_order_hit(false, pt, &with_lock),
+            Some((ZOrderTier::OverlayLayer, "overlay"))
+        );
+    }
+
+    #[test]
+    fn keyboard_interactivity_ranks_exclusive_ondemand_none_and_lock() {
+        assert_eq!(
+            resolve_keyboard_focus_source(false, false, true, true),
+            KeyboardFocusSource::ExclusiveLayer
+        );
+        assert_eq!(
+            resolve_keyboard_focus_source(false, false, false, true),
+            KeyboardFocusSource::OnDemandLayer
+        );
+        assert_eq!(
+            resolve_keyboard_focus_source(false, false, false, false),
+            KeyboardFocusSource::ActiveWindow
+        );
+
+        // Lock screen ALWAYS preempts Exclusive & OnDemand layer surfaces
+        assert_eq!(
+            resolve_keyboard_focus_source(true, true, true, true),
+            KeyboardFocusSource::LockSurface
+        );
+        // Abandoned or unmapped LockSurface steals focus away from desktop into None
+        assert_eq!(
+            resolve_keyboard_focus_source(true, false, true, true),
+            KeyboardFocusSource::LockBlackoutNone
+        );
+    }
 }

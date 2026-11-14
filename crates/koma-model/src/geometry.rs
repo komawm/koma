@@ -37,6 +37,8 @@ pub struct LogicalViewport {
     pub width: u32,
     pub height: u32,
     pub scale: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_area: Option<LogicalRect>,
 }
 
 impl Default for LogicalViewport {
@@ -45,14 +47,79 @@ impl Default for LogicalViewport {
             width: 1920,
             height: 1080,
             scale: 1.0,
+            work_area: None,
         }
     }
 }
 
 impl LogicalViewport {
     #[must_use]
+    pub const fn new(width: u32, height: u32, scale: f64) -> Self {
+        Self {
+            width,
+            height,
+            scale,
+            work_area: None,
+        }
+    }
+
+    #[must_use]
     pub const fn full_rect(self) -> LogicalRect {
         LogicalRect::new(0, 0, self.width, self.height)
+    }
+
+    /// Clamps a raw `non_exclusive_zone` rectangle safely within output logical bounds,
+    /// guaranteeing positive non-zero dimensions even if exclusive bars exhaust the output.
+    #[must_use]
+    pub fn sanitized_work_area(
+        self,
+        raw_x: i32,
+        raw_y: i32,
+        raw_w: i32,
+        raw_h: i32,
+    ) -> LogicalRect {
+        let out_w = self.width.max(1) as i32;
+        let out_h = self.height.max(1) as i32;
+        let x0 = raw_x.clamp(0, out_w - 1);
+        let y0 = raw_y.clamp(0, out_h - 1);
+        let raw_right = raw_x.saturating_add(raw_w);
+        let raw_bottom = raw_y.saturating_add(raw_h);
+        let x1 = raw_right.clamp(x0 + 1, out_w);
+        let y1 = raw_bottom.clamp(y0 + 1, out_h);
+        LogicalRect::new(x0, y0, (x1 - x0) as u32, (y1 - y0) as u32)
+    }
+
+    /// Subtracts exclusive edge insets (`top`, `bottom`, `left`, `right`) safely within bounds.
+    #[must_use]
+    pub fn work_area_from_edges(self, top: i32, bottom: i32, left: i32, right: i32) -> LogicalRect {
+        let raw_w = (self.width as i32)
+            .saturating_sub(left.max(0))
+            .saturating_sub(right.max(0));
+        let raw_h = (self.height as i32)
+            .saturating_sub(top.max(0))
+            .saturating_sub(bottom.max(0));
+        self.sanitized_work_area(left.max(0), top.max(0), raw_w, raw_h)
+    }
+
+    /// Returns the usable non-exclusive workarea rectangle (falling back to `full_rect()`).
+    #[must_use]
+    pub fn work_area_rect(self) -> LogicalRect {
+        match self.work_area {
+            Some(wa) => self.sanitized_work_area(
+                wa.x,
+                wa.y,
+                wa.w.min(i32::MAX as u32) as i32,
+                wa.h.min(i32::MAX as u32) as i32,
+            ),
+            None => self.full_rect(),
+        }
+    }
+
+    /// Returns a copy of `self` updated with a clamped `non_exclusive_zone` workarea.
+    #[must_use]
+    pub fn with_work_area_zone(mut self, loc_x: i32, loc_y: i32, width: i32, height: i32) -> Self {
+        self.work_area = Some(self.sanitized_work_area(loc_x, loc_y, width, height));
+        self
     }
 }
 
@@ -171,4 +238,52 @@ pub fn resolve_grid_225_center(
         x: f64::from(rect.x) + (f64::from(col_idx) + 0.5) * cell_w,
         y: f64::from(rect.y) + (f64::from(row_idx) + 0.5) * cell_h,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exclusive_zone_subtracts_all_four_edges_without_breaking_bounds() {
+        let vp = LogicalViewport::new(1920, 1080, 1.0);
+        let top_only = vp.work_area_from_edges(32, 0, 0, 0);
+        assert_eq!(top_only, LogicalRect::new(0, 32, 1920, 1048));
+
+        let all_four = vp.work_area_from_edges(32, 48, 60, 80);
+        assert_eq!(all_four, LogicalRect::new(60, 32, 1780, 1000));
+        assert_eq!(vp.full_rect(), LogicalRect::new(0, 0, 1920, 1080));
+    }
+
+    #[test]
+    fn exclusive_zone_guards_zero_and_negative_remaining_dimensions() {
+        let vp = LogicalViewport::new(1920, 1080, 1.0);
+        // Oversized top + bottom + left + right exclusive zones never go <= 0 or escape bounds
+        let exhausted = vp.work_area_from_edges(700, 600, 1200, 1000);
+        assert!(exhausted.x >= 0 && exhausted.x < 1920);
+        assert!(exhausted.y >= 0 && exhausted.y < 1080);
+        assert!(exhausted.w >= 1);
+        assert!(exhausted.h >= 1);
+        assert!(exhausted.x + exhausted.w as i32 <= 1920);
+        assert!(exhausted.y + exhausted.h as i32 <= 1080);
+
+        let negative_raw = vp.sanitized_work_area(-40, 2500, -100, -300);
+        assert!(negative_raw.w >= 1);
+        assert!(negative_raw.h >= 1);
+        assert!(negative_raw.x >= 0 && negative_raw.x + negative_raw.w as i32 <= 1920);
+        assert!(negative_raw.y >= 0 && negative_raw.y + negative_raw.h as i32 <= 1080);
+    }
+
+    #[test]
+    fn viewport_work_area_falls_back_to_full_rect_unless_set() {
+        let vp = LogicalViewport::new(1920, 1080, 1.5);
+        assert_eq!(vp.work_area, None);
+        assert_eq!(vp.work_area_rect(), LogicalRect::new(0, 0, 1920, 1080));
+
+        let with_bar = vp.with_work_area_zone(0, 36, 1920, 1044);
+        assert_eq!(
+            with_bar.work_area_rect(),
+            LogicalRect::new(0, 36, 1920, 1044)
+        );
+    }
 }

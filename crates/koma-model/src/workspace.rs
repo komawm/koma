@@ -548,3 +548,61 @@ impl WorkspaceState {
         out
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use koma_proto::OutputId;
+
+    use super::*;
+
+    #[test]
+    fn exclusive_zone_shrinks_dwindle_scrolling_and_deck_while_fullscreen_uses_full_output() {
+        let base_vp = LogicalViewport::new(1920, 1080, 1.0);
+        let wa = base_vp.work_area_from_edges(36, 44, 60, 40);
+        let vp_with_bars = base_vp.with_work_area_zone(wa.x, wa.y, wa.w as i32, wa.h as i32);
+
+        let mut ws = WorkspaceState::new(
+            WorkspaceId::new("main"),
+            "main",
+            SeatId::new("seat0"),
+            vp_with_bars,
+            PresentationTarget::Physical(OutputId::new("eDP-1")),
+            LayoutMode::Dwindle,
+            0,
+        );
+        ws.dwindle.config.outer_gap = 0;
+        ws.dwindle.config.inner_gap = 0;
+        let w1 = WindowId::new(1, 1);
+        ws.insert_window(w1, false, None, None, None, None, false, true, 0);
+
+        let tiled = ws.compute_visible_geometries();
+        assert_eq!(
+            tiled,
+            vec![(w1, LogicalRect::new(60, 36, 1820, 1000), false)]
+        );
+
+        ws.set_layout_mode(LayoutMode::Deck, 1);
+        let deck_geos = ws.compute_visible_geometries();
+        assert_eq!(
+            deck_geos,
+            vec![(w1, LogicalRect::new(60, 36, 1820, 1000), false)]
+        );
+
+        ws.set_layout_mode(LayoutMode::Scrolling, 2);
+        let mut s_cfg = ws.scrolling.config.clone();
+        s_cfg.outer_gap = 0;
+        ws.scrolling.update_config(s_cfg, vp_with_bars, 2);
+        let scroll_geos = ws.compute_visible_geometries();
+        assert_eq!(scroll_geos[0].1.y, 36);
+        assert_eq!(scroll_geos[0].1.h, 1000);
+        assert!(scroll_geos[0].1.x >= 60);
+        assert!(scroll_geos[0].1.x + scroll_geos[0].1.w as i32 <= 60 + 1820);
+
+        // Fullscreen spans full physical output bounds regardless of panels
+        ws.fullscreen_window = Some(w1);
+        assert_eq!(
+            ws.compute_visible_geometries(),
+            vec![(w1, LogicalRect::new(0, 0, 1920, 1080), false)]
+        );
+    }
+}

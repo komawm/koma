@@ -8,7 +8,7 @@ use smithay::{
     backend::{
         allocator::dmabuf::Dmabuf,
         input::{InputEvent, TabletToolDescriptor},
-        renderer::utils::{on_commit_buffer_handler, with_renderer_surface_state},
+        renderer::utils::on_commit_buffer_handler,
     },
     desktop::{LayerSurface, PopupKind, Window, WindowSurfaceType, layer_map_for_output},
     input::{Seat, SeatHandler, SeatState, pointer::CursorImageStatus, tablet::TabletSeatHandler},
@@ -66,15 +66,11 @@ use tracing::{info, warn};
 use crate::{
     macro_runtime::notify_workspace_surface_damage,
     security_context::is_surface_from_restricted_client,
-    state::{ClientState, KomaState, UnmappedToplevel, read_toplevel_metadata},
+    state::{
+        ClientState, KomaState, UnmappedToplevel, is_surface_mapped, output_logical_viewport,
+        read_toplevel_metadata,
+    },
 };
-
-/// Checks whether a surface currently holds a committed buffer in Smithay's renderer state.
-///
-/// Must be queried after `on_commit_buffer_handler`, which consumes `SurfaceAttributes::buffer`.
-fn is_surface_mapped(surface: &WlSurface) -> bool {
-    with_renderer_surface_state(surface, |state| state.buffer().is_some()).unwrap_or(false)
-}
 
 impl BufferHandler for KomaState {
     fn buffer_destroyed(&mut self, _buffer: &WlBuffer) {}
@@ -120,31 +116,58 @@ impl CompositorHandler for KomaState {
         let active_ws = self.active_ws_id.clone();
         notify_workspace_surface_damage(self, &active_ws);
 
-        // 2b. Arrange wlr-layer-shell surfaces (`koma-overview`, `waybar`, `mako`) on commit
-        if let Some(output) = self.primary_output() {
-            let is_layer = {
-                let mut map = layer_map_for_output(&output);
-                if map
-                    .layer_for_surface(&root_surface, WindowSurfaceType::TOPLEVEL)
-                    .is_some()
-                {
-                    if surface == &root_surface {
-                        map.arrange();
-                        if let Some(l) =
-                            map.layer_for_surface(&root_surface, WindowSurfaceType::TOPLEVEL)
-                        {
-                            l.layer_surface().send_pending_configure();
-                        }
+        // 2b. Reconcile active LockSurface commits
+        if let Some(lock_out) = self
+            .session_lock
+            .surfaces
+            .iter()
+            .find(|(_, ls)| ls.wl_surface() == &root_surface)
+            .map(|(o, _)| o.clone())
+        {
+            let (w, h, _) = output_logical_viewport(&lock_out);
+            if let Some(ls) = self.session_lock.surfaces.get(&lock_out) {
+                let needs_resize = ls.with_pending_state(|st| {
+                    let expected = Some((w, h).into());
+                    if st.size != expected {
+                        st.size = expected;
+                        true
+                    } else {
+                        false
                     }
-                    true
-                } else {
-                    false
+                });
+                if needs_resize {
+                    ls.send_configure();
                 }
-            };
-            if is_layer {
-                self.queue_redraw();
-                return;
             }
+            self.reconcile_keyboard_focus();
+            self.queue_redraw();
+            return;
+        }
+
+        // 2c. Arrange wlr-layer-shell surfaces (`koma-overview`, `waybar`, `mako`) on commit
+        let mut matched_layer_output: Option<Output> = None;
+        for output in self.all_outputs() {
+            let mut map = layer_map_for_output(&output);
+            if let Some(layer) = map
+                .layer_for_surface(&root_surface, WindowSurfaceType::ALL)
+                .cloned()
+            {
+                if surface == &root_surface {
+                    map.arrange();
+                    layer.layer_surface().send_pending_configure();
+                }
+                drop(map);
+                matched_layer_output = Some(output);
+                break;
+            }
+        }
+        if let Some(output) = matched_layer_output {
+            if surface == &root_surface {
+                self.sync_output_workarea(&output);
+            }
+            self.reconcile_keyboard_focus();
+            self.queue_redraw();
+            return;
         }
 
         // 3. Two-phase Unmapped -> Mapped window transition (`niri/src/handlers/compositor.rs`)
@@ -222,6 +245,15 @@ impl CompositorHandler for KomaState {
             CursorImageStatus::Surface(active) if active == surface
         ) {
             self.set_cursor_status(CursorImageStatus::default_named());
+        }
+        if self.session_lock.remove_wl_surface(surface) {
+            self.reconcile_session_lock();
+            self.reconcile_keyboard_focus();
+            self.queue_redraw();
+        }
+        if self.focused_ondemand_layer.as_ref() == Some(surface) {
+            self.focused_ondemand_layer = None;
+            self.reconcile_keyboard_focus();
         }
     }
 }
@@ -481,27 +513,52 @@ impl SessionLockHandler for KomaState {
     }
 
     fn lock(&mut self, confirmation: SessionLocker) {
-        self.is_session_locked = true;
-        confirmation.lock();
-        info!("host Wayland session locked via ext-session-lock-v1");
-        self.queue_redraw();
+        let ext_lock = confirmation.ext_session_lock().clone();
+        if self.session_lock.try_lock(Some(ext_lock)) {
+            self.clear_inputs_for_lock();
+            confirmation.lock();
+            info!("host Wayland session locked via ext-session-lock-v1");
+            self.reconcile_keyboard_focus();
+            self.queue_redraw();
+        } else {
+            warn!("rejected concurrent ext-session-lock-v1 acquire while lock active");
+        }
     }
 
     fn unlock(&mut self) {
-        self.is_session_locked = false;
-        info!("host Wayland session unlocked");
-        self.queue_redraw();
+        if self.session_lock.unlock() {
+            self.focused_ondemand_layer = None;
+            info!("host Wayland session unlocked");
+            self.reconcile_keyboard_focus();
+            crate::keybind_dispatcher::refresh_pointer_hover_focus(
+                self,
+                smithay::backend::input::InputTime::now(),
+            );
+            self.queue_redraw();
+        } else {
+            warn!("ignored ext-session-lock-v1 unlock request when not actively Locked");
+        }
     }
 
-    fn new_surface(&mut self, surface: LockSurface, _output: WlOutput) {
-        if let Some(out) = self.primary_output()
-            && let Some(mode) = out.current_mode()
+    fn new_surface(&mut self, surface: LockSurface, wl_output: WlOutput) {
+        if !self
+            .session_lock
+            .lock_matches_active(surface.ext_session_lock())
         {
-            surface.with_pending_state(|states| {
-                states.size = Some((mode.size.w as u32, mode.size.h as u32).into());
-            });
-            surface.send_configure();
+            warn!("ignored ext-session-lock-v1 LockSurface from inactive or defunct locker");
+            return;
         }
+        let Some(out) = Output::from_resource(&wl_output).or_else(|| self.primary_output()) else {
+            return;
+        };
+        let (w, h, _) = output_logical_viewport(&out);
+        surface.with_pending_state(|states| {
+            states.size = Some((w, h).into());
+        });
+        surface.send_configure();
+        self.session_lock.insert_surface(out, surface);
+        self.reconcile_keyboard_focus();
+        self.queue_redraw();
     }
 }
 
@@ -510,9 +567,13 @@ impl VirtualKeyboardHandler for KomaState {
         use smithay::backend::input::{Event as _, KeyboardKeyEvent as _};
         use smithay::input::keyboard::FilterResult;
 
+        self.reconcile_session_lock();
         if let InputEvent::Keyboard { event } = event
             && let Some(keyboard) = self.seat.get_keyboard()
         {
+            if self.is_locked_or_abandoned() && keyboard.current_focus().is_none() {
+                return;
+            }
             let serial = SERIAL_COUNTER.next_serial();
             let _ = keyboard.input::<(), _>(
                 self,
@@ -552,7 +613,7 @@ impl WlrLayerShellHandler for KomaState {
     fn new_layer_surface(
         &mut self,
         surface: WlrLayerSurface,
-        _wl_output: Option<WlOutput>,
+        wl_output: Option<WlOutput>,
         _layer: Layer,
         namespace: String,
     ) {
@@ -567,28 +628,47 @@ impl WlrLayerShellHandler for KomaState {
             return;
         }
 
-        let Some(output) = self.primary_output() else {
+        let Some(output) = wl_output
+            .as_ref()
+            .and_then(Output::from_resource)
+            .or_else(|| self.primary_output())
+        else {
             surface.send_close();
             return;
         };
-        let mut map = layer_map_for_output(&output);
-        let _ = map.map_layer(&LayerSurface::new(surface, namespace));
-        map.arrange();
+        {
+            let mut map = layer_map_for_output(&output);
+            let _ = map.map_layer(&LayerSurface::new(surface, namespace));
+            map.arrange();
+        }
+        self.sync_output_workarea(&output);
+        self.reconcile_keyboard_focus();
         self.queue_redraw();
     }
 
     fn layer_destroyed(&mut self, surface: WlrLayerSurface) {
-        if let Some(output) = self.primary_output() {
+        let mut removed_output: Option<Output> = None;
+        for output in self.all_outputs() {
             let mut map = layer_map_for_output(&output);
             let found = map
                 .layers()
                 .find(|l| l.layer_surface() == &surface)
                 .cloned();
             if let Some(layer) = found {
+                if self.focused_ondemand_layer.as_ref() == Some(layer.wl_surface()) {
+                    self.focused_ondemand_layer = None;
+                }
                 map.unmap_layer(&layer);
                 map.arrange();
+                drop(map);
+                removed_output = Some(output);
+                break;
             }
         }
+        if let Some(output) = removed_output {
+            self.sync_output_workarea(&output);
+        }
+        self.reconcile_keyboard_focus();
         self.queue_redraw();
     }
 }

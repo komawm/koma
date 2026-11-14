@@ -22,7 +22,7 @@ use smithay::{
             AbsolutePositionEvent as _, Event as _, InputBackend, InputEvent, InputTime,
             KeyboardKeyEvent as _, PointerButtonEvent as _,
         },
-        renderer::{ImportDma as _, damage::OutputDamageTracker, gles::GlesRenderer},
+        renderer::{Color32F, ImportDma as _, damage::OutputDamageTracker, gles::GlesRenderer},
         winit::{self, WinitEvent, WinitGraphicsBackend},
     },
     desktop::{layer_map_for_output, utils::send_frames_surface_tree},
@@ -103,11 +103,7 @@ impl WinitBackendState {
 
         let logical_w = (f64::from(win_size.w) / scale_factor).round().max(64.0) as u32;
         let logical_h = (f64::from(win_size.h) / scale_factor).round().max(64.0) as u32;
-        let initial_viewport = LogicalViewport {
-            width: logical_w,
-            height: logical_h,
-            scale: scale_factor,
-        };
+        let initial_viewport = LogicalViewport::new(logical_w, logical_h, scale_factor);
 
         event_loop
             .insert_source(winit_evt_loop, move |event, _, state| match event {
@@ -228,10 +224,114 @@ impl WinitBackendState {
     }
 }
 
+pub(crate) fn append_layer_tier_elements<R>(
+    renderer: &mut R,
+    output: &Output,
+    output_scale: smithay::utils::Scale<f64>,
+    tiers: [Layer; 2],
+    elements: &mut Vec<koma_render::elements::KomaRenderElement<R>>,
+) where
+    R: smithay::backend::renderer::Renderer + smithay::backend::renderer::ImportAll,
+    R::TextureId: Clone + 'static,
+{
+    use smithay::backend::renderer::element::{
+        AsRenderElements, surface::WaylandSurfaceRenderElement,
+    };
+
+    let map = layer_map_for_output(output);
+    for layer_tier in tiers {
+        for layer in map.layers_on(layer_tier).rev() {
+            if let Some(geo) = map.layer_geometry(layer) {
+                let loc_phys = geo.loc.to_f64().to_physical_precise_round(output_scale);
+                let l_elems: Vec<WaylandSurfaceRenderElement<R>> =
+                    AsRenderElements::render_elements(layer, renderer, loc_phys, output_scale, 1.0);
+                elements.extend(
+                    l_elems
+                        .into_iter()
+                        .map(koma_render::elements::KomaRenderElement::from),
+                );
+            }
+        }
+    }
+}
+
+pub(crate) fn assemble_locked_frame_elements<R>(
+    renderer: &mut R,
+    state: &KomaState,
+    output: &Output,
+    output_scale: smithay::utils::Scale<f64>,
+    cursor_elems: Vec<koma_render::elements::KomaRenderElement<R>>,
+) -> Vec<koma_render::elements::KomaRenderElement<R>>
+where
+    R: smithay::backend::renderer::Renderer + smithay::backend::renderer::ImportAll,
+    R::TextureId: Clone + 'static,
+{
+    use smithay::backend::renderer::element::{
+        Kind,
+        surface::{WaylandSurfaceRenderElement, render_elements_from_surface_tree},
+    };
+
+    let (out_w, out_h, _) = crate::state::output_logical_viewport(output);
+    let mut elements = cursor_elems;
+    if let Some(lock_surface) = state.session_lock.active_lock_surface_for_output(output)
+        && crate::state::is_surface_mapped(lock_surface.wl_surface())
+    {
+        let lock_elems: Vec<WaylandSurfaceRenderElement<R>> = render_elements_from_surface_tree(
+            renderer,
+            lock_surface.wl_surface(),
+            (0, 0),
+            output_scale,
+            1.0,
+            Kind::Unspecified,
+        );
+        elements.extend(
+            lock_elems
+                .into_iter()
+                .map(koma_render::elements::KomaRenderElement::from),
+        );
+    }
+    let blackout_rect =
+        smithay::utils::Rectangle::from_size((f64::from(out_w), f64::from(out_h)).into());
+    elements.push(koma_render::elements::KomaRenderElement::from(
+        koma_render::elements::KomaSolidColorElement::oneshot(blackout_rect, [0.0, 0.0, 0.0, 1.0]),
+    ));
+    elements
+}
+
+pub(crate) fn dispatch_output_frame_callbacks_filtered(
+    state: &KomaState,
+    output: &Output,
+    throttle: Option<Duration>,
+) {
+    let elapsed = state.elapsed_duration();
+    if state.is_locked_or_abandoned() {
+        if let Some(lock_surf) = state.session_lock.active_lock_surface_for_output(output) {
+            send_frames_surface_tree(lock_surf.wl_surface(), output, elapsed, throttle, |_, _| {
+                Some(output.clone())
+            });
+        }
+        return;
+    }
+
+    for wl_surf in state.visible_physical_toplevel_surfaces() {
+        send_frames_surface_tree(&wl_surf, output, elapsed, throttle, |_, _| {
+            Some(output.clone())
+        });
+    }
+    let map = layer_map_for_output(output);
+    for layer in map.layers() {
+        layer.send_frame(output, elapsed, throttle, |_, _| Some(output.clone()));
+    }
+}
+
 /// Executes a complete single-frame render pass onto the Winit EGL swapchain (`Frame 1` & live updates).
 pub fn render_winit_frame(state: &mut KomaState) -> anyhow::Result<()> {
     state.redraw_queued = false;
-    state.tick_frame_animations_and_edge_scroll();
+    state.reconcile_session_lock();
+    let locked = state.is_locked_or_abandoned();
+    if !locked {
+        state.tick_frame_animations_and_edge_scroll();
+    }
 
     let Some(ws) = state.workspaces.get(&state.active_ws_id) else {
         return Ok(());
@@ -261,138 +361,121 @@ pub fn render_winit_frame(state: &mut KomaState) -> anyhow::Result<()> {
     }
     winit_state.sync_host_cursor(state.cursor_manager.status());
 
-    // Build front-to-back scene items across optional `special:<name>` Scratchpad + `active_ws_id`
-    let (base_scene_items, special_overlay) = state.collect_physical_scene_items();
-    let blur_cfg = state.lua_sandbox.config_snapshot().appearance.blur;
-    let any_window_needs_blur = blur_cfg.enabled
-        && base_scene_items
-            .iter()
-            .chain(special_overlay.iter().flat_map(|(_, v)| v.iter()))
-            .any(|it| it.wants_blur && (blur_cfg.ignore_opacity || it.opacity < 0.999));
-
     // 1. Assemble front-to-back render elements & composite damaged regions into Winit framebuffer
     let render_res = {
-        let mut elements: Vec<koma_render::elements::KomaRenderElement<GlesRenderer>> = Vec::new();
-        let mut bg_layer_elements: Vec<koma_render::elements::KomaRenderElement<GlesRenderer>> =
-            Vec::new();
-        {
-            let map = layer_map_for_output(&winit_state.output);
-            for layer_tier in [Layer::Overlay, Layer::Top] {
-                for layer in map.layers_on(layer_tier) {
-                    if let Some(geo) = map.layer_geometry(layer) {
-                        let loc_phys = geo.loc.to_f64().to_physical_precise_round(output_scale);
-                        let l_elems: Vec<smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement<GlesRenderer>> =
-                            smithay::backend::renderer::element::surface::render_elements_from_surface_tree(
-                                winit_state.backend.renderer(),
-                                layer.wl_surface(),
-                                loc_phys,
-                                output_scale,
-                                1.0,
-                                smithay::backend::renderer::element::Kind::Unspecified,
-                            );
-                        elements.extend(
-                            l_elems
-                                .into_iter()
-                                .map(koma_render::elements::KomaRenderElement::from),
-                        );
-                    }
-                }
-            }
-            for layer_tier in [Layer::Bottom, Layer::Background] {
-                for layer in map.layers_on(layer_tier) {
-                    if let Some(geo) = map.layer_geometry(layer) {
-                        let loc_phys = geo.loc.to_f64().to_physical_precise_round(output_scale);
-                        let l_elems: Vec<smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement<GlesRenderer>> =
-                            smithay::backend::renderer::element::surface::render_elements_from_surface_tree(
-                                winit_state.backend.renderer(),
-                                layer.wl_surface(),
-                                loc_phys,
-                                output_scale,
-                                1.0,
-                                smithay::backend::renderer::element::Kind::Unspecified,
-                            );
-                        bg_layer_elements.extend(
-                            l_elems
-                                .into_iter()
-                                .map(koma_render::elements::KomaRenderElement::from),
-                        );
-                    }
-                }
-            }
-        }
-
-        let frame_blur_ctx = if any_window_needs_blur {
-            let phys_sz = winit_state.backend.window_size();
-            state
-                .backdrop_blur_cache
-                .borrow_mut()
-                .update_and_blur(
+        let (elements, clear_color) = if locked {
+            (
+                assemble_locked_frame_elements(
                     winit_state.backend.renderer(),
-                    phys_sz,
+                    state,
+                    &winit_state.output,
                     output_scale,
-                    DEFAULT_BACKDROP_CLEAR,
-                    &bg_layer_elements,
-                    blur_cfg,
-                )
-                .map(|texture| FrameBlurContext {
-                    texture,
-                    config: blur_cfg,
-                })
+                    cursor_elems,
+                ),
+                Color32F::new(0.0, 0.0, 0.0, 1.0),
+            )
         } else {
-            None
-        };
+            let (base_scene_items, special_overlay) = state.collect_physical_scene_items();
+            let blur_cfg = state.lua_sandbox.config_snapshot().appearance.blur;
+            let any_window_needs_blur = blur_cfg.enabled
+                && base_scene_items
+                    .iter()
+                    .chain(special_overlay.iter().flat_map(|(_, v)| v.iter()))
+                    .any(|it| it.wants_blur && (blur_cfg.ignore_opacity || it.opacity < 0.999));
 
-        if let Some((sp_lease, sp_items)) = &special_overlay {
-            let sp_drop = state
-                .active_special_ws_id
-                .as_ref()
-                .and_then(|sp_id| state.drop_preview_for_workspace(sp_id));
-            let sp_elems = assemble_workspace_elements(
+            let mut elements: Vec<koma_render::elements::KomaRenderElement<GlesRenderer>> =
+                Vec::new();
+            let mut bg_layer_elements: Vec<koma_render::elements::KomaRenderElement<GlesRenderer>> =
+                Vec::new();
+            append_layer_tier_elements(
+                winit_state.backend.renderer(),
+                &winit_state.output,
+                output_scale,
+                [Layer::Overlay, Layer::Top],
+                &mut elements,
+            );
+            append_layer_tier_elements(
+                winit_state.backend.renderer(),
+                &winit_state.output,
+                output_scale,
+                [Layer::Bottom, Layer::Background],
+                &mut bg_layer_elements,
+            );
+
+            let frame_blur_ctx = if any_window_needs_blur {
+                let phys_sz = winit_state.backend.window_size();
+                state
+                    .backdrop_blur_cache
+                    .borrow_mut()
+                    .update_and_blur(
+                        winit_state.backend.renderer(),
+                        phys_sz,
+                        output_scale,
+                        DEFAULT_BACKDROP_CLEAR,
+                        &bg_layer_elements,
+                        blur_cfg,
+                    )
+                    .map(|texture| FrameBlurContext {
+                        texture,
+                        config: blur_cfg,
+                    })
+            } else {
+                None
+            };
+
+            if let Some((sp_lease, sp_items)) = &special_overlay {
+                let sp_drop = state
+                    .active_special_ws_id
+                    .as_ref()
+                    .and_then(|sp_id| state.drop_preview_for_workspace(sp_id));
+                let sp_elems = assemble_workspace_elements(
+                    winit_state.backend.renderer(),
+                    viewport,
+                    output_scale,
+                    sp_lease,
+                    RenderTargetKind::PhysicalOutput,
+                    OverlayKind::None,
+                    frame_blur_ctx.as_ref(),
+                    sp_drop,
+                    sp_items,
+                );
+                elements.extend(sp_elems);
+                append_scratchpad_dim_scrim(viewport, &mut elements);
+            }
+
+            if let Some(ws) = state.workspaces.get(&state.active_ws_id)
+                && ws.layout_mode == koma_model::LayoutMode::Scrolling
+                && ws.fullscreen_window.is_none()
+            {
+                let cam_x = ws.scrolling.peek_camera_x(state.elapsed_ms());
+                let tab_segs = ws.scrolling.tab_indicator_segments_at(viewport, cam_x);
+                append_tab_indicator_elements(
+                    winit_state.backend.renderer(),
+                    output_scale,
+                    &tab_segs,
+                    &mut elements,
+                );
+            }
+            let base_drop = state.drop_preview_for_workspace(&state.active_ws_id);
+            let ws_elements = assemble_workspace_elements(
                 winit_state.backend.renderer(),
                 viewport,
                 output_scale,
-                sp_lease,
+                &lease_state,
                 RenderTargetKind::PhysicalOutput,
                 OverlayKind::None,
                 frame_blur_ctx.as_ref(),
-                sp_drop,
-                sp_items,
+                base_drop,
+                &base_scene_items,
             );
-            elements.extend(sp_elems);
-            append_scratchpad_dim_scrim(viewport, &mut elements);
-        }
-
-        if let Some(ws) = state.workspaces.get(&state.active_ws_id)
-            && ws.layout_mode == koma_model::LayoutMode::Scrolling
-            && ws.fullscreen_window.is_none()
-        {
-            let cam_x = ws.scrolling.peek_camera_x(state.elapsed_ms());
-            let tab_segs = ws.scrolling.tab_indicator_segments_at(viewport, cam_x);
-            append_tab_indicator_elements(
-                winit_state.backend.renderer(),
-                output_scale,
-                &tab_segs,
-                &mut elements,
-            );
-        }
-        let base_drop = state.drop_preview_for_workspace(&state.active_ws_id);
-        let ws_elements = assemble_workspace_elements(
-            winit_state.backend.renderer(),
-            viewport,
-            output_scale,
-            &lease_state,
-            RenderTargetKind::PhysicalOutput,
-            OverlayKind::None,
-            frame_blur_ctx.as_ref(),
-            base_drop,
-            &base_scene_items,
-        );
-        elements.extend(ws_elements);
-        elements.extend(bg_layer_elements);
-        if state.config_error_banner.is_some() {
-            prepend_config_error_banner(viewport, &mut elements);
-        }
-        elements.splice(0..0, cursor_elems);
+            elements.extend(ws_elements);
+            elements.extend(bg_layer_elements);
+            if state.config_error_banner.is_some() {
+                prepend_config_error_banner(viewport, &mut elements);
+            }
+            elements.splice(0..0, cursor_elems);
+            (elements, DEFAULT_BACKDROP_CLEAR)
+        };
 
         let (renderer, mut framebuffer) = winit_state
             .backend
@@ -401,13 +484,7 @@ pub fn render_winit_frame(state: &mut KomaState) -> anyhow::Result<()> {
 
         winit_state
             .damage_tracker
-            .render_output(
-                renderer,
-                &mut framebuffer,
-                0,
-                &elements,
-                DEFAULT_BACKDROP_CLEAR,
-            )
+            .render_output(renderer, &mut framebuffer, 0, &elements, clear_color)
             .context("OutputDamageTracker::render_output failed")?
     };
 
@@ -419,20 +496,10 @@ pub fn render_winit_frame(state: &mut KomaState) -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("failed submitting Winit damage: {e:?}"))?;
     }
 
-    // 3. Dispatch `wl_surface.frame` callbacks to ALL visible tiled, floating & Scratchpad windows
-    let elapsed = state.elapsed_duration();
-    let output_ref = winit_state.output.clone();
-    for wl_surf in state.visible_physical_toplevel_surfaces() {
-        send_frames_surface_tree(
-            &wl_surf,
-            &output_ref,
-            elapsed,
-            Some(Duration::ZERO),
-            |_, _| Some(output_ref.clone()),
-        );
-    }
+    // 3. Dispatch `wl_surface.frame` callbacks strictly respecting session lock masking
+    dispatch_output_frame_callbacks_filtered(state, &winit_state.output, Some(Duration::ZERO));
 
-    let keep_animating = state.has_active_animations();
+    let keep_animating = !locked && state.has_active_animations();
     if keep_animating {
         winit_state.request_redraw();
     }
@@ -519,8 +586,9 @@ where
                 .unwrap_or((1280, 800));
             let pos: Point<f64, _> = event.position_transformed(out_geo_size.into());
             state.pointer_location = pos;
+            state.reconcile_session_lock();
 
-            let under = hit_test_active_deck_surface(state, pos);
+            let under = state.surface_under(pos);
             if let Some(pointer) = state.seat.get_pointer() {
                 let serial = SERIAL_COUNTER.next_serial();
                 pointer.motion(
@@ -574,16 +642,4 @@ where
         }
         _ => {}
     }
-}
-
-pub(crate) fn hit_test_active_deck_surface(
-    state: &KomaState,
-    global_pos: Point<f64, smithay::utils::Logical>,
-) -> Option<(
-    smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
-    Point<f64, smithay::utils::Logical>,
-)> {
-    state
-        .hit_test_visible_surface(global_pos)
-        .map(|(_, _, surf, origin)| (surf, origin))
 }

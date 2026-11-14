@@ -86,7 +86,8 @@ pub const fn resize_corner_from_xdg_edge(edge: xdg_toplevel::ResizeEdge) -> Opti
 /// Initiates a compositor-bound (`Mod + MouseLeft`) interactive window move grab before
 /// forwarding the triggering `ButtonEvent` to `PointerHandle::button`.
 pub fn start_compositor_move_grab(state: &mut KomaState, button_code: u32, serial: Serial) -> bool {
-    if state.is_session_locked {
+    state.reconcile_session_lock();
+    if state.is_locked_or_abandoned() {
         return false;
     }
     let Some(pointer) = state.seat.get_pointer() else {
@@ -132,7 +133,8 @@ pub fn start_compositor_resize_grab(
     button_code: u32,
     serial: Serial,
 ) -> bool {
-    if state.is_session_locked {
+    state.reconcile_session_lock();
+    if state.is_locked_or_abandoned() {
         return false;
     }
     let Some(pointer) = state.seat.get_pointer() else {
@@ -179,7 +181,8 @@ pub fn start_csd_move_grab(
     start_data: PointerGrabStartData<KomaState>,
     serial: Serial,
 ) -> bool {
-    if state.is_session_locked {
+    state.reconcile_session_lock();
+    if state.is_locked_or_abandoned() {
         return false;
     }
     let Some(pointer) = state.seat.get_pointer() else {
@@ -221,7 +224,8 @@ pub fn start_csd_resize_grab(
     serial: Serial,
     edges: xdg_toplevel::ResizeEdge,
 ) -> bool {
-    if state.is_session_locked {
+    state.reconcile_session_lock();
+    if state.is_locked_or_abandoned() {
         return false;
     }
     let Some(explicit_corner) = resize_corner_from_xdg_edge(edges) else {

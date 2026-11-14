@@ -85,20 +85,20 @@ impl FloatingStack {
         viewport: LogicalViewport,
         preferred_size: Option<(u32, u32)>,
     ) -> LogicalRect {
-        let (pw, ph) = preferred_size.unwrap_or((
-            (viewport.width * 3 / 5).max(320),
-            (viewport.height * 3 / 5).max(240),
-        ));
-        let w = pw.clamp(120, viewport.width.saturating_sub(32).max(120));
-        let h = ph.clamp(90, viewport.height.saturating_sub(32).max(90));
+        let wa = viewport.work_area_rect();
+        let (pw, ph) = preferred_size.unwrap_or(((wa.w * 3 / 5).max(320), (wa.h * 3 / 5).max(240)));
+        let w = pw.clamp(120, wa.w.saturating_sub(32).max(120));
+        let h = ph.clamp(90, wa.h.saturating_sub(32).max(90));
         let cascade = ((self.entries.len() % 5) as i32) * 24;
-        let base_x = ((viewport.width.saturating_sub(w)) / 2) as i32;
-        let base_y = ((viewport.height.saturating_sub(h)) / 2) as i32;
-        let max_x = (viewport.width.saturating_sub(w + 8)) as i32;
-        let max_y = (viewport.height.saturating_sub(h + 8)) as i32;
+        let base_x = wa.x + ((wa.w.saturating_sub(w)) / 2) as i32;
+        let base_y = wa.y + ((wa.h.saturating_sub(h)) / 2) as i32;
+        let min_x = wa.x + 8;
+        let min_y = wa.y + 8;
+        let max_x = wa.x + (wa.w.saturating_sub(w + 8)) as i32;
+        let max_y = wa.y + (wa.h.saturating_sub(h + 8)) as i32;
         LogicalRect::new(
-            (base_x + cascade).clamp(8, max_x.max(8)),
-            (base_y + cascade).clamp(8, max_y.max(8)),
+            (base_x + cascade).clamp(min_x, max_x.max(min_x)),
+            (base_y + cascade).clamp(min_y, max_y.max(min_y)),
             w,
             h,
         )
@@ -146,17 +146,18 @@ impl FloatingStack {
         max_size: (u32, u32),
         viewport: LogicalViewport,
     ) -> LogicalRect {
+        let wa = viewport.work_area_rect();
         let min_w = min_size.0.max(96) as i32;
         let min_h = min_size.1.max(72) as i32;
         let max_w = if max_size.0 > 0 {
             (max_size.0 as i32).max(min_w)
         } else {
-            viewport.width.max(96) as i32
+            wa.w.max(96) as i32
         };
         let max_h = if max_size.1 > 0 {
             (max_size.1 as i32).max(min_h)
         } else {
-            viewport.height.max(72) as i32
+            wa.h.max(72) as i32
         };
 
         let right_edge = initial.x + initial.w as i32;
@@ -221,10 +222,11 @@ impl FloatingStack {
         let Some(entry) = self.entries.iter_mut().find(|e| e.win_id == win_id) else {
             return false;
         };
-        let max_x = (viewport.width as i32 - 48).max(0);
-        let max_y = (viewport.height as i32 - 48).max(0);
-        let min_x = -(entry.rect.w as i32 - 48);
-        let min_y = -(entry.rect.h as i32 - 48).min(0);
+        let wa = viewport.work_area_rect();
+        let max_x = (wa.x + wa.w as i32 - 48).max(wa.x);
+        let max_y = (wa.y + wa.h as i32 - 48).max(wa.y);
+        let min_x = wa.x - (entry.rect.w as i32 - 48);
+        let min_y = wa.y - (entry.rect.h as i32 - 48).min(0);
         entry.rect.x = x.clamp(min_x, max_x);
         entry.rect.y = y.clamp(min_y, max_y);
         true
@@ -240,11 +242,12 @@ impl FloatingStack {
         let Some(entry) = self.entries.iter_mut().find(|e| e.win_id == win_id) else {
             return false;
         };
-        let max_x = (viewport.width as i32 - 48).max(0);
-        let max_y = (viewport.height as i32 - 48).max(0);
-        let min_x = -(entry.rect.w as i32 - 48);
+        let wa = viewport.work_area_rect();
+        let max_x = (wa.x + wa.w as i32 - 48).max(wa.x);
+        let max_y = (wa.y + wa.h as i32 - 48).max(wa.y);
+        let min_x = wa.x - (entry.rect.w as i32 - 48);
         entry.rect.x = (entry.rect.x + dx).clamp(min_x, max_x);
-        entry.rect.y = (entry.rect.y + dy).clamp(0, max_y);
+        entry.rect.y = (entry.rect.y + dy).clamp(wa.y, max_y);
         true
     }
 
@@ -258,19 +261,21 @@ impl FloatingStack {
         let Some(entry) = self.entries.iter_mut().find(|e| e.win_id == win_id) else {
             return false;
         };
-        entry.rect.w = (entry.rect.w as i32 + dw).clamp(96, viewport.width as i32) as u32;
-        entry.rect.h = (entry.rect.h as i32 + dh).clamp(72, viewport.height as i32) as u32;
+        let wa = viewport.work_area_rect();
+        entry.rect.w = (entry.rect.w as i32 + dw).clamp(96, wa.w.max(96) as i32) as u32;
+        entry.rect.h = (entry.rect.h as i32 + dh).clamp(72, wa.h.max(72) as i32) as u32;
         true
     }
 
     pub fn clamp_to_viewport(&mut self, viewport: LogicalViewport) {
+        let wa = viewport.work_area_rect();
         for entry in &mut self.entries {
-            entry.rect.w = entry.rect.w.min(viewport.width.max(96));
-            entry.rect.h = entry.rect.h.min(viewport.height.max(72));
-            let max_x = viewport.width.saturating_sub(entry.rect.w) as i32;
-            let max_y = viewport.height.saturating_sub(entry.rect.h) as i32;
-            entry.rect.x = entry.rect.x.clamp(0, max_x.max(0));
-            entry.rect.y = entry.rect.y.clamp(0, max_y.max(0));
+            entry.rect.w = entry.rect.w.min(wa.w.max(96));
+            entry.rect.h = entry.rect.h.min(wa.h.max(72));
+            let max_x = wa.x + wa.w.saturating_sub(entry.rect.w) as i32;
+            let max_y = wa.y + wa.h.saturating_sub(entry.rect.h) as i32;
+            entry.rect.x = entry.rect.x.clamp(wa.x, max_x.max(wa.x));
+            entry.rect.y = entry.rect.y.clamp(wa.y, max_y.max(wa.y));
         }
     }
 
@@ -365,13 +370,8 @@ impl DeckStashStack {
     }
 
     #[must_use]
-    pub const fn active_geometry(
-        &self,
-        viewport: LogicalViewport,
-    ) -> Option<(WindowId, LogicalRect)> {
-        match self.active_deck {
-            Some(win_id) => Some((win_id, viewport.full_rect())),
-            None => None,
-        }
+    pub fn active_geometry(&self, viewport: LogicalViewport) -> Option<(WindowId, LogicalRect)> {
+        self.active_deck
+            .map(|win_id| (win_id, viewport.work_area_rect()))
     }
 }

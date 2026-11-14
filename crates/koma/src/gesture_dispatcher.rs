@@ -484,14 +484,16 @@ pub fn process_gesture_swipe_begin<B: InputBackend>(
     state: &mut KomaState,
     event: &B::GestureSwipeBeginEvent,
 ) {
+    state.reconcile_session_lock();
     state.keybinds.pending_releases.clear();
     let fingers = event.fingers().clamp(1, 8) as u8;
-    let is_locked = state.is_session_locked;
+    let is_locked = state.is_locked_or_abandoned();
     let is_preempted = active_ws_is_preempted(state);
 
-    if state
-        .gestures
-        .claims_swipe_fingers(fingers, is_locked, is_preempted)
+    if !is_locked
+        && state
+            .gestures
+            .claims_swipe_fingers(fingers, is_locked, is_preempted)
     {
         let mut tracker_x = SwipeTracker::new();
         tracker_x.push(0.0, u64::from(event.time().millis()));
@@ -586,7 +588,17 @@ pub fn process_gesture_swipe_update<B: InputBackend + 'static>(
         },
     }
 
-    let is_locked = state.is_session_locked;
+    state.reconcile_session_lock();
+    let is_locked = state.is_locked_or_abandoned();
+    if is_locked
+        && matches!(
+            state.gestures.active_swipe,
+            Some(ActiveSwipeSession::Compositor { .. })
+        )
+    {
+        state.gestures.active_swipe = None;
+        return;
+    }
     let is_preempted = active_ws_is_preempted(state);
     let interactive_ws_id = state.effective_interactive_ws_id();
     let interactive_is_scrolling = state.workspaces.get(&interactive_ws_id).is_some_and(|ws| {
@@ -704,6 +716,7 @@ pub fn process_gesture_swipe_end<B: InputBackend>(
     state: &mut KomaState,
     event: &B::GestureSwipeEndEvent,
 ) {
+    state.reconcile_session_lock();
     let prev = state.gestures.active_swipe.take();
     match prev {
         Some(ActiveSwipeSession::Compositor {
@@ -711,6 +724,9 @@ pub fn process_gesture_swipe_end<B: InputBackend>(
             phase: CompositorSwipePhase::ContinuousScrolling { ws_id },
             ..
         }) => {
+            if state.is_locked_or_abandoned() {
+                return;
+            }
             let cancelled = event.cancelled();
             let event_time_ms = u64::from(event.time().millis());
             let release_vel = if cancelled {
@@ -757,14 +773,16 @@ pub fn process_gesture_pinch_begin<B: InputBackend>(
     state: &mut KomaState,
     event: &B::GesturePinchBeginEvent,
 ) {
+    state.reconcile_session_lock();
     state.keybinds.pending_releases.clear();
     let fingers = event.fingers().clamp(1, 8) as u8;
-    let is_locked = state.is_session_locked;
+    let is_locked = state.is_locked_or_abandoned();
     let is_preempted = active_ws_is_preempted(state);
 
-    if state
-        .gestures
-        .claims_pinch_fingers(fingers, is_locked, is_preempted)
+    if !is_locked
+        && state
+            .gestures
+            .claims_pinch_fingers(fingers, is_locked, is_preempted)
     {
         state.gestures.active_pinch = Some(ActivePinchSession::Compositor {
             fingers,
@@ -794,9 +812,11 @@ pub fn process_gesture_pinch_update<B: InputBackend>(
     event: &B::GesturePinchUpdateEvent,
     is_bare_metal_tty: bool,
 ) {
+    state.reconcile_session_lock();
+    let is_locked = state.is_locked_or_abandoned();
     match &mut state.gestures.active_pinch {
         Some(ActivePinchSession::Compositor { fingers, committed }) => {
-            if *committed {
+            if is_locked || *committed {
                 return;
             }
             let f_count = *fingers;
@@ -811,7 +831,6 @@ pub fn process_gesture_pinch_update<B: InputBackend>(
 
             if let Some(pinch_dir) = dir {
                 *committed = true;
-                let is_locked = state.is_session_locked;
                 let is_preempted = active_ws_is_preempted(state);
                 if let Some(matched) = state.gestures.resolve_pinch_gesture(
                     f_count,
@@ -971,5 +990,26 @@ mod tests {
         assert!(!defaults.claims_pinch_fingers(2, false, false));
         assert!(defaults.claims_swipe_fingers(3, false, false));
         assert!(defaults.claims_swipe_fingers(4, false, false));
+    }
+
+    #[test]
+    fn session_lock_blocks_swipe_and_pinch_gesture_execution() {
+        let defaults = GestureTable::with_builtin_defaults();
+        assert!(
+            defaults
+                .resolve_swipe_gesture(3, CardinalSwipeDir::Left, true, false)
+                .is_none()
+        );
+        assert!(
+            defaults
+                .resolve_swipe_gesture(4, CardinalSwipeDir::Up, true, false)
+                .is_none()
+        );
+        assert!(
+            defaults
+                .resolve_pinch_gesture(3, PinchDir::In, true, false)
+                .is_none()
+        );
+        assert!(!defaults.claims_swipe_fingers(3, true, false));
     }
 }
