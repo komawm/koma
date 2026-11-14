@@ -1,5 +1,6 @@
-//! Non-blocking Unix domain socket framing with `SCM_RIGHTS` FD passing, `SO_PEERCRED` UID
-//! verification, and write-sealed `memfd` creation (`IPC_SPEC.md` §2.1, §2.2, §5.4).
+//! Non-blocking Unix domain socket framing with `SCM_RIGHTS` FD passing, kernel peer credential
+//! verification (`SO_PEERCRED` / `LOCAL_PEERCRED` / `getpeereid`), and write-sealed `memfd` creation
+//! (`IPC_SPEC.md` §2.1, §2.2, §5.4).
 //!
 //! Uses `rustix`'s safe `OwnedFd`/`BorrowedFd` abstractions with zero raw `cmsg` pointer arithmetic.
 
@@ -39,40 +40,154 @@ pub struct PeerCreds {
     pub gid: u32,
 }
 
-/// Verifies that a client connecting to `koma-admin.sock` runs under the exact same UID as `koma`.
-#[cfg(target_os = "linux")]
-pub fn verify_same_uid_peer(stream: &UnixStream) -> io::Result<PeerCreds> {
+/// Kernel-verified Unix socket peer identity (`pid` where reported by the kernel, plus `uid` and `gid`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SocketPeerCreds {
+    pub pid: Option<i32>,
+    pub uid: u32,
+    pub gid: u32,
+}
+
+/// Queries kernel-verified peer credentials (`pid`, `uid`, `gid`) for a connected Unix stream socket.
+///
+/// Uses `SO_PEERCRED` on Linux/Android, `LOCAL_PEERCRED` (`xucred`) on FreeBSD, and `getpeereid`
+/// on other BSD/Darwin/Unix platforms. Fails closed (`Unsupported`) if an OS has no verified probe.
+pub fn query_socket_peer_creds(stream: &UnixStream) -> io::Result<SocketPeerCreds> {
+    query_socket_peer_creds_impl(stream)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn query_socket_peer_creds_impl(stream: &UnixStream) -> io::Result<SocketPeerCreds> {
     let ucred = rustix::net::sockopt::socket_peercred(stream)
         .map_err(|e| io::Error::from_raw_os_error(e.raw_os_error()))?;
-    let host_uid = getuid();
-    if ucred.uid != host_uid {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!(
-                "koma-admin.sock rejected foreign UID {} (compositor UID is {})",
-                ucred.uid.as_raw(),
-                host_uid.as_raw()
-            ),
-        ));
-    }
-    Ok(PeerCreds {
+    Ok(SocketPeerCreds {
+        pid: Some(ucred.pid.as_raw_nonzero().get()),
         uid: ucred.uid.as_raw(),
         gid: ucred.gid.as_raw(),
     })
 }
 
-#[cfg(not(target_os = "linux"))]
-pub fn verify_same_uid_peer(_stream: &UnixStream) -> io::Result<PeerCreds> {
-    Ok(PeerCreds {
-        uid: getuid().as_raw(),
-        gid: 0,
+#[cfg(target_os = "freebsd")]
+fn query_socket_peer_creds_impl(stream: &UnixStream) -> io::Result<SocketPeerCreds> {
+    use std::os::fd::AsRawFd as _;
+
+    let mut cred = MaybeUninit::<libc::xucred>::zeroed();
+    let mut len = std::mem::size_of::<libc::xucred>() as libc::socklen_t;
+    // SAFETY: `stream` is a live Unix stream FD and `cred` points to writable `xucred` storage.
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERCRED,
+            cred.as_mut_ptr().cast::<libc::c_void>(),
+            &raw mut len,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if (len as usize) < std::mem::size_of::<libc::xucred>() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "truncated FreeBSD LOCAL_PEERCRED xucred payload",
+        ));
+    }
+    // SAFETY: `getsockopt` succeeded and populated the entire `libc::xucred` struct.
+    let cred = unsafe { cred.assume_init() };
+    if cred.cr_version != libc::XUCRED_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unsupported FreeBSD xucred version {}", cred.cr_version),
+        ));
+    }
+    let gid = if cred.cr_ngroups > 0 {
+        cred.cr_groups[0]
+    } else {
+        0
+    };
+    // SAFETY: On FreeBSD 13+, the kernel writes `cr_pid` into this union; earlier kernels leave
+    // the pointer slot zeroed, so non-positive values map to `None`.
+    let raw_pid = unsafe { cred.cr_pid__c_anonymous_union.cr_pid };
+    Ok(SocketPeerCreds {
+        pid: (raw_pid > 0).then_some(raw_pid),
+        uid: cred.cr_uid,
+        gid,
     })
+}
+
+#[cfg(any(
+    target_os = "dragonfly",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "aix",
+    target_os = "cygwin",
+    target_os = "nto"
+))]
+fn query_socket_peer_creds_impl(stream: &UnixStream) -> io::Result<SocketPeerCreds> {
+    use std::os::fd::AsRawFd as _;
+
+    let mut uid: libc::uid_t = 0;
+    let mut gid: libc::gid_t = 0;
+    // SAFETY: `stream` is a live Unix stream FD and `uid`/`gid` are valid out-pointers.
+    let rc = unsafe { libc::getpeereid(stream.as_raw_fd(), &raw mut uid, &raw mut gid) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(SocketPeerCreds {
+        pid: None,
+        uid: uid as u32,
+        gid: gid as u32,
+    })
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "dragonfly",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "aix",
+    target_os = "cygwin",
+    target_os = "nto"
+)))]
+fn query_socket_peer_creds_impl(_stream: &UnixStream) -> io::Result<SocketPeerCreds> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "kernel Unix socket peer credential verification is unsupported on this OS",
+    ))
+}
+
+fn ensure_same_uid(peer: SocketPeerCreds, host_uid: u32) -> io::Result<PeerCreds> {
+    if peer.uid != host_uid {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "koma-admin.sock rejected foreign UID {} (compositor UID is {})",
+                peer.uid, host_uid
+            ),
+        ));
+    }
+    Ok(PeerCreds {
+        uid: peer.uid,
+        gid: peer.gid,
+    })
+}
+
+/// Verifies that a client connecting to `koma-admin.sock` runs under the exact same UID as `koma`.
+pub fn verify_same_uid_peer(stream: &UnixStream) -> io::Result<PeerCreds> {
+    let creds = query_socket_peer_creds(stream)?;
+    ensure_same_uid(creds, getuid().as_raw())
 }
 
 /// Allocates an anonymous RAM-backed `memfd`, writes `payload`, rewinds to offset `0`, and applies
 /// `F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE | F_SEAL_SEAL` so untrusted IPC peers can `mmap`
 /// `PROT_READ` zero-copy without ever mutating or truncating the buffer (`IPC_SPEC.md` §5.4).
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 pub fn create_sealed_readonly_memfd(label: &str, payload: &[u8]) -> io::Result<OwnedFd> {
     use rustix::fs::{MemfdFlags, SealFlags, fcntl_add_seals, memfd_create};
 
@@ -109,6 +224,14 @@ pub fn create_sealed_readonly_memfd(label: &str, payload: &[u8]) -> io::Result<O
     .map_err(|e| io::Error::from_raw_os_error(e.raw_os_error()))?;
 
     Ok(fd)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+pub fn create_sealed_readonly_memfd(_label: &str, _payload: &[u8]) -> io::Result<OwnedFd> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "write-sealed memfd creation requires Linux or FreeBSD",
+    ))
 }
 
 /// Sends a byte slice over a `UnixStream`, attaching up to `MAX_SCM_FDS` (`4`) descriptors via `SCM_RIGHTS`.
@@ -376,15 +499,41 @@ pub fn sync_roundtrip<Req: Serialize, Resp: DeserializeOwned>(
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(test)]
 mod tests {
-    use std::io::Read as _;
-
     use super::*;
-    use crate::frame::{IpcRequest, IpcResponse};
 
     #[test]
+    fn ensure_same_uid_rejects_foreign_uid_fail_closed() {
+        let foreign = SocketPeerCreds {
+            pid: Some(4242),
+            uid: 1001,
+            gid: 1001,
+        };
+        let err = ensure_same_uid(foreign, 1000).expect_err("foreign UID must be rejected");
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+
+        let same = SocketPeerCreds {
+            pid: None,
+            uid: 1000,
+            gid: 100,
+        };
+        assert_eq!(
+            ensure_same_uid(same, 1000).unwrap(),
+            PeerCreds {
+                uid: 1000,
+                gid: 100
+            }
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[test]
     fn transfers_sealed_readonly_memfd_over_scm_rights() {
+        use std::io::Read as _;
+
+        use crate::frame::{IpcRequest, IpcResponse};
+
         let (server, client) = UnixStream::pair().unwrap();
         server.set_nonblocking(true).unwrap();
 

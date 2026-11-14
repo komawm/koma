@@ -1,0 +1,83 @@
+name: BSD tier
+
+# FreeBSD x86_64 portability check and workspace test suite running inside a real
+# FreeBSD 15.1 VM via cross-platform-actions (since GitHub hosted runners lack native FreeBSD).
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Weekly FreeBSD x86_64 validation, Sundays 03:47 UTC.
+    - cron: "47 3 * * 0"
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - ".github/workflows/bsd-tier.yml"
+      - "scripts/freebsd-pkg-bootstrap.sh"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/koma-proto/**"
+      - "crates/koma/src/main.rs"
+      - "crates/koma/src/security_context.rs"
+      - "crates/koma/src/xwayland_satellite.rs"
+      - "crates/koma/src/backend_tty.rs"
+      - "crates/koma/src/config_watcher.rs"
+      - "crates/komactl/**"
+      - "crates/koma-overview/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bsd-tier-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  freebsd-x86_64:
+    name: FreeBSD x86_64 (Tier 2)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      CARGO_INCREMENTAL: "0"
+    defaults:
+      run:
+        shell: cpa.sh {0}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Start FreeBSD 15.1 VM
+        uses: cross-platform-actions/action@82668f1fbd89d9c99487604f822cbf6716f124d3 # v1.7.0
+        with:
+          operating_system: freebsd
+          version: "15.1"
+          memory: 6G
+          cpu_count: 8
+
+      - name: Install FreeBSD build prerequisites
+        run: |
+          set -eux
+          sh scripts/freebsd-pkg-bootstrap.sh \
+            --packages "git pkgconf ca_root_nss curl python3 wayland libdrm mesa-libs mesa-dri libxkbcommon libinput libudev-devd seatd libdisplay-info pixman dbus fontconfig sqlite3"
+
+      - name: Install pinned Rust toolchain (rustup)
+        run: |
+          set -eux
+          TOOLCHAIN="$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')"
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain "$TOOLCHAIN" --component rustfmt --component clippy
+          . "$HOME/.cargo/env"
+          cargo --version
+          rustc --version
+
+      - name: Check workspace for FreeBSD
+        run: |
+          set -eux
+          . "$HOME/.cargo/env"
+          cargo check --workspace --all-targets --locked
+
+      - name: Run workspace tests on FreeBSD
+        run: |
+          set -eux
+          . "$HOME/.cargo/env"
+          cargo test --workspace --locked -- --test-threads=4

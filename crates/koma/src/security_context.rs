@@ -29,7 +29,6 @@ use std::{
 use anyhow::Context as _;
 use calloop::{Interest, LoopHandle, Mode, PostAction, RegistrationToken, generic::Generic};
 use koma_proto::WorkspaceId;
-use rustix::net::sockopt::socket_peercred;
 use smithay::{
     reexports::wayland_server::{Client, Resource as _, protocol::wl_surface::WlSurface},
     wayland::security_context::{
@@ -40,7 +39,8 @@ use tracing::{debug, info, trace, warn};
 
 use crate::state::{ClientState, KomaState};
 
-/// Kernel-verified `SO_PEERCRED` identity captured when a Wayland client connects.
+/// Kernel-verified peer identity (`SO_PEERCRED` / `LOCAL_PEERCRED` / `getpeereid`) captured when a
+/// Wayland client connects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PeerSocketCredentials {
     pub pid: Option<i32>,
@@ -136,14 +136,15 @@ pub fn client_can_view_primary_selection(client: &Client) -> bool {
         .is_some_and(|cs| !cs.primary_selection_disabled && !cs.restricted)
 }
 
-/// Reads `SO_PEERCRED` (`pid`, `uid`, `gid`) from an accepted Wayland client `UnixStream`.
+/// Reads kernel-verified peer credentials (`pid`, `uid`, `gid`) from an accepted Wayland client
+/// `UnixStream`.
 #[must_use]
 pub fn query_peer_credentials(stream: &UnixStream) -> Option<PeerSocketCredentials> {
-    let creds = socket_peercred(stream).ok()?;
+    let creds = koma_proto::scm_unix::query_socket_peer_creds(stream).ok()?;
     Some(PeerSocketCredentials {
-        pid: Some(creds.pid.as_raw_nonzero().get()),
-        uid: creds.uid.as_raw(),
-        gid: creds.gid.as_raw(),
+        pid: creds.pid,
+        uid: creds.uid,
+        gid: creds.gid,
     })
 }
 

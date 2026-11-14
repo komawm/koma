@@ -48,44 +48,80 @@ pub struct MintedTokenReply {
     pub token: String,
 }
 
+fn candidate_runtime_bases() -> Vec<PathBuf> {
+    if let Some(xdg) = env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()) {
+        return vec![PathBuf::from(xdg)];
+    }
+    let uid = rustix::process::getuid().as_raw();
+    let mut bases = Vec::with_capacity(2);
+    #[cfg(target_os = "freebsd")]
+    bases.push(PathBuf::from(format!("/var/run/user/{uid}")));
+    #[cfg(not(target_os = "freebsd"))]
+    bases.push(PathBuf::from(format!("/run/user/{uid}")));
+    // Matches `koma`'s `ipc_server` fallback when `XDG_RUNTIME_DIR` is unset.
+    bases.push(PathBuf::from(format!("/tmp/koma-runtime-{uid}")));
+    bases
+}
+
 /// Resolves `$XDG_RUNTIME_DIR/koma/<signature>/koma-admin.sock` either from
-/// `KOMA_INSTANCE_SIGNATURE` or by scanning `$XDG_RUNTIME_DIR/koma/` for an active socket.
+/// `KOMA_INSTANCE_SIGNATURE` or by scanning runtime base directories for an active socket.
 pub fn discover_koma_instance() -> io::Result<DiscoveredInstance> {
-    let runtime_base = env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(format!("/run/user/{}", rustix::process::getuid().as_raw()))
-        });
-    let koma_root = runtime_base.join("koma");
+    let runtime_bases = candidate_runtime_bases();
 
     if let Ok(sig) = env::var("KOMA_INSTANCE_SIGNATURE") {
-        let dir = koma_root.join(sig);
-        let admin_socket = dir.join(ADMIN_SOCKET_NAME);
-        let agent_socket = dir.join(AGENT_SOCKET_NAME);
-        return Ok(DiscoveredInstance {
-            runtime_dir: dir,
-            admin_socket,
-            agent_socket,
-        });
+        let mut fallback = None;
+        for base in &runtime_bases {
+            let dir = base.join("koma").join(&sig);
+            let admin_socket = dir.join(ADMIN_SOCKET_NAME);
+            let agent_socket = dir.join(AGENT_SOCKET_NAME);
+            let candidate = DiscoveredInstance {
+                runtime_dir: dir,
+                admin_socket,
+                agent_socket,
+            };
+            if candidate.admin_socket.exists() {
+                return Ok(candidate);
+            }
+            if fallback.is_none() {
+                fallback = Some(candidate);
+            }
+        }
+        if let Some(candidate) = fallback {
+            return Ok(candidate);
+        }
     }
 
-    // Fallback when `komactl` is invoked from an external TTY / SSH / systemd service:
-    // probe `$XDG_RUNTIME_DIR/koma/*/` and select the newest live `koma-admin.sock`.
-    let entries = fs::read_dir(&koma_root).map_err(|_| {
-        io::Error::new(
+    // Fallback when `komactl` is invoked from an external TTY / SSH / service session:
+    // probe `<runtime_base>/koma/*/` and select the newest live `koma-admin.sock`.
+    let mut any_root_exists = false;
+    let mut candidates = Vec::new();
+    for base in &runtime_bases {
+        let koma_root = base.join("koma");
+        let Ok(entries) = fs::read_dir(&koma_root) else {
+            continue;
+        };
+        any_root_exists = true;
+        candidates.extend(
+            entries
+                .filter_map(Result::ok)
+                .map(|e| e.path())
+                .filter(|p| p.join(ADMIN_SOCKET_NAME).exists()),
+        );
+    }
+
+    if !any_root_exists {
+        let primary_root = runtime_bases
+            .first()
+            .map_or_else(|| PathBuf::from("koma"), |b| b.join("koma"));
+        return Err(io::Error::new(
             io::ErrorKind::NotFound,
             format!(
                 "KOMA_INSTANCE_SIGNATURE is unset and {} does not exist",
-                koma_root.display()
+                primary_root.display()
             ),
-        )
-    })?;
+        ));
+    }
 
-    let mut candidates: Vec<PathBuf> = entries
-        .filter_map(Result::ok)
-        .map(|e| e.path())
-        .filter(|p| p.join(ADMIN_SOCKET_NAME).exists())
-        .collect();
     candidates.sort();
 
     for dir in candidates.into_iter().rev() {
