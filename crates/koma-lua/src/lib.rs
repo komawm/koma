@@ -18,11 +18,14 @@ pub use crate::{
     },
     recorder::{RecordedStep, compile_recorded_macro},
     schema::{
-        ActionDescriptor, BindHandleId, BindOptions, BindSpec, GestureSpec, KomaConfigRegistry,
-        KomaHandleRef, LuaLayerRuleSpec, LuaWindowRuleSpec, MacroDefinition, MacroHandleId,
-        MacroLimitsSpec, MacroParamSpec, MonitorSpec, RuleHandleId, WorkspaceSpec,
-        XwaylandConfigSpec, validate_gesture_spec,
+        ActionDescriptor, AppearanceSpec, BindHandleId, BindOptions, BindSpec, GestureSpec,
+        InputConfigSpec, KomaConfigRegistry, KomaHandleRef, LuaLayerRuleSpec, LuaWindowRuleSpec,
+        MacroDefinition, MacroHandleId, MacroLimitsSpec, MacroParamSpec, MonitorSpec, RuleHandleId,
+        WorkspaceSpec, XwaylandConfigSpec, validate_gesture_spec,
     },
     typegen::generate_luals_stubs,
 };
-pub use koma_model::{AnimationConfig, BlurConfig, DwindleConfig, ScrollingConfig};
+pub use koma_model::{
+    AnimationConfig, BlurConfig, BorderConfig, DimConfig, DwindleConfig, FocusRingConfig,
+    ScrollingConfig, ShadowConfig,
+};

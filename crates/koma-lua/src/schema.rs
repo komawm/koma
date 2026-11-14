@@ -1,8 +1,9 @@
 use std::collections::BTreeMap;
 
 use koma_model::{
-    Anchor9, AnchorPoint, AnimationConfig, BlockOutPolicy, BlurConfig, DwindleConfig,
-    FrameClockConfig, LayoutMode, LogicalViewport, OpenMode, ScrollingConfig,
+    Anchor9, AnchorPoint, AnimationConfig, BlockOutPolicy, BlurConfig, BorderConfig, DimConfig,
+    DwindleConfig, FocusRingConfig, FrameClockConfig, LayoutMode, LogicalViewport, OpenMode,
+    ScrollingConfig, ShadowConfig,
 };
 use koma_proto::{KinematicProfileKind, MacroId, OutputId, TextInjectStrategy};
 use serde::{Deserialize, Serialize};
@@ -199,6 +200,12 @@ pub struct WorkspaceSpec {
     pub viewport: LogicalViewport,
     pub layout: LayoutMode,
     pub gaps: GapsSpec,
+    pub gaps_in: Option<u32>,
+    pub gaps_out: Option<u32>,
+    #[serde(skip)]
+    pub has_explicit_layout: bool,
+    #[serde(skip)]
+    pub has_explicit_gaps: bool,
     pub frame_clock: FrameClockConfig,
     pub isolate_vseat: bool,
 }
@@ -215,20 +222,55 @@ impl Default for WorkspaceSpec {
                 inner: 6,
                 outer: 10,
             },
+            gaps_in: None,
+            gaps_out: None,
+            has_explicit_layout: false,
+            has_explicit_gaps: false,
             frame_clock: FrameClockConfig::default(),
             isolate_vseat: false,
         }
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+impl WorkspaceSpec {
+    #[must_use]
+    pub fn effective_inner_gap(&self) -> u32 {
+        self.gaps_in.unwrap_or(self.gaps.inner)
+    }
+
+    #[must_use]
+    pub fn effective_outer_gap(&self) -> u32 {
+        self.gaps_out.unwrap_or(self.gaps.outer)
+    }
+}
+
+const fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct InputConfigSpec {
     pub mod_key: Option<String>,
+    #[serde(default = "default_true")]
+    pub inherit_default_binds: bool,
     pub keyboard: serde_json::Value,
     pub pointer: serde_json::Value,
     pub touchpad: serde_json::Value,
     pub tablet: serde_json::Value,
+}
+
+impl Default for InputConfigSpec {
+    fn default() -> Self {
+        Self {
+            mod_key: None,
+            inherit_default_binds: true,
+            keyboard: serde_json::Value::Null,
+            pointer: serde_json::Value::Null,
+            touchpad: serde_json::Value::Null,
+            tablet: serde_json::Value::Null,
+        }
+    }
 }
 
 impl InputConfigSpec {
@@ -275,13 +317,17 @@ pub struct DeviceOverrideSpec {
     pub map_to_output: Option<OutputId>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppearanceSpec {
-    pub border: serde_json::Value,
-    pub focus_ring: serde_json::Value,
+    pub border: BorderConfig,
+    pub focus_ring: FocusRingConfig,
     pub corner_radius: Option<u16>,
-    pub shadow: serde_json::Value,
+    pub shadow: ShadowConfig,
+    pub dim: DimConfig,
+    pub brightness: Option<f32>,
+    pub dim_inactive: Option<bool>,
+    pub dim_strength: Option<f32>,
     pub blur: BlurConfig,
     pub animations: AnimationConfig,
 }
@@ -289,13 +335,34 @@ pub struct AppearanceSpec {
 impl Default for AppearanceSpec {
     fn default() -> Self {
         Self {
-            border: serde_json::Value::Null,
-            focus_ring: serde_json::Value::Null,
+            border: BorderConfig::default(),
+            focus_ring: FocusRingConfig::default(),
             corner_radius: Some(10),
-            shadow: serde_json::Value::Null,
+            shadow: ShadowConfig::default(),
+            dim: DimConfig::default(),
+            brightness: None,
+            dim_inactive: None,
+            dim_strength: None,
             blur: BlurConfig::default(),
             animations: AnimationConfig::default(),
         }
+    }
+}
+
+impl AppearanceSpec {
+    #[must_use]
+    pub fn effective_dim(&self) -> DimConfig {
+        let mut dim = self.dim;
+        if let Some(brightness) = self.brightness {
+            dim.brightness = brightness;
+        }
+        if let Some(dim_inactive) = self.dim_inactive {
+            dim.dim_inactive = dim_inactive;
+        }
+        if let Some(dim_strength) = self.dim_strength {
+            dim.dim_strength = dim_strength;
+        }
+        dim
     }
 }
 
@@ -658,11 +725,13 @@ impl Default for XwaylandConfigSpec {
 }
 
 /// Complete declarative state produced by evaluating `~/.config/koma/init.lua`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct KomaConfigRegistry {
     pub env_vars: BTreeMap<String, String>,
     pub notifications: Vec<String>,
     pub monitors: Vec<MonitorSpec>,
+    pub default_layout: LayoutMode,
     pub workspaces: Vec<WorkspaceSpec>,
     pub dwindle: DwindleConfig,
     pub scrolling: ScrollingConfig,
@@ -671,6 +740,7 @@ pub struct KomaConfigRegistry {
     pub appearance: AppearanceSpec,
     pub xwayland: XwaylandConfigSpec,
     pub binds: Vec<BindSpec>,
+    pub unbinds: Vec<String>,
     pub gestures: Vec<GestureSpec>,
     pub window_rules: Vec<LuaWindowRuleSpec>,
     pub layer_rules: Vec<LuaLayerRuleSpec>,

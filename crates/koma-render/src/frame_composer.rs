@@ -3,7 +3,10 @@
 //! integrating SDF rounded-corner surface clipping, anti-aliased rounded borders,
 //! 4-quadrant `smart_split` drop-zone previews, and multi-pass `Dual Kawase Blur` backdrops.
 
-use koma_model::{BlurConfig, LogicalRect, LogicalViewport, WorkspaceLeaseState};
+use koma_model::{
+    BlurConfig, BorderConfig, DimConfig, LogicalRect, LogicalViewport, ShadowConfig,
+    WorkspaceLeaseState, parse_hex_color,
+};
 use koma_proto::OverlayKind;
 use smithay::{
     backend::renderer::{
@@ -54,6 +57,47 @@ pub struct WindowSceneItem<'a> {
     pub opacity: f32,
     pub corner_radius: f32,
     pub wants_blur: bool,
+    pub border: BorderConfig,
+    pub shadow: ShadowConfig,
+    pub dim: DimConfig,
+}
+
+/// Computes the effective opacity/brightness multiplier for a window given `DimConfig`.
+#[must_use]
+pub fn effective_window_opacity_for(base_opacity: f32, is_focused: bool, dim: &DimConfig) -> f32 {
+    let base = base_opacity.clamp(0.0, 1.0);
+    let brightness = dim.brightness.clamp(0.1, 2.0);
+    let factor = if !is_focused && dim.dim_inactive {
+        (1.0 - dim.dim_strength.clamp(0.0, 0.95)) * brightness
+    } else {
+        brightness
+    };
+    (base * factor).clamp(0.0, 1.0)
+}
+
+/// Computes the effective opacity/brightness multiplier for `item` given `dim`.
+#[must_use]
+pub fn effective_window_opacity(item: &WindowSceneItem<'_>, dim: &DimConfig) -> f32 {
+    effective_window_opacity_for(item.opacity, item.is_focused, dim)
+}
+
+/// Resolves the normalized `[f32; 4]` RGBA border color for a window from `BorderConfig` and `WorkspaceLeaseState`.
+#[must_use]
+pub fn resolve_border_rgba(
+    border: &BorderConfig,
+    lease_state: &WorkspaceLeaseState,
+    is_focused: bool,
+) -> [f32; 4] {
+    match lease_state {
+        WorkspaceLeaseState::HumanPreempted { .. } if is_focused => {
+            parse_hex_color(&border.human_preempt_color, COLOR_BORDER_HUMAN_PREEMPT)
+        }
+        WorkspaceLeaseState::AgentExclusive { .. } if is_focused => {
+            parse_hex_color(&border.agent_leased_color, COLOR_BORDER_AGENT_LEASED)
+        }
+        _ if is_focused => parse_hex_color(&border.active_color, COLOR_BORDER_FOCUSED),
+        _ => parse_hex_color(&border.inactive_color, COLOR_BORDER_INACTIVE),
+    }
 }
 
 /// Optional pre-blurred `Dual Kawase` backdrop passed into `assemble_workspace_elements` on
@@ -94,7 +138,6 @@ where
         append_grid_225_hairlines(viewport, &mut elements);
     }
 
-    let border_thickness = 2.0_f64;
     let viewport_size =
         Size::<f64, Logical>::from((f64::from(viewport.width), f64::from(viewport.height)));
     let mut drop_preview_emitted =
@@ -120,8 +163,13 @@ where
             drop_preview_emitted = true;
         }
 
+        let border_thickness = if item.border.enabled {
+            f64::from(item.border.width.max(0.0))
+        } else {
+            0.0
+        };
         let outer_rect = to_smithay_logical_rect(item.rect);
-        let eff_opacity = item.opacity.clamp(0.0, 1.0);
+        let eff_opacity = effective_window_opacity(item, &item.dim);
         let radius = item.corner_radius.max(0.0);
         let outer_radii = [radius; 4];
         let inner_radius = (radius - border_thickness as f32).max(0.0);
@@ -147,16 +195,7 @@ where
             )),
         );
 
-        let border_rgba = match lease_state {
-            WorkspaceLeaseState::HumanPreempted { .. } if item.is_focused => {
-                COLOR_BORDER_HUMAN_PREEMPT
-            }
-            WorkspaceLeaseState::AgentExclusive { .. } if item.is_focused => {
-                COLOR_BORDER_AGENT_LEASED
-            }
-            _ if item.is_focused => COLOR_BORDER_FOCUSED,
-            _ => COLOR_BORDER_INACTIVE,
-        };
+        let border_rgba = resolve_border_rgba(&item.border, lease_state, item.is_focused);
 
         // 2a. Transient xdg_popup menus attached to this toplevel (front-most, unclipped)
         if let Some(toplevel) = item.window.toplevel() {
@@ -179,10 +218,13 @@ where
         }
 
         // 2b. Anti-aliased SDF rounded border ring (or solid fallback when radius == 0)
-        if let (Some(border_prog), Some(white_tex)) = (
-            shaders.rounded_border.as_ref(),
-            shaders.white_1x1_tex.as_ref(),
-        ) {
+        if item.border.enabled
+            && border_thickness > 0.0
+            && let (Some(border_prog), Some(white_tex)) = (
+                shaders.rounded_border.as_ref(),
+                shaders.white_1x1_tex.as_ref(),
+            )
+        {
             elements.push(KomaRenderElement::RoundedBorder(
                 KomaRoundedBorderElement::new(
                     outer_rect,
@@ -255,7 +297,7 @@ where
             }
         }
 
-        if shaders.rounded_border.is_none() {
+        if item.border.enabled && border_thickness > 0.0 && shaders.rounded_border.is_none() {
             elements.push(KomaRenderElement::from(KomaSolidColorElement::oneshot(
                 outer_rect,
                 border_rgba,
@@ -431,5 +473,45 @@ pub fn append_tab_indicator_elements<R>(
         elements.push(KomaRenderElement::from(KomaSolidColorElement::oneshot(
             rect, rgba,
         )));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn effective_window_opacity_applies_inactive_dim_and_brightness() {
+        let dim = DimConfig {
+            dim_inactive: true,
+            dim_strength: 0.25,
+            brightness: 0.8,
+            contrast: 1.0,
+        };
+        // Focused window only scales by brightness (1.0 * 0.8 = 0.8)
+        let focused = effective_window_opacity_for(1.0, true, &dim);
+        assert!((focused - 0.8).abs() < 1e-5);
+
+        // Inactive window scales by (1 - 0.25) * 0.8 = 0.6
+        let inactive = effective_window_opacity_for(1.0, false, &dim);
+        assert!((inactive - 0.6).abs() < 1e-5);
+    }
+
+    #[test]
+    fn resolve_border_rgba_parses_custom_configured_colors() {
+        let border = BorderConfig {
+            enabled: true,
+            width: 3.0,
+            active_color: "#ff0000".to_owned(),
+            inactive_color: "#00ff00".to_owned(),
+            agent_leased_color: "#0000ff".to_owned(),
+            human_preempt_color: "#ffff00".to_owned(),
+        };
+
+        let active = resolve_border_rgba(&border, &WorkspaceLeaseState::Unheld, true);
+        assert_eq!(active, [1.0, 0.0, 0.0, 1.0]);
+
+        let inactive = resolve_border_rgba(&border, &WorkspaceLeaseState::Unheld, false);
+        assert_eq!(inactive, [0.0, 1.0, 0.0, 1.0]);
     }
 }

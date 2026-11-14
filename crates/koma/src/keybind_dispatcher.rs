@@ -460,7 +460,7 @@ impl KeybindTable {
             ),
         ];
 
-        let mut binds = Vec::with_capacity(defaults.len());
+        let mut binds = Vec::with_capacity(defaults.len() + 18);
         for (id_num, chord_str, act, cooldown_ms) in defaults {
             if let Ok(chord) = parse_chord_spec(chord_str) {
                 let options = BindOptions {
@@ -480,6 +480,37 @@ impl KeybindTable {
             }
         }
 
+        // Hyprland default workspace focus (`Mod + 1..=9`) & window move (`Mod + Shift + 1..=9`)
+        for idx in 1_u64..=9 {
+            let ws_name = idx.to_string();
+            let focus_chord_str = format!("Mod + {ws_name}");
+            if let Ok(chord) = parse_chord_spec(&focus_chord_str) {
+                binds.push(CompiledBind {
+                    id: BindHandleId(100 + idx),
+                    mode: None,
+                    enabled: true,
+                    raw_chord: focus_chord_str,
+                    chord,
+                    press_action: Some(ActionDescriptor::WorkspaceFocus(ws_name.clone())),
+                    release_action: None,
+                    options: BindOptions::default(),
+                });
+            }
+            let move_chord_str = format!("Mod + Shift + {ws_name}");
+            if let Ok(chord) = parse_chord_spec(&move_chord_str) {
+                binds.push(CompiledBind {
+                    id: BindHandleId(110 + idx),
+                    mode: None,
+                    enabled: true,
+                    raw_chord: move_chord_str,
+                    chord,
+                    press_action: Some(ActionDescriptor::WindowMoveToWorkspace(ws_name)),
+                    release_action: None,
+                    options: BindOptions::default(),
+                });
+            }
+        }
+
         Self {
             binds,
             mod_key_override: None,
@@ -495,20 +526,50 @@ impl KeybindTable {
         }
     }
 
-    /// Validates and pre-compiles all `BindSpec` chords (XKB keysyms + `MouseLeft/Right` + `WheelScroll*` / `TouchpadScroll*`).
+    /// Validates and pre-compiles all `BindSpec` chords (XKB keysyms + `MouseLeft/Right` + `WheelScroll*` / `TouchpadScroll*`),
+    /// inheriting the complete Hyprland default keymap with zero unbinds.
+    #[allow(dead_code)]
     pub fn compile(specs: &[BindSpec], mod_key_cfg: Option<&str>) -> Result<Self, String> {
+        Self::compile_with_options(specs, &[], true, mod_key_cfg)
+    }
+
+    /// Validates and compiles `specs` on top of optional `with_builtin_defaults()`, applying
+    /// `unbinds` removal and in-place chord overrides.
+    pub fn compile_with_options(
+        specs: &[BindSpec],
+        unbinds: &[String],
+        inherit_default_binds: bool,
+        mod_key_cfg: Option<&str>,
+    ) -> Result<Self, String> {
         let mod_key_override = match mod_key_cfg.filter(|s| !s.trim().is_empty()) {
-            Some("auto") | None => None,
+            Some(s) if s.trim().eq_ignore_ascii_case("auto") => None,
+            None => None,
             Some(explicit) => Some(PhysicalModKey::parse(explicit)?),
         };
 
-        if specs.is_empty() {
-            let mut fallback = Self::with_builtin_defaults();
-            fallback.mod_key_override = mod_key_override;
-            return Ok(fallback);
+        let mut parsed_unbinds = Vec::with_capacity(unbinds.len());
+        for raw_u in unbinds {
+            let chord = parse_chord_spec(raw_u).map_err(|e| format!("in unbind `{raw_u}`: {e}"))?;
+            parsed_unbinds.push(chord);
         }
 
-        let mut binds = Vec::with_capacity(specs.len() + 2);
+        let mut binds = if inherit_default_binds {
+            Self::with_builtin_defaults().binds
+        } else {
+            Vec::with_capacity(specs.len() + 2)
+        };
+
+        if !parsed_unbinds.is_empty() {
+            binds.retain(|b| {
+                if b.mode.is_some() {
+                    return true;
+                }
+                !parsed_unbinds
+                    .iter()
+                    .any(|&u| chords_match_under_mod_override(b.chord, u, mod_key_override))
+            });
+        }
+
         for spec in specs {
             let chord = parse_chord_spec(&spec.chord)
                 .map_err(|e| format!("in bind `{}`: {e}", spec.chord))?;
@@ -538,7 +599,7 @@ impl KeybindTable {
                 ),
             };
 
-            binds.push(CompiledBind {
+            let compiled_bind = CompiledBind {
                 id: spec.id,
                 mode: spec.mode.clone(),
                 enabled: spec.enabled,
@@ -547,47 +608,67 @@ impl KeybindTable {
                 press_action,
                 release_action,
                 options: spec.options.clone(),
-            });
+            };
+
+            if let Some(existing) = binds.iter_mut().find(|b| {
+                b.mode == compiled_bind.mode
+                    && b.options.edge == compiled_bind.options.edge
+                    && chords_match_under_mod_override(
+                        b.chord,
+                        compiled_bind.chord,
+                        mod_key_override,
+                    )
+            }) {
+                *existing = compiled_bind;
+            } else {
+                binds.push(compiled_bind);
+            }
         }
 
         // Like Niri (`niri/src/input/mod.rs` lines 3316-3415), keep `Mod + MouseLeft` move and
-        // `Mod + MouseRight` resize available unless the user explicitly rebound that exact chord!
+        // `Mod + MouseRight` resize available unless explicitly unbound or rebound!
+        let lmb_chord = CompiledChord {
+            mods: MOD_COMPOSITOR,
+            trigger: BindTrigger::MouseButton(MouseButtonTrigger::Left),
+        };
+        let lmb_unbound = parsed_unbinds
+            .iter()
+            .any(|&u| chords_match_under_mod_override(lmb_chord, u, mod_key_override));
         let has_mod_lmb = binds.iter().any(|b| {
             b.mode.is_none()
-                && b.chord.mods == MOD_COMPOSITOR
-                && b.chord.trigger == BindTrigger::MouseButton(MouseButtonTrigger::Left)
+                && chords_match_under_mod_override(b.chord, lmb_chord, mod_key_override)
         });
-        if !has_mod_lmb {
+        if !has_mod_lmb && !lmb_unbound {
             binds.push(CompiledBind {
                 id: BindHandleId(u64::MAX - 1),
                 mode: None,
                 enabled: true,
                 raw_chord: "Mod + MouseLeft".to_owned(),
-                chord: CompiledChord {
-                    mods: MOD_COMPOSITOR,
-                    trigger: BindTrigger::MouseButton(MouseButtonTrigger::Left),
-                },
+                chord: lmb_chord,
                 press_action: Some(ActionDescriptor::WindowDragMove),
                 release_action: None,
                 options: BindOptions::default(),
             });
         }
 
+        let rmb_chord = CompiledChord {
+            mods: MOD_COMPOSITOR,
+            trigger: BindTrigger::MouseButton(MouseButtonTrigger::Right),
+        };
+        let rmb_unbound = parsed_unbinds
+            .iter()
+            .any(|&u| chords_match_under_mod_override(rmb_chord, u, mod_key_override));
         let has_mod_rmb = binds.iter().any(|b| {
             b.mode.is_none()
-                && b.chord.mods == MOD_COMPOSITOR
-                && b.chord.trigger == BindTrigger::MouseButton(MouseButtonTrigger::Right)
+                && chords_match_under_mod_override(b.chord, rmb_chord, mod_key_override)
         });
-        if !has_mod_rmb {
+        if !has_mod_rmb && !rmb_unbound {
             binds.push(CompiledBind {
                 id: BindHandleId(u64::MAX),
                 mode: None,
                 enabled: true,
                 raw_chord: "Mod + MouseRight".to_owned(),
-                chord: CompiledChord {
-                    mods: MOD_COMPOSITOR,
-                    trigger: BindTrigger::MouseButton(MouseButtonTrigger::Right),
-                },
+                chord: rmb_chord,
                 press_action: Some(ActionDescriptor::WindowDragResize),
                 release_action: None,
                 options: BindOptions::default(),
@@ -768,6 +849,23 @@ pub(crate) fn expand_bind_modifiers(bind_mods: u8, phys_mod: PhysicalModKey) -> 
     } else {
         bind_mods
     }
+}
+
+fn chords_match_under_mod_override(
+    a: CompiledChord,
+    b: CompiledChord,
+    mod_key_override: Option<PhysicalModKey>,
+) -> bool {
+    if a.trigger != b.trigger {
+        return false;
+    }
+    if a.mods == b.mods {
+        return true;
+    }
+    if let Some(phys) = mod_key_override {
+        return expand_bind_modifiers(a.mods, phys) == expand_bind_modifiers(b.mods, phys);
+    }
+    false
 }
 
 /// Unified `PointerButton` handler shared by `backend_winit.rs` and `backend_tty.rs`
@@ -1650,15 +1748,7 @@ pub fn execute_action_descriptor(
         }
 
         ActionDescriptor::WindowMoveToWorkspace(target_name) => {
-            let dst_ws_id = if target_name.starts_with(SPECIAL_WORKSPACE_PREFIX) {
-                state.ensure_special_workspace(Some(&target_name))
-            } else {
-                let Some(id) = resolve_workspace_by_name_or_id(state, &target_name) else {
-                    warn!(target = %target_name, "WindowMoveToWorkspace: target workspace not found");
-                    return;
-                };
-                id
-            };
+            let dst_ws_id = state.ensure_workspace_by_name_or_id(&target_name);
             let src_ws_id = state.effective_interactive_ws_id();
             move_active_window_between_workspaces(state, &src_ws_id, &dst_ws_id);
         }
@@ -2003,7 +2093,8 @@ pub fn execute_action_descriptor(
                 state.active_special_ws_id = Some(sp_id);
                 state.focus_active_deck_window();
                 state.queue_redraw();
-            } else if let Some(ws_id) = resolve_workspace_by_name_or_id(state, &target) {
+            } else {
+                let ws_id = state.ensure_workspace_by_name_or_id(&target);
                 state.active_special_ws_id = None;
                 state.active_ws_id = ws_id;
                 state.focus_active_deck_window();
@@ -2135,27 +2226,6 @@ pub fn execute_action_descriptor(
     }
 }
 
-fn resolve_workspace_by_name_or_id(state: &KomaState, query: &str) -> Option<WorkspaceId> {
-    if let Some((id, _)) = state
-        .workspaces
-        .iter()
-        .find(|(id, ws)| id.as_str() == query || ws.name == query)
-    {
-        return Some(id.clone());
-    }
-    if let Ok(index_1based) = query.parse::<usize>() {
-        let mut ids: Vec<WorkspaceId> = state.workspaces.keys().cloned().collect();
-        ids.sort();
-        if index_1based >= 1 {
-            return ids
-                .get(index_1based - 1)
-                .cloned()
-                .or_else(|| ids.last().cloned());
-        }
-    }
-    None
-}
-
 fn move_active_window_between_workspaces(
     state: &mut KomaState,
     src_ws_id: &WorkspaceId,
@@ -2282,5 +2352,73 @@ mod tests {
             m_right.trigger,
             BindTrigger::MouseButton(MouseButtonTrigger::Right)
         );
+    }
+
+    #[test]
+    fn builtin_defaults_include_hyprland_workspace_1_to_9_and_compile_with_options_overrides_and_unbinds()
+     {
+        let defaults = KeybindTable::with_builtin_defaults();
+        for idx in 1..=9 {
+            let ws = idx.to_string();
+            let focus_chord = parse_chord_spec(&format!("Mod + {ws}")).unwrap();
+            let move_chord = parse_chord_spec(&format!("Mod + Shift + {ws}")).unwrap();
+            assert!(defaults.binds.iter().any(|b| {
+                b.chord == focus_chord
+                    && b.press_action == Some(ActionDescriptor::WorkspaceFocus(ws.clone()))
+            }));
+            assert!(defaults.binds.iter().any(|b| {
+                b.chord == move_chord
+                    && b.press_action == Some(ActionDescriptor::WindowMoveToWorkspace(ws.clone()))
+            }));
+        }
+
+        // Override Mod + Return to foot and unbind Mod + Q while keeping other defaults
+        let custom_spec = BindSpec {
+            id: BindHandleId(500),
+            mode: None,
+            enabled: true,
+            chord: "Mod + Return".to_owned(),
+            action: ActionDescriptor::Spawn {
+                argv: vec!["foot".to_owned()],
+            },
+            release_action: None,
+            options: BindOptions::default(),
+        };
+        let table = KeybindTable::compile_with_options(
+            std::slice::from_ref(&custom_spec),
+            &["Mod + Q".to_owned()],
+            true,
+            Some("Alt"),
+        )
+        .unwrap();
+
+        assert_eq!(table.mod_key_override, Some(PhysicalModKey::Alt));
+        let q_chord = parse_chord_spec("Mod + Q").unwrap();
+        assert!(
+            !table.binds.iter().any(|b| b.chord == q_chord),
+            "Mod + Q should be removed by unbinds"
+        );
+        let ret_chord = parse_chord_spec("Mod + Return").unwrap();
+        let ret_binds: Vec<_> = table
+            .binds
+            .iter()
+            .filter(|b| b.chord == ret_chord)
+            .collect();
+        assert_eq!(
+            ret_binds.len(),
+            1,
+            "Mod + Return should be overridden in-place without duplication"
+        );
+        assert_eq!(
+            ret_binds[0].press_action,
+            Some(ActionDescriptor::Spawn {
+                argv: vec!["foot".to_owned()]
+            })
+        );
+
+        // When inherit_default_binds = false, only explicit user binds (+ Mod + MouseLeft/Right) remain
+        let minimal =
+            KeybindTable::compile_with_options(&[custom_spec], &[], false, Some("Super")).unwrap();
+        assert_eq!(minimal.binds.len(), 3);
     }
 }

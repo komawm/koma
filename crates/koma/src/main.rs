@@ -1,5 +1,61 @@
 //! Ring 0 Wayland compositor entry point (`koma`).
 //!
+//! ```text
+//!                                      ╭──────╮
+//!                                    ╭─╯      ╰╮
+//!                                   ╭╯ K O M A ╰╮                             ╭───────────╮
+//!                                 ╭─╯  WAYLAND  ╰╮                         ╭──╯ DUAL-MODE ╰─╮
+//!                                ╭╯ Ring 0 Core  │                     ╭───╯  Headed+Agent  ╰╮
+//!                              ╭─╯  Compositor  ╭╯                   ╭─╯    Desktop & AI     ╰╮
+//!                             ╭╯   koma-model   │                 ╭──╯    Symmetrical FBO     │
+//!                           ╭─╯  koma-render   ╭╯               ╭─╯   Dwindle   ╭───╮         │
+//!                         ╭─╯   koma-wayland   │              ╭─╯ Scrolling  ╭──╯  ╭╯         │
+//!                        ╭╯  koma-seat/vSeat  ╭╯            ╭─╯ Deck/BSP  ╭──╯   ╭─╯         ╭╯
+//!                      ╭─╯ koma-lua/Phodopus  │           ╭─╯  Grid225  ╭─╯     ╭╯  15x15   ╭╯
+//!                    ╭─╯ koma-ipc / koma-mcp ╭╯         ╭─╯ 9-Anchor  ╭─╯    ╭──╯  vSeat   ╭╯
+//!                  ╭─╯ 240Hz KMS ╭╮ Smithay  │        ╭─╯ Hyprland  ╭─╯   ╭──╯   Epoch   ╭─╯
+//!                ╭─╯ DRM/Atom  ╭─╯│ GLES/GL ╭╯       ╭╯ Keybinds  ╭─╯ ╭───╯    Lease    ╭╯
+//!              ╭─╯  Libseat  ╭─╯ ╭╯ DMABUF ╭╯      ╭─╯ Overrides  ╰───╯  Shield Mode  ╭─╯
+//!           ╭──╯ Udev/GPU  ╭─╯   │ Kawase  │     ╭─╯ AI-NATIVE WAYLAND COMPOSITOR  ╭──╯
+//!         ╭─╯  Libinput  ╭─╯    ╭╯ Spring ╭╯    ╭╯ Headed KMS + Headless Agent  ╭──╯
+//!      ╭──╯ Winit Dev  ╭─╯     ╭╯ Shadow  │    ╭╯ Configurable Lua Defaults ╭───╯
+//!   ╭──╯  XWayland   ╭─╯       │ Border  ╭╯  ╭─╯ Live Shadow Arena Swap ╭───╯
+//! ╭─╯  Satellite  ╭──╯        ╭╯ Dimming │  ╭╯  Protected Blackout  ╭───╯
+//! │  Calloop   ╭──╯           │ HotSwap ╭╯ ╭╯ Zero-Token Macro ╭────╯
+//! ╰╮        ╭──╯ Lua 5.4 VM  ╭╯        ╭╯╭─╯ Spring Motion ╭───╯
+//!  ╰─╮   ╭──╯ 4MiB Sandbox  ╭╯         │╭╯ Kawase Blur ╭───╯
+//!    ╰───╯   Fuel Metered   │          ╰╯ VRR Scan  ╭──╯
+//!                          ╭╯ EPOCH LEASE ARBITER ╭─╯
+//!                          │ Mod+G <1ms Preempt  ╭╯
+//!                         ╭╯ Zero-Copy Screencap ╰╮
+//!                        ╭╯ Isolated vSeat Focus  ╰╮
+//!                        │  3-Tier Text Injection  ╰╮
+//!                       ╭╯   Dynamic Window Rules   ╰╮
+//!                       │   Multi-Finger Gestures    ╰╮
+//!                      ╭╯    xdg-shell    ╭─╮         ╰╮
+//!                      │   layer-shell   ╭╯ │          ╰╮
+//!                     ╭╯   screencopy   ╭╯  ╰─╮         ╰╮
+//!                    ╭╯   fractional   ╭╯     ╰╮         ╰─╮
+//!                    │   viewporter    │       ╰╮   Jiku   ╰─╮             ╭───────────────────────╮
+//!                   ╭╯   drm-lease    ╭╯        ╰─╮  Bridge  ╰─╮         ╭─╯  JIKU DESKTOP AGENT   ╰─╮
+//!                   │  session-lock  ╭╯           ╰╮  MCP+CLI  ╰──╮     ╭╯ gemini-decision-1 Router  ╰╮
+//!                  ╭╯  virtual-in   ╭╯             ╰─╮  komactl   ╰──╮  ╰╮  Turn SSE & Live Bidi WS   │
+//!                  │   text-in-v3   │                ╰─╮  koma-mcp   ╰───╯ Structured Text Fallback  ╭╯
+//!                 ╭╯ security-ctx  ╭╯                  ╰─╮     koma --session | --tty | --winit     ╭╯
+//!                 │  data-control  │                     ╰──╮     komactl CLI & koma-mcp Server     │
+//!                ╭╯ idle-inhibit  ╭╯                        ╰──╮  LuaLS Stubs: komactl gen-types   ╭╯
+//!                │  presentation  │                            ╰────╮   ~/.config/koma/init.lua   ╭╯
+//!               ╭╯ linux-dmabuf  ╭╯                                 ╰──────╮        ╭──╮  240Hz   │
+//!               │  single-pixel  │                                         ╰────────╯  │ VRR/HDR ╭╯
+//!              ╭╯   xdg-dialog   │                                                    ╭╯ KMS/GL ╭╯
+//!              │   xdg-output   ╭╯                                                   ╭╯ Wayland │
+//!              │   xdg-decor   ╭╯                                                    ╰╮ Ring 0 ╭╯
+//!              ╰╮ gestures-v1 ╭╯                                                      ╰╮      ╭╯
+//!               ╰╮ GPL-3.0+ ╭─╯                                                        ╰──────╯
+//!                ╰─╮      ╭─╯
+//!                  ╰──────╯
+//! ```
+//!
 //! Launch modes (matching `niri/src/main.rs`):
 //! - Managed login session (`koma-session` / `koma.service` `Type=notify` / `greetd`):
 //!   `koma --session`

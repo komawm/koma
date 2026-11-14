@@ -320,7 +320,9 @@ impl KomaState {
             .expect("failed to initialize XKB keyboard on host seat");
         seat.add_pointer();
 
-        // Human `Headed` workspaces default to Hyprland's `Dwindle` binary tree (`LayoutMode::Dwindle`)!
+        // Human `Headed` workspaces default to `registry.default_layout` (`LayoutMode::Dwindle`)!
+        let lua_sandbox = PhodopusSandbox::default();
+        let initial_reg = lua_sandbox.config_snapshot();
         let active_ws_id = WorkspaceId::from("ws_01");
         let vseat_id = SeatId::from("vseat_01");
         let ws = WorkspaceState::new(
@@ -329,7 +331,7 @@ impl KomaState {
             vseat_id.clone(),
             initial_viewport,
             PresentationTarget::Physical(OutputId::from("primary")),
-            LayoutMode::Dwindle,
+            initial_reg.default_layout,
             0,
         );
 
@@ -385,7 +387,7 @@ impl KomaState {
             gestures: GestureTable::default(),
             pending_passthrough_actions: Vec::new(),
             lua_scheduler: TrampolineScheduler::default(),
-            lua_sandbox: PhodopusSandbox::default(),
+            lua_sandbox,
             deferred_lua_sandbox: None,
             config_path: KomaConfigPath::resolve(None),
             config_watcher: None,
@@ -442,16 +444,129 @@ impl KomaState {
             .map(|ws| ws.viewport)
             .unwrap_or_default();
         let now_ms = self.elapsed_ms();
+        let registry = self.lua_sandbox.config_snapshot();
+        let matching_spec = registry
+            .workspaces
+            .iter()
+            .find(|s| s.name == canonical_name);
+        let layout_mode = matching_spec
+            .map(|s| s.layout)
+            .unwrap_or(registry.default_layout);
 
-        let ws = WorkspaceState::new(
+        let mut ws = WorkspaceState::new(
             ws_id.clone(),
             canonical_name,
             vseat_id.clone(),
             viewport,
             PresentationTarget::Physical(OutputId::from("primary")),
-            LayoutMode::Dwindle,
+            layout_mode,
             now_ms,
         );
+        let mut d_cfg = registry.dwindle;
+        let mut s_cfg = registry.scrolling.clone();
+        if let Some(spec) = matching_spec {
+            let inner = spec.effective_inner_gap();
+            let outer = spec.effective_outer_gap().max(48);
+            d_cfg.inner_gap = inner;
+            d_cfg.outer_gap = outer;
+            s_cfg.inner_gap = inner;
+            s_cfg.outer_gap = outer;
+        } else {
+            d_cfg.inner_gap = 10;
+            d_cfg.outer_gap = d_cfg.outer_gap.max(48);
+            s_cfg.inner_gap = 10;
+            s_cfg.outer_gap = s_cfg.outer_gap.max(48);
+        }
+        ws.dwindle.config = d_cfg;
+        ws.scrolling.update_config(s_cfg, viewport, now_ms);
+
+        self.vseats
+            .insert(vseat_id.clone(), VirtualSeatLedger::new(vseat_id));
+        self.workspaces.insert(ws_id.clone(), ws);
+        ws_id
+    }
+
+    /// Resolves an existing workspace by `WorkspaceId` or `name`, or lazily creates a new workspace
+    /// applying `registry.default_layout` and any matching `WorkspaceSpec` (`layout`, `gaps`).
+    pub fn ensure_workspace_by_name_or_id(&mut self, query: &str) -> WorkspaceId {
+        if query.starts_with(koma_model::SPECIAL_WORKSPACE_PREFIX) {
+            return self.ensure_special_workspace(Some(query));
+        }
+        if let Some((existing_id, _)) = self
+            .workspaces
+            .iter()
+            .find(|(id, ws)| id.as_str() == query || ws.name == query)
+        {
+            return existing_id.clone();
+        }
+
+        let next_idx = self.workspaces.len() + 1;
+        let ws_id = WorkspaceId::new(format!("ws_{next_idx:02}"));
+        let vseat_id = SeatId::new(format!("vseat_{next_idx:02}"));
+        let fallback_viewport = self
+            .workspaces
+            .get(&self.active_ws_id)
+            .map(|ws| ws.viewport)
+            .unwrap_or_default();
+        let now_ms = self.elapsed_ms();
+        let registry = self.lua_sandbox.config_snapshot();
+        let matching_spec = registry.workspaces.iter().find(|s| s.name == query);
+
+        let is_headless =
+            matching_spec.is_some_and(|s| s.presentation.eq_ignore_ascii_case("headless"));
+        let viewport = matching_spec
+            .filter(|_s| is_headless)
+            .map(|s| s.viewport)
+            .unwrap_or(fallback_viewport);
+        let layout_mode = if is_headless {
+            LayoutMode::Deck
+        } else {
+            matching_spec
+                .map(|s| s.layout)
+                .unwrap_or(registry.default_layout)
+        };
+        let presentation = if is_headless {
+            let slot = self.fbo_pool.acquire_or_borrow(&ws_id);
+            self.offscreen_surfaces.insert(
+                ws_id.clone(),
+                LazyOffscreenSurface::new(
+                    viewport.width as i32,
+                    viewport.height as i32,
+                    viewport.scale,
+                ),
+            );
+            PresentationTarget::Offscreen {
+                lazy_fbo_slot: slot,
+            }
+        } else {
+            let out_id = matching_spec
+                .and_then(|s| s.preferred_output.clone())
+                .unwrap_or_else(|| OutputId::from("primary"));
+            PresentationTarget::Physical(out_id)
+        };
+
+        let mut ws = WorkspaceState::new(
+            ws_id.clone(),
+            query,
+            vseat_id.clone(),
+            viewport,
+            presentation,
+            layout_mode,
+            now_ms,
+        );
+        let mut d_cfg = registry.dwindle;
+        let mut s_cfg = registry.scrolling.clone();
+        if let Some(spec) = matching_spec
+            && (spec.has_explicit_gaps || spec.gaps_in.is_some() || spec.gaps_out.is_some())
+        {
+            d_cfg.inner_gap = spec.effective_inner_gap();
+            d_cfg.outer_gap = spec.effective_outer_gap();
+            s_cfg.inner_gap = spec.effective_inner_gap();
+            s_cfg.outer_gap = spec.effective_outer_gap();
+        }
+        ws.dwindle.config = d_cfg;
+        ws.scrolling.update_config(s_cfg, viewport, now_ms);
+
         self.vseats
             .insert(vseat_id.clone(), VirtualSeatLedger::new(vseat_id));
         self.workspaces.insert(ws_id.clone(), ws);
@@ -633,7 +748,13 @@ impl KomaState {
         let is_offscreen = matches!(ws.presentation, PresentationTarget::Offscreen { .. });
         let visible = ws.compute_animation_target_geometries();
         let now_ms = self.elapsed_ms();
-        let anim_cfg = self.lua_sandbox.config_snapshot().appearance.animations;
+        let appearance = self.lua_sandbox.config_snapshot().appearance;
+        let anim_cfg = appearance.animations;
+        let border_inset = if appearance.border.enabled {
+            (appearance.border.width.max(0.0) * 2.0).round() as u32
+        } else {
+            0
+        };
 
         for (win_id, target_rect, is_float) in visible {
             if let Some(mapped) = self.mapped_windows.iter_mut().find(|m| m.win_id == win_id) {
@@ -652,8 +773,8 @@ impl KomaState {
                     );
                 }
                 if size_changed {
-                    let inner_w = target_rect.w.saturating_sub(4).max(48) as i32;
-                    let inner_h = target_rect.h.saturating_sub(4).max(48) as i32;
+                    let inner_w = target_rect.w.saturating_sub(border_inset).max(48) as i32;
+                    let inner_h = target_rect.h.saturating_sub(border_inset).max(48) as i32;
                     if let Some(toplevel) = mapped.window.toplevel() {
                         toplevel.with_pending_state(|st| {
                             st.size = Some(Size::from((inner_w, inner_h)));
@@ -893,6 +1014,12 @@ impl KomaState {
         &self,
         global_pos: Point<f64, Logical>,
     ) -> Option<(WindowId, WorkspaceId, WlSurface, Point<f64, Logical>)> {
+        let border_cfg = self.lua_sandbox.config_snapshot().appearance.border;
+        let b_off = if border_cfg.enabled {
+            f64::from(border_cfg.width.max(0.0))
+        } else {
+            0.0
+        };
         let candidate_workspaces = self
             .active_special_ws_id
             .iter()
@@ -910,7 +1037,7 @@ impl KomaState {
                 let Some(mapped) = self.mapped_windows.iter().find(|m| m.win_id == win_id) else {
                     continue;
                 };
-                let origin = Point::from((f64::from(rect.x) + 2.0, f64::from(rect.y) + 2.0));
+                let origin = Point::from((f64::from(rect.x) + b_off, f64::from(rect.y) + b_off));
                 let local_pos = global_pos - origin;
                 if let Some((surf, surf_offset)) = mapped
                     .window
@@ -1054,6 +1181,9 @@ impl KomaState {
         let appearance = &self.lua_sandbox.config_snapshot().appearance;
         let default_radius = appearance.corner_radius.unwrap_or(10);
         let blur_enabled = appearance.blur.enabled;
+        let border_cfg = appearance.border.clone();
+        let shadow_cfg = appearance.shadow.clone();
+        let dim_cfg = appearance.effective_dim();
 
         let mut items = Vec::with_capacity(candidates_bottom_to_top.len());
         for (win_id, target_rect, is_floating) in candidates_bottom_to_top.into_iter().rev() {
@@ -1114,6 +1244,9 @@ impl KomaState {
                     opacity: eff_opacity,
                     corner_radius,
                     wants_blur: blur_enabled && !is_fs,
+                    border: border_cfg.clone(),
+                    shadow: shadow_cfg.clone(),
+                    dim: dim_cfg,
                 });
             }
         }

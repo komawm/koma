@@ -15,6 +15,276 @@ use serde::{Deserialize, Serialize};
 
 use crate::geometry::{LogicalRect, LogicalViewport};
 
+/// Declarative window border configuration (`koma.appearance({ border = { ... } })`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BorderConfig {
+    pub enabled: bool,
+    pub width: f32,
+    pub active_color: String,
+    pub inactive_color: String,
+    pub agent_leased_color: String,
+    pub human_preempt_color: String,
+}
+
+impl Default for BorderConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            width: 2.0,
+            active_color: "#58a6ff".to_owned(),
+            inactive_color: "#30363d".to_owned(),
+            agent_leased_color: "#d2a8ff".to_owned(),
+            human_preempt_color: "#f0883e".to_owned(),
+        }
+    }
+}
+
+/// Declarative Niri-style focus ring configuration (`koma.appearance({ focus_ring = { ... } })`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FocusRingConfig {
+    pub enabled: bool,
+    pub width: f32,
+    pub active_color: String,
+    pub inactive_color: String,
+}
+
+impl Default for FocusRingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            width: 2.0,
+            active_color: "#58a6ff".to_owned(),
+            inactive_color: "#30363d".to_owned(),
+        }
+    }
+}
+
+/// Declarative drop shadow configuration (`koma.appearance({ shadow = { ... } })`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ShadowConfig {
+    pub enabled: bool,
+    pub range: u32,
+    pub render_power: u8,
+    pub sharp: bool,
+    pub color: String,
+    pub inactive_color: Option<String>,
+    pub offset_x: f32,
+    pub offset_y: f32,
+    pub scale: f32,
+}
+
+impl Default for ShadowConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            range: 16,
+            render_power: 3,
+            sharp: false,
+            color: "#00000073".to_owned(),
+            inactive_color: None,
+            offset_x: 0.0,
+            offset_y: 4.0,
+            scale: 1.0,
+        }
+    }
+}
+
+/// Declarative window brightness, contrast, and inactive-window dimming configuration
+/// (`koma.appearance({ dim = { ... } })`).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DimConfig {
+    pub dim_inactive: bool,
+    pub dim_strength: f32,
+    pub brightness: f32,
+    pub contrast: f32,
+}
+
+impl Default for DimConfig {
+    fn default() -> Self {
+        Self {
+            dim_inactive: false,
+            dim_strength: 0.15,
+            brightness: 1.0,
+            contrast: 1.0,
+        }
+    }
+}
+
+/// Parses `#RRGGBB`, `#RRGGBBAA`, `0xRRGGBB`, `0xAARRGGBB`, or `rgba(r, g, b, a)` into
+/// normalized `[f32; 4]` (`0.0..=1.0`), returning `fallback` on invalid input.
+#[must_use]
+pub fn parse_hex_color(s: &str, fallback: [f32; 4]) -> [f32; 4] {
+    let trimmed = s.trim();
+    if !trimmed.is_ascii() {
+        return fallback;
+    }
+
+    if let Some(hex) = trimmed.strip_prefix('#') {
+        return match hex.len() {
+            6 => {
+                let Ok(r) = u8::from_str_radix(&hex[0..2], 16) else {
+                    return fallback;
+                };
+                let Ok(g) = u8::from_str_radix(&hex[2..4], 16) else {
+                    return fallback;
+                };
+                let Ok(b) = u8::from_str_radix(&hex[4..6], 16) else {
+                    return fallback;
+                };
+                [
+                    f32::from(r) / 255.0,
+                    f32::from(g) / 255.0,
+                    f32::from(b) / 255.0,
+                    1.0,
+                ]
+            }
+            8 => {
+                let Ok(r) = u8::from_str_radix(&hex[0..2], 16) else {
+                    return fallback;
+                };
+                let Ok(g) = u8::from_str_radix(&hex[2..4], 16) else {
+                    return fallback;
+                };
+                let Ok(b) = u8::from_str_radix(&hex[4..6], 16) else {
+                    return fallback;
+                };
+                let Ok(a) = u8::from_str_radix(&hex[6..8], 16) else {
+                    return fallback;
+                };
+                [
+                    f32::from(r) / 255.0,
+                    f32::from(g) / 255.0,
+                    f32::from(b) / 255.0,
+                    f32::from(a) / 255.0,
+                ]
+            }
+            _ => fallback,
+        };
+    }
+
+    if let Some(hex) = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+    {
+        return match hex.len() {
+            6 => {
+                let Ok(r) = u8::from_str_radix(&hex[0..2], 16) else {
+                    return fallback;
+                };
+                let Ok(g) = u8::from_str_radix(&hex[2..4], 16) else {
+                    return fallback;
+                };
+                let Ok(b) = u8::from_str_radix(&hex[4..6], 16) else {
+                    return fallback;
+                };
+                [
+                    f32::from(r) / 255.0,
+                    f32::from(g) / 255.0,
+                    f32::from(b) / 255.0,
+                    1.0,
+                ]
+            }
+            8 => {
+                let Ok(a) = u8::from_str_radix(&hex[0..2], 16) else {
+                    return fallback;
+                };
+                let Ok(r) = u8::from_str_radix(&hex[2..4], 16) else {
+                    return fallback;
+                };
+                let Ok(g) = u8::from_str_radix(&hex[4..6], 16) else {
+                    return fallback;
+                };
+                let Ok(b) = u8::from_str_radix(&hex[6..8], 16) else {
+                    return fallback;
+                };
+                [
+                    f32::from(r) / 255.0,
+                    f32::from(g) / 255.0,
+                    f32::from(b) / 255.0,
+                    f32::from(a) / 255.0,
+                ]
+            }
+            _ => fallback,
+        };
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    if let Some(inner) = lower
+        .strip_prefix("rgba(")
+        .and_then(|s| s.strip_suffix(')'))
+    {
+        let inner = inner.trim();
+        let parts: Vec<&str> = inner.split(',').map(str::trim).collect();
+        if parts.len() == 1 && inner.len() == 8 {
+            let Ok(r) = u8::from_str_radix(&inner[0..2], 16) else {
+                return fallback;
+            };
+            let Ok(g) = u8::from_str_radix(&inner[2..4], 16) else {
+                return fallback;
+            };
+            let Ok(b) = u8::from_str_radix(&inner[4..6], 16) else {
+                return fallback;
+            };
+            let Ok(a) = u8::from_str_radix(&inner[6..8], 16) else {
+                return fallback;
+            };
+            return [
+                f32::from(r) / 255.0,
+                f32::from(g) / 255.0,
+                f32::from(b) / 255.0,
+                f32::from(a) / 255.0,
+            ];
+        }
+        if parts.len() == 4 {
+            let Ok(r_raw) = parts[0].parse::<f32>() else {
+                return fallback;
+            };
+            let Ok(g_raw) = parts[1].parse::<f32>() else {
+                return fallback;
+            };
+            let Ok(b_raw) = parts[2].parse::<f32>() else {
+                return fallback;
+            };
+            let Ok(a_raw) = parts[3].parse::<f32>() else {
+                return fallback;
+            };
+            if !r_raw.is_finite()
+                || !g_raw.is_finite()
+                || !b_raw.is_finite()
+                || !a_raw.is_finite()
+                || r_raw < 0.0
+                || g_raw < 0.0
+                || b_raw < 0.0
+                || a_raw < 0.0
+            {
+                return fallback;
+            }
+            let rgb_is_byte_scale = r_raw > 1.0
+                || g_raw > 1.0
+                || b_raw > 1.0
+                || (!parts[0].contains('.') && !parts[1].contains('.') && !parts[2].contains('.'));
+            let (r, g, b) = if rgb_is_byte_scale {
+                (r_raw / 255.0, g_raw / 255.0, b_raw / 255.0)
+            } else {
+                (r_raw, g_raw, b_raw)
+            };
+            let a = if a_raw > 1.0 { a_raw / 255.0 } else { a_raw };
+            return [
+                r.clamp(0.0, 1.0),
+                g.clamp(0.0, 1.0),
+                b.clamp(0.0, 1.0),
+                a.clamp(0.0, 1.0),
+            ];
+        }
+    }
+
+    fallback
+}
+
 /// Declarative spring animation configuration (`koma.appearance({ animations = { ... } })`).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -593,5 +863,67 @@ mod tests {
         };
         let expanded = blur.expand_damage_rect(LogicalRect::new(100, 100, 200, 150), vp);
         assert_eq!(expanded, LogicalRect::new(52, 52, 296, 246));
+    }
+
+    #[test]
+    fn parse_hex_color_handles_all_supported_formats_and_fallback() {
+        let fb = [0.1, 0.2, 0.3, 0.4];
+
+        let c_hex6 = parse_hex_color("#58a6ff", fb);
+        assert!((c_hex6[0] - 88.0 / 255.0).abs() < 1e-4);
+        assert!((c_hex6[1] - 166.0 / 255.0).abs() < 1e-4);
+        assert!((c_hex6[2] - 1.0).abs() < 1e-4);
+        assert!((c_hex6[3] - 1.0).abs() < 1e-4);
+
+        let c_hex8 = parse_hex_color("#00000073", fb);
+        assert!((c_hex8[0] - 0.0).abs() < 1e-4);
+        assert!((c_hex8[3] - 0x73 as f32 / 255.0).abs() < 1e-4);
+
+        let c_0x6 = parse_hex_color("0x30363d", fb);
+        assert!((c_0x6[0] - 0x30 as f32 / 255.0).abs() < 1e-4);
+        assert!((c_0x6[3] - 1.0).abs() < 1e-4);
+
+        let c_0x8 = parse_hex_color("0x80ff0000", fb);
+        assert!((c_0x8[0] - 1.0).abs() < 1e-4);
+        assert!((c_0x8[1] - 0.0).abs() < 1e-4);
+        assert!((c_0x8[3] - 0x80 as f32 / 255.0).abs() < 1e-4);
+
+        let c_rgba = parse_hex_color("rgba(88, 166, 255, 0.5)", fb);
+        assert!((c_rgba[0] - 88.0 / 255.0).abs() < 1e-4);
+        assert!((c_rgba[2] - 1.0).abs() < 1e-4);
+        assert!((c_rgba[3] - 0.5).abs() < 1e-4);
+
+        assert_eq!(parse_hex_color("not-a-color", fb), fb);
+        assert_eq!(parse_hex_color("#12345", fb), fb);
+    }
+
+    #[test]
+    fn decoration_config_defaults_match_hyprland_baseline() {
+        let border = BorderConfig::default();
+        assert!(border.enabled);
+        assert_eq!(border.width, 2.0);
+        assert_eq!(border.active_color, "#58a6ff");
+        assert_eq!(border.inactive_color, "#30363d");
+        assert_eq!(border.agent_leased_color, "#d2a8ff");
+        assert_eq!(border.human_preempt_color, "#f0883e");
+
+        let ring = FocusRingConfig::default();
+        assert!(!ring.enabled);
+        assert_eq!(ring.width, 2.0);
+
+        let shadow = ShadowConfig::default();
+        assert!(shadow.enabled);
+        assert_eq!(shadow.range, 16);
+        assert_eq!(shadow.render_power, 3);
+        assert!(!shadow.sharp);
+        assert_eq!(shadow.color, "#00000073");
+        assert_eq!(shadow.offset_y, 4.0);
+        assert_eq!(shadow.scale, 1.0);
+
+        let dim = DimConfig::default();
+        assert!(!dim.dim_inactive);
+        assert!((dim.dim_strength - 0.15).abs() < 1e-6);
+        assert!((dim.brightness - 1.0).abs() < 1e-6);
+        assert!((dim.contrast - 1.0).abs() < 1e-6);
     }
 }

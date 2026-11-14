@@ -19,8 +19,8 @@ pub mod workspace;
 
 pub use crate::{
     animation::{
-        AnimationConfig, BlurConfig, SampledWindowVisual, Spring, SpringParams, SpringTrack,
-        WindowAnimationTable,
+        AnimationConfig, BlurConfig, BorderConfig, DimConfig, FocusRingConfig, SampledWindowVisual,
+        ShadowConfig, Spring, SpringParams, SpringTrack, WindowAnimationTable, parse_hex_color,
     },
     clock::{AdaptiveFrameClock, FrameClockConfig, FrameClockTier, FrameTickDecision},
     dwindle::{
