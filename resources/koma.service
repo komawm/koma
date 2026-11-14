@@ -1,0 +1,18 @@
+[Unit]
+Description=Koma Agent-native Wayland tiling compositor
+Documentation=https://github.com/komawm/koma
+BindsTo=graphical-session.target
+Before=graphical-session.target
+Wants=graphical-session-pre.target
+After=graphical-session-pre.target
+
+# Pull in XDG autostart user units after WAYLAND_DISPLAY and DISPLAY are imported
+Wants=xdg-desktop-autostart.target
+Before=xdg-desktop-autostart.target
+
+[Service]
+Slice=session.slice
+Type=notify
+NotifyAccess=main
+ExecStart=/usr/bin/koma --session
+TimeoutStopSec=10

@@ -1,0 +1,21 @@
+[package]
+name = "koma-proto"
+description = "Wire framing, SCM_RIGHTS ancillary FD transport, CapabilityToken scopes, and IPC schemas for Koma"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+license-file.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bitflags.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true

@@ -1,0 +1,75 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/koma-proto",
+    "crates/koma-model",
+    "crates/koma-lua",
+    "crates/koma-render",
+    "crates/koma-seat",
+    "crates/koma",
+    "crates/komactl",
+    "crates/koma-mcp",
+    "crates/koma-overview",
+]
+default-members = [
+    "crates/koma-proto",
+    "crates/koma-model",
+    "crates/koma-lua",
+    "crates/komactl",
+    "crates/koma-mcp",
+    "crates/koma-overview",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.100"
+license = "GPL-3.0-or-later"
+license-file = "LICENSE"
+repository = "https://github.com/komawm/koma"
+
+[workspace.dependencies]
+# Internal workspace crates
+koma-proto = { path = "crates/koma-proto", version = "0.0.1" }
+koma-model = { path = "crates/koma-model", version = "0.0.1" }
+koma-lua = { path = "crates/koma-lua", version = "0.0.1" }
+koma-render = { path = "crates/koma-render", version = "0.0.1" }
+koma-seat = { path = "crates/koma-seat", version = "0.0.1" }
+
+# Pure-Rust stackless Lua 5.4 sandbox (Piccolo fork), v0.2.0 tag's commit.
+phodopus = { git = "https://github.com/Xuepoo/phodopus", rev = "f3d6a9b8ecdf829629daa688a4adbe08259b1b81", version = "0.2.0" }
+phodopus-util = { git = "https://github.com/Xuepoo/phodopus", rev = "f3d6a9b8ecdf829629daa688a4adbe08259b1b81", version = "0.2.0", features = ["serde"] }
+gc-arena = { git = "https://github.com/Xuepoo/phodopus", rev = "f3d6a9b8ecdf829629daa688a4adbe08259b1b81", package = "phodopus-gc-arena", version = "0.5.3" }
+
+# Serialization, error handling, regex & bitflags
+anyhow = "1.0.104"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+base64 = "0.23.1"
+libc = "0.2.191"
+# Existing SCM_RIGHTS code uses rustix 1.x ancillary buffers and peercred API;
+# this also matches the API line consumed by the pinned Smithay revision.
+rustix = { version = "1.1.6", features = ["fs", "net", "process"] }
+bitflags = "2.13.2"
+regex = "1.13.1"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+# Wayland compositor & bare-metal KMS/DRM stack (pinned to exact Niri-tested Smithay rev)
+calloop = "0.14.5"
+smithay = { git = "https://github.com/Smithay/smithay.git", rev = "65aa86fa5236e41775c313408102a5d5c2d1e2ca", default-features = false }
+smithay-drm-extras = { git = "https://github.com/Smithay/smithay.git", rev = "65aa86fa5236e41775c313408102a5d5c2d1e2ca" }
+wayland-server = "0.31.14"
+wayland-client = "0.31.15"
+wayland-protocols-wlr = { version = "0.3.12", features = ["client"] }
+calloop-wayland-source = "0.4.1"
+
+[workspace.lints.rust]
+unused_must_use = "deny"
+
+# Uncomment during local co-development with a sibling phodopus checkout:
+# [patch."https://github.com/Xuepoo/phodopus"]
+# phodopus = { path = "../phodopus/crates/phodopus" }
+# phodopus-util = { path = "../phodopus/crates/phodopus-util" }
+# phodopus-gc-arena = { path = "../phodopus/crates/phodopus-gc-arena" }

@@ -1,0 +1,10 @@
+# Lefthook owns pre-commit; CarryCtx owns prepare-commit-msg and post-commit.
+pre-commit:
+  parallel: false
+  commands:
+    infrastructure:
+      run: just infra-check
+    rust-format:
+      glob: "*.rs"
+      run: just fmt-check
+

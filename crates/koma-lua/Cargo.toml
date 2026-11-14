@@ -1,0 +1,28 @@
+[package]
+name = "koma-lua"
+description = "Sandboxed Phodopus Lua 5.4 Host ABI, HostOpHandle coroutine scheduler, macro denoiser, and LuaLS stub generator"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+license-file.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = ["phodopus-vm"]
+# Enables direct binding against the pure-Rust stackless `phodopus` & `phodopus-util` crates.
+phodopus-vm = ["dep:phodopus", "dep:phodopus-util", "dep:gc-arena"]
+
+[dependencies]
+koma-model.workspace = true
+koma-proto.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+phodopus = { workspace = true, optional = true }
+phodopus-util = { workspace = true, optional = true }
+gc-arena = { workspace = true, optional = true }

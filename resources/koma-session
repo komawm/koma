@@ -1,0 +1,96 @@
+#!/bin/sh
+# Koma Wayland session wrapper (`koma-session`)
+# Install to: /usr/bin/koma-session (0755)
+#
+# Responsibilities:
+# 1. Re-executes inside the user's login shell (`fish`, `zsh`, `bash`) so `~/.config/environment.d`
+#    and login PATH customizations (`~/.local/bin`, Cargo/pnpm bins) are inherited by the session.
+# 2. Cleans stale `WAYLAND_DISPLAY` / `DISPLAY` / `KOMA_INSTANCE_SIGNATURE` variables before launch,
+#    imports login environment into `systemd --user` and D-Bus, and starts `koma.service` (`Type=notify`).
+# 3. Waits for `koma.service` to exit, triggers `koma-shutdown.target` to stop `graphical-session.target`
+#    units (`waybar`, `fcitx5`, `koma-overview`, `mako`/`swaync`), and unsets session variables.
+
+set -u
+
+# 1. If invoked directly as ExecStart of a systemd user service, exec `koma --session` immediately
+#    to avoid recursive `systemctl --user start` loops.
+if [ -n "${MANAGERPID:-}" ] && [ "${SYSTEMD_EXEC_PID:-}" = "$$" ]; then
+    case "$(ps -p "$MANAGERPID" -o cmd= 2>/dev/null)" in
+        *systemd*--user*)
+            exec koma --session "$@"
+            ;;
+    esac
+fi
+
+# 2. Re-execute once through the user's login shell (`$SHELL -l`, compatible with Fish, Zsh & Bash)
+#    so login profile environment variables are loaded prior to `dbus-update-activation-environment`.
+if [ -n "${SHELL:-}" ] &&
+   grep -qxF "$SHELL" /etc/shells 2>/dev/null &&
+   ! printf '%s\n' "$SHELL" | grep -qE '(false|nologin)$'; then
+    if [ "${1:-}" != "-l" ]; then
+        exec "$SHELL" -l -c "exec \"$0\" -l $*"
+    else
+        shift
+    fi
+fi
+
+SESSION_VARS="WAYLAND_DISPLAY DISPLAY XDG_SESSION_TYPE XDG_CURRENT_DESKTOP KOMA_INSTANCE_SIGNATURE"
+
+# 3. Delegate lifecycle to systemd user manager (or dinit fallback, else direct `koma --session`)
+if command -v systemctl >/dev/null 2>&1; then
+    if systemctl --user -q is-active koma.service; then
+        printf 'koma-session: a Koma session (koma.service) is already active.\n' >&2
+        exit 1
+    fi
+
+    # Clear failed status from previous graphical sessions (e.g. waybar / polkit / portal units)
+    systemctl --user reset-failed
+
+    # Scrub any leftover display variables in our local env & user manager before importing
+    unset WAYLAND_DISPLAY DISPLAY WAYLAND_SOCKET KOMA_INSTANCE_SIGNATURE
+    # shellcheck disable=SC2086
+    systemctl --user unset-environment $SESSION_VARS >/dev/null 2>&1 || true
+
+    # Export session identity early for xdg-desktop-portal & Qt/GTK/Electron Wayland backends
+    export XDG_SESSION_TYPE=wayland
+    export XDG_CURRENT_DESKTOP=koma
+
+    # Import full login environment into both D-Bus and systemd --user without deprecation warnings
+    if command -v dbus-update-activation-environment >/dev/null 2>&1; then
+        dbus-update-activation-environment --systemd --all
+    else
+        systemctl --user import-environment
+    fi
+
+    # Start `koma.service` (`Type=notify`) and block until the compositor terminates
+    systemctl --user --wait start koma.service
+    KOMA_EXIT_CODE=$?
+
+    # Tear down `graphical-session.target` and all `PartOf=graphical-session.target` services
+    systemctl --user start --job-mode=replace-irreversibly koma-shutdown.target || true
+
+    # Scrub compositor socket variables from systemd --user after logout
+    # shellcheck disable=SC2086
+    systemctl --user unset-environment $SESSION_VARS || true
+
+    exit "$KOMA_EXIT_CODE"
+elif command -v dinitctl >/dev/null 2>&1; then
+    if ! pgrep -u "$(id -u)" dinit >/dev/null 2>&1; then
+        printf 'koma-session: dinit user daemon is not running.\n' >&2
+        exit 1
+    fi
+    if dinitctl --quiet --user is-started koma 2>/dev/null; then
+        printf 'koma-session: a Koma session is already running under dinit.\n' >&2
+        exit 1
+    fi
+    export XDG_SESSION_TYPE=wayland
+    export XDG_CURRENT_DESKTOP=koma
+    awk 'BEGIN{for(v in ENVIRON) if (v != "AWKPATH" && v != "AWKLIBPATH") print v}' 2>/dev/null |
+        xargs dinitctl --quiet --user setenv 2>/dev/null || true
+    if command -v dbus-update-activation-environment >/dev/null 2>&1; then
+        dbus-update-activation-environment --all >/dev/null 2>&1 || true
+    fi
+    exec koma --session "$@"
+else
+    exec koma --session "$@"
+fi

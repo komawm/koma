@@ -1,0 +1,38 @@
+[package]
+name = "koma-overview"
+description = "wlr-layer-shell companion daemon for 150ms status-bar hover workspace thumbnails and live overview grid"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+license-file.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = ["wayland-layer-shell"]
+wayland-layer-shell = [
+    "dep:anyhow",
+    "dep:calloop",
+    "dep:calloop-wayland-source",
+    "dep:rustix",
+    "dep:wayland-client",
+    "dep:wayland-protocols-wlr",
+]
+
+[dependencies]
+koma-model.workspace = true
+koma-proto.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+anyhow = { workspace = true, optional = true }
+calloop = { workspace = true, optional = true }
+calloop-wayland-source = { workspace = true, optional = true }
+rustix = { workspace = true, optional = true }
+wayland-client = { workspace = true, optional = true }
+wayland-protocols-wlr = { workspace = true, optional = true }

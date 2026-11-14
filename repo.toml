@@ -1,0 +1,9 @@
+[repo]
+name = "koma"
+kind = "core"
+lang = "rust"
+role = "Wayland tiling compositor, controller, MCP adapter, and overview"
+owner = "koma"
+repository = "https://github.com/komawm/koma"
+docs = "https://github.com/komawm/docs/tree/main/docs"
+

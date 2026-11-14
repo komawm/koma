@@ -1,0 +1,35 @@
+[package]
+name = "koma-render"
+description = "GlesRenderer scene composer, LazyFbo offscreen pool, Protected Surface blackout pass, and grid_225 overlays"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+license-file.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = ["smithay-renderer"]
+smithay-renderer = ["dep:smithay", "dep:anyhow", "dep:tracing"]
+
+[dependencies]
+koma-model.workspace = true
+koma-proto.workspace = true
+anyhow = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
+
+[dependencies.smithay]
+workspace = true
+optional = true
+features = [
+    "backend_drm",
+    "backend_egl",
+    "backend_gbm",
+    "desktop",
+    "renderer_gl",
+    "renderer_multi",
+    "wayland_frontend",
+]

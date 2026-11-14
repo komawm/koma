@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=Koma
+Comment=An Agent-native tiling Wayland compositor
+Exec=koma-session
+TryExec=koma-session
+Type=Application
+DesktopNames=koma
+Keywords=wayland;compositor;tiling;wm;agent;

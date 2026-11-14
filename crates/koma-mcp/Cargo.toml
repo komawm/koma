@@ -1,0 +1,23 @@
+[package]
+name = "koma-mcp"
+description = "Standard stdio MCP server connecting to koma-agent.sock with CapabilityToken auth, zero-copy SCM_RIGHTS PNG capture, and ERR_STALE_EPOCH re-observation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+license-file.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+base64.workspace = true
+koma-lua.workspace = true
+koma-proto.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true, features = ["mm"] }

@@ -1,0 +1,26 @@
+# /etc/greetd/config.toml — Minimal & TUI greeter configuration for Koma (`komawm`)
+# Reference: https://wiki.archlinux.org/title/Greetd & man greetd(5)
+#
+# Ensure `seatd` or `systemd-logind` is active and user `greeter` exists:
+#   sudo systemctl enable --now greetd.service
+
+[terminal]
+# Run the greeter on VT1 (Ctrl+Alt+F1); Koma inherits the VT seamlessly via libseat.
+vt = 1
+
+[default_session]
+# Recommended TUI greeter (`pacman -S greetd-tuigreet`):
+# Discovers `/usr/share/wayland-sessions/koma.desktop` (`Exec=koma-session`) alongside Niri/Hyprland,
+# remembers the last user & chosen session, and defaults to `koma-session`.
+command = "tuigreet --time --remember --remember-user-session --asterisks --sessions /usr/share/wayland-sessions:/usr/local/share/wayland-sessions --cmd koma-session"
+user = "greeter"
+
+# Minimal built-in text greeter alternative (uncomment if `tuigreet` is not installed):
+# command = "agreety --cmd koma-session"
+# user = "greeter"
+
+# Optional single-user boot autologin (uncomment only on full-disk-encrypted personal laptops;
+# skips greeter on initial boot while returning to `tuigreet` upon `Super+Shift+E` logout):
+# [initial_session]
+# command = "koma-session"
+# user = "fuyu"

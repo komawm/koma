@@ -1,0 +1,18 @@
+[package]
+name = "koma-model"
+description = "Pure-Rust compositor state machine: Dual-mode workspaces, Deck/Stash, Lease+Epoch gate, 4-tier clock, rules, and kinematics"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+license-file.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+koma-proto.workspace = true
+regex.workspace = true
+serde.workspace = true
+thiserror.workspace = true

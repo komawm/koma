@@ -1,0 +1,16 @@
+[package]
+name = "koma-seat"
+description = "Physical seat0 shield/preemption (Mod+G <1ms flush), per-workspace vSeat ledger, and 3-tier Zero-IME text injection"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+license-file.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+koma-model.workspace = true
+koma-proto.workspace = true
