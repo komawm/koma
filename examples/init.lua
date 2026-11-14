@@ -25,7 +25,9 @@ koma.monitor({
     focus_at_startup = true,
 })
 
--- Workspaces 1..4 use Hyprland's default `dwindle` binary tree; Workspace 5 opts into Niri `scrolling`!
+-- Workspaces 1..4 inherit the global default `dwindle` binary tree; Workspace 5 opts into Niri `scrolling`!
+koma.layout("dwindle")
+
 for i = 1, 4 do
     koma.workspace({
         name = tostring(i),
@@ -99,13 +101,37 @@ koma.workspace({
 -- 4. Input & Appearance
 koma.input({
     mod_key = "Super",
+    inherit_default_binds = true,
     touchpad = { tap_to_click = true, natural_scroll = true },
     tablet = { map_to_output = "eDP-1" },
 })
 
 koma.appearance({
     corner_radius = 12,
-    border = { enabled = true, width = 2, active_color = "#58a6ff", inactive_color = "#30363d" },
+    border = {
+        enabled = true,
+        width = 2.0,
+        active_color = "#58a6ff",
+        inactive_color = "#30363d",
+        agent_leased_color = "#d2a8ff",
+        human_preempt_color = "#f0883e",
+    },
+    shadow = {
+        enabled = true,
+        range = 16,
+        render_power = 3,
+        sharp = false,
+        color = "#00000073",
+        offset_x = 0.0,
+        offset_y = 4.0,
+        scale = 1.0,
+    },
+    dim = {
+        dim_inactive = false,
+        dim_strength = 0.15,
+        brightness = 1.0,
+        contrast = 1.0,
+    },
     blur = {
         enabled = true,
         size = 6,
@@ -125,12 +151,14 @@ koma.appearance({
     },
 })
 
--- 5. Core Keybindings
+-- 5. Core Keybindings (inherits Hyprland default keymap; override or unbind selectively)
+-- Example: koma.unbind("Mod + P")
+koma.unbind("Mod + P")
+koma.bind("Mod + P",         koma.act.window.pseudotile_toggle(), { desc = "Toggle Dwindle pseudotile" })
 koma.bind("Mod + Return", koma.act.spawn({ "ghostty" }), { desc = "Open terminal" })
 koma.bind("Mod + D",      koma.act.spawn({ "fuzzel" }),  { desc = "Application launcher" })
 koma.bind("Mod + Q",         koma.act.window.close(),             { desc = "Close active window" })
 koma.bind("Mod + V",         koma.act.window.float_toggle(),      { desc = "Toggle floating layer" })
-koma.bind("Mod + P",         koma.act.window.pseudotile_toggle(), { desc = "Toggle Dwindle pseudotile" })
 koma.bind("Mod + E",         koma.act.dwindle.toggle_split(),     { desc = "Toggle Dwindle split axis" })
 koma.bind("Mod + R",         koma.act.scrolling.switch_preset_column_width(),      { desc = "Cycle Scrolling column width forward" })
 koma.bind("Mod + Ctrl + R",  koma.act.scrolling.switch_preset_column_width_back(), { desc = "Cycle Scrolling column width backward" })

@@ -1463,6 +1463,7 @@ fn execute_zero_copy_capture_frame(
                     })
                     .block_out_from
                     .is_some_and(|p| p.blocks_agent_capture());
+                let appearance = &state.lua_sandbox.config_snapshot().appearance;
                 vec![WindowSceneItem {
                     window: &mapped.window,
                     rect: mapped.rect,
@@ -1472,6 +1473,9 @@ fn execute_zero_copy_capture_frame(
                     opacity: 1.0,
                     corner_radius: 0.0,
                     wants_blur: false,
+                    border: appearance.border.clone(),
+                    shadow: appearance.shadow.clone(),
+                    dim: appearance.effective_dim(),
                 }]
             })
             .unwrap_or_default()

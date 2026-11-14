@@ -502,7 +502,12 @@ pub fn build_validated_shadow_sandbox(
     shadow_vm.set_clock_ms(now_ms);
     let registry = shadow_vm.eval_init_lua(init_source)?;
     let compiled_rules = compile_window_rule_specs(&registry.window_rules)?;
-    let compiled_binds = KeybindTable::compile(&registry.binds, registry.input.mod_key.as_deref())?;
+    let compiled_binds = KeybindTable::compile_with_options(
+        &registry.binds,
+        &registry.unbinds,
+        registry.input.inherit_default_binds,
+        registry.input.mod_key.as_deref(),
+    )?;
     let compiled_gestures = GestureTable::compile(&registry.gestures)?;
     Ok((
         shadow_vm,
@@ -727,7 +732,7 @@ fn reconcile_declarative_workspaces(
     registry: &KomaConfigRegistry,
     now_ms: u64,
 ) {
-    // Apply global `koma.dwindle({...})` & `koma.scrolling({...})` settings across workspaces first
+    // Apply global `koma.layout(...)`, `koma.dwindle({...})` & `koma.scrolling({...})` settings across workspaces first
     for ws in state.workspaces.values_mut() {
         let mut d_cfg = registry.dwindle;
         let mut s_cfg = registry.scrolling.clone();
@@ -738,7 +743,14 @@ fn reconcile_declarative_workspaces(
         ws.dwindle.config = d_cfg;
         let vp = ws.viewport;
         ws.scrolling.update_config(s_cfg, vp, now_ms);
-        ws.recalculate(now_ms);
+        if matches!(ws.presentation, PresentationTarget::Physical(_))
+            && !ws.is_special
+            && !registry.workspaces.iter().any(|s| s.name == ws.name)
+        {
+            ws.set_layout_mode(registry.default_layout, now_ms);
+        } else {
+            ws.recalculate(now_ms);
+        }
     }
 
     let mut sync_ids: Vec<WorkspaceId> = state.workspaces.keys().cloned().collect();
@@ -747,9 +759,16 @@ fn reconcile_declarative_workspaces(
         let is_headless = spec.presentation.eq_ignore_ascii_case("headless");
         let effective_layout = if is_headless {
             LayoutMode::Deck
-        } else {
+        } else if spec.has_explicit_layout {
             spec.layout
+        } else {
+            registry.default_layout
         };
+        let use_spec_gaps = spec.has_explicit_gaps
+            || spec.gaps_in.is_some()
+            || spec.gaps_out.is_some()
+            || spec.gaps.inner != 6
+            || spec.gaps.outer != 10;
 
         if let Some((existing_id, existing)) = state
             .workspaces
@@ -757,20 +776,27 @@ fn reconcile_declarative_workspaces(
             .find(|(_, w)| w.name == spec.name)
         {
             let mut d_cfg = registry.dwindle;
-            d_cfg.inner_gap = spec.gaps.inner;
-            d_cfg.outer_gap = if existing.is_special {
-                spec.gaps.outer.max(48)
-            } else {
-                spec.gaps.outer
-            };
-            existing.dwindle.config = d_cfg;
             let mut s_cfg = registry.scrolling.clone();
-            s_cfg.inner_gap = spec.gaps.inner;
-            s_cfg.outer_gap = if existing.is_special {
-                spec.gaps.outer.max(48)
-            } else {
-                spec.gaps.outer
-            };
+            if use_spec_gaps {
+                let inner = spec.effective_inner_gap();
+                let outer = spec.effective_outer_gap();
+                d_cfg.inner_gap = inner;
+                d_cfg.outer_gap = if existing.is_special {
+                    outer.max(48)
+                } else {
+                    outer
+                };
+                s_cfg.inner_gap = inner;
+                s_cfg.outer_gap = if existing.is_special {
+                    outer.max(48)
+                } else {
+                    outer
+                };
+            } else if existing.is_special {
+                d_cfg.outer_gap = d_cfg.outer_gap.max(48);
+                s_cfg.outer_gap = s_cfg.outer_gap.max(48);
+            }
+            existing.dwindle.config = d_cfg;
             let vp = existing.viewport;
             existing.scrolling.update_config(s_cfg, vp, now_ms);
             existing.set_layout_mode(effective_layout, now_ms);
@@ -815,20 +841,19 @@ fn reconcile_declarative_workspaces(
             now_ms,
         );
         let mut d_cfg = registry.dwindle;
-        d_cfg.inner_gap = spec.gaps.inner;
-        d_cfg.outer_gap = if ws.is_special {
-            spec.gaps.outer.max(48)
-        } else {
-            spec.gaps.outer
-        };
-        ws.dwindle.config = d_cfg;
         let mut s_cfg = registry.scrolling.clone();
-        s_cfg.inner_gap = spec.gaps.inner;
-        s_cfg.outer_gap = if ws.is_special {
-            spec.gaps.outer.max(48)
-        } else {
-            spec.gaps.outer
-        };
+        if use_spec_gaps {
+            let inner = spec.effective_inner_gap();
+            let outer = spec.effective_outer_gap();
+            d_cfg.inner_gap = inner;
+            d_cfg.outer_gap = if ws.is_special { outer.max(48) } else { outer };
+            s_cfg.inner_gap = inner;
+            s_cfg.outer_gap = if ws.is_special { outer.max(48) } else { outer };
+        } else if ws.is_special {
+            d_cfg.outer_gap = d_cfg.outer_gap.max(48);
+            s_cfg.outer_gap = s_cfg.outer_gap.max(48);
+        }
+        ws.dwindle.config = d_cfg;
         ws.scrolling.update_config(s_cfg, spec.viewport, now_ms);
 
         state

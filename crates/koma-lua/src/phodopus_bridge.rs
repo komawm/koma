@@ -18,7 +18,7 @@ use std::{
 };
 
 use gc_arena::Rootable;
-use koma_model::{AnchorPoint, DwindleConfig, ScrollingConfig};
+use koma_model::{AnchorPoint, DwindleConfig, LayoutMode, ScrollingConfig};
 use koma_proto::{Epoch, ErrorSymbol, IpcError, MacroId, TextInjectStrategy, WorkspaceId};
 use phodopus::{
     Callback, CallbackReturn, Closure, Context, Error as LuaError, Executor, ExecutorMode, Fuel,
@@ -807,7 +807,36 @@ fn install_koma_globals<'gc>(ctx: Context<'gc>, state: SharedState) -> Result<()
         );
     }
 
-    // 2. koma.monitor, koma.workspace, koma.input, koma.device, koma.appearance
+    // 2. koma.layout, koma.monitor, koma.workspace, koma.input, koma.device, koma.appearance
+    {
+        let st = state.clone();
+        koma.set_field(
+            ctx,
+            "layout",
+            Callback::from_fn(&ctx, move |ctx, _, mut stack| {
+                let mode_str: std::string::String = stack.consume(ctx)?;
+                let parsed_mode = match mode_str.trim().to_ascii_lowercase().as_str() {
+                    "dwindle" | "bsp" => LayoutMode::Dwindle,
+                    "scrolling" => LayoutMode::Scrolling,
+                    "deck" => LayoutMode::Deck,
+                    other => {
+                        return Err(runtime_err(format!(
+                            "invalid layout mode `{other}` (expected \"dwindle\", \"scrolling\", \"deck\", or \"bsp\")"
+                        )));
+                    }
+                };
+                let mut inner = st.borrow_mut();
+                inner.config.default_layout = parsed_mode;
+                for ws in &mut inner.config.workspaces {
+                    if !ws.has_explicit_layout && !ws.presentation.eq_ignore_ascii_case("headless")
+                    {
+                        ws.layout = parsed_mode;
+                    }
+                }
+                Ok(CallbackReturn::Return)
+            }),
+        );
+    }
     {
         let st = state.clone();
         koma.set_field(
@@ -828,8 +857,29 @@ fn install_koma_globals<'gc>(ctx: Context<'gc>, state: SharedState) -> Result<()
             "workspace",
             Callback::from_fn(&ctx, move |ctx, _, mut stack| {
                 let val: Value = stack.consume(ctx)?;
-                let spec: WorkspaceSpec = from_value(val).map_err(RuntimeError::new)?;
-                st.borrow_mut().config.workspaces.push(spec);
+                let (has_explicit_layout, has_explicit_gaps) = match val {
+                    Value::Table(t) => (
+                        !t.get_value(ctx, "layout").is_nil(),
+                        !t.get_value(ctx, "gaps").is_nil()
+                            || !t.get_value(ctx, "gaps_in").is_nil()
+                            || !t.get_value(ctx, "gaps_out").is_nil(),
+                    ),
+                    _ => (false, false),
+                };
+                let mut spec: WorkspaceSpec = from_value(val).map_err(RuntimeError::new)?;
+                let mut inner = st.borrow_mut();
+                spec.has_explicit_layout = has_explicit_layout;
+                spec.has_explicit_gaps = has_explicit_gaps;
+                if !has_explicit_layout && !spec.presentation.eq_ignore_ascii_case("headless") {
+                    spec.layout = inner.config.default_layout;
+                }
+                if let Some(gi) = spec.gaps_in {
+                    spec.gaps.inner = gi;
+                }
+                if let Some(go) = spec.gaps_out {
+                    spec.gaps.outer = go;
+                }
+                inner.config.workspaces.push(spec);
                 Ok(CallbackReturn::Return)
             }),
         );
@@ -945,6 +995,23 @@ fn install_koma_globals<'gc>(ctx: Context<'gc>, state: SharedState) -> Result<()
 
                 let handle_ud = wrap_handle(ctx, handle_mt, KomaHandleRef::Bind(id));
                 stack.replace(ctx, handle_ud);
+                Ok(CallbackReturn::Return)
+            }),
+        );
+    }
+
+    // 3b. koma.unbind(chord)
+    {
+        let st = state.clone();
+        koma.set_field(
+            ctx,
+            "unbind",
+            Callback::from_fn(&ctx, move |ctx, _, mut stack| {
+                let chord: std::string::String = stack.consume(ctx)?;
+                if chord.trim().is_empty() {
+                    return Err(runtime_err("koma.unbind requires a non-empty chord"));
+                }
+                st.borrow_mut().config.unbinds.push(chord);
                 Ok(CallbackReturn::Return)
             }),
         );
@@ -2352,5 +2419,104 @@ mod tests {
         let final_actions = sandbox.drain_queued_actions();
         assert_eq!(final_actions.len(), 2, "PointerButton(up) + InjectText");
         let _ = exec;
+    }
+
+    #[test]
+    fn evaluates_configurable_layout_appearance_input_and_unbind_apis() {
+        let mut sandbox = PhodopusSandbox::new(DEFAULT_HEAP_LIMIT_BYTES, None).unwrap();
+
+        let init_src = r##"
+            koma.layout("scrolling")
+            koma.workspace({ name = "1", gaps_in = 8, gaps_out = 16 })
+            koma.workspace({ name = "2", layout = "dwindle" })
+
+            koma.input({
+                mod_key = "Alt",
+                inherit_default_binds = false,
+            })
+
+            koma.appearance({
+                corner_radius = 14,
+                border = {
+                    enabled = true,
+                    width = 3.0,
+                    active_color = "#ff5555",
+                    inactive_color = "#282a36",
+                    agent_leased_color = "#bd93f9",
+                    human_preempt_color = "#ffb86c",
+                },
+                shadow = {
+                    enabled = true,
+                    range = 24,
+                    render_power = 4,
+                    sharp = false,
+                    color = "#00000099",
+                    offset_x = 0.0,
+                    offset_y = 6.0,
+                    scale = 1.0,
+                },
+                dim = {
+                    dim_inactive = true,
+                    dim_strength = 0.20,
+                    brightness = 0.95,
+                    contrast = 1.05,
+                },
+                brightness = 0.90,
+                blur = {
+                    enabled = true,
+                    size = 8,
+                    passes = 4,
+                },
+                animations = {
+                    enabled = true,
+                    damping_ratio = 0.85,
+                    stiffness = 750.0,
+                },
+            })
+
+            koma.unbind("Mod + Q")
+            koma.bind("Mod + Return", koma.act.spawn({ "foot" }))
+        "##;
+
+        let cfg = sandbox
+            .eval_init_lua(init_src)
+            .expect("configurable init.lua should evaluate cleanly");
+        assert_eq!(cfg.default_layout, LayoutMode::Scrolling);
+        assert_eq!(cfg.workspaces.len(), 2);
+        assert_eq!(cfg.workspaces[0].layout, LayoutMode::Scrolling);
+        assert_eq!(cfg.workspaces[0].effective_inner_gap(), 8);
+        assert_eq!(cfg.workspaces[0].effective_outer_gap(), 16);
+        assert_eq!(cfg.workspaces[1].layout, LayoutMode::Dwindle);
+
+        assert_eq!(cfg.input.mod_key.as_deref(), Some("Alt"));
+        assert!(!cfg.input.inherit_default_binds);
+        assert_eq!(cfg.unbinds, vec!["Mod + Q".to_owned()]);
+
+        assert_eq!(cfg.appearance.corner_radius, Some(14));
+        assert_eq!(cfg.appearance.border.width, 3.0);
+        assert_eq!(cfg.appearance.border.active_color, "#ff5555");
+        assert_eq!(cfg.appearance.shadow.range, 24);
+        assert_eq!(cfg.appearance.shadow.render_power, 4);
+
+        let eff_dim = cfg.appearance.effective_dim();
+        assert!(eff_dim.dim_inactive);
+        assert!((eff_dim.dim_strength - 0.20).abs() < 1e-6);
+        assert!((eff_dim.brightness - 0.90).abs() < 1e-6);
+
+        let stubs = crate::generate_luals_stubs();
+        assert!(stubs.contains("---@class KomaBorderSpec"));
+        assert!(stubs.contains("---@class KomaShadowSpec"));
+        assert!(stubs.contains("---@class KomaDimSpec"));
+        assert!(stubs.contains("---@field layout fun(mode: KomaLayoutMode)"));
+        assert!(stubs.contains("---@field unbind fun(chord: string)"));
+
+        let mut example_sandbox = PhodopusSandbox::new(DEFAULT_HEAP_LIMIT_BYTES, None).unwrap();
+        let example_cfg = example_sandbox
+            .eval_init_lua(include_str!("../../../examples/init.lua"))
+            .expect("examples/init.lua should evaluate cleanly");
+        assert_eq!(example_cfg.default_layout, LayoutMode::Dwindle);
+        assert!(example_cfg.input.inherit_default_binds);
+        assert!(example_cfg.appearance.border.enabled);
+        assert!(example_cfg.appearance.shadow.enabled);
     }
 }
