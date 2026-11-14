@@ -329,6 +329,7 @@ fn run_nested_winit(
     event_loop
         .run(Some(Duration::from_millis(16)), &mut state, |state| {
             state.popups.cleanup();
+            state.cleanup_ime_popups();
             let _ = state.display_handle.flush_clients();
         })
         .context("Koma nested Winit calloop failed")?;
@@ -390,6 +391,8 @@ fn run_bare_metal_tty(
     // would keep showing the text console (komawm/koma#2).
     tty_backend.enumerate_initial_devices(&mut state)?;
     state.backend = Some(ActiveBackend::Tty(tty_backend));
+    let initial_reg = state.lua_sandbox.config_snapshot();
+    state.apply_runtime_input_config(&initial_reg);
 
     let ipc_paths =
         crate::ipc_server::start_dual_socket_server(&event_loop.handle(), &socket_name)?;
@@ -421,6 +424,7 @@ fn run_bare_metal_tty(
                 render_pending_tty_outputs(state);
             }
             state.popups.cleanup();
+            state.cleanup_ime_popups();
             let _ = state.display_handle.flush_clients();
         })
         .context("Koma bare-metal TTY calloop failed")?;

@@ -805,7 +805,20 @@ fn resolve_xkb_keysym_token(token: &str) -> Result<(Keysym, bool), String> {
         "grave" | "`" => "grave",
         "pageup" | "page_up" | "pgup" => "Page_Up",
         "pagedown" | "page_down" | "pgdn" => "Page_Down",
-        "printscreen" | "print" => "Print",
+        "printscreen" | "print_screen" | "print" | "sysrq" => "Print",
+        "xf86audioprevious" | "audioprev" | "audioprevious" => "XF86AudioPrev",
+        "audionext" => "XF86AudioNext",
+        "audioplay" => "XF86AudioPlay",
+        "audiopause" => "XF86AudioPause",
+        "audiostop" => "XF86AudioStop",
+        "audiomute" => "XF86AudioMute",
+        "audiomicmute" => "XF86AudioMicMute",
+        "audioraisevolume" => "XF86AudioRaiseVolume",
+        "audiolowervolume" => "XF86AudioLowerVolume",
+        "monbrightnessup" | "brightnessup" => "XF86MonBrightnessUp",
+        "monbrightnessdown" | "brightnessdown" => "XF86MonBrightnessDown",
+        "kbdbrightnessup" => "XF86KbdBrightnessUp",
+        "kbdbrightnessdown" => "XF86KbdBrightnessDown",
         "left" => "Left",
         "right" => "Right",
         "up" => "Up",
@@ -1106,6 +1119,9 @@ pub fn process_keyboard_key_event(
     is_bare_metal_tty: bool,
 ) {
     state.reconcile_session_lock();
+    if state.virtual_keyboard_keymap_active {
+        state.force_reapply_configured_xkb_config();
+    }
     let serial = SERIAL_COUNTER.next_serial();
     let Some(keyboard) = state.seat.get_keyboard() else {
         return;
@@ -1127,12 +1143,32 @@ pub fn process_keyboard_key_event(
 
     // 1. On physical key release, dispatch pending `TriggerEdge::Release`/`Both` action and
     //    reset scroll trackers if any modifier bit changed (`niri` modifier release rule).
+    //    Fail-closed on locked sessions: never deliver lock-screen key events into an active IME grab!
     if key_state == KeyState::Released {
         let prev_mask = modifiers_mask_from_smithay(&keyboard.modifier_state());
         let release_act = state.keybinds.pending_releases.remove(&raw_keycode);
-        let _ = keyboard.input::<(), _>(state, keycode, key_state, serial, time, |_, _, _| {
-            FilterResult::Forward
-        });
+        if state.is_locked_or_abandoned() {
+            if let Some(((), mods_changed)) = keyboard.input_intercept(
+                smithay::input::keyboard::KeyboardSource::MAIN,
+                state,
+                keycode,
+                key_state,
+                |_, _, _| (),
+            ) {
+                keyboard.input_forward_bypassing_grab(
+                    state,
+                    keycode,
+                    key_state,
+                    serial,
+                    time,
+                    mods_changed,
+                );
+            }
+        } else {
+            let _ = keyboard.input::<(), _>(state, keycode, key_state, serial, time, |_, _, _| {
+                FilterResult::Forward
+            });
+        }
         let next_mask = modifiers_mask_from_smithay(&keyboard.modifier_state());
         if prev_mask != next_mask {
             state.keybinds.reset_scroll_trackers();
@@ -1148,13 +1184,12 @@ pub fn process_keyboard_key_event(
         return;
     }
 
-    // 2. Evaluate Ring 0 safety chords & `KeybindTable` inside `keyboard.input`
-    let outcome = keyboard.input(
+    // 2. Evaluate Ring 0 safety chords & `KeybindTable`, bypassing any IME grab when session-locked.
+    let outcome = if let Some((filter_result, mods_changed)) = keyboard.input_intercept(
+        smithay::input::keyboard::KeyboardSource::MAIN,
         state,
         keycode,
         key_state,
-        serial,
-        time,
         |state, modifiers, handle| {
             let modified_sym = handle.modified_sym();
             let mod_raw = modified_sym.raw();
@@ -1301,7 +1336,28 @@ pub fn process_keyboard_key_event(
                 })
             }
         },
-    );
+    ) {
+        match filter_result {
+            FilterResult::Intercept(val) => Some(val),
+            FilterResult::Forward => {
+                if state.is_locked_or_abandoned() {
+                    keyboard.input_forward_bypassing_grab(
+                        state,
+                        keycode,
+                        key_state,
+                        serial,
+                        time,
+                        mods_changed,
+                    );
+                } else {
+                    keyboard.input_forward(state, keycode, key_state, serial, time, mods_changed);
+                }
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     if !state.pending_passthrough_actions.is_empty() {
         let passthrough = std::mem::take(&mut state.pending_passthrough_actions);
@@ -2549,5 +2605,59 @@ mod tests {
             true,
             term.options.allow_when_locked
         ));
+    }
+
+    #[test]
+    fn parses_macbook_and_laptop_xf86_media_brightness_and_print_keysyms() {
+        let cases = [
+            ("XF86AudioRaiseVolume", keysyms::KEY_XF86AudioRaiseVolume),
+            ("xf86audioraisevolume", keysyms::KEY_XF86AudioRaiseVolume),
+            ("AudioRaiseVolume", keysyms::KEY_XF86AudioRaiseVolume),
+            ("XF86AudioLowerVolume", keysyms::KEY_XF86AudioLowerVolume),
+            ("AudioLowerVolume", keysyms::KEY_XF86AudioLowerVolume),
+            ("XF86AudioMute", keysyms::KEY_XF86AudioMute),
+            ("AudioMute", keysyms::KEY_XF86AudioMute),
+            ("XF86AudioMicMute", keysyms::KEY_XF86AudioMicMute),
+            ("AudioMicMute", keysyms::KEY_XF86AudioMicMute),
+            ("XF86AudioPlay", keysyms::KEY_XF86AudioPlay),
+            ("AudioPlay", keysyms::KEY_XF86AudioPlay),
+            ("XF86AudioPause", keysyms::KEY_XF86AudioPause),
+            ("AudioPause", keysyms::KEY_XF86AudioPause),
+            ("XF86AudioNext", keysyms::KEY_XF86AudioNext),
+            ("AudioNext", keysyms::KEY_XF86AudioNext),
+            ("XF86AudioPrev", keysyms::KEY_XF86AudioPrev),
+            ("XF86AudioPrevious", keysyms::KEY_XF86AudioPrev),
+            ("AudioPrev", keysyms::KEY_XF86AudioPrev),
+            ("XF86AudioStop", keysyms::KEY_XF86AudioStop),
+            ("AudioStop", keysyms::KEY_XF86AudioStop),
+            ("XF86MonBrightnessUp", keysyms::KEY_XF86MonBrightnessUp),
+            ("MonBrightnessUp", keysyms::KEY_XF86MonBrightnessUp),
+            ("XF86MonBrightnessDown", keysyms::KEY_XF86MonBrightnessDown),
+            ("MonBrightnessDown", keysyms::KEY_XF86MonBrightnessDown),
+            ("XF86KbdBrightnessUp", keysyms::KEY_XF86KbdBrightnessUp),
+            ("KbdBrightnessUp", keysyms::KEY_XF86KbdBrightnessUp),
+            ("XF86KbdBrightnessDown", keysyms::KEY_XF86KbdBrightnessDown),
+            ("KbdBrightnessDown", keysyms::KEY_XF86KbdBrightnessDown),
+            ("Print", keysyms::KEY_Print),
+            ("print_screen", keysyms::KEY_Print),
+            ("PrintScreen", keysyms::KEY_Print),
+        ];
+
+        for (token, expected_raw) in cases {
+            let (sym, _) = resolve_xkb_keysym_token(token)
+                .unwrap_or_else(|e| panic!("failed resolving `{token}`: {e}"));
+            assert_eq!(sym.raw(), expected_raw, "token `{token}` mismatch");
+
+            let chord = parse_chord_spec(token)
+                .unwrap_or_else(|e| panic!("failed parsing chord `{token}`: {e}"));
+            match chord.trigger {
+                BindTrigger::Keysym { sym, .. } => assert_eq!(
+                    sym.raw(),
+                    expected_raw,
+                    "chord trigger mismatch for `{token}`"
+                ),
+                other => panic!("expected Keysym trigger for `{token}`, got {other:?}"),
+            }
+        }
     }
 }

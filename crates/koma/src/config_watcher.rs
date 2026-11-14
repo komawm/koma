@@ -709,6 +709,7 @@ pub fn reload_from_lua_source(
         false
     };
 
+    state.apply_runtime_input_config(&registry);
     state.queue_redraw();
 
     if had_previous_error && send_desktop_notification {
@@ -751,6 +752,8 @@ pub fn promote_deferred_sandbox_if_idle(state: &mut KomaState) {
         && let Some(ready_vm) = state.deferred_lua_sandbox.take()
     {
         state.lua_sandbox = ready_vm;
+        let registry = state.lua_sandbox.config_snapshot();
+        state.apply_runtime_input_config(&registry);
         info!(
             generation = state.config_generation,
             "promoted staged Shadow PhodopusSandbox after in-flight coroutines finished"

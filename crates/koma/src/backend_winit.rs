@@ -255,6 +255,38 @@ pub(crate) fn append_layer_tier_elements<R>(
     }
 }
 
+pub(crate) fn append_ime_popup_elements<R>(
+    renderer: &mut R,
+    state: &KomaState,
+    output: &Output,
+    output_scale: smithay::utils::Scale<f64>,
+    elements: &mut Vec<koma_render::elements::KomaRenderElement<R>>,
+) where
+    R: smithay::backend::renderer::Renderer + smithay::backend::renderer::ImportAll,
+    R::TextureId: Clone + 'static,
+{
+    use smithay::backend::renderer::element::{
+        Kind,
+        surface::{WaylandSurfaceRenderElement, render_elements_from_surface_tree},
+    };
+
+    for (surface, origin) in state.ime_popup_render_targets(output) {
+        let popup_elems: Vec<WaylandSurfaceRenderElement<R>> = render_elements_from_surface_tree(
+            renderer,
+            &surface,
+            origin.to_physical_precise_round(output_scale),
+            output_scale,
+            1.0,
+            Kind::Unspecified,
+        );
+        elements.extend(
+            popup_elems
+                .into_iter()
+                .map(koma_render::elements::KomaRenderElement::from),
+        );
+    }
+}
+
 pub(crate) fn assemble_locked_frame_elements<R>(
     renderer: &mut R,
     state: &KomaState,
@@ -322,6 +354,11 @@ pub(crate) fn dispatch_output_frame_callbacks_filtered(
     for layer in map.layers() {
         layer.send_frame(output, elapsed, throttle, |_, _| Some(output.clone()));
     }
+    for (ime_surf, _) in state.ime_popup_render_targets(output) {
+        send_frames_surface_tree(&ime_surf, output, elapsed, throttle, |_, _| {
+            Some(output.clone())
+        });
+    }
 }
 
 /// Executes a complete single-frame render pass onto the Winit EGL swapchain (`Frame 1` & live updates).
@@ -387,6 +424,13 @@ pub fn render_winit_frame(state: &mut KomaState) -> anyhow::Result<()> {
                 Vec::new();
             let mut bg_layer_elements: Vec<koma_render::elements::KomaRenderElement<GlesRenderer>> =
                 Vec::new();
+            append_ime_popup_elements(
+                winit_state.backend.renderer(),
+                state,
+                &winit_state.output,
+                output_scale,
+                &mut elements,
+            );
             append_layer_tier_elements(
                 winit_state.backend.renderer(),
                 &winit_state.output,
@@ -639,6 +683,21 @@ where
         }
         InputEvent::GestureHoldEnd { event } => {
             crate::gesture_dispatcher::process_gesture_hold_end::<B>(state, &event);
+        }
+        InputEvent::TouchDown { event } => {
+            state.handle_touch_down::<B>(event);
+        }
+        InputEvent::TouchMotion { event } => {
+            state.handle_touch_motion::<B>(event);
+        }
+        InputEvent::TouchUp { event } => {
+            state.handle_touch_up::<B>(event);
+        }
+        InputEvent::TouchFrame { .. } => {
+            state.handle_touch_frame();
+        }
+        InputEvent::TouchCancel { .. } => {
+            state.handle_touch_cancel();
         }
         _ => {}
     }

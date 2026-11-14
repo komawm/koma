@@ -18,10 +18,14 @@ pub use crate::{
     },
     recorder::{RecordedStep, compile_recorded_macro},
     schema::{
-        ActionDescriptor, AppearanceSpec, BindHandleId, BindOptions, BindSpec, GestureSpec,
-        InputConfigSpec, KomaConfigRegistry, KomaHandleRef, LuaLayerRuleSpec, LuaWindowRuleSpec,
-        MacroDefinition, MacroHandleId, MacroLimitsSpec, MacroParamSpec, MonitorSpec, RuleHandleId,
-        WorkspaceSpec, XwaylandConfigSpec, validate_gesture_spec,
+        AccelProfileSpec, ActionDescriptor, AppearanceSpec, BindHandleId, BindOptions, BindSpec,
+        ClickMethodSpec, DEFAULT_KEYBOARD_REPEAT_DELAY_MS, DEFAULT_KEYBOARD_REPEAT_RATE_HZ,
+        DeviceOverrideSpec, EffectiveLibinputSettings, GestureSpec, InputConfigSpec,
+        KeyboardInputSpec, KomaConfigRegistry, KomaHandleRef, LibinputDeviceProbe,
+        LuaLayerRuleSpec, LuaWindowRuleSpec, MacroDefinition, MacroHandleId, MacroLimitsSpec,
+        MacroParamSpec, MonitorSpec, PointerInputSpec, RuleHandleId, ScrollMethodSpec,
+        TabletInputSpec, TouchpadInputSpec, WorkspaceSpec, XwaylandConfigSpec,
+        resolve_effective_libinput_settings, validate_gesture_spec,
     },
     typegen::generate_luals_stubs,
 };

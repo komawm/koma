@@ -103,6 +103,22 @@ impl CompositorHandler for KomaState {
 
         // 2. Track popup state commits & reset active workspace damage-settle timer
         self.popups.commit(surface);
+        self.cleanup_ime_popups();
+
+        if let Some(ime_popup) = self
+            .ime_popups
+            .iter()
+            .find(|p| p.wl_surface() == &root_surface)
+            .cloned()
+        {
+            if self.is_locked_or_abandoned() {
+                self.clear_ime_state_for_lock();
+            } else {
+                self.unconstrain_ime_popup(&ime_popup);
+                self.queue_redraw();
+            }
+            return;
+        }
 
         // 2a. Apply committed cursor hotspot buffer_delta & redraw when active cursor commits
         if self
@@ -457,6 +473,29 @@ impl SeatHandler for KomaState {
             allow_data_device.then(|| client.clone()).flatten(),
         );
         set_primary_focus(dh, seat, allow_primary.then_some(client).flatten());
+
+        if self.is_locked_or_abandoned() {
+            self.clear_ime_state_for_lock();
+        } else if !self.ime_popups.is_empty() {
+            let popups = self.ime_popups.clone();
+            for popup in &popups {
+                self.unconstrain_ime_popup(popup);
+            }
+            self.queue_redraw();
+        }
+    }
+
+    fn led_state_changed(
+        &mut self,
+        _seat: &Seat<Self>,
+        led_state: smithay::input::keyboard::LedState,
+    ) {
+        #[cfg(feature = "smithay-tty")]
+        if let Some(crate::state::ActiveBackend::Tty(tty)) = self.backend.as_mut() {
+            tty.sync_keyboard_leds(led_state);
+        }
+        #[cfg(not(feature = "smithay-tty"))]
+        let _ = led_state;
     }
 }
 
@@ -566,23 +605,88 @@ impl VirtualKeyboardHandler for KomaState {
     fn process_virtual_keyboard_event(&mut self, event: InputEvent<VirtualKeyboardBackend>) {
         use smithay::backend::input::{Event as _, KeyboardKeyEvent as _};
         use smithay::input::keyboard::FilterResult;
+        use smithay::wayland::input_method::InputMethodSeat as _;
+        use smithay::wayland::virtual_keyboard::VirtualKeyboardSpecialEvent;
 
         self.reconcile_session_lock();
-        if let InputEvent::Keyboard { event } = event
-            && let Some(keyboard) = self.seat.get_keyboard()
-        {
-            if self.is_locked_or_abandoned() && keyboard.current_focus().is_none() {
-                return;
+        if self.is_locked_or_abandoned() {
+            if let InputEvent::DeviceRemoved { .. } = event
+                && self.virtual_keyboard_keymap_active
+            {
+                self.force_reapply_configured_xkb_config();
             }
-            let serial = SERIAL_COUNTER.next_serial();
-            let _ = keyboard.input::<(), _>(
-                self,
-                event.key_code(),
-                event.state(),
-                serial,
-                event.time(),
-                |_, _, _| FilterResult::Forward,
-            );
+            return;
+        }
+
+        let Some(keyboard) = self.seat.get_keyboard() else {
+            return;
+        };
+
+        let sync_vk_keymap =
+            |state: &mut Self,
+             device: &smithay::wayland::virtual_keyboard::VirtualKeyboardDevice| {
+                if let Some(keymap) = device.keymap() {
+                    if let Err(err) = keyboard.set_keymap_from_keymap_file(state, keymap) {
+                        warn!("failed applying virtual keyboard keymap: {err:?}");
+                    } else {
+                        state.virtual_keyboard_keymap_active = true;
+                    }
+                } else if state.virtual_keyboard_keymap_active {
+                    state.force_reapply_configured_xkb_config();
+                }
+            };
+
+        match event {
+            InputEvent::DeviceAdded { .. } => {}
+            InputEvent::DeviceRemoved { device } => {
+                if device.keymap().is_some() && self.virtual_keyboard_keymap_active {
+                    self.force_reapply_configured_xkb_config();
+                }
+            }
+            InputEvent::Keyboard { event } => {
+                let device = event.device();
+                sync_vk_keymap(self, &device);
+
+                let grab_client = self.seat.input_method().keyboard_grab_client();
+                let from_active_ime_grab = grab_client.is_some() && grab_client == device.client();
+                let serial = SERIAL_COUNTER.next_serial();
+                if from_active_ime_grab {
+                    keyboard.input_forward_bypassing_grab(
+                        self,
+                        event.key_code(),
+                        event.state(),
+                        serial,
+                        event.time(),
+                        true,
+                    );
+                } else {
+                    let _ = keyboard.input_from_source(
+                        device.source(),
+                        self,
+                        event.key_code(),
+                        event.state(),
+                        serial,
+                        event.time(),
+                        |_, _, _| FilterResult::Forward::<()>,
+                    );
+                }
+            }
+            InputEvent::Special(VirtualKeyboardSpecialEvent::KeymapChanged { device }) => {
+                sync_vk_keymap(self, &device);
+            }
+            InputEvent::Special(VirtualKeyboardSpecialEvent::Modifiers {
+                device,
+                mods_depressed,
+                mods_latched,
+                mods_locked,
+                group,
+            }) => {
+                sync_vk_keymap(self, &device);
+                keyboard.with_xkb_state(self, |mut ctx| {
+                    ctx.set_modifier_mask(mods_depressed, mods_latched, mods_locked, group);
+                });
+            }
+            _ => {}
         }
     }
 }
@@ -685,4 +789,65 @@ impl TabletSeatHandler for KomaState {
 
 // Unified Smithay `Dispatch2` / `GlobalDispatch2` delegation (`niri/src/niri.rs` line 488,
 // pinned Smithay rev `65aa86fa5236e41775c313408102a5d5c2d1e2ca`).
+impl smithay::wayland::input_method::InputMethodHandler for KomaState {
+    fn new_popup(&mut self, surface: smithay::wayland::input_method::PopupSurface) {
+        if self.is_locked_or_abandoned() {
+            return;
+        }
+        self.cleanup_ime_popups();
+        self.unconstrain_ime_popup(&surface);
+        self.ime_popups.retain(|p| p != &surface);
+        self.ime_popups.push(surface);
+        self.queue_redraw();
+    }
+
+    fn dismiss_popup(&mut self, surface: smithay::wayland::input_method::PopupSurface) {
+        self.ime_popups.retain(|p| p != &surface);
+        self.queue_redraw();
+    }
+
+    fn popup_repositioned(&mut self, surface: smithay::wayland::input_method::PopupSurface) {
+        if self.is_locked_or_abandoned() {
+            self.clear_ime_state_for_lock();
+            return;
+        }
+        self.unconstrain_ime_popup(&surface);
+        self.queue_redraw();
+    }
+
+    fn parent_geometry(
+        &self,
+        parent: &WlSurface,
+    ) -> smithay::utils::Rectangle<i32, smithay::utils::Logical> {
+        self.ime_parent_geometry(parent)
+    }
+}
+
+impl smithay::wayland::text_input::TextInputActivation for KomaState {
+    fn activated(
+        &mut self,
+        _content_type: Option<(
+            smithay::reexports::wayland_protocols::wp::text_input::zv3::server::zwp_text_input_v3::ContentHint,
+            smithay::reexports::wayland_protocols::wp::text_input::zv3::server::zwp_text_input_v3::ContentPurpose,
+        )>,
+    ) {
+        if self.is_locked_or_abandoned() {
+            self.clear_ime_state_for_lock();
+            return;
+        }
+        let popups = self.ime_popups.clone();
+        for popup in &popups {
+            self.unconstrain_ime_popup(popup);
+        }
+        self.queue_redraw();
+    }
+
+    fn deactivated(&mut self) {
+        if self.is_locked_or_abandoned() {
+            self.clear_ime_state_for_lock();
+        }
+        self.queue_redraw();
+    }
+}
+
 smithay::delegate_dispatch2!(KomaState);
