@@ -20,7 +20,7 @@ package = workspace["package"]
 assert package["edition"] == "2024", "unexpected Rust edition"
 assert toolchain["channel"].startswith(package["rust-version"] + "."), "MSRV/toolchain drift"
 assert package["license"] == "GPL-3.0-or-later", "product license drift"
-assert package["license-file"] == "LICENSE", "workspace license file drift"
+assert "license-file" not in package, "license-file is redundant with the SPDX license field"
 assert (root / "LICENSE").read_text().startswith("GNU GENERAL PUBLIC LICENSE"), "GPL license text missing"
 assert list(root.glob("LICENSE*")) == [root / "LICENSE"], "keep one root LICENSE"
 for member in workspace["members"]:
@@ -28,7 +28,7 @@ for member in workspace["members"]:
     assert crate["package"]["name"] == Path(member).name, f"crate name drift: {member}"
     assert crate["package"]["version"] == {"workspace": True}, f"crate version drift: {member}"
     assert crate["package"]["license"] == {"workspace": True}, f"unexpected product license override: {member}"
-    assert crate["package"]["license-file"] == {"workspace": True}, f"license file inheritance missing: {member}"
+    assert "license-file" not in crate["package"], f"license-file is redundant with license: {member}"
     assert not list((root / member).glob("LICENSE*")), f"use the shared root LICENSE: {member}"
     assert (root / member / "src").is_dir(), f"crate source missing: {member}"
 for name, dependency in workspace["dependencies"].items():

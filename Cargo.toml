@@ -25,7 +25,6 @@ version = "0.0.1"
 edition = "2024"
 rust-version = "1.100"
 license = "GPL-3.0-or-later"
-license-file = "LICENSE"
 repository = "https://github.com/komawm/koma"
 
 [workspace.dependencies]
