@@ -1,7 +1,7 @@
 name: BSD tier
 
-# FreeBSD x86_64 portability check and workspace test suite running inside a real
-# FreeBSD 15.1 VM via cross-platform-actions (since GitHub hosted runners lack native FreeBSD).
+# FreeBSD 15.1 and OpenBSD 8.0 x86_64 portability checks and workspace test suites
+# running inside real VMs via cross-platform-actions (since GitHub hosted runners lack native BSD).
 
 on:
   workflow_dispatch:
@@ -81,3 +81,88 @@ jobs:
           set -eux
           . "$HOME/.cargo/env"
           cargo test --workspace --locked -- --test-threads=4
+
+  openbsd-x86_64:
+    name: OpenBSD x86_64 (Tier 2)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      CARGO_INCREMENTAL: "0"
+    defaults:
+      run:
+        shell: cpa.sh {0}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Start OpenBSD 8.0 VM
+        uses: cross-platform-actions/action@82668f1fbd89d9c99487604f822cbf6716f124d3 # v1.7.0
+        with:
+          operating_system: openbsd
+          version: "8.0"
+          architecture: x86-64
+          memory: 6G
+          cpu_count: 8
+
+      - name: Install OpenBSD build prerequisites
+        run: |
+          set -eux
+          if [ "$(id -u)" -eq 0 ]; then
+            AS_ROOT=""
+          elif command -v doas >/dev/null 2>&1; then
+            AS_ROOT="doas"
+          elif command -v sudo >/dev/null 2>&1; then
+            AS_ROOT="sudo"
+          else
+            echo "no privilege escalation helper found for pkg_add" >&2
+            exit 1
+          fi
+          $AS_ROOT pkg_add -I rust pkgconf git sqlite3
+          # Mesa, fontconfig, and pixman live in Xenocara (/usr/X11R6) on OpenBSD;
+          # probe optional ports individually so unavailable names do not abort setup.
+          for pkg in wayland libinput-openbsd libudev-openbsd seatd libxkbcommon mesa dbus fontconfig pixman; do
+            $AS_ROOT pkg_add -I "$pkg" || echo "optional port unavailable via pkg_add: $pkg"
+          done
+          rustc --version
+          cargo --version
+
+      - name: Test core crates and headless overview on OpenBSD
+        run: |
+          set -eux
+          export PKG_CONFIG_PATH="/usr/local/lib/pkgconfig:/usr/X11R6/lib/pkgconfig"
+          MIN_VER="$(sed -n 's/^rust-version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+          CUR_VER="$(rustc --version | awk '{print $2}' | cut -d- -f1)"
+          EXTRA_FLAGS=""
+          if awk -v cur="$CUR_VER" -v req="$MIN_VER" '
+            BEGIN {
+              split(cur, c, "."); split(req, r, ".");
+              cv = (c[1] + 0) * 1000000 + (c[2] + 0) * 1000 + (c[3] + 0);
+              rv = (r[1] + 0) * 1000000 + (r[2] + 0) * 1000 + (r[3] + 0);
+              exit !(cv < rv);
+            }'; then
+            echo "::warning::OpenBSD rustc $CUR_VER < rust-version $MIN_VER; passing --ignore-rust-version"
+            EXTRA_FLAGS="--ignore-rust-version"
+          fi
+          # shellcheck disable=SC2086
+          cargo test --locked $EXTRA_FLAGS \
+            -p koma-proto \
+            -p koma-model \
+            -p koma-lua \
+            -p koma-seat \
+            -p komactl \
+            -p koma-mcp \
+            -- --test-threads=4
+          # shellcheck disable=SC2086
+          cargo check --locked $EXTRA_FLAGS -p koma-overview --no-default-features --all-targets
+          if pkg-config --exists wayland-client 2>/dev/null; then
+            # shellcheck disable=SC2086
+            cargo test --locked $EXTRA_FLAGS -p koma-overview -- --test-threads=4
+          else
+            echo "wayland-client.pc absent; skipping default koma-overview check on OpenBSD"
+          fi
+          if pkg-config --exists wayland-client xkbcommon dbus-1 fontconfig libinput libudev gbm 2>/dev/null; then
+            # shellcheck disable=SC2086
+            cargo check --locked $EXTRA_FLAGS --workspace --all-targets || echo "Full compositor workspace check failed on OpenBSD (diagnostic)"
+          else
+            echo "Compositor C pkg-config libraries not all present; skipping --workspace diagnostic probe on OpenBSD"
+          fi

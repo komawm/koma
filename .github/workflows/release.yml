@@ -19,9 +19,6 @@ concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
-env:
-  TARGET: x86_64-unknown-linux-gnu
-
 jobs:
   verify:
     name: Verify version and repository gates
@@ -81,7 +78,7 @@ jobs:
           sudo apt-get install --no-install-recommends -y \
             pkg-config libudev-dev libinput-dev libseat-dev libgbm-dev \
             libegl1-mesa-dev libgles2-mesa-dev libwayland-dev libxkbcommon-dev \
-            libdbus-1-dev libfontconfig1-dev libdisplay-info-dev
+            libdbus-1-dev libfontconfig1-dev
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: linux-${{ steps.rust.outputs.channel }}
@@ -90,9 +87,17 @@ jobs:
         run: just fmt-check typecheck clippy test-core test
 
   build:
-    name: Build release archive
-    runs-on: ubuntu-24.04
+    name: Build release archive (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -123,18 +128,20 @@ jobs:
           sudo apt-get install --no-install-recommends -y \
             pkg-config libudev-dev libinput-dev libseat-dev libgbm-dev \
             libegl1-mesa-dev libgles2-mesa-dev libwayland-dev libxkbcommon-dev \
-            libdbus-1-dev libfontconfig1-dev libdisplay-info-dev
+            libdbus-1-dev libfontconfig1-dev
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          shared-key: release-${{ steps.rust.outputs.channel }}
+          shared-key: release-${{ matrix.target }}-${{ steps.rust.outputs.channel }}
       - name: Package release archive
         env:
           VERSION: ${{ steps.version.outputs.version }}
+          TARGET: ${{ matrix.target }}
           OUT_DIR: ${{ runner.temp }}/release
         run: bash scripts/package-release.sh --version "$VERSION" --target "$TARGET" --out "$OUT_DIR"
       - name: Smoke-test packaged binaries
         env:
           VERSION: ${{ steps.version.outputs.version }}
+          TARGET: ${{ matrix.target }}
           OUT_DIR: ${{ runner.temp }}/release
         run: |
           cd "$OUT_DIR"
@@ -145,7 +152,36 @@ jobs:
           rm -rf "koma-$VERSION-$TARGET"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: koma-release-${{ steps.version.outputs.version }}
+          name: koma-release-${{ steps.version.outputs.version }}-${{ matrix.target }}
+          path: ${{ runner.temp }}/release/koma-*.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  assemble:
+    name: Assemble release checksums
+    needs: [verify, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: koma-release-${{ needs.verify.outputs.version }}-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/release
+      - name: Generate unified SHA256SUMS
+        working-directory: ${{ runner.temp }}/release
+        run: |
+          shopt -s nullglob
+          tarballs=(koma-*.tar.gz)
+          if [ "${#tarballs[@]}" -ne 2 ]; then
+            echo "::error::expected 2 release tarballs, found ${#tarballs[*]}"
+            exit 1
+          fi
+          LC_ALL=C sha256sum "${tarballs[@]}" > SHA256SUMS
+          sha256sum -c SHA256SUMS
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: koma-release-${{ needs.verify.outputs.version }}
           path: |
             ${{ runner.temp }}/release/koma-*.tar.gz
             ${{ runner.temp }}/release/SHA256SUMS
@@ -155,7 +191,7 @@ jobs:
   publish:
     name: Publish GitHub prerelease
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    needs: [verify, build]
+    needs: [verify, assemble]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     environment: release
