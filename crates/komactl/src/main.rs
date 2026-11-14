@@ -20,7 +20,7 @@ use serde_json::json;
 
 use crate::{
     admin_rpc::AdminClient,
-    sandbox_runner::{dispatch_sandbox_subcommand, print_sandbox_help},
+    sandbox_runner::{dispatch_sandbox_subcommand, print_sandbox_help, print_sandbox_help_to},
 };
 
 fn default_init_lua_path() -> PathBuf {
@@ -73,6 +73,24 @@ fn validate_init_lua_offline(path: &Path) -> Result<(), String> {
         registry.macros.len()
     );
     Ok(())
+}
+
+/// Exit status for usage errors (no or unknown subcommand).
+const USAGE_EXIT_CODE: i32 = 2;
+
+fn usage_text() -> &'static str {
+    "Usage:
+  komactl validate [path/to/init.lua]
+  komactl reload [path/to/init.lua]
+  komactl config-status
+  komactl gen-types
+  komactl inventory
+  komactl token mint [label]
+  komactl capture [ws_id] [out.rgba]
+  komactl sandbox <run|create-jail|revoke-jail> [OPTIONS]
+  komactl -h | --help
+  komactl -V | --version
+"
 }
 
 fn main() -> io::Result<()> {
@@ -167,22 +185,45 @@ fn main() -> io::Result<()> {
                 process::exit(1);
             }
         },
-        _ => {
-            eprintln!(
-                "Usage:
-  komactl validate [path/to/init.lua]
-  komactl reload [path/to/init.lua]
-  komactl config-status
-  komactl gen-types
-  komactl inventory
-  komactl token mint [label]
-  komactl capture [ws_id] [out.rgba]
-  komactl sandbox <run|create-jail|revoke-jail> [OPTIONS]"
-            );
+        Some("-h" | "--help" | "help") => {
+            print!("{}", usage_text());
+            println!();
+            print_sandbox_help_to(&mut io::stdout())?;
+        }
+        Some("-V" | "--version") => println!("komactl {}", env!("CARGO_PKG_VERSION")),
+        other => {
+            if let Some(cmd) = other {
+                eprintln!("komactl: unknown command `{cmd}`\n");
+            }
+            eprint!("{}", usage_text());
             eprintln!();
             print_sandbox_help();
-            process::exit(1);
+            process::exit(USAGE_EXIT_CODE);
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::usage_text;
+
+    #[test]
+    fn usage_lists_every_subcommand_and_help() {
+        let text = usage_text();
+        for cmd in [
+            "validate",
+            "reload",
+            "config-status",
+            "gen-types",
+            "inventory",
+            "token mint",
+            "capture",
+            "sandbox",
+            "--help",
+            "--version",
+        ] {
+            assert!(text.contains(cmd), "usage is missing {cmd}");
+        }
+    }
 }

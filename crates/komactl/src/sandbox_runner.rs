@@ -179,7 +179,13 @@ pub fn dispatch_sandbox_subcommand(args: &[String]) -> io::Result<i32> {
 }
 
 pub fn print_sandbox_help() {
-    eprintln!(
+    let _ = print_sandbox_help_to(&mut std::io::stderr());
+}
+
+/// Writes the `komactl sandbox` help to `out` (stdout for `--help`, stderr for usage errors).
+pub fn print_sandbox_help_to(out: &mut impl std::io::Write) -> std::io::Result<()> {
+    writeln!(
+        out,
         "Usage:
   komactl sandbox run [OPTIONS] [--] <COMMAND> [ARGS...]
   komactl sandbox create-jail <ws_id> [label]
@@ -200,7 +206,7 @@ Options for `sandbox run`:
   --with-agent-sock          Mount koma-agent.sock + inject a single-workspace KOMA_CAPABILITY_TOKEN
   --keep-jail                Keep `jail-<ws_id>.sock` alive after the container process exits
   --dry-run                  Print the constructed `bwrap` or `podman` command without spawning"
-    );
+    )
 }
 
 fn parse_sandbox_run_args(args: &[String]) -> Result<SandboxRunConfig, String> {

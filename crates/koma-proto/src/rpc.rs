@@ -19,6 +19,7 @@ pub enum WorkspaceModeSpec {
 pub enum OverlayKind {
     None,
     Som,
+    #[serde(rename = "grid_225", alias = "grid225")]
     Grid225,
 }
 
@@ -107,4 +108,33 @@ pub struct WorkspaceSetModeParams {
     pub ws_id: WorkspaceId,
     pub mode: WorkspaceModeSpec,
     pub output: Option<OutputId>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn overlay_kind_grid225_uses_spec_wire_name_with_legacy_alias() {
+        assert_eq!(
+            serde_json::to_string(&OverlayKind::Grid225).unwrap(),
+            "\"grid_225\""
+        );
+        assert_eq!(
+            serde_json::from_str::<OverlayKind>("\"grid_225\"").unwrap(),
+            OverlayKind::Grid225
+        );
+        assert_eq!(
+            serde_json::from_str::<OverlayKind>("\"grid225\"").unwrap(),
+            OverlayKind::Grid225
+        );
+        assert_eq!(
+            serde_json::to_string(&ImageFormat::RawRgba8).unwrap(),
+            "\"raw_rgba8\""
+        );
+        assert_eq!(
+            serde_json::to_string(&TransportKind::ShmFd).unwrap(),
+            "\"shm_fd\""
+        );
+    }
 }
