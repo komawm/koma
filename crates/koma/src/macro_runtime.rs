@@ -475,10 +475,17 @@ pub(crate) fn dispatch_single_host_action(state: &mut KomaState, action: QueuedH
                 TextInjectStrategy::Clipboard => {
                     paste_utf8_via_clipboard(state, &ws_id, utf8);
                 }
-                TextInjectStrategy::XkbKeymap
-                | TextInjectStrategy::Auto
-                | TextInjectStrategy::TextInputV3 => {
+                TextInjectStrategy::XkbKeymap => {
                     if can_type_via_ascii_xkb(&utf8) {
+                        synthesize_ascii_xkb_typing(state, &ws_id, &utf8);
+                    } else {
+                        paste_utf8_via_clipboard(state, &ws_id, utf8);
+                    }
+                }
+                TextInjectStrategy::Auto | TextInjectStrategy::TextInputV3 => {
+                    if try_commit_via_text_input_v3(state, &ws_id, &utf8) {
+                        state.queue_redraw();
+                    } else if can_type_via_ascii_xkb(&utf8) {
                         synthesize_ascii_xkb_typing(state, &ws_id, &utf8);
                     } else {
                         paste_utf8_via_clipboard(state, &ws_id, utf8);
@@ -669,6 +676,36 @@ fn active_window_in_ws<'a>(
 ) -> Option<&'a crate::state::MappedWindow> {
     let active_id = state.workspaces.get(ws_id)?.active_window()?;
     state.mapped_windows.iter().find(|m| m.win_id == active_id)
+}
+
+fn try_commit_via_text_input_v3(state: &KomaState, ws_id: &WorkspaceId, utf8: &str) -> bool {
+    use smithay::reexports::wayland_server::Resource as _;
+    use smithay::wayland::text_input::TextInputSeat as _;
+
+    let Some(target_wl) = active_window_in_ws(state, ws_id)
+        .and_then(|m| m.window.toplevel().map(|t| t.wl_surface().clone()))
+    else {
+        return false;
+    };
+
+    let text_input = state.seat.text_input();
+    let mut committed = false;
+    text_input.with_active_text_input(|ti, surface| {
+        if !committed {
+            let mut root = surface.clone();
+            while let Some(parent) = smithay::wayland::compositor::get_parent(&root) {
+                root = parent;
+            }
+            if root.id() == target_wl.id() {
+                ti.commit_string(Some(utf8.to_owned()));
+                committed = true;
+            }
+        }
+    });
+    if committed {
+        text_input.done(false);
+    }
+    committed
 }
 
 fn target_window_rect(state: &KomaState, ws_id: &WorkspaceId) -> LogicalRect {

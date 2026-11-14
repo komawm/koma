@@ -100,6 +100,42 @@ use crate::{
     },
     xwayland_satellite::SatelliteSlot,
 };
+use koma_lua::schema::{
+    DeviceOverrideSpec, InputConfigSpec, KeyboardInputSpec, KomaConfigRegistry,
+};
+use smithay::{
+    backend::input::{Event as _, InputBackend, TouchEvent as _},
+    input::touch::{
+        DownEvent as TouchDownPayload, MotionEvent as TouchMotionPayload, UpEvent as TouchUpPayload,
+    },
+    utils::Rectangle,
+    wayland::{
+        input_method::{InputMethodManagerState, PopupSurface as ImePopupSurface},
+        text_input::{TextInputManagerState, TextInputSeat as _},
+    },
+};
+
+/// Canonical signature of the active `KeyboardInputSpec` XKB settings for runtime reload diffing.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct KeyboardXkbSignature {
+    pub rules: String,
+    pub model: String,
+    pub layout: String,
+    pub variant: String,
+    pub options: Option<String>,
+}
+
+impl From<&KeyboardInputSpec> for KeyboardXkbSignature {
+    fn from(spec: &KeyboardInputSpec) -> Self {
+        Self {
+            rules: spec.rules.clone().unwrap_or_default(),
+            model: spec.model.clone().unwrap_or_default(),
+            layout: spec.layout.clone().unwrap_or_default(),
+            variant: spec.variant.clone().unwrap_or_default(),
+            options: spec.options.clone(),
+        }
+    }
+}
 
 /// Fail-closed state machine for `ext-session-lock-v1`.
 ///
@@ -511,7 +547,16 @@ pub struct KomaState {
     pub viewporter_state: ViewporterState,
     #[allow(dead_code)]
     pub fractional_scale_state: FractionalScaleManagerState,
+    #[allow(dead_code)]
+    pub text_input_state: TextInputManagerState,
+    #[allow(dead_code)]
+    pub input_method_state: InputMethodManagerState,
     pub popups: PopupManager,
+    pub ime_popups: Vec<ImePopupSurface>,
+    pub applied_keyboard_xkb: Option<KeyboardXkbSignature>,
+    pub applied_keyboard_repeat: (i32, i32),
+    pub applied_startup_numlock: Option<bool>,
+    pub virtual_keyboard_keymap_active: bool,
 
     // Physical/nested host seat (`seat0` / `libseat`)
     pub seat: Seat<Self>,
@@ -601,6 +646,9 @@ impl KomaState {
             SecurityContextState::new::<Self, _>(&display_handle, client_is_unrestricted);
         let virtual_keyboard_state =
             VirtualKeyboardManagerState::new::<Self, _>(&display_handle, client_is_unrestricted);
+        let text_input_state = TextInputManagerState::new::<Self>(&display_handle);
+        let input_method_state =
+            InputMethodManagerState::new::<Self, _>(&display_handle, client_is_unrestricted);
 
         let pointer_gestures_state = PointerGesturesState::new::<Self>(&display_handle);
         let cursor_shape_manager_state = CursorShapeManagerState::new::<Self>(&display_handle);
@@ -609,9 +657,14 @@ impl KomaState {
         let fractional_scale_state = FractionalScaleManagerState::new::<Self>(&display_handle);
 
         let mut seat = seat_state.new_wl_seat(&display_handle, seat_name);
-        seat.add_keyboard(XkbConfig::default(), 220, 35)
-            .expect("failed to initialize XKB keyboard on host seat");
+        seat.add_keyboard(
+            XkbConfig::default(),
+            koma_lua::schema::DEFAULT_KEYBOARD_REPEAT_DELAY_MS,
+            koma_lua::schema::DEFAULT_KEYBOARD_REPEAT_RATE_HZ,
+        )
+        .expect("failed to initialize XKB keyboard on host seat");
         seat.add_pointer();
+        seat.add_touch();
 
         // Human `Headed` workspaces default to `registry.default_layout` (`LayoutMode::Dwindle`)!
         let lua_sandbox = PhodopusSandbox::default();
@@ -666,7 +719,17 @@ impl KomaState {
             dmabuf_state,
             viewporter_state,
             fractional_scale_state,
+            text_input_state,
+            input_method_state,
             popups: PopupManager::default(),
+            ime_popups: Vec::new(),
+            applied_keyboard_xkb: Some(KeyboardXkbSignature::default()),
+            applied_keyboard_repeat: (
+                koma_lua::schema::DEFAULT_KEYBOARD_REPEAT_DELAY_MS,
+                koma_lua::schema::DEFAULT_KEYBOARD_REPEAT_RATE_HZ,
+            ),
+            applied_startup_numlock: None,
+            virtual_keyboard_keymap_active: false,
             seat,
             pointer_location: Point::from((
                 f64::from(initial_viewport.width) * 0.5,
@@ -939,6 +1002,7 @@ impl KomaState {
         if changed {
             if self.is_locked_or_abandoned() {
                 self.focused_ondemand_layer = None;
+                self.clear_ime_state_for_lock();
             }
             self.reconcile_keyboard_focus();
             self.queue_redraw();
@@ -977,6 +1041,10 @@ impl KomaState {
                 },
             );
             pointer.frame(self);
+        }
+        self.clear_ime_state_for_lock();
+        if let Some(touch) = self.seat.get_touch() {
+            touch.cancel(self);
         }
         if let Some(keyboard) = self.seat.get_keyboard() {
             let serial = SERIAL_COUNTER.next_serial();
@@ -2126,6 +2194,376 @@ impl KomaState {
     }
 }
 
+impl KomaState {
+    /// Fail-closed IME barrier enforced whenever `SessionLockPhase != Unlocked`:
+    /// drops active `zwp_text_input_v3` focus/enter and discards all IME popup surfaces.
+    pub fn clear_ime_state_for_lock(&mut self) {
+        let text_input = self.seat.text_input();
+        if text_input.focus().is_some() {
+            text_input.leave();
+            text_input.set_focus(None);
+        }
+        self.ime_popups.clear();
+    }
+
+    /// Prunes destroyed IME popup handles alongside XDG popups during event-loop cleanup.
+    pub fn cleanup_ime_popups(&mut self) {
+        self.ime_popups.retain(|popup| popup.alive());
+    }
+
+    /// Computes an `Output`'s logical bounding rectangle in global compositor coordinates.
+    #[must_use]
+    pub fn output_logical_rect(&self, output: &Output) -> Rectangle<i32, Logical> {
+        let loc = output.current_location();
+        let scale = output.current_scale().fractional_scale().max(0.01);
+        let size = output
+            .current_mode()
+            .map(|mode| {
+                output
+                    .current_transform()
+                    .transform_size(mode.size)
+                    .to_f64()
+                    .to_logical(scale)
+                    .to_i32_round()
+            })
+            .unwrap_or_else(|| {
+                self.workspaces
+                    .get(&self.active_ws_id)
+                    .map(|ws| (ws.viewport.width as i32, ws.viewport.height as i32).into())
+                    .unwrap_or_else(|| (1920, 1080).into())
+            });
+        Rectangle::new(loc, size)
+    }
+
+    /// Resolves the global logical geometry of a parent `wl_surface` hosting an IME popup.
+    #[must_use]
+    pub fn ime_parent_geometry(&self, parent: &WlSurface) -> Rectangle<i32, Logical> {
+        let mut root = parent.clone();
+        while let Some(ancestor) = smithay::wayland::compositor::get_parent(&root) {
+            root = ancestor;
+        }
+
+        let active_ws = self.active_ws_id.clone();
+        let active_special = self.active_special_ws_id.clone();
+
+        // Check active mapped windows first, preferring the active interactive workspace.
+        let win_match = self
+            .mapped_windows
+            .iter()
+            .filter(|m| m.ws_id == active_ws || active_special.as_ref() == Some(&m.ws_id))
+            .chain(self.mapped_windows.iter())
+            .find(|m| m.window.toplevel().is_some_and(|t| t.wl_surface() == &root));
+
+        if let Some(m) = win_match {
+            let win_geo_loc = m.window.geometry().loc;
+            return Rectangle::new(
+                Point::from((m.rect.x - win_geo_loc.x, m.rect.y - win_geo_loc.y)),
+                Size::from((m.rect.w.max(1) as i32, m.rect.h.max(1) as i32)),
+            );
+        }
+
+        for output in self.all_outputs() {
+            let out_origin = output.current_location();
+            let map = layer_map_for_output(&output);
+            for layer in map.layers() {
+                if layer.wl_surface() == &root
+                    && let Some(layer_geo) = map.layer_geometry(layer)
+                {
+                    return Rectangle::new(out_origin + layer_geo.loc, layer_geo.size);
+                }
+            }
+        }
+
+        self.primary_output()
+            .map(|o| self.output_logical_rect(&o))
+            .unwrap_or_default()
+    }
+
+    /// Repositions `popup` near the active text-input cursor rectangle while constraining it
+    /// inside the target output bounds (placing below the cursor, or flipping above if needed).
+    pub fn unconstrain_ime_popup(&self, popup: &ImePopupSurface) {
+        if self.is_locked_or_abandoned() {
+            return;
+        }
+        let Some(parent) = popup.get_parent() else {
+            return;
+        };
+        let parent_geo = self.ime_parent_geometry(&parent.surface);
+        let parent_loc = if parent_geo.size.w > 0 && parent_geo.size.h > 0 {
+            parent_geo.loc
+        } else {
+            parent.location.loc
+        };
+
+        let text_rect = popup.text_input_rectangle();
+        let cursor_global = Rectangle::new(parent_loc + text_rect.loc, text_rect.size);
+
+        let popup_bbox =
+            smithay::desktop::utils::bbox_from_surface_tree(popup.wl_surface(), (0, 0));
+        let popup_size: Size<i32, Logical> =
+            Size::from((popup_bbox.size.w.max(1), popup_bbox.size.h.max(1)));
+
+        let target_output = self
+            .all_outputs()
+            .into_iter()
+            .find(|out| self.output_logical_rect(out).contains(cursor_global.loc))
+            .or_else(|| self.primary_output());
+
+        let Some(output) = target_output else {
+            return;
+        };
+        let out_geo = self.output_logical_rect(&output);
+
+        let max_x = out_geo.loc.x + (out_geo.size.w - popup_size.w).max(0);
+        let x = cursor_global.loc.x.clamp(out_geo.loc.x, max_x);
+
+        let below_y = cursor_global.loc.y + cursor_global.size.h.max(1);
+        let above_y = cursor_global.loc.y - popup_size.h;
+        let max_y = out_geo.loc.y + (out_geo.size.h - popup_size.h).max(0);
+
+        let y = if below_y + popup_size.h <= out_geo.loc.y + out_geo.size.h {
+            below_y
+        } else if above_y >= out_geo.loc.y {
+            above_y
+        } else {
+            below_y.clamp(out_geo.loc.y, max_y)
+        };
+
+        // Store location relative to `parent.location.loc` while rendering computes relative to live `parent_loc`.
+        popup.set_location(Point::from((x, y)) - parent_loc);
+    }
+
+    /// Returns live mapped IME popup `(WlSurface, output_local_origin)` items for `output`,
+    /// returning empty whenever the session is locked or abandoned.
+    #[must_use]
+    pub fn ime_popup_render_targets(
+        &self,
+        output: &Output,
+    ) -> Vec<(WlSurface, Point<i32, Logical>)> {
+        if self.is_locked_or_abandoned() || self.ime_popups.is_empty() {
+            return Vec::new();
+        }
+        let out_geo = self.output_logical_rect(output);
+        let single_output = self.all_outputs().len() <= 1;
+        let mut out = Vec::with_capacity(self.ime_popups.len());
+
+        for popup in &self.ime_popups {
+            if !popup.alive() {
+                continue;
+            }
+            self.unconstrain_ime_popup(popup);
+            let Some(parent) = popup.get_parent() else {
+                continue;
+            };
+            let parent_geo = self.ime_parent_geometry(&parent.surface);
+            let parent_loc = if parent_geo.size.w > 0 && parent_geo.size.h > 0 {
+                parent_geo.loc
+            } else {
+                parent.location.loc
+            };
+            let global_pos = parent_loc + popup.location();
+            let bbox =
+                smithay::desktop::utils::bbox_from_surface_tree(popup.wl_surface(), global_pos);
+            let render_rect = if bbox.size.w > 0 && bbox.size.h > 0 {
+                bbox
+            } else {
+                Rectangle::new(global_pos, Size::from((1, 1)))
+            };
+            if single_output || out_geo.overlaps(render_rect) {
+                out.push((popup.wl_surface().clone(), global_pos - out_geo.loc));
+            }
+        }
+        out
+    }
+
+    fn apply_keyboard_spec_to_seat(&mut self, kb_spec: &KeyboardInputSpec, force_xkb: bool) {
+        let Some(keyboard) = self.seat.get_keyboard() else {
+            return;
+        };
+
+        let target_sig = KeyboardXkbSignature::from(kb_spec);
+        if force_xkb || self.applied_keyboard_xkb.as_ref() != Some(&target_sig) {
+            let xkb_cfg = XkbConfig {
+                rules: &target_sig.rules,
+                model: &target_sig.model,
+                layout: &target_sig.layout,
+                variant: &target_sig.variant,
+                options: target_sig.options.clone(),
+            };
+            if let Err(err) = keyboard.set_xkb_config(self, xkb_cfg) {
+                warn!(
+                    layout = %target_sig.layout,
+                    variant = %target_sig.variant,
+                    options = ?target_sig.options,
+                    "failed applying runtime XkbConfig: {err:?}"
+                );
+            } else {
+                self.applied_keyboard_xkb = Some(target_sig);
+                self.virtual_keyboard_keymap_active = false;
+            }
+        }
+
+        // NOTE: Smithay `KeyboardHandle::change_repeat_info(rate, delay)` expects `(rate_hz, delay_ms)`.
+        let target_delay = kb_spec.effective_repeat_delay();
+        let target_rate = kb_spec.effective_repeat_rate();
+        if self.applied_keyboard_repeat != (target_delay, target_rate) {
+            keyboard.change_repeat_info(target_rate, target_delay);
+            self.applied_keyboard_repeat = (target_delay, target_rate);
+        }
+
+        if kb_spec.numlock.is_some() && self.applied_startup_numlock != kb_spec.numlock {
+            let want_numlock = kb_spec.numlock == Some(true);
+            let mut mods = keyboard.modifier_state();
+            if mods.num_lock != want_numlock {
+                mods.num_lock = want_numlock;
+                keyboard.set_modifier_state(mods);
+                keyboard.advertise_modifier_state(self);
+            }
+            self.applied_startup_numlock = kb_spec.numlock;
+        }
+    }
+
+    /// Applies runtime XKB keyboard settings, repeat info, startup NumLock, and live `libinput`
+    /// pointer/touchpad/device rules from a freshly evaluated [`KomaConfigRegistry`].
+    pub fn apply_runtime_input_config(&mut self, registry: &KomaConfigRegistry) {
+        self.apply_keyboard_spec_to_seat(&registry.input.keyboard, false);
+        self.apply_backend_input_config(&registry.input, &registry.devices);
+    }
+
+    /// Restores the compositor's configured Lua XKB layout after a custom `zwp_virtual_keyboard_v1`
+    /// keymap was active on the seat.
+    pub fn force_reapply_configured_xkb_config(&mut self) {
+        let registry = self.lua_sandbox.config_snapshot();
+        self.apply_keyboard_spec_to_seat(&registry.input.keyboard, true);
+    }
+
+    /// Re-applies declarative `koma.input` + `koma.device` rules to all connected backend devices.
+    pub fn apply_backend_input_config(
+        &mut self,
+        input: &InputConfigSpec,
+        devices: &[DeviceOverrideSpec],
+    ) {
+        #[cfg(feature = "smithay-tty")]
+        if let Some(ActiveBackend::Tty(tty)) = self.backend.as_mut() {
+            tty.apply_libinput_config_to_all(input, devices);
+        }
+        #[cfg(not(feature = "smithay-tty"))]
+        let _ = (input, devices);
+    }
+
+    fn resolve_touch_position<
+        B: InputBackend,
+        E: smithay::backend::input::Event<B> + smithay::backend::input::AbsolutePositionEvent<B>,
+    >(
+        &self,
+        event: &E,
+    ) -> Option<Point<f64, Logical>>
+    where
+        B::Device: smithay::backend::input::Device,
+    {
+        let dev_name = smithay::backend::input::Device::name(&event.device());
+        let reg = self.lua_sandbox.config_snapshot();
+        let mapped_output_id = reg
+            .devices
+            .iter()
+            .find(|d| {
+                !d.name.is_empty() && (d.name == dev_name || d.name.eq_ignore_ascii_case(&dev_name))
+            })
+            .and_then(|d| d.map_to_output.as_ref());
+
+        let outputs = self.all_outputs();
+        let target_output = mapped_output_id
+            .and_then(|out_id| {
+                outputs
+                    .iter()
+                    .find(|o| o.name() == out_id.as_str())
+                    .cloned()
+            })
+            .or_else(|| self.primary_output())?;
+
+        let out_geo = self.output_logical_rect(&target_output);
+        let pos = event.position_transformed(out_geo.size) + out_geo.loc.to_f64();
+        Some(pos)
+    }
+
+    pub fn handle_touch_down<B: InputBackend>(&mut self, event: B::TouchDownEvent)
+    where
+        B::Device: smithay::backend::input::Device,
+    {
+        self.reconcile_session_lock();
+        let Some(pos) = self.resolve_touch_position::<B, _>(&event) else {
+            return;
+        };
+        let Some(touch) = self.seat.get_touch() else {
+            return;
+        };
+        if !self.is_locked_or_abandoned() && !touch.is_grabbed() {
+            self.handle_pointer_button_focus(pos);
+        }
+        let under = self.surface_under(pos);
+        let serial = SERIAL_COUNTER.next_serial();
+        touch.down(
+            self,
+            under,
+            &TouchDownPayload {
+                slot: event.slot(),
+                location: pos,
+                serial,
+                time: event.time(),
+            },
+        );
+    }
+
+    pub fn handle_touch_motion<B: InputBackend>(&mut self, event: B::TouchMotionEvent)
+    where
+        B::Device: smithay::backend::input::Device,
+    {
+        let Some(pos) = self.resolve_touch_position::<B, _>(&event) else {
+            return;
+        };
+        let Some(touch) = self.seat.get_touch() else {
+            return;
+        };
+        let under = self.surface_under(pos);
+        touch.motion(
+            self,
+            under,
+            &TouchMotionPayload {
+                slot: event.slot(),
+                location: pos,
+                time: event.time(),
+            },
+        );
+    }
+
+    pub fn handle_touch_up<B: InputBackend>(&mut self, event: B::TouchUpEvent) {
+        let Some(touch) = self.seat.get_touch() else {
+            return;
+        };
+        let serial = SERIAL_COUNTER.next_serial();
+        touch.up(
+            self,
+            &TouchUpPayload {
+                slot: event.slot(),
+                serial,
+                time: event.time(),
+            },
+        );
+    }
+
+    pub fn handle_touch_frame(&mut self) {
+        if let Some(touch) = self.seat.get_touch() {
+            touch.frame(self);
+        }
+    }
+
+    pub fn handle_touch_cancel(&mut self) {
+        if let Some(touch) = self.seat.get_touch() {
+            touch.cancel(self);
+        }
+    }
+}
+
 pub fn read_toplevel_metadata(wl_surface: &WlSurface) -> (String, String) {
     with_states(wl_surface, |states| {
         let role = states
@@ -2335,6 +2773,150 @@ mod tests {
         assert_eq!(
             resolve_keyboard_focus_source(true, false, true, true),
             KeyboardFocusSource::LockBlackoutNone
+        );
+    }
+
+    fn make_headless_test_state() -> (
+        calloop::EventLoop<'static, KomaState>,
+        smithay::reexports::wayland_server::Display<KomaState>,
+        KomaState,
+    ) {
+        let event_loop: calloop::EventLoop<'static, KomaState> =
+            calloop::EventLoop::try_new().expect("calloop EventLoop");
+        let display: smithay::reexports::wayland_server::Display<KomaState> =
+            smithay::reexports::wayland_server::Display::new().expect("wayland Display");
+        let state = KomaState::new(
+            display.handle(),
+            event_loop.get_signal(),
+            OsString::from("wayland-koma-unit-test"),
+            "seat0",
+            LogicalViewport::new(1920, 1080, 1.0),
+        );
+        (event_loop, display, state)
+    }
+
+    #[test]
+    fn ime_protocols_and_touch_capability_registered_on_headless_state() {
+        use smithay::wayland::input_method::InputMethodSeat as _;
+
+        let (_el, _disp, state) = make_headless_test_state();
+        assert!(
+            state.seat.get_touch().is_some(),
+            "seat must advertise wl_touch capability at startup"
+        );
+        assert!(state.seat.get_keyboard().is_some());
+        assert!(state.seat.get_pointer().is_some());
+        assert!(state.ime_popups.is_empty());
+        assert!(!state.seat.input_method().has_instance());
+        assert!(!state.seat.input_method().keyboard_grabbed());
+        assert!(state.seat.text_input().focus().is_none());
+    }
+
+    #[test]
+    fn runtime_input_config_updates_xkb_options_and_repeat_info() {
+        let (_el, _disp, mut state) = make_headless_test_state();
+
+        let mut registry = KomaConfigRegistry::default();
+        registry.input.keyboard = KeyboardInputSpec {
+            rules: None,
+            model: None,
+            layout: Some("us".to_owned()),
+            variant: Some("intl".to_owned()),
+            options: Some("altwin:swap_alt_win,caps:escape".to_owned()),
+            repeat_delay: Some(180),
+            repeat_rate: Some(50),
+            numlock: Some(true),
+        };
+        state.apply_runtime_input_config(&registry);
+
+        assert_eq!(
+            state.applied_keyboard_xkb,
+            Some(KeyboardXkbSignature {
+                rules: String::new(),
+                model: String::new(),
+                layout: "us".to_owned(),
+                variant: "intl".to_owned(),
+                options: Some("altwin:swap_alt_win,caps:escape".to_owned()),
+            })
+        );
+        assert_eq!(state.applied_keyboard_repeat, (180, 50));
+        assert!(
+            state
+                .seat
+                .get_keyboard()
+                .expect("keyboard handle")
+                .modifier_state()
+                .num_lock
+        );
+
+        // Live reload removing options and changing repeat delay/rate
+        registry.input.keyboard.options = None;
+        registry.input.keyboard.repeat_delay = Some(300);
+        registry.input.keyboard.repeat_rate = Some(25);
+        state.apply_runtime_input_config(&registry);
+
+        assert_eq!(
+            state
+                .applied_keyboard_xkb
+                .as_ref()
+                .and_then(|s| s.options.as_ref()),
+            None
+        );
+        assert_eq!(state.applied_keyboard_repeat, (300, 25));
+
+        state.virtual_keyboard_keymap_active = true;
+        state.force_reapply_configured_xkb_config();
+        assert!(!state.virtual_keyboard_keymap_active);
+    }
+
+    #[test]
+    fn locked_session_suppresses_ime_popups_and_touch_surfaces() {
+        use smithay::{
+            backend::input::{InputTime, KeyState},
+            input::{SeatHandler, keyboard::Keycode},
+            output::{Output, PhysicalProperties, Subpixel},
+            wayland::text_input::TextInputActivation,
+        };
+
+        let (_el, _disp, mut state) = make_headless_test_state();
+        let test_output = Output::new(
+            "test-out".to_owned(),
+            PhysicalProperties {
+                size: (0, 0).into(),
+                subpixel: Subpixel::Unknown,
+                make: "Koma".into(),
+                model: "Test".into(),
+                serial_number: "0".into(),
+            },
+        );
+
+        state.session_lock.phase = SessionLockPhase::Abandoned;
+        assert!(state.is_locked_or_abandoned());
+
+        let seat = state.seat.clone();
+        <KomaState as TextInputActivation>::activated(&mut state, None);
+        <KomaState as SeatHandler>::focus_changed(&mut state, &seat, None);
+        state.clear_inputs_for_lock();
+
+        assert!(state.seat.text_input().focus().is_none());
+        assert!(state.ime_popups.is_empty());
+        assert!(state.ime_popup_render_targets(&test_output).is_empty());
+        assert!(state.surface_under(Point::from((100.0, 100.0))).is_none());
+
+        // Exercise locked keyboard routing (must cleanly traverse grab-bypassing path without panicking)
+        crate::keybind_dispatcher::process_keyboard_key_event(
+            &mut state,
+            Keycode::from(38_u32),
+            KeyState::Pressed,
+            InputTime::from_millis(1),
+            false,
+        );
+        crate::keybind_dispatcher::process_keyboard_key_event(
+            &mut state,
+            Keycode::from(38_u32),
+            KeyState::Released,
+            InputTime::from_millis(2),
+            false,
         );
     }
 }

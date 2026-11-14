@@ -84,7 +84,7 @@ use tracing::{debug, info, trace, warn};
 
 use crate::{
     backend_winit::{
-        append_layer_tier_elements, assemble_locked_frame_elements,
+        append_ime_popup_elements, append_layer_tier_elements, assemble_locked_frame_elements,
         dispatch_output_frame_callbacks_filtered,
     },
     state::{ActiveBackend, KomaState},
@@ -164,6 +164,7 @@ pub struct TtyBackendState {
     pub seat_name: String,
     udev_dispatcher: Dispatcher<'static, UdevBackend, KomaState>,
     libinput: Libinput,
+    pub libinput_devices: Vec<smithay::reexports::input::Device>,
     pub gpu_manager: GpuManager<GbmGlesBackend<GlesRenderer, DeviceFd>>,
     pub primary_node: DrmNode,
     pub primary_render_node: DrmNode,
@@ -209,6 +210,7 @@ impl TtyBackendState {
         let input_backend = LibinputInputBackend::new(libinput.clone());
         event_loop
             .insert_source(input_backend, |event, _, state| {
+                handle_libinput_device_event(state, &event);
                 process_tty_input_event(state, event);
             })
             .map_err(|e| anyhow!("failed inserting LibinputInputBackend into calloop: {e}"))?;
@@ -239,6 +241,7 @@ impl TtyBackendState {
             seat_name,
             udev_dispatcher,
             libinput,
+            libinput_devices: Vec::new(),
             gpu_manager,
             primary_node,
             primary_render_node,
@@ -246,6 +249,29 @@ impl TtyBackendState {
             dmabuf_global: None,
             connector_errors: Vec::new(),
         })
+    }
+
+    /// Re-applies declarative `koma.input` and `koma.device` rules to every connected `libinput` device.
+    pub fn apply_libinput_config_to_all(
+        &mut self,
+        input: &koma_lua::schema::InputConfigSpec,
+        devices: &[koma_lua::schema::DeviceOverrideSpec],
+    ) {
+        for dev in &mut self.libinput_devices {
+            configure_libinput_device(dev, input, devices);
+        }
+    }
+
+    /// Synchronizes keyboard NumLock/CapsLock/ScrollLock hardware LEDs with Smithay's `LedState`.
+    pub fn sync_keyboard_leds(&mut self, led_state: smithay::input::keyboard::LedState) {
+        use smithay::reexports::input::DeviceCapability;
+
+        let leds = led_state.into();
+        for dev in &mut self.libinput_devices {
+            if dev.has_capability(DeviceCapability::Keyboard) {
+                dev.led_update(leds);
+            }
+        }
     }
 
     /// Enumerates DRM nodes when the VT session is active, always adding `primary_node` first so
@@ -1190,6 +1216,11 @@ fn on_session_event_callback(state: &mut KomaState, event: SessionEvent) {
             if tty.libinput.resume().is_err() {
                 warn!("libinput::resume reported an error on VT activation");
             }
+            let reg = state.lua_sandbox.config_snapshot();
+            tty.apply_libinput_config_to_all(&reg.input, &reg.devices);
+            if let Some(keyboard) = state.seat.get_keyboard() {
+                tty.sync_keyboard_leds(keyboard.led_state());
+            }
 
             let mut current_udev: HashMap<dev_t, PathBuf> = tty
                 .udev_dispatcher
@@ -1423,8 +1454,15 @@ fn render_single_drm_surface(
             None
         };
 
-        // Assemble front-to-back elements: Overlay/Top layer-shell -> Scratchpad -> Base Space -> Bottom/Bg layers
+        // Assemble front-to-back elements: IME Popups -> Overlay/Top layer-shell -> Scratchpad -> Base Space -> Bottom/Bg layers
         let mut elements: Vec<KomaRenderElement<TtyRenderer<'_>>> = Vec::new();
+        append_ime_popup_elements(
+            &mut renderer,
+            state,
+            &surface.output,
+            output_scale,
+            &mut elements,
+        );
         append_layer_tier_elements(
             &mut renderer,
             &surface.output,
@@ -1673,7 +1711,185 @@ where
             crate::gesture_dispatcher::process_gesture_hold_end::<B>(state, &event);
         }
 
+        InputEvent::TouchDown { event } => {
+            state.handle_touch_down::<B>(event);
+        }
+
+        InputEvent::TouchMotion { event } => {
+            state.handle_touch_motion::<B>(event);
+        }
+
+        InputEvent::TouchUp { event } => {
+            state.handle_touch_up::<B>(event);
+        }
+
+        InputEvent::TouchFrame { .. } => {
+            state.handle_touch_frame();
+        }
+
+        InputEvent::TouchCancel { .. } => {
+            state.handle_touch_cancel();
+        }
+
         _ => {}
+    }
+}
+
+fn handle_libinput_device_event(state: &mut KomaState, event: &InputEvent<LibinputInputBackend>) {
+    use smithay::reexports::input::DeviceCapability;
+
+    match event {
+        InputEvent::DeviceAdded { device } => {
+            let mut dev = device.clone();
+            let reg = state.lua_sandbox.config_snapshot();
+            configure_libinput_device(&mut dev, &reg.input, &reg.devices);
+            if dev.has_capability(DeviceCapability::Keyboard)
+                && let Some(keyboard) = state.seat.get_keyboard()
+            {
+                dev.led_update(keyboard.led_state().into());
+            }
+            if let Some(ActiveBackend::Tty(tty)) = state.backend.as_mut()
+                && !tty.libinput_devices.contains(&dev)
+            {
+                tty.libinput_devices.push(dev);
+            }
+        }
+        InputEvent::DeviceRemoved { device } => {
+            if let Some(ActiveBackend::Tty(tty)) = state.backend.as_mut() {
+                tty.libinput_devices.retain(|d| d != device);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn probe_libinput_device(
+    device: &smithay::reexports::input::Device,
+) -> koma_lua::schema::LibinputDeviceProbe {
+    use koma_lua::schema::ClickMethodSpec;
+    use smithay::reexports::input::{ClickMethod, DeviceCapability, SendEventsMode};
+
+    let is_pointer = device.has_capability(DeviceCapability::Pointer);
+    let tap_finger_count = device.config_tap_finger_count();
+    let click_methods = device.config_click_methods();
+    let supports_clickfinger = click_methods.contains(&ClickMethod::Clickfinger);
+    let default_click_method = device.config_click_default_method().and_then(|m| match m {
+        ClickMethod::ButtonAreas => Some(ClickMethodSpec::ButtonAreas),
+        ClickMethod::Clickfinger => Some(ClickMethodSpec::Clickfinger),
+        _ => None,
+    });
+    // In libinput, `Clickfinger` is supported specifically on clickpads/buttonpads lacking
+    // separate physical mouse buttons (e.g. Apple MacBook Force Touch trackpads).
+    let has_physical_buttons = !supports_clickfinger;
+    let send_modes = device.config_send_events_modes();
+
+    koma_lua::schema::LibinputDeviceProbe {
+        name: device.name().into_owned(),
+        vendor_id: device.id_vendor(),
+        product_id: device.id_product(),
+        is_pointer,
+        tap_finger_count,
+        supports_clickfinger,
+        has_physical_buttons,
+        default_click_method,
+        dwt_available: device.config_dwt_is_available(),
+        dwtp_available: false,
+        supports_disabled_on_external_mouse: send_modes
+            .contains(SendEventsMode::DISABLED_ON_EXTERNAL_MOUSE),
+        is_trackball: false,
+        is_trackpoint: false,
+    }
+}
+
+fn configure_libinput_device(
+    device: &mut smithay::reexports::input::Device,
+    input: &koma_lua::schema::InputConfigSpec,
+    devices: &[koma_lua::schema::DeviceOverrideSpec],
+) {
+    use koma_lua::schema::{AccelProfileSpec, ClickMethodSpec, ScrollMethodSpec};
+    use smithay::reexports::input::{
+        AccelProfile, ClickMethod, DragLockState, ScrollMethod, SendEventsMode,
+    };
+
+    let probe = probe_libinput_device(device);
+    if !probe.is_pointer {
+        return;
+    }
+
+    let eff = koma_lua::schema::resolve_effective_libinput_settings(input, devices, &probe);
+
+    if let Some(speed) = eff.accel_speed {
+        let _ = device.config_accel_set_speed(speed);
+    }
+    if let Some(profile) = eff.accel_profile {
+        let _ = device.config_accel_set_profile(match profile {
+            AccelProfileSpec::Adaptive => AccelProfile::Adaptive,
+            AccelProfileSpec::Flat => AccelProfile::Flat,
+        });
+    }
+    if let Some(natural) = eff.natural_scroll {
+        let _ = device.config_scroll_set_natural_scroll_enabled(natural);
+    }
+    if let Some(left) = eff.left_handed {
+        let _ = device.config_left_handed_set(left);
+    }
+    if let Some(middle) = eff.middle_emulation {
+        let _ = device.config_middle_emulation_set_enabled(middle);
+    }
+    if let Some(method) = eff.scroll_method {
+        let mapped = match method {
+            ScrollMethodSpec::NoScroll => ScrollMethod::NoScroll,
+            ScrollMethodSpec::TwoFinger => ScrollMethod::TwoFinger,
+            ScrollMethodSpec::Edge => ScrollMethod::Edge,
+            ScrollMethodSpec::OnButtonDown => ScrollMethod::OnButtonDown,
+        };
+        let _ = device.config_scroll_set_method(mapped);
+    }
+
+    if eff.is_touchpad {
+        if let Some(tap) = eff.tap {
+            let _ = device.config_tap_set_enabled(tap);
+        }
+        if let Some(drag) = eff.tap_and_drag {
+            let _ = device.config_tap_set_drag_enabled(drag);
+        }
+        if let Some(lock) = eff.tap_drag_lock {
+            let _ = device.config_tap_set_drag_lock_enabled(if lock {
+                DragLockState::EnabledTimeout
+            } else {
+                DragLockState::Disabled
+            });
+        }
+        if let Some(dwt) = eff.dwt
+            && probe.dwt_available
+        {
+            let _ = device.config_dwt_set_enabled(dwt);
+        }
+        if let Some(click) = eff.click_method {
+            match click {
+                ClickMethodSpec::Clickfinger => {
+                    let _ = device.config_click_set_method(ClickMethod::Clickfinger);
+                }
+                ClickMethodSpec::ButtonAreas => {
+                    let _ = device.config_click_set_method(ClickMethod::ButtonAreas);
+                }
+                ClickMethodSpec::None => {
+                    if let Some(default_method) = device.config_click_default_method() {
+                        let _ = device.config_click_set_method(default_method);
+                    }
+                }
+            }
+        }
+        if let Some(disabled_on_ext) = eff.disabled_on_external_mouse
+            && probe.supports_disabled_on_external_mouse
+        {
+            let mode = if disabled_on_ext {
+                SendEventsMode::DISABLED_ON_EXTERNAL_MOUSE
+            } else {
+                SendEventsMode::ENABLED
+            };
+            let _ = device.config_send_events_set_mode(mode);
+        }
     }
 }
 

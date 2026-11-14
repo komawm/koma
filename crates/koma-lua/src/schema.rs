@@ -6,7 +6,7 @@ use koma_model::{
     ScrollingConfig, ShadowConfig,
 };
 use koma_proto::{KinematicProfileKind, MacroId, OutputId, TextInjectStrategy};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct BindHandleId(pub u64);
@@ -248,16 +248,193 @@ const fn default_true() -> bool {
     true
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Pointer acceleration profile exposed to `koma.input` and `koma.device`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccelProfileSpec {
+    Adaptive,
+    Flat,
+}
+
+impl<'de> Deserialize<'de> for AccelProfileSpec {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "adaptive" => Ok(Self::Adaptive),
+            "flat" => Ok(Self::Flat),
+            other => Err(serde::de::Error::unknown_variant(
+                other,
+                &["adaptive", "flat"],
+            )),
+        }
+    }
+}
+
+/// Pointer/touchpad scroll method exposed to `koma.input` and `koma.device`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScrollMethodSpec {
+    NoScroll,
+    TwoFinger,
+    Edge,
+    OnButtonDown,
+}
+
+impl<'de> Deserialize<'de> for ScrollMethodSpec {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "none" | "no_scroll" | "noscroll" => Ok(Self::NoScroll),
+            "two_finger" | "twofinger" | "2fg" => Ok(Self::TwoFinger),
+            "edge" => Ok(Self::Edge),
+            "on_button_down" | "onbuttondown" => Ok(Self::OnButtonDown),
+            other => Err(serde::de::Error::unknown_variant(
+                other,
+                &["none", "no_scroll", "two_finger", "edge", "on_button_down"],
+            )),
+        }
+    }
+}
+
+/// Clickpad software button method exposed to `koma.input.touchpad` and `koma.device`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClickMethodSpec {
+    None,
+    ButtonAreas,
+    Clickfinger,
+}
+
+impl<'de> Deserialize<'de> for ClickMethodSpec {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "none" => Ok(Self::None),
+            "button_areas" | "buttonareas" => Ok(Self::ButtonAreas),
+            "clickfinger" | "click_finger" => Ok(Self::Clickfinger),
+            other => Err(serde::de::Error::unknown_variant(
+                other,
+                &["none", "button_areas", "clickfinger"],
+            )),
+        }
+    }
+}
+
+/// Accepts either a comma-separated string (`"altwin:swap_alt_win,caps:escape"`) or a Lua string array.
+fn deserialize_opt_xkb_options<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OptionsValue {
+        Single(String),
+        List(Vec<String>),
+    }
+
+    match Option::<OptionsValue>::deserialize(deserializer)? {
+        None => Ok(None),
+        Some(OptionsValue::Single(s)) => Ok(Some(s)),
+        Some(OptionsValue::List(items)) => Ok(Some(items.join(","))),
+    }
+}
+
+/// Default keyboard repeat delay (`ms`) matching initial seat setup.
+pub const DEFAULT_KEYBOARD_REPEAT_DELAY_MS: i32 = 220;
+/// Default keyboard repeat rate (`Hz`) matching initial seat setup.
+pub const DEFAULT_KEYBOARD_REPEAT_RATE_HZ: i32 = 35;
+
+/// Typed XKB & repeat-rate settings under `koma.input({ keyboard = { ... } })`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct KeyboardInputSpec {
+    pub rules: Option<String>,
+    pub model: Option<String>,
+    pub layout: Option<String>,
+    pub variant: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_opt_xkb_options")]
+    pub options: Option<String>,
+    #[serde(alias = "repeat_delay_ms")]
+    pub repeat_delay: Option<i32>,
+    #[serde(alias = "repeat_rate_hz")]
+    pub repeat_rate: Option<i32>,
+    #[serde(alias = "numlock_on_startup")]
+    pub numlock: Option<bool>,
+}
+
+impl KeyboardInputSpec {
+    /// Returns the effective repeat delay in milliseconds, clamped to a positive range.
+    #[must_use]
+    pub fn effective_repeat_delay(&self) -> i32 {
+        self.repeat_delay
+            .unwrap_or(DEFAULT_KEYBOARD_REPEAT_DELAY_MS)
+            .clamp(1, 10_000)
+    }
+
+    /// Returns the effective repeat rate in repeats per second, clamped to a positive range.
+    #[must_use]
+    pub fn effective_repeat_rate(&self) -> i32 {
+        self.repeat_rate
+            .unwrap_or(DEFAULT_KEYBOARD_REPEAT_RATE_HZ)
+            .clamp(1, 1_000)
+    }
+}
+
+/// Typed `libinput` pointer settings under `koma.input({ pointer = { ... } })`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PointerInputSpec {
+    pub accel_speed: Option<f64>,
+    pub accel_profile: Option<AccelProfileSpec>,
+    pub natural_scroll: Option<bool>,
+    pub left_handed: Option<bool>,
+    pub scroll_method: Option<ScrollMethodSpec>,
+    pub middle_emulation: Option<bool>,
+    pub scroll_factor: Option<f64>,
+    pub follow_mouse: Option<String>,
+}
+
+/// Typed `libinput` touchpad settings under `koma.input({ touchpad = { ... } })`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TouchpadInputSpec {
+    #[serde(alias = "tap_to_click")]
+    pub tap: Option<bool>,
+    pub tap_and_drag: Option<bool>,
+    pub tap_drag_lock: Option<bool>,
+    #[serde(alias = "disable_while_typing")]
+    pub dwt: Option<bool>,
+    #[serde(alias = "disable_while_trackpointing")]
+    pub dwtp: Option<bool>,
+    pub natural_scroll: Option<bool>,
+    pub accel_speed: Option<f64>,
+    pub accel_profile: Option<AccelProfileSpec>,
+    pub scroll_method: Option<ScrollMethodSpec>,
+    pub click_method: Option<ClickMethodSpec>,
+    pub left_handed: Option<bool>,
+    pub middle_emulation: Option<bool>,
+    pub disabled_on_external_mouse: Option<bool>,
+    pub scroll_factor: Option<f64>,
+    pub pinch_sensitivity: Option<f64>,
+}
+
+/// Typed drawing-tablet configuration under `koma.input({ tablet = { ... } })`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TabletInputSpec {
+    pub map_to_output: Option<OutputId>,
+    pub left_handed: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct InputConfigSpec {
     pub mod_key: Option<String>,
     #[serde(default = "default_true")]
     pub inherit_default_binds: bool,
-    pub keyboard: serde_json::Value,
-    pub pointer: serde_json::Value,
-    pub touchpad: serde_json::Value,
-    pub tablet: serde_json::Value,
+    pub keyboard: KeyboardInputSpec,
+    pub pointer: PointerInputSpec,
+    pub touchpad: TouchpadInputSpec,
+    pub tablet: TabletInputSpec,
 }
 
 impl Default for InputConfigSpec {
@@ -265,10 +442,10 @@ impl Default for InputConfigSpec {
         Self {
             mod_key: None,
             inherit_default_binds: true,
-            keyboard: serde_json::Value::Null,
-            pointer: serde_json::Value::Null,
-            touchpad: serde_json::Value::Null,
-            tablet: serde_json::Value::Null,
+            keyboard: KeyboardInputSpec::default(),
+            pointer: PointerInputSpec::default(),
+            touchpad: TouchpadInputSpec::default(),
+            tablet: TabletInputSpec::default(),
         }
     }
 }
@@ -276,16 +453,13 @@ impl Default for InputConfigSpec {
 impl InputConfigSpec {
     #[must_use]
     pub fn touchpad_natural_scroll(&self) -> Option<bool> {
-        self.touchpad
-            .get("natural_scroll")
-            .and_then(serde_json::Value::as_bool)
+        self.touchpad.natural_scroll
     }
 
     #[must_use]
     pub fn mouse_scroll_factor(&self) -> f64 {
         self.pointer
-            .get("scroll_factor")
-            .and_then(serde_json::Value::as_f64)
+            .scroll_factor
             .filter(|&f| f.is_finite() && f != 0.0)
             .unwrap_or(1.0)
     }
@@ -293,8 +467,7 @@ impl InputConfigSpec {
     #[must_use]
     pub fn touchpad_scroll_factor(&self) -> f64 {
         self.touchpad
-            .get("scroll_factor")
-            .and_then(serde_json::Value::as_f64)
+            .scroll_factor
             .filter(|&f| f.is_finite() && f != 0.0)
             .unwrap_or(1.0)
     }
@@ -302,19 +475,184 @@ impl InputConfigSpec {
     #[must_use]
     pub fn touchpad_pinch_sensitivity(&self) -> f64 {
         self.touchpad
-            .get("pinch_sensitivity")
-            .and_then(serde_json::Value::as_f64)
+            .pinch_sensitivity
             .filter(|&f| f.is_finite() && f > 0.0)
             .unwrap_or(1.0)
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DeviceOverrideSpec {
     pub name: String,
     pub sensitivity: Option<f64>,
     pub map_to_output: Option<OutputId>,
+    pub accel_speed: Option<f64>,
+    pub accel_profile: Option<AccelProfileSpec>,
+    pub natural_scroll: Option<bool>,
+    pub left_handed: Option<bool>,
+    #[serde(alias = "tap_to_click")]
+    pub tap: Option<bool>,
+    pub tap_and_drag: Option<bool>,
+    pub tap_drag_lock: Option<bool>,
+    #[serde(alias = "disable_while_typing")]
+    pub dwt: Option<bool>,
+    #[serde(alias = "disable_while_trackpointing")]
+    pub dwtp: Option<bool>,
+    pub scroll_method: Option<ScrollMethodSpec>,
+    pub click_method: Option<ClickMethodSpec>,
+    pub middle_emulation: Option<bool>,
+    pub disabled_on_external_mouse: Option<bool>,
+    pub scroll_factor: Option<f64>,
+}
+
+/// Hardware capabilities probed from a `libinput` device (or mocked in unit tests).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LibinputDeviceProbe {
+    pub name: String,
+    pub vendor_id: u32,
+    pub product_id: u32,
+    pub is_pointer: bool,
+    pub tap_finger_count: u32,
+    pub supports_clickfinger: bool,
+    pub has_physical_buttons: bool,
+    pub default_click_method: Option<ClickMethodSpec>,
+    pub dwt_available: bool,
+    pub dwtp_available: bool,
+    pub supports_disabled_on_external_mouse: bool,
+    pub is_trackball: bool,
+    pub is_trackpoint: bool,
+}
+
+impl LibinputDeviceProbe {
+    /// Returns `true` when this device acts as a touchpad (`Pointer` + tap fingers > 0).
+    #[must_use]
+    pub fn is_touchpad(&self) -> bool {
+        self.is_pointer && self.tap_finger_count > 0
+    }
+
+    /// Returns `true` for buttonpads/Force Touch clickpads lacking separate physical mouse buttons
+    /// and supporting libinput `Clickfinger` (e.g. Apple SPI/USB/Bluetooth Force Touch trackpads).
+    #[must_use]
+    pub fn is_force_touch_buttonpad(&self) -> bool {
+        self.is_touchpad() && self.supports_clickfinger && !self.has_physical_buttons
+    }
+}
+
+/// Effective per-device `libinput` configuration resolved from Lua input/device rules + hardware defaults.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct EffectiveLibinputSettings {
+    pub is_touchpad: bool,
+    pub accel_speed: Option<f64>,
+    pub accel_profile: Option<AccelProfileSpec>,
+    pub natural_scroll: Option<bool>,
+    pub left_handed: Option<bool>,
+    pub scroll_method: Option<ScrollMethodSpec>,
+    pub middle_emulation: Option<bool>,
+    pub tap: Option<bool>,
+    pub tap_and_drag: Option<bool>,
+    pub tap_drag_lock: Option<bool>,
+    pub dwt: Option<bool>,
+    pub dwtp: Option<bool>,
+    pub click_method: Option<ClickMethodSpec>,
+    pub disabled_on_external_mouse: Option<bool>,
+}
+
+/// Resolves effective `libinput` settings for a device from `koma.input`, `koma.device` overrides,
+/// and MacBook Force Touch buttonpad defaults (`click_method = Clickfinger`, `dwt = true` when unset).
+#[must_use]
+pub fn resolve_effective_libinput_settings(
+    input: &InputConfigSpec,
+    devices: &[DeviceOverrideSpec],
+    probe: &LibinputDeviceProbe,
+) -> EffectiveLibinputSettings {
+    if !probe.is_pointer {
+        return EffectiveLibinputSettings::default();
+    }
+
+    let dev_override = devices
+        .iter()
+        .find(|d| !d.name.is_empty() && d.name == probe.name)
+        .or_else(|| {
+            devices
+                .iter()
+                .find(|d| !d.name.is_empty() && d.name.eq_ignore_ascii_case(&probe.name))
+        });
+
+    let override_accel_speed = dev_override
+        .and_then(|d| d.accel_speed.or(d.sensitivity))
+        .filter(|v| v.is_finite());
+
+    if probe.is_touchpad() {
+        let tp = &input.touchpad;
+        let force_touch = probe.is_force_touch_buttonpad();
+
+        let click_method = dev_override
+            .and_then(|d| d.click_method)
+            .or(tp.click_method)
+            .or_else(|| force_touch.then_some(ClickMethodSpec::Clickfinger))
+            .or(probe.default_click_method);
+
+        let dwt = dev_override
+            .and_then(|d| d.dwt)
+            .or(tp.dwt)
+            .or_else(|| (force_touch && probe.dwt_available).then_some(true));
+
+        return EffectiveLibinputSettings {
+            is_touchpad: true,
+            accel_speed: override_accel_speed
+                .or(tp.accel_speed.filter(|v| v.is_finite()))
+                .map(|s| s.clamp(-1.0, 1.0)),
+            accel_profile: dev_override
+                .and_then(|d| d.accel_profile)
+                .or(tp.accel_profile),
+            natural_scroll: dev_override
+                .and_then(|d| d.natural_scroll)
+                .or(tp.natural_scroll),
+            left_handed: dev_override.and_then(|d| d.left_handed).or(tp.left_handed),
+            scroll_method: dev_override
+                .and_then(|d| d.scroll_method)
+                .or(tp.scroll_method),
+            middle_emulation: dev_override
+                .and_then(|d| d.middle_emulation)
+                .or(tp.middle_emulation),
+            tap: dev_override.and_then(|d| d.tap).or(tp.tap),
+            tap_and_drag: dev_override
+                .and_then(|d| d.tap_and_drag)
+                .or(tp.tap_and_drag),
+            tap_drag_lock: dev_override
+                .and_then(|d| d.tap_drag_lock)
+                .or(tp.tap_drag_lock),
+            dwt,
+            dwtp: dev_override.and_then(|d| d.dwtp).or(tp.dwtp),
+            click_method,
+            disabled_on_external_mouse: dev_override
+                .and_then(|d| d.disabled_on_external_mouse)
+                .or(tp.disabled_on_external_mouse),
+        };
+    }
+
+    let ptr = &input.pointer;
+    EffectiveLibinputSettings {
+        is_touchpad: false,
+        accel_speed: override_accel_speed
+            .or(ptr.accel_speed.filter(|v| v.is_finite()))
+            .map(|s| s.clamp(-1.0, 1.0)),
+        accel_profile: dev_override
+            .and_then(|d| d.accel_profile)
+            .or(ptr.accel_profile),
+        natural_scroll: dev_override
+            .and_then(|d| d.natural_scroll)
+            .or(ptr.natural_scroll),
+        left_handed: dev_override.and_then(|d| d.left_handed).or(ptr.left_handed),
+        scroll_method: dev_override
+            .and_then(|d| d.scroll_method)
+            .or(ptr.scroll_method),
+        middle_emulation: dev_override
+            .and_then(|d| d.middle_emulation)
+            .or(ptr.middle_emulation),
+        ..EffectiveLibinputSettings::default()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -820,5 +1158,225 @@ impl KomaConfigRegistry {
                 key.is_some_and(|k| self.macros.remove(&k).is_some())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn apple_force_touch_probe() -> LibinputDeviceProbe {
+        LibinputDeviceProbe {
+            name: "Apple Inc. Apple Internal Keyboard / Trackpad".to_owned(),
+            vendor_id: 0x05ac,
+            product_id: 0x027c,
+            is_pointer: true,
+            tap_finger_count: 5,
+            supports_clickfinger: true,
+            has_physical_buttons: false,
+            default_click_method: Some(ClickMethodSpec::ButtonAreas),
+            dwt_available: true,
+            dwtp_available: false,
+            supports_disabled_on_external_mouse: true,
+            is_trackball: false,
+            is_trackpoint: false,
+        }
+    }
+
+    #[test]
+    fn input_config_spec_parses_xkb_repeat_pointer_and_touchpad_fields() {
+        let json = serde_json::json!({
+            "mod_key": "Super",
+            "inherit_default_binds": true,
+            "keyboard": {
+                "layout": "us,de",
+                "variant": ",nodeadkeys",
+                "model": "applealu_ansi",
+                "options": "altwin:swap_alt_win,caps:escape",
+                "rules": "evdev",
+                "repeat_delay": 180,
+                "repeat_rate": 45,
+                "numlock": true
+            },
+            "pointer": {
+                "accel_speed": -0.25,
+                "accel_profile": "flat",
+                "natural_scroll": false,
+                "left_handed": true,
+                "scroll_method": "on_button_down",
+                "middle_emulation": true,
+                "scroll_factor": 1.5
+            },
+            "touchpad": {
+                "tap": true,
+                "tap_and_drag": true,
+                "tap_drag_lock": false,
+                "dwt": true,
+                "dwtp": true,
+                "natural_scroll": true,
+                "accel_speed": 0.35,
+                "accel_profile": "adaptive",
+                "scroll_method": "two_finger",
+                "click_method": "clickfinger",
+                "left_handed": false,
+                "middle_emulation": false,
+                "disabled_on_external_mouse": true,
+                "scroll_factor": 0.8,
+                "pinch_sensitivity": 1.2
+            }
+        });
+
+        let cfg: InputConfigSpec = serde_json::from_value(json).expect("valid InputConfigSpec");
+        assert_eq!(cfg.keyboard.layout.as_deref(), Some("us,de"));
+        assert_eq!(cfg.keyboard.variant.as_deref(), Some(",nodeadkeys"));
+        assert_eq!(cfg.keyboard.model.as_deref(), Some("applealu_ansi"));
+        assert_eq!(
+            cfg.keyboard.options.as_deref(),
+            Some("altwin:swap_alt_win,caps:escape")
+        );
+        assert_eq!(cfg.keyboard.rules.as_deref(), Some("evdev"));
+        assert_eq!(cfg.keyboard.repeat_delay, Some(180));
+        assert_eq!(cfg.keyboard.repeat_rate, Some(45));
+        assert_eq!(cfg.keyboard.numlock, Some(true));
+
+        assert_eq!(cfg.pointer.accel_speed, Some(-0.25));
+        assert_eq!(cfg.pointer.accel_profile, Some(AccelProfileSpec::Flat));
+        assert_eq!(cfg.pointer.natural_scroll, Some(false));
+        assert_eq!(cfg.pointer.left_handed, Some(true));
+        assert_eq!(
+            cfg.pointer.scroll_method,
+            Some(ScrollMethodSpec::OnButtonDown)
+        );
+        assert_eq!(cfg.pointer.middle_emulation, Some(true));
+        assert_eq!(cfg.mouse_scroll_factor(), 1.5);
+
+        assert_eq!(cfg.touchpad.tap, Some(true));
+        assert_eq!(cfg.touchpad.tap_and_drag, Some(true));
+        assert_eq!(cfg.touchpad.tap_drag_lock, Some(false));
+        assert_eq!(cfg.touchpad.dwt, Some(true));
+        assert_eq!(cfg.touchpad.dwtp, Some(true));
+        assert_eq!(cfg.touchpad_natural_scroll(), Some(true));
+        assert_eq!(cfg.touchpad.accel_speed, Some(0.35));
+        assert_eq!(cfg.touchpad.accel_profile, Some(AccelProfileSpec::Adaptive));
+        assert_eq!(
+            cfg.touchpad.scroll_method,
+            Some(ScrollMethodSpec::TwoFinger)
+        );
+        assert_eq!(
+            cfg.touchpad.click_method,
+            Some(ClickMethodSpec::Clickfinger)
+        );
+        assert_eq!(cfg.touchpad.disabled_on_external_mouse, Some(true));
+        assert_eq!(cfg.touchpad_scroll_factor(), 0.8);
+        assert_eq!(cfg.touchpad_pinch_sensitivity(), 1.2);
+    }
+
+    #[test]
+    fn input_config_spec_supports_lua_aliases_and_xkb_option_list() {
+        let json = serde_json::json!({
+            "keyboard": {
+                "options": ["altwin:swap_alt_win", "lv3:ralt_switch"],
+                "repeat_delay_ms": 200,
+                "repeat_rate_hz": 40,
+                "numlock_on_startup": true
+            },
+            "touchpad": {
+                "tap_to_click": true,
+                "disable_while_typing": false,
+                "click_method": "button_areas"
+            }
+        });
+        let cfg: InputConfigSpec = serde_json::from_value(json).expect("alias InputConfigSpec");
+        assert_eq!(
+            cfg.keyboard.options.as_deref(),
+            Some("altwin:swap_alt_win,lv3:ralt_switch")
+        );
+        assert_eq!(cfg.keyboard.effective_repeat_delay(), 200);
+        assert_eq!(cfg.keyboard.effective_repeat_rate(), 40);
+        assert_eq!(cfg.keyboard.numlock, Some(true));
+        assert_eq!(cfg.touchpad.tap, Some(true));
+        assert_eq!(cfg.touchpad.dwt, Some(false));
+        assert_eq!(
+            cfg.touchpad.click_method,
+            Some(ClickMethodSpec::ButtonAreas)
+        );
+    }
+
+    #[test]
+    fn force_touch_buttonpad_defaults_and_lua_overrides() {
+        let probe = apple_force_touch_probe();
+        assert!(probe.is_force_touch_buttonpad());
+
+        // 1. Unset Lua config -> Clickfinger + DWT enabled by default on Force Touch buttonpads
+        let default_cfg = InputConfigSpec::default();
+        let resolved_default = resolve_effective_libinput_settings(&default_cfg, &[], &probe);
+        assert_eq!(
+            resolved_default.click_method,
+            Some(ClickMethodSpec::Clickfinger)
+        );
+        assert_eq!(resolved_default.dwt, Some(true));
+
+        // 2. Explicit Lua overrides (`button_areas`, `none`, `dwt = false`) always win
+        let mut override_areas = InputConfigSpec::default();
+        override_areas.touchpad.click_method = Some(ClickMethodSpec::ButtonAreas);
+        override_areas.touchpad.dwt = Some(false);
+        let res_areas = resolve_effective_libinput_settings(&override_areas, &[], &probe);
+        assert_eq!(res_areas.click_method, Some(ClickMethodSpec::ButtonAreas));
+        assert_eq!(res_areas.dwt, Some(false));
+
+        let mut override_none = InputConfigSpec::default();
+        override_none.touchpad.click_method = Some(ClickMethodSpec::None);
+        let res_none = resolve_effective_libinput_settings(&override_none, &[], &probe);
+        assert_eq!(res_none.click_method, Some(ClickMethodSpec::None));
+
+        // 3. Per-device override beats global touchpad config
+        let dev_override = vec![DeviceOverrideSpec {
+            name: probe.name.clone(),
+            click_method: Some(ClickMethodSpec::ButtonAreas),
+            dwt: Some(false),
+            natural_scroll: Some(false),
+            ..DeviceOverrideSpec::default()
+        }];
+        let res_dev = resolve_effective_libinput_settings(&default_cfg, &dev_override, &probe);
+        assert_eq!(res_dev.click_method, Some(ClickMethodSpec::ButtonAreas));
+        assert_eq!(res_dev.dwt, Some(false));
+        assert_eq!(res_dev.natural_scroll, Some(false));
+
+        // 4. Non-buttonpad touchpad preserves physical-button defaults (does not force Clickfinger/DWT)
+        let non_buttonpad = LibinputDeviceProbe {
+            name: "SynPS/2 Synaptics TouchPad".to_owned(),
+            vendor_id: 0x0002,
+            product_id: 0x0007,
+            is_pointer: true,
+            tap_finger_count: 3,
+            supports_clickfinger: false,
+            has_physical_buttons: true,
+            default_click_method: None,
+            dwt_available: true,
+            ..LibinputDeviceProbe::default()
+        };
+        assert!(!non_buttonpad.is_force_touch_buttonpad());
+        let res_non_bp = resolve_effective_libinput_settings(&default_cfg, &[], &non_buttonpad);
+        assert_eq!(res_non_bp.click_method, None);
+        assert_eq!(res_non_bp.dwt, None);
+
+        // 5. External mouse uses pointer config, never touchpad Force Touch defaults
+        let mouse_probe = LibinputDeviceProbe {
+            name: "Logitech MX Master 3".to_owned(),
+            vendor_id: 0x046d,
+            product_id: 0xb023,
+            is_pointer: true,
+            tap_finger_count: 0,
+            ..LibinputDeviceProbe::default()
+        };
+        let mut mouse_cfg = InputConfigSpec::default();
+        mouse_cfg.pointer.accel_profile = Some(AccelProfileSpec::Flat);
+        mouse_cfg.pointer.accel_speed = Some(0.4);
+        let res_mouse = resolve_effective_libinput_settings(&mouse_cfg, &[], &mouse_probe);
+        assert!(!res_mouse.is_touchpad);
+        assert_eq!(res_mouse.accel_profile, Some(AccelProfileSpec::Flat));
+        assert_eq!(res_mouse.accel_speed, Some(0.4));
+        assert_eq!(res_mouse.click_method, None);
+        assert_eq!(res_mouse.dwt, None);
     }
 }

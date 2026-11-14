@@ -88,13 +88,59 @@ pub fn generate_luals_stubs() -> String {
 ---@field blur? KomaBlurSpec
 ---@field animations? KomaAnimationsSpec
 
+---@class KomaKeyboardInputSpec
+---@field rules? string
+---@field model? string
+---@field layout? string
+---@field variant? string
+---@field options? string|string[]
+---@field repeat_delay? integer
+---@field repeat_delay_ms? integer
+---@field repeat_rate? integer
+---@field repeat_rate_hz? integer
+---@field numlock? boolean
+---@field numlock_on_startup? boolean
+
+---@class KomaPointerInputSpec
+---@field accel_speed? number
+---@field accel_profile? "adaptive"|"flat"
+---@field natural_scroll? boolean
+---@field left_handed? boolean
+---@field scroll_method? "none"|"no_scroll"|"two_finger"|"edge"|"on_button_down"
+---@field middle_emulation? boolean
+---@field scroll_factor? number
+---@field follow_mouse? "off"|"normal"|"focus_only"
+
+---@class KomaTouchpadInputSpec
+---@field tap? boolean
+---@field tap_to_click? boolean
+---@field tap_and_drag? boolean
+---@field tap_drag_lock? boolean
+---@field dwt? boolean
+---@field disable_while_typing? boolean
+---@field dwtp? boolean
+---@field natural_scroll? boolean
+---@field accel_speed? number
+---@field accel_profile? "adaptive"|"flat"
+---@field scroll_method? "none"|"no_scroll"|"two_finger"|"edge"|"on_button_down"
+---@field click_method? "none"|"button_areas"|"clickfinger"
+---@field left_handed? boolean
+---@field middle_emulation? boolean
+---@field disabled_on_external_mouse? boolean
+---@field scroll_factor? number
+---@field pinch_sensitivity? number
+
+---@class KomaTabletInputSpec
+---@field map_to_output? string
+---@field left_handed? boolean
+
 ---@class KomaInputSpec
 ---@field mod_key? string
 ---@field inherit_default_binds? boolean
----@field keyboard? table
----@field pointer? table
----@field touchpad? table
----@field tablet? table
+---@field keyboard? KomaKeyboardInputSpec
+---@field pointer? KomaPointerInputSpec
+---@field touchpad? KomaTouchpadInputSpec
+---@field tablet? KomaTabletInputSpec
 
 ---@class KomaMacroContext
 local MacroContext = {}
