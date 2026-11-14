@@ -6,12 +6,16 @@
 
 use smithay::{
     backend::renderer::{
-        Color32F, Frame, ImportAll, Renderer, buffer_y_inverted,
+        Color32F, Frame, ImportAll, ImportMem, Renderer, buffer_y_inverted,
         element::{
-            Element, Id, Kind, RenderElement, UnderlyingStorage, render_elements,
+            Element, Id, Kind, RenderElement, UnderlyingStorage,
+            memory::MemoryRenderBufferRenderElement, render_elements,
             surface::WaylandSurfaceRenderElement,
         },
-        gles::{GlesError, GlesFrame, GlesRenderer, GlesTexProgram, GlesTexture, Uniform},
+        gles::{
+            GlesError, GlesFrame, GlesPixelProgram, GlesRenderer, GlesTexProgram, GlesTexture,
+            Uniform, element::PixelShaderElement,
+        },
         multigpu::{Error as MultiError, MultiRenderer, gbm::GbmGlesBackend},
         utils::{CommitCounter, DamageSet, OpaqueRegions},
     },
@@ -35,7 +39,7 @@ type TtyMultiError =
 
 /// Bridges `GlesRenderer` (nested Winit / offscreen FBO) and `TtyMultiRenderer` (DRM/KMS)
 /// so `KomaRenderElement<R>` can implement `RenderElement<R>` uniformly under `render_elements!`.
-pub trait KomaRenderTarget: Renderer + ImportAll {
+pub trait KomaRenderTarget: Renderer + ImportAll + ImportMem {
     fn gles_frame_mut<'a, 'frame, 'buffer>(
         frame: &'a mut Self::Frame<'frame, 'buffer>,
     ) -> &'a mut GlesFrame<'frame, 'buffer>
@@ -577,12 +581,151 @@ impl<R: Renderer> RenderElement<R> for KomaSolidColorElement {
     }
 }
 
+// ==============================================================================
+// 5. `KomaDropShadowElement` (Analytical Gaussian/Erf Rounded Drop Shadow)
+// ==============================================================================
+
+/// Analytical GLES2 rounded-rectangle drop shadow element wrapping Smithay's [`PixelShaderElement`]
+/// for both `GlesRenderer` and `TtyMultiRenderer` via [`KomaRenderTarget`].
+#[derive(Debug, Clone)]
+pub struct KomaDropShadowElement {
+    inner: PixelShaderElement,
+}
+
+impl KomaDropShadowElement {
+    /// Builds a drop shadow element over `area`, rendering `shadow_geo` with optional
+    /// interior cutout matching `window_geo` so translucent windows are never darkened inside.
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub fn new(
+        area: Rectangle<i32, Logical>,
+        shadow_geo: Rectangle<f64, Logical>,
+        shadow_radii: [f32; 4],
+        sigma: f32,
+        sharp: bool,
+        color: [f32; 4],
+        window_geo: Rectangle<f64, Logical>,
+        window_radii: [f32; 4],
+        opacity: f32,
+        scale: Scale<f64>,
+        program: GlesPixelProgram,
+    ) -> Self {
+        let area_w = area.size.w.max(1) as f32;
+        let area_h = area.size.h.max(1) as f32;
+        let input_to_geo = Mat3f::from_translation(
+            area.loc.x as f32 - shadow_geo.loc.x as f32,
+            area.loc.y as f32 - shadow_geo.loc.y as f32,
+        )
+        .mul(Mat3f::from_scale(area_w, area_h));
+        let window_input_to_geo = Mat3f::from_translation(
+            area.loc.x as f32 - window_geo.loc.x as f32,
+            area.loc.y as f32 - window_geo.loc.y as f32,
+        )
+        .mul(Mat3f::from_scale(area_w, area_h));
+
+        let uniforms = vec![
+            Uniform::new("koma_scale", scale.x.max(1.0) as f32),
+            Uniform::new("shadow_color", color),
+            Uniform::new("shadow_sigma", sigma.max(0.0)),
+            Uniform::new("shadow_sharp", if sharp { 1.0_f32 } else { 0.0_f32 }),
+            Uniform::new(
+                "geo_size",
+                (
+                    shadow_geo.size.w.max(1.0) as f32,
+                    shadow_geo.size.h.max(1.0) as f32,
+                ),
+            ),
+            Uniform::new("corner_radius", shadow_radii),
+            mat3_uniform("input_to_geo", input_to_geo),
+            Uniform::new(
+                "window_geo_size",
+                (
+                    window_geo.size.w.max(0.0) as f32,
+                    window_geo.size.h.max(0.0) as f32,
+                ),
+            ),
+            Uniform::new("window_corner_radius", window_radii),
+            mat3_uniform("window_input_to_geo", window_input_to_geo),
+        ];
+
+        Self {
+            inner: PixelShaderElement::new(
+                program,
+                area,
+                None,
+                opacity.clamp(0.0, 1.0),
+                uniforms,
+                Kind::Unspecified,
+            ),
+        }
+    }
+}
+
+impl Element for KomaDropShadowElement {
+    fn id(&self) -> &Id {
+        self.inner.id()
+    }
+
+    fn current_commit(&self) -> CommitCounter {
+        self.inner.current_commit()
+    }
+
+    fn src(&self) -> Rectangle<f64, Buffer> {
+        self.inner.src()
+    }
+
+    fn geometry(&self, scale: Scale<f64>) -> Rectangle<i32, Physical> {
+        self.inner.geometry(scale)
+    }
+
+    fn opaque_regions(&self, scale: Scale<f64>) -> OpaqueRegions<i32, Physical> {
+        self.inner.opaque_regions(scale)
+    }
+
+    fn alpha(&self) -> f32 {
+        self.inner.alpha()
+    }
+
+    fn kind(&self) -> Kind {
+        self.inner.kind()
+    }
+}
+
+impl<R: KomaRenderTarget> RenderElement<R> for KomaDropShadowElement {
+    fn draw(
+        &self,
+        frame: &mut R::Frame<'_, '_>,
+        src: Rectangle<f64, Buffer>,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        opaque_regions: &[Rectangle<i32, Physical>],
+        cache: Option<&UserDataMap>,
+    ) -> Result<(), R::Error> {
+        RenderElement::<GlesRenderer>::draw(
+            &self.inner,
+            R::gles_frame_mut(frame),
+            src,
+            dst,
+            damage,
+            opaque_regions,
+            cache,
+        )
+        .map_err(R::map_gles_error)
+    }
+
+    fn underlying_storage(&self, _renderer: &mut R) -> Option<UnderlyingStorage<'_>> {
+        None
+    }
+}
+
 render_elements! {
-    pub KomaRenderElement<R> where R: KomaRenderTarget;
+    pub KomaRenderElement<R> where R: KomaRenderTarget, R::TextureId: 'static;
     Surface = WaylandSurfaceRenderElement<R>,
     ClippedSurface = KomaClippedSurfaceElement<R>,
     RoundedBorder = KomaRoundedBorderElement,
     BlurredBackdrop = KomaBlurredBackdropElement,
+    DropShadow = KomaDropShadowElement,
+    CursorBuffer = MemoryRenderBufferRenderElement<R>,
     Solid = KomaSolidColorElement,
 }
 

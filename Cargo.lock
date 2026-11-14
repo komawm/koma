@@ -650,6 +650,7 @@ dependencies = [
  "anyhow",
  "base64",
  "calloop",
+ "cursor-icon",
  "koma-lua",
  "koma-model",
  "koma-proto",
@@ -665,6 +666,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "wayland-server",
+ "xcursor",
 ]
 
 [[package]]

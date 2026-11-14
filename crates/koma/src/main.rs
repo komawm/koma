@@ -71,6 +71,8 @@ mod backend_winit;
 #[cfg(feature = "smithay-winit")]
 mod config_watcher;
 #[cfg(feature = "smithay-winit")]
+mod cursor;
+#[cfg(feature = "smithay-winit")]
 mod gesture_dispatcher;
 #[cfg(feature = "smithay-winit")]
 mod handlers;

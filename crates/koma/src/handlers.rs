@@ -7,11 +7,11 @@ use rustix::fs::{OFlags, fcntl_setfl};
 use smithay::{
     backend::{
         allocator::dmabuf::Dmabuf,
-        input::InputEvent,
+        input::{InputEvent, TabletToolDescriptor},
         renderer::utils::{on_commit_buffer_handler, with_renderer_surface_state},
     },
     desktop::{LayerSurface, PopupKind, Window, WindowSurfaceType, layer_map_for_output},
-    input::{Seat, SeatHandler, SeatState, pointer::CursorImageStatus},
+    input::{Seat, SeatHandler, SeatState, pointer::CursorImageStatus, tablet::TabletSeatHandler},
     output::Output,
     reexports::{
         wayland_protocols::xdg::shell::server::xdg_toplevel,
@@ -107,6 +107,16 @@ impl CompositorHandler for KomaState {
 
         // 2. Track popup state commits & reset active workspace damage-settle timer
         self.popups.commit(surface);
+
+        // 2a. Apply committed cursor hotspot buffer_delta & redraw when active cursor commits
+        if self
+            .cursor_manager
+            .on_surface_commit(surface, &root_surface)
+        {
+            self.queue_redraw();
+            return;
+        }
+
         let active_ws = self.active_ws_id.clone();
         notify_workspace_surface_damage(self, &active_ws);
 
@@ -203,6 +213,15 @@ impl CompositorHandler for KomaState {
             if ws_id == self.active_ws_id || Some(&ws_id) == self.active_special_ws_id.as_ref() {
                 self.queue_redraw();
             }
+        }
+    }
+
+    fn destroyed(&mut self, surface: &WlSurface) {
+        if matches!(
+            self.cursor_manager.status(),
+            CursorImageStatus::Surface(active) if active == surface
+        ) {
+            self.set_cursor_status(CursorImageStatus::default_named());
         }
     }
 }
@@ -381,8 +400,7 @@ impl SeatHandler for KomaState {
     }
 
     fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
-        self.cursor_status = image;
-        self.queue_redraw();
+        self.set_cursor_status(image);
     }
 
     fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&WlSurface>) {
@@ -576,6 +594,14 @@ impl WlrLayerShellHandler for KomaState {
 }
 
 impl PointerConstraintsHandler for KomaState {}
+
+impl TabletSeatHandler for KomaState {
+    type ToolFocus = WlSurface;
+
+    fn tablet_tool_image(&mut self, _tool: &TabletToolDescriptor, image: CursorImageStatus) {
+        self.set_cursor_status(image);
+    }
+}
 
 // Unified Smithay `Dispatch2` / `GlobalDispatch2` delegation (`niri/src/niri.rs` line 488,
 // pinned Smithay rev `65aa86fa5236e41775c313408102a5d5c2d1e2ca`).

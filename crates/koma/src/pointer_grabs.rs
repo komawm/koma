@@ -121,8 +121,7 @@ pub fn start_compositor_move_grab(state: &mut KomaState, button_code: u32, seria
     };
 
     pointer.set_grab(state, grab, serial, Focus::Clear);
-    state.cursor_status = CursorImageStatus::Named(CursorIcon::Grabbing);
-    state.queue_redraw();
+    state.set_cursor_status(CursorImageStatus::Named(CursorIcon::Grabbing));
     true
 }
 
@@ -168,8 +167,7 @@ pub fn start_compositor_resize_grab(
     };
 
     pointer.set_grab(state, grab, serial, Focus::Clear);
-    state.cursor_status = CursorImageStatus::Named(cursor_icon_for_corner(corner));
-    state.queue_redraw();
+    state.set_cursor_status(CursorImageStatus::Named(cursor_icon_for_corner(corner)));
     true
 }
 
@@ -210,8 +208,7 @@ pub fn start_csd_move_grab(
     };
 
     pointer.set_grab(state, grab, serial, Focus::Clear);
-    state.cursor_status = CursorImageStatus::Named(CursorIcon::Grabbing);
-    state.queue_redraw();
+    state.set_cursor_status(CursorImageStatus::Named(CursorIcon::Grabbing));
     true
 }
 
@@ -258,8 +255,7 @@ pub fn start_csd_resize_grab(
     };
 
     pointer.set_grab(state, grab, serial, Focus::Clear);
-    state.cursor_status = CursorImageStatus::Named(cursor_icon_for_corner(corner));
-    state.queue_redraw();
+    state.set_cursor_status(CursorImageStatus::Named(cursor_icon_for_corner(corner)));
     true
 }
 
@@ -280,8 +276,7 @@ pub fn cancel_active_pointer_grab(state: &mut KomaState, serial: Serial, time: I
     for ws in state.workspaces.values_mut() {
         ws.scrolling.reset_edge_auto_scroll();
     }
-    state.cursor_status = CursorImageStatus::default_named();
-    state.queue_redraw();
+    state.set_cursor_status(CursorImageStatus::default_named());
     true
 }
 
@@ -510,10 +505,9 @@ impl MoveWindowGrab {
         if let Some(ws) = state.workspaces.get_mut(&self.ws_id) {
             ws.scrolling.reset_edge_auto_scroll();
         }
-        state.cursor_status = CursorImageStatus::default_named();
+        state.set_cursor_status(CursorImageStatus::default_named());
 
         if !self.drag_recognized || !state.mapped_windows.iter().any(|m| m.win_id == self.win_id) {
-            state.queue_redraw();
             return;
         }
 
@@ -902,8 +896,7 @@ impl ResizeWindowGrab {
     }
 
     fn on_ungrab(&mut self, state: &mut KomaState) {
-        state.cursor_status = CursorImageStatus::default_named();
-        state.queue_redraw();
+        state.set_cursor_status(CursorImageStatus::default_named());
     }
 }
 

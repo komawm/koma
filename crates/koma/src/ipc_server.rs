@@ -1487,6 +1487,7 @@ fn execute_zero_copy_capture_frame(
                     corner_radius: 0.0,
                     wants_blur: false,
                     border: appearance.border.clone(),
+                    focus_ring: appearance.focus_ring.clone(),
                     shadow: appearance.shadow.clone(),
                     dim: appearance.effective_dim(),
                 }]

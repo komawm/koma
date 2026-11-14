@@ -1345,6 +1345,18 @@ fn render_single_drm_surface(
     };
 
     state.tick_frame_animations_and_edge_scroll();
+    let pointer_loc = state.pointer_location;
+    let now_ms = state.elapsed_ms();
+    let cursor_elems =
+        state
+            .cursor_manager
+            .render_elements(&mut renderer, pointer_loc, output_scale, now_ms);
+    if let Some(delay_ms) = state
+        .cursor_manager
+        .next_frame_delay_ms(output_scale.x, now_ms)
+    {
+        state.schedule_cursor_animation_redraw(delay_ms);
+    }
     let (base_scene_items, special_overlay) = state.collect_physical_scene_items();
     let blur_cfg = state.lua_sandbox.config_snapshot().appearance.blur;
     let any_window_needs_blur = blur_cfg.enabled
@@ -1487,6 +1499,8 @@ fn render_single_drm_surface(
             }
         }
     }
+
+    elements.splice(0..0, cursor_elems);
 
     let scanout_flags =
         FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY | FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT;
