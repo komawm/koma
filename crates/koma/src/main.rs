@@ -85,19 +85,17 @@ mod pointer_grabs;
 #[cfg(feature = "smithay-winit")]
 mod security_context;
 #[cfg(feature = "smithay-winit")]
+mod signals;
+#[cfg(feature = "smithay-winit")]
 mod state;
 #[cfg(feature = "smithay-winit")]
 mod xwayland_satellite;
 
+mod cli;
+
 use std::env;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LaunchMode {
-    Auto,
-    Winit,
-    Tty,
-    HeadlessCheck,
-}
+use crate::cli::{CliAction, LaunchMode, RunOptions};
 
 /// Synchronously imports compositor environment variables into `systemd --user` and D-Bus
 /// before sending `READY=1`, ensuring `graphical-session.target` services (`waybar`, `fcitx5`,
@@ -289,6 +287,7 @@ fn run_nested_winit(
     let ipc_paths =
         crate::ipc_server::start_dual_socket_server(&event_loop.handle(), &socket_name)?;
     state.instance_signature = Some(ipc_paths.instance_signature.clone());
+    crate::signals::listen_for_termination(&event_loop.handle())?;
     crate::xwayland_satellite::setup_primary_satellite(&mut state);
     finalize_session_startup(&state, is_session);
 
@@ -315,6 +314,9 @@ fn run_nested_winit(
         })
         .context("Koma nested Winit calloop failed")?;
 
+    info!("Koma nested Winit event loop stopped; removing IPC sockets");
+    drop(state);
+    drop(ipc_paths);
     Ok(())
 }
 
@@ -368,13 +370,16 @@ fn run_bare_metal_tty(
         crate::config_watcher::KomaConfigPath::resolve(config_override),
     );
 
-    // Enumerate primary iGPU + secondary dGPU KMS connectors and create `DrmCompositor` surfaces
-    tty_backend.enumerate_initial_devices(&mut state);
+    // Enumerate primary iGPU + secondary dGPU KMS connectors and create `DrmCompositor` surfaces.
+    // Running without any driven output is fatal: clients would see no `wl_output` and the VT
+    // would keep showing the text console (komawm/koma#2).
+    tty_backend.enumerate_initial_devices(&mut state)?;
     state.backend = Some(ActiveBackend::Tty(tty_backend));
 
     let ipc_paths =
         crate::ipc_server::start_dual_socket_server(&event_loop.handle(), &socket_name)?;
     state.instance_signature = Some(ipc_paths.instance_signature.clone());
+    crate::signals::listen_for_termination(&event_loop.handle())?;
     crate::xwayland_satellite::setup_primary_satellite(&mut state);
     finalize_session_startup(&state, is_session);
 
@@ -405,10 +410,34 @@ fn run_bare_metal_tty(
         })
         .context("Koma bare-metal TTY calloop failed")?;
 
+    // Drop order: the backend (DRM surfaces, DRM master, libseat session) goes first, then the
+    // IPC sockets and finally the Wayland listening socket owned by the event loop.
+    info!("Koma TTY event loop stopped; releasing DRM master, seat and IPC sockets");
+    drop(state);
+    drop(ipc_paths);
     Ok(())
 }
 
 fn main() {
+    let action = match cli::parse_args(env::args().skip(1)) {
+        Ok(action) => action,
+        Err(err) => {
+            eprintln!("koma: {err}\n\n{}", cli::usage());
+            std::process::exit(cli::USAGE_EXIT_CODE);
+        }
+    };
+    let opts = match action {
+        CliAction::Help => {
+            print!("{}", cli::usage());
+            return;
+        }
+        CliAction::Version => {
+            println!("{}", cli::version());
+            return;
+        }
+        CliAction::Run(opts) => opts,
+    };
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -416,23 +445,12 @@ fn main() {
         )
         .init();
 
-    let mut args = env::args().skip(1);
-    let mut spawn_cmd: Option<String> = None;
-    let mut config_override: Option<std::path::PathBuf> = None;
-    let mut mode = LaunchMode::Auto;
-    let mut is_session = false;
-
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--session" => is_session = true,
-            "--tty" => mode = LaunchMode::Tty,
-            "--winit" => mode = LaunchMode::Winit,
-            "--headless-check" => mode = LaunchMode::HeadlessCheck,
-            "--spawn" => spawn_cmd = args.next(),
-            "-c" | "--config" => config_override = args.next().map(std::path::PathBuf::from),
-            _ => {}
-        }
-    }
+    let RunOptions {
+        mode,
+        is_session,
+        spawn_cmd,
+        config_override,
+    } = opts;
 
     // Match `niri/src/main.rs` `--session` semantics: scrub stale host display variables unless WSL,
     // and export `XDG_CURRENT_DESKTOP=koma` + `XDG_SESSION_TYPE=wayland` for portals and autostart.

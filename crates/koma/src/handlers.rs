@@ -6,7 +6,9 @@ use std::{fs::File, io::Write as _, os::fd::OwnedFd, sync::Arc, thread};
 use rustix::fs::{OFlags, fcntl_setfl};
 use smithay::{
     backend::{
-        allocator::dmabuf::Dmabuf, input::InputEvent, renderer::utils::on_commit_buffer_handler,
+        allocator::dmabuf::Dmabuf,
+        input::InputEvent,
+        renderer::utils::{on_commit_buffer_handler, with_renderer_surface_state},
     },
     desktop::{LayerSurface, PopupKind, Window, WindowSurfaceType, layer_map_for_output},
     input::{Seat, SeatHandler, SeatState, pointer::CursorImageStatus},
@@ -24,8 +26,8 @@ use smithay::{
     wayland::{
         buffer::BufferHandler,
         compositor::{
-            BufferAssignment, CompositorClientState, CompositorHandler, CompositorState,
-            SurfaceAttributes, is_sync_subsurface, with_states,
+            CompositorClientState, CompositorHandler, CompositorState, get_parent,
+            is_sync_subsurface, with_states,
         },
         dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier},
         fractional_scale::{FractionalScaleHandler, with_fractional_scale},
@@ -67,6 +69,13 @@ use crate::{
     state::{ClientState, KomaState, UnmappedToplevel, read_toplevel_metadata},
 };
 
+/// Checks whether a surface currently holds a committed buffer in Smithay's renderer state.
+///
+/// Must be queried after `on_commit_buffer_handler`, which consumes `SurfaceAttributes::buffer`.
+fn is_surface_mapped(surface: &WlSurface) -> bool {
+    with_renderer_surface_state(surface, |state| state.buffer().is_some()).unwrap_or(false)
+}
+
 impl BufferHandler for KomaState {
     fn buffer_destroyed(&mut self, _buffer: &WlBuffer) {}
 }
@@ -90,6 +99,12 @@ impl CompositorHandler for KomaState {
             return;
         }
 
+        // Resolve child `wl_subsurface` commits (e.g., `foot` CSD borders/titlebars) to their root.
+        let mut root_surface = surface.clone();
+        while let Some(parent) = get_parent(&root_surface) {
+            root_surface = parent;
+        }
+
         // 2. Track popup state commits & reset active workspace damage-settle timer
         self.popups.commit(surface);
         let active_ws = self.active_ws_id.clone();
@@ -100,12 +115,16 @@ impl CompositorHandler for KomaState {
             let is_layer = {
                 let mut map = layer_map_for_output(&output);
                 if map
-                    .layer_for_surface(surface, WindowSurfaceType::TOPLEVEL)
+                    .layer_for_surface(&root_surface, WindowSurfaceType::TOPLEVEL)
                     .is_some()
                 {
-                    map.arrange();
-                    if let Some(l) = map.layer_for_surface(surface, WindowSurfaceType::TOPLEVEL) {
-                        l.layer_surface().send_pending_configure();
+                    if surface == &root_surface {
+                        map.arrange();
+                        if let Some(l) =
+                            map.layer_for_surface(&root_surface, WindowSurfaceType::TOPLEVEL)
+                        {
+                            l.layer_surface().send_pending_configure();
+                        }
                     }
                     true
                 } else {
@@ -119,19 +138,10 @@ impl CompositorHandler for KomaState {
         }
 
         // 3. Two-phase Unmapped -> Mapped window transition (`niri/src/handlers/compositor.rs`)
-        if let Some(mut unmapped) = self.unmapped_windows.remove(surface) {
-            let has_buffer = with_states(surface, |states| {
-                matches!(
-                    states
-                        .cached_state
-                        .get::<SurfaceAttributes>()
-                        .current()
-                        .buffer,
-                    Some(BufferAssignment::NewBuffer(_))
-                )
-            });
-
-            if has_buffer {
+        if surface == &root_surface
+            && let Some(mut unmapped) = self.unmapped_windows.remove(&root_surface)
+        {
+            if is_surface_mapped(&root_surface) {
                 unmapped.window.on_commit();
                 self.promote_unmapped_to_mapped(unmapped);
                 return;
@@ -143,18 +153,45 @@ impl CompositorHandler for KomaState {
                 }
                 unmapped.initial_configure_sent = true;
             }
-            self.unmapped_windows.insert(surface.clone(), unmapped);
+            self.unmapped_windows.insert(root_surface, unmapped);
             return;
         }
 
-        // 4. Refresh live metadata & schedule damage redraw for already-mapped windows
+        // 4. Refresh live metadata, handle explicit unmap, & schedule redraw for mapped windows
         if let Some(idx) = self.mapped_windows.iter().position(|m| {
             m.window
                 .toplevel()
-                .is_some_and(|t| t.wl_surface() == surface)
+                .is_some_and(|t| t.wl_surface() == &root_surface)
         }) {
+            if surface == &root_surface && !is_surface_mapped(&root_surface) {
+                let removed = self.mapped_windows.remove(idx);
+                self.window_animations
+                    .borrow_mut()
+                    .remove_immediately(removed.win_id);
+                let now_ms = self.elapsed_ms();
+                if let Some(ws) = self.workspaces.get_mut(&removed.ws_id) {
+                    ws.remove_window(removed.win_id, now_ms);
+                }
+                self.sync_workspace_geometries(&removed.ws_id);
+                self.unmapped_windows.insert(
+                    root_surface,
+                    UnmappedToplevel {
+                        win_id: removed.win_id,
+                        window: removed.window,
+                        initial_configure_sent: false,
+                    },
+                );
+                if removed.ws_id == self.active_ws_id
+                    || Some(&removed.ws_id) == self.active_special_ws_id.as_ref()
+                {
+                    self.focus_active_deck_window();
+                    self.queue_redraw();
+                }
+                return;
+            }
+
             self.mapped_windows[idx].window.on_commit();
-            let (app_id, title) = read_toplevel_metadata(surface);
+            let (app_id, title) = read_toplevel_metadata(&root_surface);
             self.mapped_windows[idx].app_id = app_id;
             self.mapped_windows[idx].title = title;
             let ws_id = self.mapped_windows[idx].ws_id.clone();
@@ -163,7 +200,7 @@ impl CompositorHandler for KomaState {
                 ws.frame_clock.record_activity(now);
             }
             notify_workspace_surface_damage(self, &ws_id);
-            if ws_id == self.active_ws_id {
+            if ws_id == self.active_ws_id || Some(&ws_id) == self.active_special_ws_id.as_ref() {
                 self.queue_redraw();
             }
         }

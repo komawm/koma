@@ -35,10 +35,13 @@ use smithay::{
     desktop::{PopupManager, Window, WindowSurfaceType},
     input::{Seat, SeatState, keyboard::XkbConfig, pointer::CursorImageStatus},
     output::Output,
-    reexports::wayland_server::{
-        DisplayHandle,
-        backend::{ClientData, ClientId, DisconnectReason},
-        protocol::wl_surface::WlSurface,
+    reexports::{
+        wayland_protocols::xdg::shell::server::xdg_toplevel,
+        wayland_server::{
+            DisplayHandle,
+            backend::{ClientData, ClientId, DisconnectReason},
+            protocol::wl_surface::WlSurface,
+        },
     },
     utils::{Logical, Point, Size},
     wayland::{
@@ -65,6 +68,13 @@ use smithay::{
     },
 };
 use tracing::{debug, info, warn};
+
+const TILED_TOPLEVEL_STATES: [xdg_toplevel::State; 4] = [
+    xdg_toplevel::State::TiledLeft,
+    xdg_toplevel::State::TiledRight,
+    xdg_toplevel::State::TiledTop,
+    xdg_toplevel::State::TiledBottom,
+];
 
 #[cfg(feature = "smithay-tty")]
 use crate::backend_tty::TtyBackendState;
@@ -708,6 +718,12 @@ impl KomaState {
 
         toplevel.with_pending_state(|state| {
             state.size = initial_size;
+            state.states.set(xdg_toplevel::State::Activated);
+            if initial_size.is_some() {
+                for tiled_state in TILED_TOPLEVEL_STATES {
+                    state.states.set(tiled_state);
+                }
+            }
         });
         toplevel.send_configure();
     }
@@ -760,6 +776,7 @@ impl KomaState {
             if let Some(mapped) = self.mapped_windows.iter_mut().find(|m| m.win_id == win_id) {
                 let rect_changed = mapped.rect != target_rect;
                 let size_changed = mapped.rect.w != target_rect.w || mapped.rect.h != target_rect.h;
+                let float_changed = mapped.is_floating != is_float;
                 mapped.rect = target_rect;
                 mapped.is_floating = is_float;
                 let bypass = is_offscreen || all_instant || instant_win == Some(win_id);
@@ -772,12 +789,19 @@ impl KomaState {
                         bypass,
                     );
                 }
-                if size_changed {
+                if size_changed || float_changed {
                     let inner_w = target_rect.w.saturating_sub(border_inset).max(48) as i32;
                     let inner_h = target_rect.h.saturating_sub(border_inset).max(48) as i32;
                     if let Some(toplevel) = mapped.window.toplevel() {
                         toplevel.with_pending_state(|st| {
                             st.size = Some(Size::from((inner_w, inner_h)));
+                            for tiled_state in TILED_TOPLEVEL_STATES {
+                                if is_float {
+                                    st.states.unset(tiled_state);
+                                } else {
+                                    st.states.set(tiled_state);
+                                }
+                            }
                         });
                         toplevel.send_pending_configure();
                     }
@@ -1001,6 +1025,21 @@ impl KomaState {
                 .find(|m| m.win_id == id)
                 .and_then(|m| m.window.toplevel().map(|t| t.wl_surface().clone()))
         });
+        for mapped in &self.mapped_windows {
+            if mapped.ws_id == target_ws_id
+                && let Some(toplevel) = mapped.window.toplevel()
+            {
+                let is_active = Some(mapped.win_id) == active_id;
+                toplevel.with_pending_state(|st| {
+                    if is_active {
+                        st.states.set(xdg_toplevel::State::Activated);
+                    } else {
+                        st.states.unset(xdg_toplevel::State::Activated);
+                    }
+                });
+                toplevel.send_pending_configure();
+            }
+        }
         if let Some(keyboard) = self.seat.get_keyboard() {
             let serial = smithay::utils::SERIAL_COUNTER.next_serial();
             keyboard.set_focus(self, target_surface, serial);

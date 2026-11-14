@@ -161,13 +161,26 @@ impl IpcClientConn {
 
 pub struct IpcServerPaths {
     pub instance_signature: String,
-    // Resolved IPC runtime paths retained on startup handle for admin/diagnostics.
-    #[allow(dead_code)]
     pub runtime_dir: PathBuf,
-    #[allow(dead_code)]
     pub admin_socket: PathBuf,
-    #[allow(dead_code)]
     pub agent_socket: PathBuf,
+}
+
+impl Drop for IpcServerPaths {
+    /// Removes both IPC sockets and the per-instance runtime directory on graceful shutdown so
+    /// stale `KOMA_INSTANCE_SIGNATURE` directories do not accumulate (komawm/koma#4).
+    fn drop(&mut self) {
+        for sock in [&self.admin_socket, &self.agent_socket] {
+            if let Err(err) = fs::remove_file(sock)
+                && err.kind() != io::ErrorKind::NotFound
+            {
+                warn!(socket = %sock.display(), "failed removing IPC socket: {err}");
+            }
+        }
+        // Only removes the directory when empty; foreign files are left in place.
+        let _ = fs::remove_dir(&self.runtime_dir);
+        info!(runtime_dir = %self.runtime_dir.display(), "removed IPC sockets");
+    }
 }
 
 /// Initializes `$XDG_RUNTIME_DIR/koma/<instance_signature>/` (`0700`) and registers both

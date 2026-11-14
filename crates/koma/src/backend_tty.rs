@@ -16,6 +16,7 @@
 use std::{
     collections::HashMap,
     env, mem,
+    os::fd::{AsFd, BorrowedFd},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -61,7 +62,10 @@ use smithay::{
             gles::GlesRenderer,
             multigpu::{GpuManager, MultiRenderer, gbm::GbmGlesBackend},
         },
-        session::{Event as SessionEvent, Session as _, libseat::LibSeatSession},
+        session::{
+            Event as SessionEvent, Session as _,
+            libseat::{Error as LibSeatError, LibSeatSession},
+        },
         udev::{self, UdevBackend, UdevEvent},
     },
     desktop::{layer_map_for_output, utils::send_frames_surface_tree},
@@ -71,7 +75,7 @@ use smithay::{
         drm::control::{self, ModeFlags, ModeTypeFlags, connector, crtc},
         gbm::Modifier,
         input::Libinput,
-        rustix::fs::OFlags,
+        rustix::{fs::OFlags, io::Errno},
         wayland_server::backend::GlobalId,
     },
     utils::{DeviceFd, Point, SERIAL_COUNTER, Scale as MathScale},
@@ -93,7 +97,12 @@ use crate::{
 const SUPPORTED_COLOR_FORMATS_10BIT: [Fourcc; 3] =
     [Fourcc::Abgr2101010, Fourcc::Argb8888, Fourcc::Abgr8888];
 
-const SUPPORTED_COLOR_FORMATS_8BIT: [Fourcc; 2] = [Fourcc::Argb8888, Fourcc::Abgr8888];
+const SUPPORTED_COLOR_FORMATS_8BIT: [Fourcc; 4] = [
+    Fourcc::Argb8888,
+    Fourcc::Abgr8888,
+    Fourcc::Xrgb8888,
+    Fourcc::Xbgr8888,
+];
 
 /// Multi-GPU OpenGL ES renderer spanning primary render node and target scanout node.
 pub type TtyRenderer<'render> = MultiRenderer<
@@ -141,6 +150,8 @@ pub struct DrmOutputSurface {
 pub struct DrmOutputDevice {
     pub token: RegistrationToken,
     pub render_node: Option<DrmNode>,
+    /// Rendering through Mesa's software rasterizer on a display-only device.
+    pub software_rendering: bool,
     pub drm_scanner: DrmScanner,
     pub surfaces: HashMap<crtc::Handle, DrmOutputSurface>,
     // Drop `drm` and `gbm` after `surfaces` (`https://github.com/Smithay/smithay/issues/1102`).
@@ -160,6 +171,8 @@ pub struct TtyBackendState {
     pub primary_render_node: DrmNode,
     pub devices: HashMap<DrmNode, DrmOutputDevice>,
     pub dmabuf_global: Option<DmabufGlobal>,
+    /// Connector configuration failures since the last enumeration, reported if no output works.
+    connector_errors: Vec<String>,
 }
 
 impl TtyBackendState {
@@ -233,15 +246,21 @@ impl TtyBackendState {
             primary_render_node,
             devices: HashMap::new(),
             dmabuf_global: None,
+            connector_errors: Vec::new(),
         })
     }
 
     /// Enumerates DRM nodes when the VT session is active, always adding `primary_node` first so
     /// secondary/dGPU outputs can share the primary `DmabufGlobal` and `GbmAllocator`.
-    pub fn enumerate_initial_devices(&mut self, state: &mut KomaState) {
+    ///
+    /// # Errors
+    ///
+    /// Fails when the session is active but no KMS output could be driven, carrying every
+    /// per-device failure so the cause is visible without debug logging (komawm/koma#2).
+    pub fn enumerate_initial_devices(&mut self, state: &mut KomaState) -> anyhow::Result<()> {
         if !self.session.is_active() {
-            debug!("TTY session not yet active; deferring DRM enumeration to ActivateSession");
-            return;
+            info!("TTY session not yet active; deferring DRM enumeration to ActivateSession");
+            return Ok(());
         }
 
         let snapshot: Vec<(dev_t, PathBuf)> = self
@@ -251,12 +270,15 @@ impl TtyBackendState {
             .map(|(id, p)| (id, p.to_owned()))
             .collect();
 
+        self.connector_errors.clear();
+        let mut failures: Vec<String> = Vec::new();
         if let Some((prim_id, prim_path)) = snapshot
             .iter()
             .find(|(id, _)| *id == self.primary_node.dev_id())
             && let Err(err) = self.device_added(*prim_id, prim_path, state)
         {
             warn!("failed initializing primary DRM node {prim_path:?}: {err:#}");
+            failures.push(format!("{}: {err:#}", prim_path.display()));
         }
 
         for (dev_id, path) in &snapshot {
@@ -265,8 +287,41 @@ impl TtyBackendState {
             }
             if let Err(err) = self.device_added(*dev_id, path, state) {
                 warn!("failed initializing secondary DRM node {path:?}: {err:#}");
+                failures.push(format!("{}: {err:#}", path.display()));
             }
         }
+
+        failures.append(&mut self.connector_errors);
+        let output_count = self.output_count();
+        if output_count == 0 {
+            let detail = if failures.is_empty() {
+                "no connected connector with a usable mode was found".to_owned()
+            } else {
+                failures.join("; ")
+            };
+            bail!(
+                "no KMS output could be initialized on seat `{}` ({} DRM device(s) seen): {detail}",
+                self.seat_name,
+                snapshot.len()
+            );
+        }
+        info!(outputs = output_count, "initialized KMS outputs");
+        Ok(())
+    }
+
+    /// Keeps the most recent connector failures for the fatal no-output report (bounded).
+    fn record_connector_error(&mut self, message: String) {
+        const MAX_CONNECTOR_ERRORS: usize = 16;
+        if self.connector_errors.len() >= MAX_CONNECTOR_ERRORS {
+            self.connector_errors.remove(0);
+        }
+        self.connector_errors.push(message);
+    }
+
+    /// Number of active KMS scanout surfaces across all devices.
+    #[must_use]
+    pub fn output_count(&self) -> usize {
+        self.devices.values().map(|d| d.surfaces.len()).sum()
     }
 
     /// Invokes `f` with the primary GPU's `GlesRenderer` (used for `Headless` `LazyOffscreenSurface`
@@ -378,7 +433,10 @@ impl TtyBackendState {
     pub fn change_vt(&mut self, vt: i32) {
         info!(vt, "switching Linux virtual terminal via libseat");
         if let Err(err) = self.session.change_vt(vt) {
-            warn!(vt, "LibSeatSession::change_vt failed: {err}");
+            match vt_switch_failure_hint(&err) {
+                Some(hint) => warn!(vt, "VT switch failed: {err}. {hint}"),
+                None => warn!(vt, "LibSeatSession::change_vt failed: {err}"),
+            }
         }
     }
 
@@ -402,29 +460,64 @@ impl TtyBackendState {
             .session
             .open(path, open_flags)
             .with_context(|| format!("LibSeatSession::open({path:?}) failed"))?;
-        let device_fd = DrmDeviceFd::new(DeviceFd::from(fd));
+        let raw_device_fd = DeviceFd::from(fd);
+        log_drm_master_status(path, &raw_device_fd, self.session.is_active());
+        let device_fd = DrmDeviceFd::new(raw_device_fd);
 
         let (drm, drm_notifier) =
             DrmDevice::new(device_fd.clone(), false).context("DrmDevice::new failed")?;
         let gbm = GbmDevice::new(device_fd.device_fd()).context("GbmDevice::new failed")?;
 
-        // Initialize hardware EGL render node (rejecting software `llvmpipe` per `niri/src/backend/tty.rs`)
-        let render_node = match try_register_egl_render_node(&mut self.gpu_manager, &gbm, node) {
+        // Initialize hardware EGL render node (rejecting software `llvmpipe` per
+        // `niri/src/backend/tty.rs`). A display-only primary device (bochs-drm, simpledrm,
+        // virtio-gpu without virgl) has no hardware renderer to borrow, so it falls back to Mesa's
+        // software rasterizer through GBM on its own card node (`kms_swrast` + llvmpipe dumb
+        // buffers). Secondary display-only devices keep borrowing the primary GPU.
+        let is_primary = node == self.primary_node;
+        let (render_node, software_rendering) = match try_register_egl_render_node(
+            &mut self.gpu_manager,
+            &gbm,
+            node,
+            false,
+        ) {
             Ok(rn) => {
                 debug!(?node, ?rn, "registered hardware EGL render node");
-                Some(rn)
+                (Some(rn), false)
+            }
+            Err(err) if is_primary && software_rendering_allowed() => {
+                warn!(
+                    ?node,
+                    "primary DRM device has no hardware renderer ({err:#}); falling back to software rendering (llvmpipe). Expect high CPU use; set KOMA_DISABLE_SOFTWARE_RENDERING=1 to fail instead"
+                );
+                let rn = try_register_egl_render_node(&mut self.gpu_manager, &gbm, node, true)
+                    .context("software (llvmpipe) EGL fallback on display-only primary DRM device failed")?;
+                if rn != self.primary_render_node {
+                    info!(old = ?self.primary_render_node, new = ?rn, "using software render node as primary renderer");
+                    self.primary_render_node = rn;
+                }
+                (Some(rn), true)
             }
             Err(err) => {
+                if is_primary {
+                    bail!(
+                        "primary DRM device {node:?} has no hardware renderer and software rendering is disabled: {err:#}"
+                    );
+                }
                 debug!(
                     ?node,
                     "display-only or software DRM device; falling back to primary GPU: {err:#}"
                 );
-                None
+                (None, false)
             }
         };
 
-        // Advertise `zwp_linux_dmabuf_v1` global once the primary render node comes online
-        if render_node == Some(self.primary_render_node) && self.dmabuf_global.is_none() {
+        // Advertise `zwp_linux_dmabuf_v1` global once the primary render node comes online.
+        // Skipped for software rendering: llvmpipe cannot reliably import client dmabufs (niri
+        // rejects software renderers for the same reason), so clients fall back to `wl_shm`.
+        if render_node == Some(self.primary_render_node)
+            && !software_rendering
+            && self.dmabuf_global.is_none()
+        {
             let renderer = self
                 .gpu_manager
                 .single_renderer(&self.primary_render_node)
@@ -445,12 +538,16 @@ impl TtyBackendState {
             self.dmabuf_global = Some(global);
         }
 
-        let allocator_gbm = if render_node.is_some() {
+        // The primary device never borrows from itself: it is not yet in `self.devices` here, so
+        // a display-only primary must allocate from its own GBM device (komawm/koma#2).
+        let allocator_gbm = if render_node.is_some() || is_primary {
             gbm.clone()
         } else if let Some(primary_dev) = self.devices.get(&self.primary_node) {
             primary_dev.gbm.clone()
         } else {
-            bail!("no GBM allocator available for display-only DRM node {node:?}");
+            bail!(
+                "no GBM allocator available for display-only DRM node {node:?} (primary DRM node is not initialized)"
+            );
         };
         let allocator = GbmAllocator::new(
             allocator_gbm,
@@ -479,6 +576,7 @@ impl TtyBackendState {
             DrmOutputDevice {
                 token,
                 render_node,
+                software_rendering,
                 drm_scanner: DrmScanner::new(),
                 surfaces: HashMap::new(),
                 drm,
@@ -514,6 +612,9 @@ impl TtyBackendState {
                 Ok(res) => res.into_iter().collect(),
                 Err(err) => {
                     warn!(?node, "DrmScanner::scan_connectors failed: {err:?}");
+                    self.record_connector_error(format!(
+                        "{node}: scanning connectors failed: {err:?}"
+                    ));
                     return;
                 }
             }
@@ -531,6 +632,7 @@ impl TtyBackendState {
                             ?crtc,
                             "failed configuring connected KMS connector: {err:#}"
                         );
+                        self.record_connector_error(format!("{node}: {err:#}"));
                     }
                 }
                 DrmScanEvent::Disconnected {
@@ -549,6 +651,7 @@ impl TtyBackendState {
                             ?crtc,
                             "failed reconfiguring changed KMS connector: {err:#}"
                         );
+                        self.record_connector_error(format!("{node}: {err:#}"));
                     }
                 }
                 _ => {}
@@ -624,10 +727,10 @@ impl TtyBackendState {
         let render_formats: FormatSet = {
             let renderer = self.gpu_manager.single_renderer(&target_render_node)?;
             let raw_formats = renderer.as_ref().egl_context().dmabuf_render_formats();
-            let is_display_only = self
-                .devices
-                .get(&node)
-                .is_some_and(|d| d.render_node.is_none());
+            let (is_display_only, is_software) =
+                self.devices.get(&node).map_or((false, false), |d| {
+                    (d.render_node.is_none(), d.software_rendering)
+                });
 
             raw_formats
                 .iter()
@@ -635,6 +738,10 @@ impl TtyBackendState {
                 .filter(|fmt| {
                     if is_display_only {
                         return fmt.modifier == Modifier::Linear;
+                    }
+                    if is_software {
+                        // `kms_swrast` allocates linear dumb buffers, often without modifier support.
+                        return matches!(fmt.modifier, Modifier::Linear | Modifier::Invalid);
                     }
                     // Exclude high-bandwidth Intel CCS modifiers (`niri/src/backend/tty.rs` lines 1440-1458)
                     !matches!(
@@ -829,11 +936,14 @@ fn try_register_egl_render_node(
     gpu_manager: &mut GpuManager<GbmGlesBackend<GlesRenderer, DeviceFd>>,
     gbm: &GbmDevice<DeviceFd>,
     fallback_node: DrmNode,
+    allow_software: bool,
 ) -> anyhow::Result<DrmNode> {
+    // SAFETY: the GBM device wraps a DRM fd that stays open for the device lifetime.
     let display = unsafe { EGLDisplay::new(gbm.clone())? };
     let egl_device = EGLDevice::device_for_display(&display)?;
+    let is_software = egl_device.is_software();
     ensure!(
-        !egl_device.is_software(),
+        allow_software || !is_software,
         "rejecting software llvmpipe/softpipe EGL device"
     );
     let render_node = egl_device
@@ -845,7 +955,98 @@ fn try_register_egl_render_node(
         .as_mut()
         .add_node(render_node, gbm.clone())
         .context("GpuManager::add_node failed")?;
+    if is_software {
+        info!(
+            ?render_node,
+            "registered software EGL renderer (llvmpipe) on display-only device"
+        );
+    }
     Ok(render_node)
+}
+
+/// Software rendering on a display-only primary device is on unless
+/// `KOMA_DISABLE_SOFTWARE_RENDERING=1` (or `true`) is set.
+fn software_rendering_allowed() -> bool {
+    !is_truthy_env_value(env::var("KOMA_DISABLE_SOFTWARE_RENDERING").ok().as_deref())
+}
+
+fn is_truthy_env_value(value: Option<&str>) -> bool {
+    value.is_some_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+/// `DRM_IOCTL_AUTH_MAGIC` (`_IOW('d', 0x11, struct drm_auth)`).
+const DRM_IOCTL_AUTH_MAGIC: libc::c_ulong = 0x4004_6411;
+
+/// Mirrors libdrm's `drmIsMaster`: authenticating magic `0` fails with `EINVAL` for a master
+/// (unknown token) and with `EACCES` for a non-master, without changing any state.
+fn drm_fd_is_master(fd: BorrowedFd<'_>) -> std::io::Result<bool> {
+    let mut magic: u32 = 0;
+    // SAFETY: `fd` is a valid open DRM fd and `magic` matches `struct drm_auth` (one `u32`).
+    let rc = unsafe {
+        libc::ioctl(
+            std::os::fd::AsRawFd::as_raw_fd(&fd),
+            DRM_IOCTL_AUTH_MAGIC as _,
+            &raw mut magic,
+        )
+    };
+    if rc == 0 {
+        return Ok(true);
+    }
+    let err = std::io::Error::last_os_error();
+    match err.raw_os_error() {
+        Some(libc::EACCES) => Ok(false),
+        Some(libc::EINVAL) => Ok(true),
+        _ => Err(err),
+    }
+}
+
+/// Explains Smithay's generic "Unable to become drm master" warning (komawm/koma#2).
+///
+/// The kernel refuses `DRM_IOCTL_SET_MASTER` from an unprivileged process for an fd it did not
+/// open itself, even when that fd already *is* master. Seat managers (seatd, systemd-logind)
+/// open the device and grant master on our behalf, so the warning is harmless whenever the fd is
+/// already master. This checks the real state like libdrm's `drmIsMaster` (only a master can
+/// authenticate a magic token) and logs the actual cause.
+fn log_drm_master_status(path: &Path, fd: &DeviceFd, session_active: bool) {
+    match drm_fd_is_master(fd.as_fd()) {
+        Ok(true) => info!(
+            ?path,
+            "seat manager granted DRM master; a following \"Unable to become drm master\" warning only means SET_MASTER is refused because the seat manager, not Koma, opened the fd, and is harmless"
+        ),
+        Ok(false) => warn!(
+            ?path,
+            session_active,
+            "Koma does not hold DRM master on this device, so modesetting will fail. Likely causes: the session's VT is not in the foreground (start Koma from the VT it will own, not over SSH or from another VT), another compositor or display server holds master, or the seat manager (seatd / systemd-logind) did not grant the device to this session"
+        ),
+        Err(err) => debug!(?path, "could not query DRM master state: {err}"),
+    }
+}
+
+/// Explains libseat VT-switch failures (komawm/koma#5).
+fn vt_switch_failure_hint(err: &LibSeatError) -> Option<&'static str> {
+    match err {
+        LibSeatError::FailedToChangeVt(errno) => vt_switch_errno_hint(*errno),
+        _ => None,
+    }
+}
+
+fn vt_switch_errno_hint(errno: Errno) -> Option<&'static str> {
+    if errno == Errno::ACCESS || errno == Errno::PERM {
+        Some(
+            "The seat manager denied the switch: systemd-logind only allows SwitchTo for an unprivileged session when polkit authorizes it (org.freedesktop.login1.chvt). Install and run polkit, or run Koma under seatd (`LIBSEAT_BACKEND=seatd`, user in the `seat` group), which permits VT switching for the active session",
+        )
+    } else if errno == Errno::NOSYS || errno == Errno::OPNOTSUPP {
+        Some(
+            "This seat has no virtual terminals (e.g. seat1 or a VT-less kernel); VT switching is unavailable",
+        )
+    } else {
+        None
+    }
 }
 
 /// Selects either the user-requested `"WIDTHxHEIGHT@HZ"` mode from `init.lua` or the connector's
@@ -1475,5 +1676,51 @@ where
         }
 
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truthy_env_values() {
+        for v in ["1", "true", "TRUE", " yes ", "on"] {
+            assert!(is_truthy_env_value(Some(v)), "{v:?}");
+        }
+        for v in [None, Some(""), Some("0"), Some("false"), Some("off")] {
+            assert!(!is_truthy_env_value(v), "{v:?}");
+        }
+    }
+
+    #[test]
+    fn vt_switch_hints_name_cause_and_fix() {
+        let denied = vt_switch_errno_hint(Errno::ACCESS).expect("EACCES hint");
+        assert!(denied.contains("polkit") && denied.contains("seatd"));
+        assert_eq!(vt_switch_errno_hint(Errno::PERM), Some(denied));
+        assert!(vt_switch_errno_hint(Errno::NOSYS).is_some());
+        assert!(vt_switch_errno_hint(Errno::IO).is_none());
+        assert!(vt_switch_failure_hint(&LibSeatError::FailedToChangeVt(Errno::ACCESS)).is_some());
+        assert!(vt_switch_failure_hint(&LibSeatError::SessionLost).is_none());
+    }
+
+    #[test]
+    fn mode_spec_parsing() {
+        assert_eq!(
+            parse_mode_spec("2560x1600@240"),
+            Some((2560, 1600, Some(240_000)))
+        );
+        assert_eq!(
+            parse_mode_spec("1920x1080@59.94Hz"),
+            Some((1920, 1080, Some(59_940)))
+        );
+        assert_eq!(parse_mode_spec("1280x720"), Some((1280, 720, None)));
+        assert_eq!(parse_mode_spec("preferred"), None);
+    }
+
+    #[test]
+    fn drm_master_query_rejects_non_drm_fd() {
+        let file = std::fs::File::open("/dev/null").expect("open /dev/null");
+        assert!(drm_fd_is_master(file.as_fd()).is_err());
     }
 }
