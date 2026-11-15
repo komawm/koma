@@ -1199,6 +1199,7 @@ fn apply_validated_configuration(
 
     // Ensure every enabled output owns a workspace and `focused_output_name` points at one.
     let mut enabled_outputs = Vec::new();
+    let mut changed_outputs = Vec::new();
     for upd in &updates {
         if let Some(output) = by_name.get(&upd.output_name) {
             if upd.enabled {
@@ -1212,13 +1213,14 @@ fn apply_validated_configuration(
                 let cur_mode = output
                     .current_mode()
                     .map(|m| (m.size.w, m.size.h, m.refresh.max(0) as u32));
+                let cur_scale = output.current_scale().fractional_scale();
                 let transform = smithay_transform_to_koma(output.current_transform());
                 state.output_layout.record_hotplug_state(
                     &upd.output_name,
                     SavedOutputConfig {
                         active_ws_id: Some(ws_id.clone()),
                         position: resolved_pos,
-                        scale: Some(output.current_scale().fractional_scale()),
+                        scale: Some(cur_scale),
                         transform: Some(transform),
                         mode: cur_mode,
                         enabled: true,
@@ -1227,6 +1229,8 @@ fn apply_validated_configuration(
                 state.sync_output_workarea(output);
                 state.sync_window_output_membership(&ws_id);
                 state.sync_output_layer_scales(output);
+                let (mw, mh) = cur_mode.map(|(w, h, _)| (w, h)).unwrap_or((0, 0));
+                changed_outputs.push((upd.output_name.clone(), mw, mh, cur_scale));
             } else if state.focused_output_name.as_deref() == Some(upd.output_name.as_str()) {
                 state.focused_output_name = None;
             }
@@ -1245,5 +1249,17 @@ fn apply_validated_configuration(
     state.reconcile_keyboard_focus();
     state.sync_foreign_toplevels();
     state.queue_redraw();
+    for (out_name, width, height, scale) in changed_outputs {
+        state.emit_lua_event(
+            "output.changed",
+            serde_json::json!({
+                "action": "configured",
+                "output": out_name,
+                "width": width,
+                "height": height,
+                "scale": scale,
+            }),
+        );
+    }
     Ok(())
 }

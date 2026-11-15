@@ -55,10 +55,15 @@ pub struct WindowSceneItem<'a> {
     pub rect: LogicalRect,
     pub is_floating: bool,
     pub is_focused: bool,
+    /// Animated border transition factor (`0.0` = unfocused, `1.0` = focused).
+    pub focus_factor: f32,
     pub is_protected_surface: bool,
     pub opacity: f32,
     pub corner_radius: f32,
     pub wants_blur: bool,
+    pub no_shadow: bool,
+    pub border_color_override: Option<String>,
+    pub gradient_time_ms: u64,
     pub border: BorderConfig,
     pub focus_ring: FocusRingConfig,
     pub shadow: ShadowConfig,
@@ -217,6 +222,65 @@ pub fn effective_window_opacity(item: &WindowSceneItem<'_>, dim: &DimConfig) -> 
     effective_window_opacity_for(item.opacity, item.is_focused, dim)
 }
 
+/// Resolves `(start_rgba, end_rgba, angle_rad)` for a gradient border interpolated smoothly by `focus_factor`.
+#[must_use]
+pub fn resolve_border_gradient(
+    border: &BorderConfig,
+    lease_state: &WorkspaceLeaseState,
+    focus_factor: f32,
+    border_color_override: Option<&str>,
+    now_ms: u64,
+) -> ([f32; 4], [f32; 4], f32) {
+    let t = if focus_factor.is_finite() {
+        focus_factor.clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    let inactive_start = parse_hex_color(&border.inactive_color, COLOR_BORDER_INACTIVE);
+    let inactive_end = border
+        .inactive_color_end
+        .as_deref()
+        .map_or(inactive_start, |c| parse_hex_color(c, inactive_start));
+
+    let (active_start, active_end) = match lease_state {
+        WorkspaceLeaseState::HumanPreempted { .. } => {
+            let c = parse_hex_color(&border.human_preempt_color, COLOR_BORDER_HUMAN_PREEMPT);
+            (c, c)
+        }
+        WorkspaceLeaseState::AgentExclusive { .. } => {
+            let c = parse_hex_color(&border.agent_leased_color, COLOR_BORDER_AGENT_LEASED);
+            (c, c)
+        }
+        _ => {
+            if let Some(custom) = border_color_override {
+                let c = parse_hex_color(custom, COLOR_BORDER_FOCUSED);
+                (c, c)
+            } else {
+                let s = parse_hex_color(&border.active_color, COLOR_BORDER_FOCUSED);
+                let e = border
+                    .active_color_end
+                    .as_deref()
+                    .map_or(s, |c| parse_hex_color(c, s));
+                (s, e)
+            }
+        }
+    };
+
+    let mix = |a: [f32; 4], b: [f32; 4]| -> [f32; 4] {
+        [
+            a[0] + (b[0] - a[0]) * t,
+            a[1] + (b[1] - a[1]) * t,
+            a[2] + (b[2] - a[2]) * t,
+            a[3] + (b[3] - a[3]) * t,
+        ]
+    };
+    (
+        mix(inactive_start, active_start),
+        mix(inactive_end, active_end),
+        border.effective_gradient_angle_rad(now_ms),
+    )
+}
+
 /// Resolves the normalized `[f32; 4]` RGBA border color for a window from `BorderConfig` and `WorkspaceLeaseState`.
 #[must_use]
 pub fn resolve_border_rgba(
@@ -331,7 +395,13 @@ where
             )),
         );
 
-        let border_rgba = resolve_border_rgba(&item.border, lease_state, item.is_focused);
+        let (border_rgba, border_rgba_end, border_angle_rad) = resolve_border_gradient(
+            &item.border,
+            lease_state,
+            item.focus_factor,
+            item.border_color_override.as_deref(),
+            item.gradient_time_ms,
+        );
 
         // 2a. Transient xdg_popup menus attached to this toplevel (front-most, unclipped)
         if let Some(toplevel) = item.window.toplevel() {
@@ -394,7 +464,8 @@ where
                     output_scale,
                     white_tex.clone(),
                     border_prog.clone(),
-                ),
+                )
+                .with_gradient(border_rgba_end, border_angle_rad),
             ));
         }
 
@@ -477,10 +548,12 @@ where
         }
 
         // 2e. Rounded drop shadow behind window, border, focus ring, and blur backdrop
-        if let (Some(shadow_geom), Some(shadow_prog)) = (
-            compute_drop_shadow_geometry(outer_rect, radius, &item.shadow, item.is_focused),
-            shaders.rounded_shadow.as_ref(),
-        ) {
+        if !item.no_shadow
+            && let (Some(shadow_geom), Some(shadow_prog)) = (
+                compute_drop_shadow_geometry(outer_rect, radius, &item.shadow, item.is_focused),
+                shaders.rounded_shadow.as_ref(),
+            )
+        {
             elements.push(KomaRenderElement::DropShadow(KomaDropShadowElement::new(
                 shadow_geom.area,
                 shadow_geom.shadow_box,
@@ -698,6 +771,10 @@ mod tests {
             inactive_color: "#00ff00".to_owned(),
             agent_leased_color: "#0000ff".to_owned(),
             human_preempt_color: "#ffff00".to_owned(),
+            active_color_end: Some("#0000ff".to_owned()),
+            inactive_color_end: None,
+            gradient_angle: 90.0,
+            gradient_rotate_rpm: 10.0,
         };
 
         let active = resolve_border_rgba(&border, &WorkspaceLeaseState::Unheld, true);
@@ -705,6 +782,17 @@ mod tests {
 
         let inactive = resolve_border_rgba(&border, &WorkspaceLeaseState::Unheld, false);
         assert_eq!(inactive, [0.0, 1.0, 0.0, 1.0]);
+
+        let (mid_s, mid_e, angle0) =
+            resolve_border_gradient(&border, &WorkspaceLeaseState::Unheld, 0.5, None, 0);
+        assert!((mid_s[0] - 0.5).abs() < 1e-5);
+        assert!((mid_s[1] - 0.5).abs() < 1e-5);
+        assert!((mid_e[2] - 0.5).abs() < 1e-5);
+        assert!((angle0 - 90.0_f32.to_radians()).abs() < 1e-5);
+
+        let (_, _, angle_spun) =
+            resolve_border_gradient(&border, &WorkspaceLeaseState::Unheld, 1.0, None, 1500);
+        assert!((angle_spun - 180.0_f32.to_radians()).abs() < 1e-4);
     }
 
     #[test]

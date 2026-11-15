@@ -344,6 +344,10 @@ fn run_nested_winit(
     render_winit_frame(&mut state)?;
     state.queue_redraw();
 
+    if env::var_os("KOMA_SKIP_AUTOSTART").is_none() {
+        state.emit_lua_event("compositor.start", serde_json::json!({}));
+    }
+
     if let Some(cmd_name) = spawn_cmd {
         let active_ws = state.active_ws_id.clone();
         let mut child_cmd = Command::new(&cmd_name);
@@ -436,6 +440,10 @@ fn run_bare_metal_tty(
 
     // Submit Frame 1 (`#111216` backdrop) to active KMS CRTCs
     render_pending_tty_outputs(&mut state);
+
+    if env::var_os("KOMA_SKIP_AUTOSTART").is_none() {
+        state.emit_lua_event("compositor.start", serde_json::json!({}));
+    }
 
     if let Some(cmd_name) = spawn_cmd {
         let active_ws = state.active_ws_id.clone();

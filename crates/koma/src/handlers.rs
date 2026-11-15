@@ -247,6 +247,22 @@ impl CompositorHandler for KomaState {
                 self.break_active_pointer_constraints();
                 self.reconcile_idle_inhibitors();
                 self.sync_foreign_toplevels();
+                let is_offscreen = self.workspaces.get(&removed.ws_id).is_some_and(|ws| {
+                    matches!(
+                        ws.presentation,
+                        koma_model::PresentationTarget::Offscreen { .. }
+                    )
+                });
+                if !is_offscreen {
+                    self.emit_lua_event(
+                        "window.closed",
+                        serde_json::json!({
+                            "id": removed.win_id.slot,
+                            "app_id": removed.app_id,
+                            "workspace": removed.ws_id.to_string(),
+                        }),
+                    );
+                }
                 if removed.ws_id == self.active_ws_id
                     || Some(&removed.ws_id) == self.active_special_ws_id.as_ref()
                 {
@@ -516,6 +532,22 @@ impl XdgShellHandler for KomaState {
             self.break_active_pointer_constraints();
             self.reconcile_idle_inhibitors();
             self.sync_foreign_toplevels();
+            let is_offscreen = self.workspaces.get(&removed.ws_id).is_some_and(|ws| {
+                matches!(
+                    ws.presentation,
+                    koma_model::PresentationTarget::Offscreen { .. }
+                )
+            });
+            if !is_offscreen {
+                self.emit_lua_event(
+                    "window.closed",
+                    serde_json::json!({
+                        "id": removed.win_id.slot,
+                        "app_id": removed.app_id,
+                        "workspace": removed.ws_id.to_string(),
+                    }),
+                );
+            }
             if removed.ws_id == self.active_ws_id
                 || Some(&removed.ws_id) == self.active_special_ws_id.as_ref()
             {

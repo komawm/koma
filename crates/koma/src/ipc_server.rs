@@ -1298,6 +1298,8 @@ fn dispatch_rpc(
                 )?;
             }
 
+            let snap = state.capture_lua_desktop_snapshot(Some(&params.ws_id));
+            state.lua_sandbox.set_desktop_snapshot(snap);
             let (_stashed_exec, mode) = state.lua_sandbox.start_macro_tx(
                 params.ws_id.clone(),
                 params.expected_epoch,
@@ -1506,10 +1508,14 @@ fn execute_zero_copy_capture_frame(
                     rect: mapped.rect,
                     is_floating: mapped.is_floating,
                     is_focused: true,
+                    focus_factor: 1.0,
                     is_protected_surface: is_protected,
                     opacity: 1.0,
                     corner_radius: 0.0,
                     wants_blur: false,
+                    no_shadow: false,
+                    border_color_override: None,
+                    gradient_time_ms: 0,
                     border: appearance.border.clone(),
                     focus_ring: appearance.focus_ring.clone(),
                     shadow: appearance.shadow.clone(),

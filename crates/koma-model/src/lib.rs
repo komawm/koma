@@ -22,8 +22,11 @@ pub mod workspace;
 
 pub use crate::{
     animation::{
-        AnimationConfig, BlurConfig, BorderConfig, DimConfig, FocusRingConfig, SampledWindowVisual,
-        ShadowConfig, Spring, SpringParams, SpringTrack, WindowAnimationTable, parse_hex_color,
+        AnimationChannelConfig, AnimationConfig, AnimationSolverKind, BezierTrack, BlurConfig,
+        BorderConfig, CubicBezier, CurveSpec, DimConfig, FocusRingConfig, HookeSpringParams,
+        HookeSpringTrack, MotionTrack, SampledWindowVisual, SampledWorkspaceTransform,
+        ShadowConfig, SlideEdge, Spring, SpringParams, SpringTrack, WindowAnimationTable,
+        WindowOpenStyle, WorkspaceTransitionTable, parse_hex_color, resolve_named_curve,
     },
     clock::{AdaptiveFrameClock, FrameClockConfig, FrameClockTier, FrameTickDecision},
     dwindle::{

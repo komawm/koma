@@ -217,6 +217,8 @@ pub fn drive_macro_tick(state: &mut KomaState, explicit_settled: &[WorkspaceId])
     }
 
     // 3. Resume ready `Phodopus` coroutines & cancel stale-epoch ones
+    let snap = state.capture_lua_desktop_snapshot(None);
+    state.lua_sandbox.set_desktop_snapshot(snap);
     let report = {
         let view = StateEpochView {
             workspaces: &state.workspaces,
@@ -512,6 +514,34 @@ pub(crate) fn dispatch_single_host_action(state: &mut KomaState, action: QueuedH
             set_data_device_selection(&state.display_handle, &state.seat, mimes, buf);
             let chord = paste_chord_for_workspace(state, &ws_id);
             synthesize_chord_tap(state, &ws_id, chord);
+        }
+
+        QueuedHostAction::DispatchAction {
+            ws_id,
+            expected_epoch,
+            action,
+        } => {
+            if state.is_locked_or_abandoned() {
+                warn!("blocked DispatchAction while session is locked");
+                return;
+            }
+            let valid = state.workspaces.get(&ws_id).is_some_and(|ws| {
+                ws.lease.epoch() == expected_epoch
+                    && (!matches!(
+                        ws.presentation,
+                        koma_model::PresentationTarget::Offscreen { .. }
+                    ) || !ws.lease.is_human_preempted())
+            });
+            if !valid {
+                let _ = state.lua_sandbox.cancel_workspace_coroutines(
+                    &ws_id,
+                    "ERR_STALE_EPOCH: action dropped due to workspace epoch or takeover barrier",
+                );
+                return;
+            }
+            crate::keybind_dispatcher::execute_action_descriptor(state, action, false);
+            let snap = state.capture_lua_desktop_snapshot(None);
+            state.lua_sandbox.set_desktop_snapshot(snap);
         }
     }
 }

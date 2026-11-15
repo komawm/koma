@@ -2256,7 +2256,9 @@ pub fn execute_action_descriptor(
                     return;
                 }
                 state.active_special_ws_id = None;
+                let prev_ws_id = state.active_ws_id.clone();
                 state.active_ws_id = ws_id.clone();
+                let mut switched_out: Option<String> = None;
                 if let Some(focused_out) = state.focused_output() {
                     let out_name = focused_out.name();
                     state
@@ -2275,8 +2277,12 @@ pub fn execute_action_descriptor(
                     }
                     state.sync_workspace_geometries(&ws_id);
                     state.sync_window_output_membership(&ws_id);
+                    switched_out = Some(out_name);
                 }
                 state.focus_active_deck_window();
+                if let Some(out_name) = switched_out {
+                    state.trigger_workspace_transition(&out_name, &prev_ws_id, &ws_id, 0);
+                }
                 state.reconcile_idle_inhibitors();
                 state.sync_foreign_toplevels();
                 state.queue_redraw();
@@ -2291,6 +2297,22 @@ pub fn execute_action_descriptor(
             cycle_workspace_focus(state, false);
         }
 
+        ActionDescriptor::WindowFocus(win_slot) => {
+            if !state.activate_window_by_slot(win_slot) {
+                warn!(win_slot, "WindowFocus target window not found");
+            }
+        }
+
+        ActionDescriptor::WorkspaceSetLayout { workspace, layout } => {
+            if !state.set_workspace_layout(workspace.as_deref(), layout) {
+                warn!(
+                    ?workspace,
+                    ?layout,
+                    "WorkspaceSetLayout target workspace not found"
+                );
+            }
+        }
+
         ActionDescriptor::ModeEnter(mode_name) => {
             debug!(mode = %mode_name, "entering keybind submap mode");
             state.keybinds.active_mode = Some(mode_name.clone());
@@ -2301,6 +2323,8 @@ pub fn execute_action_descriptor(
                 .map(|w| w.lease.epoch())
                 .unwrap_or_default();
             let now_ms = state.elapsed_ms();
+            let snap = state.capture_lua_desktop_snapshot(Some(&ws_id));
+            state.lua_sandbox.set_desktop_snapshot(snap);
             match state
                 .lua_sandbox
                 .start_mode_enter_hook_tx(&mode_name, ws_id, epoch, now_ms)
@@ -2338,6 +2362,8 @@ pub fn execute_action_descriptor(
                 .map(|w| w.lease.epoch())
                 .unwrap_or_default();
             let now_ms = state.elapsed_ms();
+            let snap = state.capture_lua_desktop_snapshot(Some(&ws_id));
+            state.lua_sandbox.set_desktop_snapshot(snap);
             match state
                 .lua_sandbox
                 .start_macro_tx(ws_id, epoch, &macro_id, &args, now_ms)
@@ -2358,6 +2384,8 @@ pub fn execute_action_descriptor(
                 .map(|w| w.lease.epoch())
                 .unwrap_or_default();
             let now_ms = state.elapsed_ms();
+            let snap = state.capture_lua_desktop_snapshot(Some(&ws_id));
+            state.lua_sandbox.set_desktop_snapshot(snap);
             match state
                 .lua_sandbox
                 .start_bind_callback_tx(bind_id, ws_id, epoch, now_ms)
@@ -2442,7 +2470,9 @@ fn cycle_workspace_focus(state: &mut KomaState, forward: bool) {
     }
     state.break_active_pointer_constraints();
     state.active_special_ws_id = None;
+    let prev_ws_id = state.active_ws_id.clone();
     state.active_ws_id = next_ws.clone();
+    let mut switched_out: Option<String> = None;
     if let Some(focused_out) = state.focused_output() {
         let out_name = focused_out.name();
         state
@@ -2460,8 +2490,17 @@ fn cycle_workspace_focus(state: &mut KomaState, forward: bool) {
         }
         state.sync_workspace_geometries(&next_ws);
         state.sync_window_output_membership(&next_ws);
+        switched_out = Some(out_name);
     }
     state.focus_active_deck_window();
+    if let Some(out_name) = switched_out {
+        state.trigger_workspace_transition(
+            &out_name,
+            &prev_ws_id,
+            &next_ws,
+            if forward { 1 } else { -1 },
+        );
+    }
     state.reconcile_idle_inhibitors();
     state.sync_foreign_toplevels();
     state.queue_redraw();
