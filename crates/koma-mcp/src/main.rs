@@ -14,10 +14,7 @@ pub mod png_codec;
 
 use std::env;
 
-use crate::{
-    agent_client::KomaAgentSession,
-    mcp_stdio::{builtin_mcp_tool_schemas, run_stdio_mcp_loop},
-};
+use crate::mcp_stdio::{LazyKomaSession, builtin_mcp_tool_schemas, run_stdio_mcp_loop};
 
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -28,13 +25,7 @@ fn main() {
     }
 
     let auto_mint = args.iter().any(|a| a == "--auto-mint-admin");
-    let mut session = match KomaAgentSession::from_env(auto_mint) {
-        Ok(s) => s,
-        Err(err) => {
-            eprintln!("koma-mcp authentication failed: {err}");
-            std::process::exit(1);
-        }
-    };
+    let mut session = LazyKomaSession::new(auto_mint);
 
     if let Err(err) = run_stdio_mcp_loop(&mut session) {
         eprintln!("koma-mcp stdio fatal I/O error: {err}");
