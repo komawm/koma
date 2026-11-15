@@ -343,30 +343,79 @@ pub(crate) fn dispatch_output_frame_callbacks_filtered(
     output: &Output,
     throttle: Option<Duration>,
 ) {
+    use smithay::{
+        desktop::{
+            PopupManager,
+            utils::{OutputPresentationFeedback, take_presentation_feedback_surface_tree},
+        },
+        reexports::{
+            wayland_protocols::wp::presentation_time::server::wp_presentation_feedback,
+            wayland_server::protocol::wl_surface::WlSurface,
+        },
+        utils::Monotonic,
+        wayland::{compositor::SurfaceData, presentation::Refresh},
+    };
+
     let elapsed = state.elapsed_duration();
+    let mut output_feedback = OutputPresentationFeedback::new(output);
+    let refresh = output
+        .current_mode()
+        .filter(|m| m.refresh > 0)
+        .map(|m| Refresh::fixed(Duration::from_secs_f64(1_000f64 / f64::from(m.refresh))))
+        .unwrap_or(Refresh::Unknown);
+    let seq = state.next_presentation_seq();
+    let scanout = |_: &WlSurface, _: &SurfaceData| Some(output.clone());
+    let flags = |_: &WlSurface, _: &SurfaceData| wp_presentation_feedback::Kind::Vsync;
+
     if state.is_locked_or_abandoned() {
         if let Some(lock_surf) = state.session_lock.active_lock_surface_for_output(output) {
-            send_frames_surface_tree(lock_surf.wl_surface(), output, elapsed, throttle, |_, _| {
-                Some(output.clone())
-            });
+            send_frames_surface_tree(lock_surf.wl_surface(), output, elapsed, throttle, scanout);
+            take_presentation_feedback_surface_tree(
+                lock_surf.wl_surface(),
+                &mut output_feedback,
+                scanout,
+                flags,
+            );
         }
+        output_feedback.presented::<_, Monotonic>(
+            state.clock.now(),
+            refresh,
+            seq,
+            wp_presentation_feedback::Kind::Vsync,
+        );
         return;
     }
 
     for wl_surf in state.visible_physical_toplevel_surfaces_for_output(&output.name()) {
-        send_frames_surface_tree(&wl_surf, output, elapsed, throttle, |_, _| {
-            Some(output.clone())
-        });
+        send_frames_surface_tree(&wl_surf, output, elapsed, throttle, scanout);
+        take_presentation_feedback_surface_tree(&wl_surf, &mut output_feedback, scanout, flags);
+        for (popup, _) in PopupManager::popups_for_surface(&wl_surf) {
+            let popup_surf = popup.wl_surface();
+            send_frames_surface_tree(popup_surf, output, elapsed, throttle, scanout);
+            take_presentation_feedback_surface_tree(
+                popup_surf,
+                &mut output_feedback,
+                scanout,
+                flags,
+            );
+        }
     }
     let map = layer_map_for_output(output);
     for layer in map.layers() {
-        layer.send_frame(output, elapsed, throttle, |_, _| Some(output.clone()));
+        layer.send_frame(output, elapsed, throttle, scanout);
+        layer.take_presentation_feedback(&mut output_feedback, scanout, flags);
     }
     for (ime_surf, _) in state.ime_popup_render_targets(output) {
-        send_frames_surface_tree(&ime_surf, output, elapsed, throttle, |_, _| {
-            Some(output.clone())
-        });
+        send_frames_surface_tree(&ime_surf, output, elapsed, throttle, scanout);
+        take_presentation_feedback_surface_tree(&ime_surf, &mut output_feedback, scanout, flags);
     }
+
+    output_feedback.presented::<_, Monotonic>(
+        state.clock.now(),
+        refresh,
+        seq,
+        wp_presentation_feedback::Kind::Vsync,
+    );
 }
 
 /// Executes a complete single-frame render pass onto the Winit EGL swapchain (`Frame 1` & live updates).
@@ -609,6 +658,7 @@ pub(crate) fn toggle_ring0_preempt_takeover(state: &mut KomaState, trigger_label
     if let Some((ep, ev)) = maybe_broadcast {
         state.broadcast_workspace_event(koma_proto::EventTopic::WorkspaceLease, &ws_id, ep, ev);
     }
+    state.reconcile_keyboard_shortcuts_inhibitors();
     state.queue_redraw();
 }
 

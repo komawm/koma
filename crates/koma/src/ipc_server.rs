@@ -1514,6 +1514,7 @@ fn execute_zero_copy_capture_frame(
                     is_protected_surface: is_protected,
                     opacity: 1.0,
                     corner_radius: 0.0,
+                    clip_to_geometry: true,
                     wants_blur: false,
                     no_shadow: false,
                     border_color_override: None,

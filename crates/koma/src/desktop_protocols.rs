@@ -868,6 +868,21 @@ impl KomaState {
     #[must_use]
     pub fn surface_global_origin(&self, surface: &WlSurface) -> Option<Point<f64, Logical>> {
         let root = root_surface_of(surface);
+        if let Some(popup) = self.popups.find_popup(&root)
+            && let Ok(popup_root) = smithay::desktop::find_popup_root_surface(&popup)
+            && let Some(root_origin) = self.surface_global_origin(&popup_root)
+        {
+            for (candidate, offset) in
+                smithay::desktop::PopupManager::popups_for_surface(&popup_root)
+            {
+                if *candidate.wl_surface() == root {
+                    return Some(root_origin + (offset - candidate.geometry().loc).to_f64());
+                }
+            }
+            return Some(
+                root_origin + smithay::desktop::get_popup_toplevel_coords(&popup).to_f64(),
+            );
+        }
         if let Some(m) = self.mapped_windows.iter().find(|m| {
             !m.is_minimized && m.window.toplevel().is_some_and(|t| *t.wl_surface() == root)
         }) {

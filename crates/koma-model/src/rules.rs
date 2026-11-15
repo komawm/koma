@@ -259,3 +259,37 @@ impl ProtectedSurfaceClassifier {
         self.denylist_app_id.is_match(app_id)
     }
 }
+
+/// Returns `true` when `app_id` belongs to a Waydroid container or Android window
+/// (`Waydroid`, `waydroid.<android.package>`).
+#[must_use]
+pub fn is_waydroid_app_id(app_id: &str) -> bool {
+    let normalized = app_id.trim().to_ascii_lowercase();
+    normalized == "waydroid" || normalized.starts_with("waydroid.")
+}
+
+/// Returns `true` when `app_id` identifies an individual Waydroid multi-window Android app.
+#[must_use]
+pub fn is_waydroid_multiwindow_app_id(app_id: &str) -> bool {
+    app_id.trim().to_ascii_lowercase().starts_with("waydroid.")
+}
+
+#[cfg(test)]
+mod waydroid_rule_tests {
+    use super::{is_waydroid_app_id, is_waydroid_multiwindow_app_id};
+
+    #[test]
+    fn identifies_waydroid_full_ui_and_multiwindow_app_ids() {
+        assert!(is_waydroid_app_id("Waydroid"));
+        assert!(is_waydroid_app_id("waydroid"));
+        assert!(is_waydroid_app_id("waydroid.com.android.settings"));
+        assert!(!is_waydroid_app_id("firefox"));
+        assert!(!is_waydroid_app_id("waydroid-helper"));
+
+        assert!(!is_waydroid_multiwindow_app_id("Waydroid"));
+        assert!(is_waydroid_multiwindow_app_id(
+            "waydroid.com.android.settings"
+        ));
+        assert!(is_waydroid_multiwindow_app_id("WAYDROID.org.fdroid.fdroid"));
+    }
+}

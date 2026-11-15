@@ -7,7 +7,7 @@ use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
     ffi::OsString,
-    sync::Arc,
+    sync::{Arc, atomic::AtomicU64},
     time::{Duration, Instant},
 };
 
@@ -20,7 +20,7 @@ use koma_model::{
     LayoutMode, LogicalPoint, LogicalRect, LogicalViewport, OpenMode, OutputLayout,
     OutputTransform, PresentationTarget, SafeAreaInsets, SavedOutputConfig, WindowAnimationTable,
     WindowMatchContext, WindowRuleEngine, WorkspaceLeaseState, WorkspaceState,
-    WorkspaceTransitionTable,
+    WorkspaceTransitionTable, is_waydroid_app_id,
 };
 use koma_proto::{
     CapabilityToken, Epoch, EventTopic, OutputId, SeatId, TokenClaims, WindowId, WorkspaceEvent,
@@ -37,8 +37,8 @@ use smithay::{
         renderer::{ImportDma as _, gles::GlesRenderer, utils::with_renderer_surface_state},
     },
     desktop::{
-        LayerMap, PopupManager, Window, WindowSurfaceType, layer_map_for_output,
-        utils::under_from_surface_tree,
+        LayerMap, PopupKind, PopupManager, Window, WindowSurfaceType, find_popup_root_surface,
+        get_popup_toplevel_coords, layer_map_for_output, utils::under_from_surface_tree,
     },
     input::{Seat, SeatState, keyboard::XkbConfig, pointer::CursorImageStatus},
     output::{Output, Scale},
@@ -53,14 +53,16 @@ use smithay::{
         wayland_server::{
             DisplayHandle, Resource as _,
             backend::{ClientData, ClientId, DisconnectReason},
-            protocol::wl_surface::WlSurface,
+            protocol::{wl_shm, wl_surface::WlSurface},
         },
     },
-    utils::{IsAlive as _, Logical, Point, SERIAL_COUNTER, Size, Transform},
+    utils::{
+        Clock, IsAlive as _, Logical, Monotonic, Point, Rectangle, SERIAL_COUNTER, Size, Transform,
+    },
     wayland::{
         compositor::{
-            CompositorClientState, CompositorState, TraversalAction, get_parent, with_states,
-            with_surface_tree_downward,
+            CompositorClientState, CompositorState, RectangleKind, SurfaceAttributes,
+            TraversalAction, get_parent, with_states, with_surface_tree_downward,
         },
         cursor_shape::CursorShapeManagerState,
         dmabuf::DmabufState,
@@ -68,9 +70,11 @@ use smithay::{
         fractional_scale::{FractionalScaleManagerState, with_fractional_scale},
         idle_inhibit::IdleInhibitManagerState,
         idle_notify::IdleNotifierState,
+        keyboard_shortcuts_inhibit::{KeyboardShortcutsInhibitState, KeyboardShortcutsInhibitor},
         output::OutputManagerState,
         pointer_constraints::PointerConstraintsState,
         pointer_gestures::PointerGesturesState,
+        presentation::PresentationState,
         relative_pointer::RelativePointerManagerState,
         security_context::{SecurityContext, SecurityContextState},
         selection::{
@@ -83,13 +87,15 @@ use smithay::{
         shell::{
             wlr_layer::{KeyboardInteractivity, Layer, WlrLayerShellState},
             xdg::{
-                SurfaceCachedState, ToplevelSurface, XdgShellState, XdgToplevelSurfaceData,
-                decoration::XdgDecorationState,
+                PopupSurface, SurfaceCachedState, ToplevelSurface, XdgShellState,
+                XdgToplevelSurfaceData, decoration::XdgDecorationState,
             },
         },
         shm::ShmState,
+        single_pixel_buffer::SinglePixelBufferState,
         viewporter::ViewporterState,
         virtual_keyboard::VirtualKeyboardManagerState,
+        virtual_pointer::VirtualPointerManagerState,
         xdg_activation::{XdgActivationState, XdgActivationToken},
         xdg_toplevel_icon::XdgToplevelIconManager,
     },
@@ -134,7 +140,6 @@ use smithay::{
     input::touch::{
         DownEvent as TouchDownPayload, MotionEvent as TouchMotionPayload, UpEvent as TouchUpPayload,
     },
-    utils::Rectangle,
     wayland::{
         input_method::{InputMethodManagerState, PopupSurface as ImePopupSurface},
         text_input::{TextInputManagerState, TextInputSeat as _},
@@ -456,6 +461,40 @@ pub fn is_surface_mapped(surface: &WlSurface) -> bool {
     with_renderer_surface_state(surface, |state| state.buffer().is_some()).unwrap_or(false)
 }
 
+/// Returns `true` when `surface` has an explicitly committed empty `wl_region` input mask
+/// (`wl_surface.set_input_region`), allowing pointer clicks to pass through (`Waydroid` container).
+#[must_use]
+pub fn surface_has_empty_input_region(surface: &WlSurface) -> bool {
+    with_states(surface, |states| {
+        states
+            .cached_state
+            .get::<SurfaceAttributes>()
+            .current()
+            .input_region
+            .as_ref()
+            .is_some_and(|region| {
+                !region.rects.iter().any(|(kind, rect)| {
+                    matches!(kind, RectangleKind::Add) && rect.size.w > 0 && rect.size.h > 0
+                })
+            })
+    })
+}
+
+fn surfaces_share_root(a: &WlSurface, b: &WlSurface) -> bool {
+    if a == b {
+        return true;
+    }
+    let mut ra = a.clone();
+    while let Some(parent) = get_parent(&ra) {
+        ra = parent;
+    }
+    let mut rb = b.clone();
+    while let Some(parent) = get_parent(&rb) {
+        rb = parent;
+    }
+    ra == rb
+}
+
 /// Active Ring 0 display & input backend (`niri/src/backend/mod.rs` `Backend` enum).
 #[allow(clippy::large_enum_variant)] // Stored once on `KomaState`; avoids boxing churn across backend paths.
 pub enum ActiveBackend {
@@ -568,6 +607,8 @@ pub struct MappedWindow {
 
 pub struct KomaState {
     pub start_time: Instant,
+    pub clock: Clock<Monotonic>,
+    pub presentation_seq: AtomicU64,
     pub display_handle: DisplayHandle,
     pub loop_signal: LoopSignal,
     pub loop_handle: Option<LoopHandle<'static, Self>>,
@@ -633,6 +674,14 @@ pub struct KomaState {
     pub pointer_constraints_state: PointerConstraintsState,
     #[allow(dead_code)]
     pub relative_pointer_manager_state: RelativePointerManagerState,
+    #[allow(dead_code)]
+    pub single_pixel_buffer_state: SinglePixelBufferState,
+    #[allow(dead_code)]
+    pub presentation_state: PresentationState,
+    #[allow(dead_code)]
+    pub virtual_pointer_state: VirtualPointerManagerState,
+    pub keyboard_shortcuts_inhibit_state: KeyboardShortcutsInhibitState,
+    pub active_shortcuts_inhibitors: Vec<KeyboardShortcutsInhibitor>,
     pub screencopy_state: ScreencopyState,
     pub output_power_state: OutputPowerState,
     pub wlr_output_manager_state: WlrOutputManagerState,
@@ -718,7 +767,10 @@ impl KomaState {
         let session_lock_state =
             SessionLockManagerState::new::<Self, _>(&display_handle, client_is_unrestricted);
 
-        let shm_state = ShmState::new::<Self>(&display_handle, vec![]);
+        let shm_state = ShmState::new::<Self>(
+            &display_handle,
+            vec![wl_shm::Format::Abgr8888, wl_shm::Format::Xbgr8888],
+        );
         let output_manager_state = OutputManagerState::new_with_xdg_output::<Self>(&display_handle);
         let mut seat_state = SeatState::new();
         let data_device_state = DataDeviceState::new::<Self>(&display_handle);
@@ -764,6 +816,13 @@ impl KomaState {
         let pointer_constraints_state = PointerConstraintsState::new::<Self>(&display_handle);
         let relative_pointer_manager_state =
             RelativePointerManagerState::new::<Self>(&display_handle);
+        let clock = Clock::<Monotonic>::new();
+        let single_pixel_buffer_state = SinglePixelBufferState::new::<Self>(&display_handle);
+        let presentation_state = PresentationState::new::<Self>(&display_handle, clock.id() as u32);
+        let virtual_pointer_state =
+            VirtualPointerManagerState::new::<Self, _>(&display_handle, client_is_unrestricted);
+        let keyboard_shortcuts_inhibit_state =
+            KeyboardShortcutsInhibitState::new::<Self>(&display_handle);
         let screencopy_state = ScreencopyState::new(&display_handle);
         let output_power_state = OutputPowerState::new(&display_handle);
         let wlr_output_manager_state = WlrOutputManagerState::new(&display_handle);
@@ -802,6 +861,8 @@ impl KomaState {
 
         Self {
             start_time: Instant::now(),
+            clock,
+            presentation_seq: AtomicU64::new(0),
             display_handle,
             loop_signal,
             loop_handle: Some(loop_handle),
@@ -846,6 +907,11 @@ impl KomaState {
             idle_inhibitors: HashSet::new(),
             pointer_constraints_state,
             relative_pointer_manager_state,
+            single_pixel_buffer_state,
+            presentation_state,
+            virtual_pointer_state,
+            keyboard_shortcuts_inhibit_state,
+            active_shortcuts_inhibitors: Vec::new(),
             screencopy_state,
             output_power_state,
             wlr_output_manager_state,
@@ -2782,7 +2848,21 @@ impl KomaState {
                     && output_local.x <= f64::from(rect.x + rect.w as i32)
                     && output_local.y >= f64::from(rect.y)
                     && output_local.y <= f64::from(rect.y + rect.h as i32);
-                if in_frame && let Some(toplevel) = mapped.window.toplevel() {
+                let allow_frame_fallback = mapped.window.toplevel().is_some_and(|t| {
+                    let root = t.wl_surface();
+                    if surface_has_empty_input_region(root) {
+                        return false;
+                    }
+                    !is_surface_mapped(root)
+                        || local_pos.x < 0.0
+                        || local_pos.y < 0.0
+                        || local_pos.x >= f64::from(rect.w) - 2.0 * b_off
+                        || local_pos.y >= f64::from(rect.h) - 2.0 * b_off
+                });
+                if in_frame
+                    && allow_frame_fallback
+                    && let Some(toplevel) = mapped.window.toplevel()
+                {
                     return Some((win_id, ws_id, toplevel.wl_surface().clone(), global_origin));
                 }
             }
@@ -3130,6 +3210,24 @@ impl KomaState {
                     }
                 }
 
+                let is_waydroid = is_waydroid_app_id(&mapped.app_id);
+                let is_click_through = is_waydroid
+                    && mapped.window.toplevel().is_some_and(|t| {
+                        let root = t.wl_surface();
+                        is_surface_mapped(root) && surface_has_empty_input_region(root)
+                    });
+                let eff_no_blur = dyn_rules.no_blur.unwrap_or(is_waydroid);
+                let eff_clip_to_geometry =
+                    dyn_rules.clip_to_geometry.unwrap_or(true) && !is_click_through;
+                let mut eff_border = border_cfg.clone();
+                let mut eff_focus_ring = focus_ring_cfg.clone();
+                let mut eff_shadow = shadow_cfg.clone();
+                if is_click_through {
+                    eff_border.enabled = false;
+                    eff_focus_ring.enabled = false;
+                    eff_shadow.enabled = false;
+                }
+
                 items.push(WindowSceneItem {
                     window: &mapped.window,
                     rect: render_rect,
@@ -3139,18 +3237,27 @@ impl KomaState {
                     is_protected_surface: is_protected,
                     opacity: eff_opacity,
                     corner_radius,
-                    wants_blur: blur_enabled && !is_fs && !dyn_rules.no_blur.unwrap_or(false),
-                    no_shadow: dyn_rules.no_shadow.unwrap_or(false),
-                    border_color_override: dyn_rules.border_color,
+                    clip_to_geometry: eff_clip_to_geometry,
+                    wants_blur: blur_enabled && !is_fs && !is_click_through && !eff_no_blur,
+                    no_shadow: is_click_through || dyn_rules.no_shadow.unwrap_or(false),
+                    border_color_override: if is_click_through {
+                        None
+                    } else {
+                        dyn_rules.border_color
+                    },
                     gradient_time_ms: if is_screencast_or_agent_capture || is_agent_ws {
                         0
                     } else {
                         now_ms
                     },
-                    border: border_cfg.clone(),
-                    focus_ring: focus_ring_cfg.clone(),
-                    shadow: shadow_cfg.clone(),
-                    dim: dim_cfg,
+                    border: eff_border,
+                    focus_ring: eff_focus_ring,
+                    shadow: eff_shadow,
+                    dim: if is_click_through {
+                        Default::default()
+                    } else {
+                        dim_cfg
+                    },
                 });
             }
         }
@@ -3290,6 +3397,179 @@ impl KomaState {
             text_input.set_focus(None);
         }
         self.ime_popups.clear();
+        self.reconcile_keyboard_shortcuts_inhibitors();
+    }
+
+    #[must_use]
+    pub fn is_bare_metal_tty(&self) -> bool {
+        match self.backend {
+            Some(ActiveBackend::Winit(_)) | None => false,
+            #[cfg(feature = "smithay-tty")]
+            Some(ActiveBackend::Tty(_)) => true,
+        }
+    }
+
+    #[must_use]
+    pub fn next_presentation_seq(&self) -> u64 {
+        self.presentation_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Unconstrains an `xdg_popup` relative to its root toplevel window or `wlr_layer_shell` panel.
+    pub fn unconstrain_xdg_popup(&self, popup: &PopupSurface) {
+        let kind = PopupKind::Xdg(popup.clone());
+        let Ok(root) = find_popup_root_surface(&kind) else {
+            return;
+        };
+
+        let mut target: Option<(Rectangle<i32, Logical>, Point<i32, Logical>)> = None;
+
+        if let Some(m) = self
+            .mapped_windows
+            .iter()
+            .find(|m| m.window.toplevel().is_some_and(|t| *t.wl_surface() == root))
+        {
+            let ws_origin = self.workspace_output_origin(&m.ws_id);
+            let vis_rect = self
+                .workspaces
+                .get(&m.ws_id)
+                .and_then(|ws| {
+                    ws.compute_visible_geometries_at(self.elapsed_ms())
+                        .into_iter()
+                        .find(|(id, _, _)| *id == m.win_id)
+                        .map(|(_, rect, _)| rect)
+                })
+                .unwrap_or(m.rect);
+            let output_rect = self
+                .workspaces
+                .get(&m.ws_id)
+                .and_then(|ws| match &ws.presentation {
+                    PresentationTarget::Physical(id) => {
+                        self.all_outputs().into_iter().find(|o| o.name() == id.0)
+                    }
+                    PresentationTarget::Offscreen { .. } => None,
+                })
+                .or_else(|| {
+                    self.output_at_point_strict(
+                        Point::from((f64::from(vis_rect.x), f64::from(vis_rect.y))) + ws_origin,
+                    )
+                })
+                .or_else(|| self.primary_output())
+                .map(|o| self.output_logical_rect(&o))
+                .unwrap_or_else(|| {
+                    let vp = self
+                        .workspaces
+                        .get(&m.ws_id)
+                        .map(|ws| ws.viewport)
+                        .unwrap_or_default();
+                    Rectangle::from_size((vp.width as i32, vp.height as i32).into())
+                });
+            let is_fs = self
+                .workspaces
+                .get(&m.ws_id)
+                .is_some_and(|ws| ws.fullscreen_window == Some(m.win_id));
+            let border_w = if is_fs {
+                0
+            } else {
+                let border_cfg = &self.lua_sandbox.config_snapshot().appearance.border;
+                if border_cfg.enabled {
+                    border_cfg.width.round() as i32
+                } else {
+                    0
+                }
+            };
+            let root_global_loc = Point::from((
+                ws_origin.x.round() as i32 + vis_rect.x + border_w,
+                ws_origin.y.round() as i32 + vis_rect.y + border_w,
+            ));
+            target = Some((output_rect, root_global_loc));
+        }
+
+        if target.is_none() {
+            for output in self.all_outputs() {
+                let map = layer_map_for_output(&output);
+                if let Some(layer) = map.layer_for_surface(&root, WindowSurfaceType::TOPLEVEL)
+                    && let Some(layer_geo) = map.layer_geometry(layer)
+                {
+                    let output_rect = self.output_logical_rect(&output);
+                    let root_global_loc = output_rect.loc + layer_geo.loc;
+                    target = Some((output_rect, root_global_loc));
+                    break;
+                }
+            }
+        }
+
+        let Some((mut constraint_rect, root_global_loc)) = target else {
+            return;
+        };
+        constraint_rect.loc -= root_global_loc;
+        constraint_rect.loc -= get_popup_toplevel_coords(&kind);
+
+        popup.with_pending_state(|state| {
+            state.geometry = state.positioner.get_unconstrained_geometry(constraint_rect);
+        });
+    }
+
+    /// Reconciles active `zwp_keyboard_shortcuts_inhibitor_v1` instances against lock/preempt/focus.
+    pub fn reconcile_keyboard_shortcuts_inhibitors(&mut self) {
+        let focused = self.seat.get_keyboard().and_then(|kb| kb.current_focus());
+        self.reconcile_keyboard_shortcuts_inhibitors_with_focus(focused.as_ref());
+    }
+
+    /// Reconciles keyboard shortcuts inhibitors using an explicit focused surface without
+    /// re-locking Smithay's `KeyboardHandle` internal mutex (required inside `focus_changed`).
+    pub fn reconcile_keyboard_shortcuts_inhibitors_with_focus(
+        &mut self,
+        focused: Option<&WlSurface>,
+    ) {
+        self.active_shortcuts_inhibitors
+            .retain(|inh| inh.wl_surface().alive());
+        let locked = self.is_locked_or_abandoned();
+        let active_ws_id = self.effective_interactive_ws_id();
+        let human_preempted = self
+            .workspaces
+            .get(&active_ws_id)
+            .is_some_and(|ws| ws.lease.is_human_preempted());
+
+        for inhibitor in &self.active_shortcuts_inhibitors {
+            let inh_surf = inhibitor.wl_surface();
+            let restricted = is_surface_from_restricted_client(self, inh_surf);
+            let matches_focus = focused.is_some_and(|f| surfaces_share_root(f, inh_surf));
+            let should_activate = !locked && !human_preempted && !restricted && matches_focus;
+            if should_activate {
+                if !inhibitor.is_active() {
+                    inhibitor.activate();
+                }
+            } else if inhibitor.is_active() {
+                inhibitor.inactivate();
+            }
+        }
+    }
+
+    #[must_use]
+    pub fn are_shortcuts_inhibited_for_focused_surface(&self) -> bool {
+        if self.is_locked_or_abandoned() {
+            return false;
+        }
+        let active_ws_id = self.effective_interactive_ws_id();
+        if self
+            .workspaces
+            .get(&active_ws_id)
+            .is_some_and(|ws| ws.lease.is_human_preempted())
+        {
+            return false;
+        }
+        let Some(focused) = self.seat.get_keyboard().and_then(|kb| kb.current_focus()) else {
+            return false;
+        };
+        if is_surface_from_restricted_client(self, &focused) {
+            return false;
+        }
+        self.active_shortcuts_inhibitors.iter().any(|inh| {
+            inh.wl_surface().alive()
+                && inh.is_active()
+                && surfaces_share_root(&focused, inh.wl_surface())
+        })
     }
 
     /// Prunes destroyed IME popup handles alongside XDG popups during event-loop cleanup.

@@ -235,5 +235,16 @@ koma.rule.window({
     block_out_from = "all",
 })
 
+-- Optional desktop widgets (Waybar / Ironbar / Quickshell), RustDesk (uses
+-- `zwlr_virtual_pointer_manager_v1` + `zwp_keyboard_shortcuts_inhibit_v1`),
+-- and clean Waydroid Android window framing (`no_blur = true` is already automatic):
+-- koma.exec_once({ "waybar" }) -- or { "ironbar" } / { "quickshell" }
+koma.rule.window({
+    name = "waydroid-android-apps",
+    matches = { { app_id = "^waydroid(\\..*)?$" } },
+    no_blur = true,
+    clip_to_geometry = true,
+})
+
 
 koma.bind("Mod + W", koma.act.scrolling.toggle_column_tabbed_display(), { desc = "Toggle Scrolling column Tabbed / Split mode" })

@@ -105,6 +105,9 @@ done
 if [[ "$target" != "$host_target" ]]; then
     build_args+=(--target "$target")
 fi
+if [[ "$target" == "aarch64-unknown-linux-gnu" ]]; then
+    export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS="${CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS:+$CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS }-C link-arg=-Wl,-z,max-page-size=16384 -C link-arg=-Wl,-z,common-page-size=16384"
+fi
 cargo "${build_args[@]}"
 
 target_dir="${CARGO_TARGET_DIR:-${repo_root}/target}"

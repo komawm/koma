@@ -7,11 +7,21 @@ use rustix::fs::{OFlags, fcntl_setfl};
 use smithay::{
     backend::{
         allocator::dmabuf::Dmabuf,
-        input::{InputEvent, TabletToolDescriptor},
+        input::{
+            AbsolutePositionEvent as _, Event as _, InputEvent, PointerButtonEvent as _,
+            PointerMotionEvent as _, TabletToolDescriptor,
+        },
         renderer::utils::on_commit_buffer_handler,
     },
-    desktop::{LayerSurface, PopupKind, Window, WindowSurfaceType, layer_map_for_output},
-    input::{Seat, SeatHandler, SeatState, pointer::CursorImageStatus, tablet::TabletSeatHandler},
+    desktop::{
+        LayerSurface, PopupKeyboardGrab, PopupKind, PopupPointerGrab, PopupUngrabStrategy, Window,
+        WindowSurfaceType, find_popup_root_surface, layer_map_for_output,
+    },
+    input::{
+        Seat, SeatHandler, SeatState,
+        pointer::{CursorImageStatus, Focus},
+        tablet::TabletSeatHandler,
+    },
     output::Output,
     reexports::{
         wayland_protocols::xdg::{
@@ -25,7 +35,7 @@ use smithay::{
             },
         },
     },
-    utils::{SERIAL_COUNTER, Serial},
+    utils::{IsAlive as _, SERIAL_COUNTER, Serial},
     wayland::{
         buffer::BufferHandler,
         compositor::{
@@ -34,6 +44,10 @@ use smithay::{
         },
         dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier},
         fractional_scale::{FractionalScaleHandler, with_fractional_scale},
+        keyboard_shortcuts_inhibit::{
+            KeyboardShortcutsInhibitHandler, KeyboardShortcutsInhibitState,
+            KeyboardShortcutsInhibitor,
+        },
         output::OutputHandler,
         selection::{
             SelectionHandler, SelectionTarget,
@@ -61,6 +75,7 @@ use smithay::{
         },
         shm::{ShmHandler, ShmState},
         virtual_keyboard::{VirtualKeyboardBackend, VirtualKeyboardHandler},
+        virtual_pointer::{VirtualPointerBackend, VirtualPointerHandler},
     },
 };
 use tracing::{info, warn};
@@ -105,7 +120,14 @@ impl CompositorHandler for KomaState {
 
         // 2. Track popup state commits & reset active workspace damage-settle timer
         self.popups.commit(surface);
+        self.popups.cleanup();
         self.cleanup_ime_popups();
+        if let Some(PopupKind::Xdg(ref popup)) = self.popups.find_popup(surface)
+            && !popup.is_initial_configure_sent()
+        {
+            self.unconstrain_xdg_popup(popup);
+            let _ = popup.send_configure();
+        }
 
         if let Some(ime_popup) = self
             .ime_popups
@@ -158,6 +180,7 @@ impl CompositorHandler for KomaState {
                 }
             }
             self.reconcile_keyboard_focus();
+            self.reconcile_keyboard_shortcuts_inhibitors();
             self.reconcile_idle_inhibitors();
             self.maybe_activate_pointer_constraint();
             self.queue_redraw();
@@ -186,6 +209,7 @@ impl CompositorHandler for KomaState {
                 self.sync_output_workarea(&output);
             }
             self.reconcile_keyboard_focus();
+            self.reconcile_keyboard_shortcuts_inhibitors();
             self.reconcile_idle_inhibitors();
             self.maybe_activate_pointer_constraint();
             self.queue_redraw();
@@ -360,13 +384,58 @@ impl XdgShellHandler for KomaState {
     }
 
     fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {
+        self.unconstrain_xdg_popup(&surface);
         if let Err(err) = self.popups.track_popup(PopupKind::Xdg(surface)) {
             warn!("failed tracking xdg_popup: {err:?}");
         }
         self.queue_redraw();
     }
 
-    fn grab(&mut self, _surface: PopupSurface, _seat: WlSeat, _serial: Serial) {}
+    fn grab(&mut self, surface: PopupSurface, seat: WlSeat, serial: Serial) {
+        let Some(seat) = Seat::<Self>::from_resource(&seat) else {
+            return;
+        };
+        let kind = PopupKind::Xdg(surface);
+        let Ok(root) = find_popup_root_surface(&kind) else {
+            return;
+        };
+        let root_in_tree = self
+            .mapped_windows
+            .iter()
+            .any(|m| m.window.toplevel().is_some_and(|t| *t.wl_surface() == root))
+            || self.all_outputs().into_iter().any(|o| {
+                layer_map_for_output(&o)
+                    .layer_for_surface(&root, WindowSurfaceType::TOPLEVEL)
+                    .is_some()
+            });
+        if !root_in_tree {
+            return;
+        }
+        if let Ok(mut grab) = self.popups.grab_popup(root, kind, &seat, serial) {
+            if let Some(keyboard) = seat.get_keyboard() {
+                if keyboard.is_grabbed()
+                    && !(keyboard.has_grab(serial)
+                        || keyboard.has_grab(grab.previous_serial().unwrap_or(serial)))
+                {
+                    grab.ungrab(PopupUngrabStrategy::All);
+                    return;
+                }
+                keyboard.set_focus(self, grab.current_grab(), serial);
+                keyboard.set_grab(self, PopupKeyboardGrab::new(&grab), serial);
+            }
+            if let Some(pointer) = seat.get_pointer() {
+                if pointer.is_grabbed()
+                    && !(pointer.has_grab(serial)
+                        || pointer
+                            .has_grab(grab.previous_serial().unwrap_or_else(|| grab.serial())))
+                {
+                    grab.ungrab(PopupUngrabStrategy::All);
+                    return;
+                }
+                pointer.set_grab(self, PopupPointerGrab::new(&grab), serial, Focus::Keep);
+            }
+        }
+    }
 
     fn move_request(&mut self, surface: ToplevelSurface, _seat: WlSeat, serial: Serial) {
         let wl_surface = surface.wl_surface();
@@ -444,10 +513,13 @@ impl XdgShellHandler for KomaState {
     fn reposition_request(
         &mut self,
         surface: PopupSurface,
-        _positioner: PositionerState,
+        positioner: PositionerState,
         token: u32,
     ) {
+        surface.with_pending_state(|s| s.positioner = positioner);
+        self.unconstrain_xdg_popup(&surface);
         surface.send_repositioned(token);
+        let _ = surface.send_configure();
         self.queue_redraw();
     }
 
@@ -507,6 +579,7 @@ impl XdgShellHandler for KomaState {
     }
 
     fn parent_changed(&mut self, _surface: ToplevelSurface) {
+        self.reconcile_keyboard_shortcuts_inhibitors();
         self.sync_foreign_toplevels();
     }
 
@@ -650,6 +723,7 @@ impl SeatHandler for KomaState {
                 self.break_active_pointer_constraints();
             }
         }
+        self.reconcile_keyboard_shortcuts_inhibitors_with_focus(focused);
         self.sync_foreign_toplevels();
     }
 
@@ -726,6 +800,7 @@ impl SessionLockHandler for KomaState {
             confirmation.lock();
             info!("host Wayland session locked via ext-session-lock-v1");
             self.reconcile_keyboard_focus();
+            self.reconcile_keyboard_shortcuts_inhibitors();
             self.reconcile_idle_inhibitors();
             self.sync_foreign_toplevels();
             self.queue_redraw();
@@ -739,6 +814,7 @@ impl SessionLockHandler for KomaState {
             self.focused_ondemand_layer = None;
             info!("host Wayland session unlocked");
             self.reconcile_keyboard_focus();
+            self.reconcile_keyboard_shortcuts_inhibitors();
             self.flush_deferred_xdg_activations();
             self.reconcile_idle_inhibitors();
             self.sync_foreign_toplevels();
@@ -948,6 +1024,18 @@ impl WlrLayerShellHandler for KomaState {
         self.reconcile_keyboard_focus();
         self.queue_redraw();
     }
+
+    fn new_popup(&mut self, _parent: WlrLayerSurface, popup: PopupSurface) {
+        if crate::security_context::is_surface_from_restricted_client(self, popup.wl_surface()) {
+            popup.send_popup_done();
+            return;
+        }
+        self.unconstrain_xdg_popup(&popup);
+        if let Err(err) = self.popups.track_popup(PopupKind::Xdg(popup)) {
+            warn!("failed tracking layer xdg_popup: {err:?}");
+        }
+        self.queue_redraw();
+    }
 }
 
 impl TabletSeatHandler for KomaState {
@@ -1018,6 +1106,83 @@ impl smithay::wayland::text_input::TextInputActivation for KomaState {
             self.clear_ime_state_for_lock();
         }
         self.queue_redraw();
+    }
+}
+
+impl VirtualPointerHandler for KomaState {
+    fn process_virtual_pointer_event(&mut self, event: InputEvent<VirtualPointerBackend>) {
+        self.reconcile_session_lock();
+        if self.is_locked_or_abandoned() {
+            return;
+        }
+        let is_bare_metal_tty = self.is_bare_metal_tty();
+        match event {
+            InputEvent::PointerMotion { event } => {
+                self.handle_pointer_relative_motion(
+                    event.delta(),
+                    event.delta_unaccel(),
+                    event.time(),
+                );
+            }
+            InputEvent::PointerMotionAbsolute { event } => {
+                let target_output = event
+                    .device()
+                    .output()
+                    .or_else(|| {
+                        self.focused_output_name.as_deref().and_then(|name| {
+                            self.all_outputs().into_iter().find(|o| o.name() == name)
+                        })
+                    })
+                    .or_else(|| self.primary_output());
+                let out_rect = target_output
+                    .as_ref()
+                    .map(|o| self.output_logical_rect(o))
+                    .unwrap_or_else(|| smithay::utils::Rectangle::from_size((1920, 1080).into()));
+                let target_pos = event.position_transformed(out_rect.size) + out_rect.loc.to_f64();
+                self.handle_pointer_absolute_motion(target_pos, event.time());
+            }
+            InputEvent::PointerButton { event } => {
+                crate::keybind_dispatcher::process_pointer_button_event(
+                    self,
+                    event.button_code(),
+                    event.state(),
+                    event.time(),
+                    is_bare_metal_tty,
+                );
+            }
+            InputEvent::PointerAxis { event } => {
+                crate::keybind_dispatcher::process_pointer_axis_event::<VirtualPointerBackend>(
+                    self,
+                    &event,
+                    is_bare_metal_tty,
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
+impl KeyboardShortcutsInhibitHandler for KomaState {
+    fn keyboard_shortcuts_inhibit_state(&mut self) -> &mut KeyboardShortcutsInhibitState {
+        &mut self.keyboard_shortcuts_inhibit_state
+    }
+
+    fn new_inhibitor(&mut self, inhibitor: KeyboardShortcutsInhibitor) {
+        if crate::security_context::is_surface_from_restricted_client(self, inhibitor.wl_surface())
+        {
+            warn!("ignored zwp_keyboard_shortcuts_inhibitor_v1 from restricted sandbox client");
+            return;
+        }
+        if !self.active_shortcuts_inhibitors.contains(&inhibitor) {
+            self.active_shortcuts_inhibitors.push(inhibitor);
+        }
+        self.reconcile_keyboard_shortcuts_inhibitors();
+    }
+
+    fn inhibitor_destroyed(&mut self, inhibitor: KeyboardShortcutsInhibitor) {
+        self.active_shortcuts_inhibitors
+            .retain(|i| i != &inhibitor && i.wl_surface().alive());
+        self.reconcile_keyboard_shortcuts_inhibitors();
     }
 }
 

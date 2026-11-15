@@ -2366,3 +2366,910 @@ fn screencopy_v1_emits_single_buffer_event_and_ready() {
     buf.destroy();
     pool.destroy();
 }
+
+mod kom_0024_compat_tests {
+    use super::*;
+    use koma_proto::WindowId;
+    use smithay::{
+        backend::input::{InputTime, KeyState},
+        desktop::{PopupManager, layer_map_for_output},
+        input::keyboard::Keycode,
+        reexports::wayland_protocols::wp::{
+            keyboard_shortcuts_inhibit::zv1::client::{
+                zwp_keyboard_shortcuts_inhibit_manager_v1, zwp_keyboard_shortcuts_inhibitor_v1,
+            },
+            presentation_time::client::{wp_presentation, wp_presentation_feedback},
+            single_pixel_buffer::v1::client::wp_single_pixel_buffer_manager_v1,
+        },
+        reexports::wayland_protocols::xdg::shell::client::{xdg_popup, xdg_positioner},
+    };
+    use std::collections::BTreeMap;
+    use wayland_client::{Connection, Dispatch, EventQueue, WEnum, delegate_noop};
+    use wayland_protocols_wlr::virtual_pointer::v1::client::{
+        zwlr_virtual_pointer_manager_v1, zwlr_virtual_pointer_v1,
+    };
+
+    #[derive(Default)]
+    struct CompatHarness {
+        sync_done: bool,
+        globals: BTreeMap<String, (u32, u32)>,
+        shm_formats: Vec<wl_shm::Format>,
+        compositor: Option<wl_compositor::WlCompositor>,
+        shm: Option<wl_shm::WlShm>,
+        wm_base: Option<xdg_wm_base::XdgWmBase>,
+        seats: Vec<wl_seat::WlSeat>,
+        outputs: Vec<wl_output::WlOutput>,
+        xdg_surface_configures: usize,
+        popup_configures: Vec<(i32, i32, i32, i32)>,
+        layer_configures: usize,
+        presentation_presented: usize,
+        presentation_discarded: usize,
+        presentation_sync_outputs: usize,
+        inhibitor_active: usize,
+        inhibitor_inactive: usize,
+        keyboard_keys: Vec<u32>,
+        pointer_motions: usize,
+        pointer_buttons: Vec<(u32, wl_pointer::ButtonState)>,
+    }
+
+    impl CompatHarness {
+        fn connect(
+            display: &Display<KomaState>,
+            restricted: bool,
+        ) -> (Connection, EventQueue<Self>, Self, wl_registry::WlRegistry) {
+            let (server_sock, client_sock) = UnixStream::pair().expect("UnixStream::pair");
+            display
+                .handle()
+                .insert_client(
+                    server_sock,
+                    Arc::new(ClientState {
+                        restricted,
+                        ..Default::default()
+                    }),
+                )
+                .expect("insert client");
+            let conn = Connection::from_socket(client_sock).expect("Connection::from_socket");
+            let queue = conn.new_event_queue::<Self>();
+            let qh = queue.handle();
+            let registry = conn.display().get_registry(&qh, ());
+            (conn, queue, Self::default(), registry)
+        }
+
+        fn bind<I: wayland_client::Proxy + 'static>(
+            &self,
+            registry: &wl_registry::WlRegistry,
+            qh: &wayland_client::QueueHandle<Self>,
+            interface: &str,
+        ) -> I
+        where
+            Self: Dispatch<I, ()>,
+        {
+            let (name, version) = self
+                .globals
+                .get(interface)
+                .copied()
+                .unwrap_or_else(|| panic!("missing global {interface}"));
+            registry.bind::<I, (), Self>(name, version, qh, ())
+        }
+    }
+
+    struct CompatEnv {
+        event_loop: EventLoop<'static, KomaState>,
+        display: Display<KomaState>,
+        state: KomaState,
+        output: Output,
+        _output_global: smithay::reexports::wayland_server::backend::GlobalId,
+        conn: Connection,
+        queue: EventQueue<CompatHarness>,
+        client: CompatHarness,
+        registry: wl_registry::WlRegistry,
+    }
+
+    impl CompatEnv {
+        fn new(restricted: bool) -> Self {
+            let (mut event_loop, mut display, mut state) = make_headless_test_state();
+            let output = test_output("DP-1");
+            let output_global = output.create_global::<KomaState>(&state.display_handle);
+            state.test_outputs.push(output.clone());
+            let (conn, mut queue, mut client, registry) =
+                CompatHarness::connect(&display, restricted);
+            Self::pump_with(
+                &conn,
+                &mut queue,
+                &mut client,
+                &mut display,
+                &mut event_loop,
+                &mut state,
+            );
+            // Second pump receives initial events (e.g. `wl_shm.format`, `wl_seat.capabilities`)
+            // emitted by globals bound during the initial registry enumeration above.
+            Self::pump_with(
+                &conn,
+                &mut queue,
+                &mut client,
+                &mut display,
+                &mut event_loop,
+                &mut state,
+            );
+            Self {
+                event_loop,
+                display,
+                state,
+                output,
+                _output_global: output_global,
+                conn,
+                queue,
+                client,
+                registry,
+            }
+        }
+
+        fn pump_with(
+            conn: &Connection,
+            queue: &mut EventQueue<CompatHarness>,
+            client: &mut CompatHarness,
+            display: &mut Display<KomaState>,
+            event_loop: &mut EventLoop<'static, KomaState>,
+            state: &mut KomaState,
+        ) {
+            let qh = queue.handle();
+            client.sync_done = false;
+            let _cb = conn.display().sync(&qh, ());
+            conn.flush().expect("flush client");
+            for _ in 0..16 {
+                display
+                    .dispatch_clients(state)
+                    .expect("dispatch server clients");
+                event_loop
+                    .dispatch(Some(Duration::ZERO), state)
+                    .expect("dispatch calloop");
+                display.flush_clients().expect("flush server clients");
+                if let Some(guard) = queue.prepare_read() {
+                    let _ = guard.read();
+                }
+                queue
+                    .dispatch_pending(client)
+                    .expect("dispatch client pending");
+                conn.flush().expect("flush client post-dispatch");
+                if client.sync_done {
+                    break;
+                }
+            }
+            assert!(client.sync_done, "CompatEnv pump did not complete sync");
+        }
+
+        fn pump(&mut self) {
+            Self::pump_with(
+                &self.conn,
+                &mut self.queue,
+                &mut self.client,
+                &mut self.display,
+                &mut self.event_loop,
+                &mut self.state,
+            );
+        }
+
+        fn ensure_globals(
+            &mut self,
+        ) -> (
+            wl_compositor::WlCompositor,
+            xdg_wm_base::XdgWmBase,
+            wl_shm::WlShm,
+        ) {
+            let qh = self.queue.handle();
+            let comp = self.client.compositor.clone().unwrap_or_else(|| {
+                self.client.bind::<wl_compositor::WlCompositor>(
+                    &self.registry,
+                    &qh,
+                    "wl_compositor",
+                )
+            });
+            self.client.compositor = Some(comp.clone());
+            let wm = self.client.wm_base.clone().unwrap_or_else(|| {
+                self.client
+                    .bind::<xdg_wm_base::XdgWmBase>(&self.registry, &qh, "xdg_wm_base")
+            });
+            self.client.wm_base = Some(wm.clone());
+            let shm = self.client.shm.clone().unwrap_or_else(|| {
+                self.client
+                    .bind::<wl_shm::WlShm>(&self.registry, &qh, "wl_shm")
+            });
+            self.client.shm = Some(shm.clone());
+            (comp, wm, shm)
+        }
+
+        fn spawn_window(
+            &mut self,
+            title: &str,
+            app_id: &str,
+            empty_input_region: bool,
+        ) -> (
+            wl_surface::WlSurface,
+            xdg_surface::XdgSurface,
+            xdg_toplevel::XdgToplevel,
+            WindowId,
+        ) {
+            let qh = self.queue.handle();
+            let (comp, wm, shm) = self.ensure_globals();
+            let surface = comp.create_surface(&qh, ());
+            let xdg_surface = wm.get_xdg_surface(&surface, &qh, ());
+            let toplevel = xdg_surface.get_toplevel(&qh, ());
+            toplevel.set_title(title.to_owned());
+            toplevel.set_app_id(app_id.to_owned());
+            surface.commit();
+            self.pump();
+
+            if empty_input_region {
+                let empty_region = comp.create_region(&qh, ());
+                surface.set_input_region(Some(&empty_region));
+                empty_region.destroy();
+            }
+
+            let shm_fd = create_portable_shm_fd(64 * 64 * 4, None);
+            let pool = shm.create_pool(shm_fd.as_fd(), 64 * 64 * 4, &qh, ());
+            let buf = pool.create_buffer(0, 64, 64, 64 * 4, wl_shm::Format::Argb8888, &qh, ());
+            surface.attach(Some(&buf), 0, 0);
+            surface.commit();
+            self.pump();
+
+            buf.destroy();
+            pool.destroy();
+            let win_id = self
+                .state
+                .mapped_windows
+                .last()
+                .expect("mapped window")
+                .win_id;
+            (surface, xdg_surface, toplevel, win_id)
+        }
+    }
+
+    impl Dispatch<wl_registry::WlRegistry, ()> for CompatHarness {
+        fn event(
+            state: &mut Self,
+            registry: &wl_registry::WlRegistry,
+            event: wl_registry::Event,
+            _: &(),
+            _: &Connection,
+            qh: &wayland_client::QueueHandle<Self>,
+        ) {
+            if let wl_registry::Event::Global {
+                name,
+                interface,
+                version,
+            } = event
+            {
+                match interface.as_str() {
+                    "wl_output" => {
+                        let out = registry.bind::<wl_output::WlOutput, (), Self>(
+                            name,
+                            version.min(4),
+                            qh,
+                            (),
+                        );
+                        state.outputs.push(out);
+                    }
+                    "wl_seat" => {
+                        let seat = registry.bind::<wl_seat::WlSeat, (), Self>(
+                            name,
+                            version.min(9),
+                            qh,
+                            (),
+                        );
+                        let _ = seat.get_pointer(qh, ());
+                        let _ = seat.get_keyboard(qh, ());
+                        state.seats.push(seat);
+                    }
+                    "wl_shm" => {
+                        let shm =
+                            registry.bind::<wl_shm::WlShm, (), Self>(name, version.min(2), qh, ());
+                        state.shm = Some(shm);
+                    }
+                    _ => {}
+                }
+                state.globals.insert(interface, (name, version));
+            }
+        }
+    }
+
+    impl Dispatch<wl_shm::WlShm, ()> for CompatHarness {
+        fn event(
+            state: &mut Self,
+            _: &wl_shm::WlShm,
+            event: wl_shm::Event,
+            _: &(),
+            _: &Connection,
+            _: &wayland_client::QueueHandle<Self>,
+        ) {
+            if let wl_shm::Event::Format {
+                format: WEnum::Value(fmt),
+            } = event
+            {
+                state.shm_formats.push(fmt);
+            }
+        }
+    }
+
+    impl Dispatch<wl_callback::WlCallback, ()> for CompatHarness {
+        fn event(
+            state: &mut Self,
+            _: &wl_callback::WlCallback,
+            event: wl_callback::Event,
+            _: &(),
+            _: &Connection,
+            _: &wayland_client::QueueHandle<Self>,
+        ) {
+            if matches!(event, wl_callback::Event::Done { .. }) {
+                state.sync_done = true;
+            }
+        }
+    }
+
+    impl Dispatch<xdg_wm_base::XdgWmBase, ()> for CompatHarness {
+        fn event(
+            _: &mut Self,
+            wm: &xdg_wm_base::XdgWmBase,
+            event: xdg_wm_base::Event,
+            _: &(),
+            _: &Connection,
+            _: &wayland_client::QueueHandle<Self>,
+        ) {
+            if let xdg_wm_base::Event::Ping { serial } = event {
+                wm.pong(serial);
+            }
+        }
+    }
+
+    impl Dispatch<xdg_surface::XdgSurface, ()> for CompatHarness {
+        fn event(
+            state: &mut Self,
+            xdg_surface: &xdg_surface::XdgSurface,
+            event: xdg_surface::Event,
+            _: &(),
+            _: &Connection,
+            _: &wayland_client::QueueHandle<Self>,
+        ) {
+            if let xdg_surface::Event::Configure { serial } = event {
+                xdg_surface.ack_configure(serial);
+                state.xdg_surface_configures += 1;
+            }
+        }
+    }
+
+    impl Dispatch<xdg_popup::XdgPopup, ()> for CompatHarness {
+        fn event(
+            state: &mut Self,
+            _: &xdg_popup::XdgPopup,
+            event: xdg_popup::Event,
+            _: &(),
+            _: &Connection,
+            _: &wayland_client::QueueHandle<Self>,
+        ) {
+            if let xdg_popup::Event::Configure {
+                x,
+                y,
+                width,
+                height,
+            } = event
+            {
+                state.popup_configures.push((x, y, width, height));
+            }
+        }
+    }
+
+    impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, ()> for CompatHarness {
+        fn event(
+            state: &mut Self,
+            surface: &zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
+            event: zwlr_layer_surface_v1::Event,
+            _: &(),
+            _: &Connection,
+            _: &wayland_client::QueueHandle<Self>,
+        ) {
+            if let zwlr_layer_surface_v1::Event::Configure { serial, .. } = event {
+                state.layer_configures += 1;
+                surface.ack_configure(serial);
+            }
+        }
+    }
+
+    impl Dispatch<wp_presentation::WpPresentation, ()> for CompatHarness {
+        fn event(
+            _: &mut Self,
+            _: &wp_presentation::WpPresentation,
+            _: wp_presentation::Event,
+            _: &(),
+            _: &Connection,
+            _: &wayland_client::QueueHandle<Self>,
+        ) {
+        }
+    }
+
+    impl Dispatch<wp_presentation_feedback::WpPresentationFeedback, ()> for CompatHarness {
+        fn event(
+            state: &mut Self,
+            _: &wp_presentation_feedback::WpPresentationFeedback,
+            event: wp_presentation_feedback::Event,
+            _: &(),
+            _: &Connection,
+            _: &wayland_client::QueueHandle<Self>,
+        ) {
+            match event {
+                wp_presentation_feedback::Event::SyncOutput { .. } => {
+                    state.presentation_sync_outputs += 1;
+                }
+                wp_presentation_feedback::Event::Presented { .. } => {
+                    state.presentation_presented += 1;
+                }
+                wp_presentation_feedback::Event::Discarded => {
+                    state.presentation_discarded += 1;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    impl Dispatch<zwp_keyboard_shortcuts_inhibitor_v1::ZwpKeyboardShortcutsInhibitorV1, ()>
+        for CompatHarness
+    {
+        fn event(
+            state: &mut Self,
+            _: &zwp_keyboard_shortcuts_inhibitor_v1::ZwpKeyboardShortcutsInhibitorV1,
+            event: zwp_keyboard_shortcuts_inhibitor_v1::Event,
+            _: &(),
+            _: &Connection,
+            _: &wayland_client::QueueHandle<Self>,
+        ) {
+            match event {
+                zwp_keyboard_shortcuts_inhibitor_v1::Event::Active => {
+                    state.inhibitor_active += 1;
+                }
+                zwp_keyboard_shortcuts_inhibitor_v1::Event::Inactive => {
+                    state.inhibitor_inactive += 1;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    impl Dispatch<wl_keyboard::WlKeyboard, ()> for CompatHarness {
+        fn event(
+            state: &mut Self,
+            _: &wl_keyboard::WlKeyboard,
+            event: wl_keyboard::Event,
+            _: &(),
+            _: &Connection,
+            _: &wayland_client::QueueHandle<Self>,
+        ) {
+            if let wl_keyboard::Event::Key { key, .. } = event {
+                state.keyboard_keys.push(key);
+            }
+        }
+    }
+
+    impl Dispatch<wl_pointer::WlPointer, ()> for CompatHarness {
+        fn event(
+            state: &mut Self,
+            _: &wl_pointer::WlPointer,
+            event: wl_pointer::Event,
+            _: &(),
+            _: &Connection,
+            _: &wayland_client::QueueHandle<Self>,
+        ) {
+            match event {
+                wl_pointer::Event::Motion { .. } => state.pointer_motions += 1,
+                wl_pointer::Event::Button {
+                    button,
+                    state: WEnum::Value(btn_state),
+                    ..
+                } => state.pointer_buttons.push((button, btn_state)),
+                _ => {}
+            }
+        }
+    }
+
+    delegate_noop!(CompatHarness: ignore wl_compositor::WlCompositor);
+    delegate_noop!(CompatHarness: ignore wl_surface::WlSurface);
+    delegate_noop!(CompatHarness: ignore wl_region::WlRegion);
+    delegate_noop!(CompatHarness: ignore wl_shm_pool::WlShmPool);
+    delegate_noop!(CompatHarness: ignore wl_buffer::WlBuffer);
+    delegate_noop!(CompatHarness: ignore wl_output::WlOutput);
+    delegate_noop!(CompatHarness: ignore wl_seat::WlSeat);
+    delegate_noop!(CompatHarness: ignore xdg_toplevel::XdgToplevel);
+    delegate_noop!(CompatHarness: ignore xdg_positioner::XdgPositioner);
+    delegate_noop!(CompatHarness: ignore zwlr_layer_shell_v1::ZwlrLayerShellV1);
+    delegate_noop!(CompatHarness: ignore wp_single_pixel_buffer_manager_v1::WpSinglePixelBufferManagerV1);
+    delegate_noop!(CompatHarness: ignore zwlr_virtual_pointer_manager_v1::ZwlrVirtualPointerManagerV1);
+    delegate_noop!(CompatHarness: ignore zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1);
+    delegate_noop!(CompatHarness: ignore zwp_keyboard_shortcuts_inhibit_manager_v1::ZwpKeyboardShortcutsInhibitManagerV1);
+
+    #[test]
+    fn shm_abgr_formats_single_pixel_buffer_and_presentation_feedback() {
+        let mut env = CompatEnv::new(false);
+        assert!(env.client.shm_formats.contains(&wl_shm::Format::Argb8888));
+        assert!(env.client.shm_formats.contains(&wl_shm::Format::Xrgb8888));
+        assert!(env.client.shm_formats.contains(&wl_shm::Format::Abgr8888));
+        assert!(env.client.shm_formats.contains(&wl_shm::Format::Xbgr8888));
+
+        let qh = env.queue.handle();
+        let (comp, wm, _shm) = env.ensure_globals();
+        let spb = env
+            .client
+            .bind::<wp_single_pixel_buffer_manager_v1::WpSinglePixelBufferManagerV1>(
+                &env.registry,
+                &qh,
+                "wp_single_pixel_buffer_manager_v1",
+            );
+        let pres = env.client.bind::<wp_presentation::WpPresentation>(
+            &env.registry,
+            &qh,
+            "wp_presentation",
+        );
+
+        let surf = comp.create_surface(&qh, ());
+        let xdg_surf = wm.get_xdg_surface(&surf, &qh, ());
+        let toplevel = xdg_surf.get_toplevel(&qh, ());
+        toplevel.set_app_id("org.quickshell.test".to_owned());
+        surf.commit();
+        env.pump();
+
+        let px_buf = spb.create_u32_rgba_buffer(0xffff_ffff, 0, 0, 0xffff_ffff, &qh, ());
+        let _fb = pres.feedback(&surf, &qh, ());
+        surf.attach(Some(&px_buf), 0, 0);
+        surf.commit();
+        env.pump();
+
+        let out = env.output.clone();
+        crate::backend_winit::dispatch_output_frame_callbacks_filtered(&env.state, &out, None);
+        env.pump();
+
+        assert!(env.client.presentation_presented >= 1);
+        assert!(env.client.presentation_sync_outputs >= 1);
+        assert_eq!(env.client.presentation_discarded, 0);
+
+        px_buf.destroy();
+    }
+
+    #[test]
+    fn layer_shell_get_popup_and_xdg_popup_unconstrain() {
+        let mut env = CompatEnv::new(false);
+        let qh = env.queue.handle();
+        let (comp, wm, shm) = env.ensure_globals();
+        let layer_shell = env.client.bind::<zwlr_layer_shell_v1::ZwlrLayerShellV1>(
+            &env.registry,
+            &qh,
+            "zwlr_layer_shell_v1",
+        );
+
+        let bar_surf = comp.create_surface(&qh, ());
+        let layer_surf = layer_shell.get_layer_surface(
+            &bar_surf,
+            None,
+            zwlr_layer_shell_v1::Layer::Top,
+            "waybar".to_owned(),
+            &qh,
+            (),
+        );
+        layer_surf.set_size(1920, 32);
+        layer_surf.set_anchor(
+            zwlr_layer_surface_v1::Anchor::Top
+                | zwlr_layer_surface_v1::Anchor::Left
+                | zwlr_layer_surface_v1::Anchor::Right,
+        );
+        layer_surf.set_exclusive_zone(32);
+        bar_surf.commit();
+        env.pump();
+        assert!(env.client.layer_configures >= 1);
+
+        let bar_fd = create_portable_shm_fd(1920 * 32 * 4, None);
+        let bar_pool = shm.create_pool(bar_fd.as_fd(), 1920 * 32 * 4, &qh, ());
+        let bar_buf =
+            bar_pool.create_buffer(0, 1920, 32, 1920 * 4, wl_shm::Format::Argb8888, &qh, ());
+        bar_surf.attach(Some(&bar_buf), 0, 0);
+        bar_surf.commit();
+        env.pump();
+
+        // Popup anchored near the far right edge so unconstrained positioner flips/slides back on-screen.
+        let pos = wm.create_positioner(&qh, ());
+        pos.set_size(200, 120);
+        pos.set_anchor_rect(1850, 0, 40, 32);
+        pos.set_anchor(xdg_positioner::Anchor::BottomRight);
+        pos.set_gravity(xdg_positioner::Gravity::BottomRight);
+        pos.set_constraint_adjustment(
+            xdg_positioner::ConstraintAdjustment::FlipX
+                | xdg_positioner::ConstraintAdjustment::SlideX
+                | xdg_positioner::ConstraintAdjustment::FlipY
+                | xdg_positioner::ConstraintAdjustment::SlideY,
+        );
+
+        let popup_surf = comp.create_surface(&qh, ());
+        let popup_xdg = wm.get_xdg_surface(&popup_surf, &qh, ());
+        let popup = popup_xdg.get_popup(None, &pos, &qh, ());
+        layer_surf.get_popup(&popup);
+        popup_surf.commit();
+        env.pump();
+
+        assert_eq!(env.client.popup_configures.len(), 1);
+        let (px, py, pw, ph) = env.client.popup_configures[0];
+        assert!(
+            px + pw <= 1920,
+            "popup should be unconstrained inside output width: x={px}, w={pw}"
+        );
+        assert!(
+            py + ph <= 1080,
+            "popup should stay within output height: y={py}, h={ph}"
+        );
+
+        let pop_fd = create_portable_shm_fd(200 * 120 * 4, None);
+        let pop_pool = shm.create_pool(pop_fd.as_fd(), 200 * 120 * 4, &qh, ());
+        let pop_buf =
+            pop_pool.create_buffer(0, 200, 120, 200 * 4, wl_shm::Format::Argb8888, &qh, ());
+        popup_surf.attach(Some(&pop_buf), 0, 0);
+        popup_surf.commit();
+        env.pump();
+
+        let map = layer_map_for_output(&env.output);
+        let srv_layer = map
+            .layers()
+            .next()
+            .expect("mapped layer surface")
+            .wl_surface()
+            .clone();
+        drop(map);
+        assert!(
+            PopupManager::popups_for_surface(&srv_layer)
+                .next()
+                .is_some(),
+            "layer surface must track child xdg_popup"
+        );
+        let hit = env
+            .state
+            .surface_under(Point::from((f64::from(px + 20), f64::from(py + 20))));
+        assert!(
+            hit.is_some(),
+            "hit-test must hit mapped layer popup surface"
+        );
+
+        pop_buf.destroy();
+        pop_pool.destroy();
+        bar_buf.destroy();
+        bar_pool.destroy();
+    }
+
+    #[test]
+    fn virtual_pointer_motion_click_and_security_gates() {
+        // Restricted client must not see `zwlr_virtual_pointer_manager_v1`.
+        let restricted_env = CompatEnv::new(true);
+        assert!(
+            !restricted_env
+                .client
+                .globals
+                .contains_key("zwlr_virtual_pointer_manager_v1")
+        );
+
+        let mut env = CompatEnv::new(false);
+        let (_surf, _xs, _tl, _) = env.spawn_window("RustDesk", "com.rustdesk.RustDesk", false);
+        let qh = env.queue.handle();
+        let vptr_mgr = env
+            .client
+            .bind::<zwlr_virtual_pointer_manager_v1::ZwlrVirtualPointerManagerV1>(
+                &env.registry,
+                &qh,
+                "zwlr_virtual_pointer_manager_v1",
+            );
+        let vptr = vptr_mgr.create_virtual_pointer(None, &qh, ());
+        vptr.motion_absolute(100, 500, 500, 1000, 1000);
+        vptr.frame();
+        env.pump();
+        assert!((env.state.pointer_location.x - 960.0).abs() <= 1.0);
+        assert!((env.state.pointer_location.y - 540.0).abs() <= 1.0);
+
+        // Move inside the 64x64 committed RustDesk surface so `wl_pointer` enters and forwards motion + click.
+        vptr.motion_absolute(101, 20, 20, 1000, 1000);
+        vptr.frame();
+        vptr.motion_absolute(102, 25, 25, 1000, 1000);
+        vptr.frame();
+        vptr.button(103, 0x110, wl_pointer::ButtonState::Pressed);
+        vptr.frame();
+        vptr.button(104, 0x110, wl_pointer::ButtonState::Released);
+        vptr.frame();
+        env.pump();
+
+        assert!(env.client.pointer_motions >= 1);
+        assert!(
+            env.client
+                .pointer_buttons
+                .contains(&(0x110, wl_pointer::ButtonState::Pressed))
+        );
+
+        // Fail-closed during locked/abandoned session state.
+        env.state.session_lock.phase = crate::state::SessionLockPhase::Abandoned;
+        let locked_pos = env.state.pointer_location;
+        vptr.motion(200, 35.0, 25.0);
+        vptr.frame();
+        env.pump();
+        assert_eq!(env.state.pointer_location, locked_pos);
+    }
+
+    #[test]
+    fn keyboard_shortcuts_inhibit_forwards_wm_binds_but_preserves_mod_g_preempt() {
+        let mut env = CompatEnv::new(false);
+        let (surf, _xs, _tl, win_id) = env.spawn_window("Remote", "com.rustdesk.RustDesk", false);
+        env.state.reconcile_keyboard_focus();
+        let qh = env.queue.handle();
+        let seat = env.client.seats[0].clone();
+
+        // Helper to press Mod(Alt)+key on nested/non-TTY test seat.
+        let send_mod_chord = |state: &mut KomaState, evdev_key: u32, t: u32| {
+            let mod_code = Keycode::from((56 + 8) as u32);
+            let key_code = Keycode::from(evdev_key + 8);
+            crate::keybind_dispatcher::process_keyboard_key_event(
+                state,
+                mod_code,
+                KeyState::Pressed,
+                InputTime::from_millis(t),
+                false,
+            );
+            crate::keybind_dispatcher::process_keyboard_key_event(
+                state,
+                key_code,
+                KeyState::Pressed,
+                InputTime::from_millis(t + 1),
+                false,
+            );
+            crate::keybind_dispatcher::process_keyboard_key_event(
+                state,
+                key_code,
+                KeyState::Released,
+                InputTime::from_millis(t + 2),
+                false,
+            );
+            crate::keybind_dispatcher::process_keyboard_key_event(
+                state,
+                mod_code,
+                KeyState::Released,
+                InputTime::from_millis(t + 3),
+                false,
+            );
+        };
+
+        // Sanity check: before inhibition, Mod+V toggles float on focused window.
+        send_mod_chord(&mut env.state, 47, 10);
+        assert!(
+            env.state
+                .mapped_windows
+                .iter()
+                .find(|m| m.win_id == win_id)
+                .unwrap()
+                .is_floating
+        );
+        send_mod_chord(&mut env.state, 47, 20);
+        assert!(
+            !env.state
+                .mapped_windows
+                .iter()
+                .find(|m| m.win_id == win_id)
+                .unwrap()
+                .is_floating
+        );
+
+        // Activate `zwp_keyboard_shortcuts_inhibitor_v1`.
+        let inh_mgr = env
+            .client
+            .bind::<zwp_keyboard_shortcuts_inhibit_manager_v1::ZwpKeyboardShortcutsInhibitManagerV1>(
+                &env.registry,
+                &qh,
+                "zwp_keyboard_shortcuts_inhibit_manager_v1",
+            );
+        let _inh = inh_mgr.inhibit_shortcuts(&surf, &seat, &qh, ());
+        env.pump();
+        assert_eq!(env.client.inhibitor_active, 1);
+        assert!(env.state.are_shortcuts_inhibited_for_focused_surface());
+
+        // Normal WM chord Mod+V (47) is forwarded to the client rather than toggling float.
+        let before_keys = env.client.keyboard_keys.len();
+        send_mod_chord(&mut env.state, 47, 30);
+        env.pump();
+        assert!(
+            !env.state
+                .mapped_windows
+                .iter()
+                .find(|m| m.win_id == win_id)
+                .unwrap()
+                .is_floating
+        );
+        assert!(env.client.keyboard_keys.len() > before_keys);
+
+        // Ring-0 `Mod+G` (34) remains un-inhibitable and cancels inhibitor via preempt takeover.
+        send_mod_chord(&mut env.state, 34, 40);
+        env.pump();
+        let active_ws = &env.state.workspaces[&env.state.active_ws_id];
+        assert!(active_ws.lease.is_human_preempted());
+        assert!(!env.state.are_shortcuts_inhibited_for_focused_surface());
+        assert!(env.client.inhibitor_inactive >= 1);
+    }
+
+    #[test]
+    fn waydroid_defaults_blur_clip_and_empty_input_region_click_through() {
+        let mut env = CompatEnv::new(false);
+        let (_s1, _xs1, _tl1, win_base) =
+            env.spawn_window("Terminal", "org.example.Terminal", false);
+        let (_s2, _xs2, _tl2, win_container) = env.spawn_window("Waydroid", "Waydroid", true);
+        let (_s3, _xs3, _tl3, win_android_app) =
+            env.spawn_window("Settings", "waydroid.com.android.settings", false);
+
+        // Make click-through Waydroid container float over the base window so hit-testing would
+        // normally encounter it first unless empty `input_region` click-through passes through.
+        let ws_id = env.state.active_ws_id.clone();
+        let now_ms = env.state.elapsed_ms();
+        if let Some(ws) = env.state.workspaces.get_mut(&ws_id) {
+            ws.toggle_floating(win_container, None, None, now_ms);
+            ws.floating.set_rect(
+                win_container,
+                koma_model::LogicalRect::new(0, 0, 1920, 1080),
+            );
+        }
+        env.state.sync_workspace_geometries(&ws_id);
+        let base_rect = env
+            .state
+            .workspaces
+            .get(&ws_id)
+            .expect("ws")
+            .compute_visible_geometries_at(env.state.elapsed_ms())
+            .into_iter()
+            .find(|(id, _, _)| *id == win_base)
+            .map(|(_, rect, _)| rect)
+            .expect("base rect");
+        let probe = Point::from((f64::from(base_rect.x + 24), f64::from(base_rect.y + 24)));
+        let hit = env
+            .state
+            .hit_test_visible_surface(probe)
+            .expect("click-through should hit base window");
+        assert_eq!(hit.0, win_base);
+
+        let items = env.state.collect_workspace_scene_items(&ws_id, false);
+        let container_item = items
+            .iter()
+            .find(|it| {
+                it.window
+                    .toplevel()
+                    .and_then(|t| {
+                        env.state.mapped_windows.iter().find(|m| {
+                            m.win_id == win_container
+                                && m.window
+                                    .toplevel()
+                                    .is_some_and(|mt| mt.wl_surface() == t.wl_surface())
+                        })
+                    })
+                    .is_some()
+            })
+            .expect("container scene item");
+        assert!(!container_item.wants_blur);
+        assert!(!container_item.clip_to_geometry);
+        assert!(!container_item.border.enabled);
+        assert!(container_item.no_shadow);
+
+        let android_item = items
+            .iter()
+            .find(|it| {
+                it.window
+                    .toplevel()
+                    .and_then(|t| {
+                        env.state.mapped_windows.iter().find(|m| {
+                            m.win_id == win_android_app
+                                && m.window
+                                    .toplevel()
+                                    .is_some_and(|mt| mt.wl_surface() == t.wl_surface())
+                        })
+                    })
+                    .is_some()
+            })
+            .expect("android scene item");
+        assert!(
+            !android_item.wants_blur,
+            "Waydroid defaults to no_blur = true"
+        );
+        assert!(android_item.clip_to_geometry);
+        assert!(android_item.border.enabled);
+    }
+}

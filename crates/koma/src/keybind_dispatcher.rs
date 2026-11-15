@@ -1226,6 +1226,12 @@ pub fn process_keyboard_key_event(
                 }
             }
 
+            // Gate 0c: Honor active `zwp_keyboard_shortcuts_inhibit_v1` for unrestricted focused surfaces
+            // while keeping Ring-0 VT switching and `Mod + G` human preempt takeover un-inhibitable.
+            if !is_locked && state.are_shortcuts_inhibited_for_focused_surface() {
+                return FilterResult::Forward;
+            }
+
             // Gate 1: Match user-configured XKB keysym binds (`modified_sym` -> `raw_syms` fallback)
             let active_mode = state.keybinds.active_mode.clone();
             let is_preempted = state

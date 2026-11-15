@@ -28,6 +28,17 @@ Initial development prerelease of the imported incubation baseline.
     animations.
 - `komactl gen-types` emits LuaLS definitions for the configuration API;
   `komactl validate` checks a configuration offline.
+- Compatibility & input protocols:
+  - `wp_single_pixel_buffer_v1` and `wp_presentation` feedback alongside
+    `wl_shm` `Abgr8888`/`Xbgr8888` pixel formats for `waybar`, `ironbar`,
+    `quickshell`, and Android/`Waydroid` surfaces.
+  - Full `wlr_layer_shell` `get_popup`, `xdg_popup` unconstraining and
+    pointer/keyboard grabs, plus `zwlr_virtual_pointer_manager_v1` and
+    `zwp_keyboard_shortcuts_inhibit_manager_v1` (with `Mod + G` / VT switch
+    kept un-inhibitable) for `RustDesk` and remote desktop tools.
+  - 2D damped Hooke's law semi-implicit Euler spring kinematics (`pointer.spring` /
+    `pointer.curve`) for smooth macro & cursor motion, plus smart `Waydroid`
+    `no_blur`, `clip_to_geometry` gating, and empty `input_region` click-through.
 - Session resources (desktop entry, systemd units, portals configuration,
   greetd example) and example configuration under `examples/`.
 - Shared local/CI quality gates (`just check`: descriptor validation,

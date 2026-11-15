@@ -47,7 +47,7 @@ pub use crate::{
     rules::{
         BlockOutPolicy, DynamicWindowRules, InitialWindowRules, OpenMode,
         ProtectedSurfaceClassifier, WindowMatchContext, WindowMatchSpec, WindowRuleEngine,
-        WindowRuleEntry,
+        WindowRuleEntry, is_waydroid_app_id, is_waydroid_multiwindow_app_id,
     },
     scrolling::{
         CenterFocusedColumn, ColumnDisplay, EdgeAutoScrollConfig, EdgeScrollStep,

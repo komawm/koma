@@ -60,6 +60,7 @@ pub struct WindowSceneItem<'a> {
     pub is_protected_surface: bool,
     pub opacity: f32,
     pub corner_radius: f32,
+    pub clip_to_geometry: bool,
     pub wants_blur: bool,
     pub no_shadow: bool,
     pub border_color_override: Option<String>,
@@ -407,7 +408,8 @@ where
         if let Some(toplevel) = item.window.toplevel() {
             let wl_surface = toplevel.wl_surface();
             for (popup, popup_offset) in PopupManager::popups_for_surface(wl_surface) {
-                let popup_loc_logical = inner_rect.loc + popup_offset.to_f64();
+                let popup_loc_logical =
+                    inner_rect.loc + (popup_offset - popup.geometry().loc).to_f64();
                 let popup_loc_phys: Point<i32, Physical> =
                     popup_loc_logical.to_physical_precise_round(output_scale);
                 let popup_elems: Vec<WaylandSurfaceRenderElement<R>> =
@@ -484,7 +486,8 @@ where
                     Kind::Unspecified,
                 );
 
-            let needs_shader_clip = inner_radius > 0.5 || eff_opacity < 0.999;
+            let needs_shader_clip =
+                item.clip_to_geometry && (inner_radius > 0.5 || eff_opacity < 0.999);
             if let (true, Some(clip_prog)) = (needs_shader_clip, shaders.clipped_surface.as_ref()) {
                 for surf_el in surface_elems {
                     elements.push(KomaRenderElement::ClippedSurface(
