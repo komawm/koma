@@ -452,6 +452,7 @@ pub(crate) fn dispatch_single_host_action(state: &mut KomaState, action: QueuedH
             if !verify_action_epoch_and_protection(state, &ws_id, expected_epoch) {
                 return;
             }
+            finalize_workspace_pointer_animations(state, &ws_id);
             let win_rect = target_window_rect(state, &ws_id);
             if let Ok(dst_pt) = target.resolve_in(win_rect) {
                 apply_vseat_pointer_motion(
@@ -478,9 +479,7 @@ pub(crate) fn dispatch_single_host_action(state: &mut KomaState, action: QueuedH
             if !verify_action_epoch_and_protection(state, &ws_id, expected_epoch) {
                 return;
             }
-            if let Some(pointer) = state.seat.get_pointer()
-                && !pointer.is_grabbed()
-            {
+            if let Some(pointer) = state.seat.get_pointer() {
                 let mut frame = AxisFrame::new(InputTime::now()).source(AxisSource::Wheel);
                 if dx.abs() > f64::EPSILON {
                     frame = frame
@@ -699,6 +698,7 @@ fn launch_pointer_path_inner(
         .map(|ws| ws.viewport.full_rect());
 
     if let Some(btn) = &opts.press_button_at_start {
+        finalize_workspace_pointer_animations(state, &ws_id);
         apply_vseat_pointer_motion(
             state,
             &ws_id,
@@ -719,7 +719,7 @@ fn launch_pointer_path_inner(
         && opts.hold_start_ms == 0
         && opts.hold_end_ms == 0
     {
-        state.pointer_animations.retain(|a| a.ws_id != ws_id);
+        finalize_workspace_pointer_animations(state, &ws_id);
         let last = *resolved_pts.last().expect("checked non-empty");
         apply_vseat_pointer_motion(state, &ws_id, last, LogicalPoint { x: 0.0, y: 0.0 }, None);
         if let Some(button) = opts.release_button_on_finish {
@@ -761,11 +761,16 @@ fn launch_pointer_path_inner(
         return Ok(1);
     }
 
-    let prev_anim = state
+    let mut prev_anim = state
         .pointer_animations
         .iter()
         .position(|a| a.ws_id == ws_id)
         .map(|idx| state.pointer_animations.swap_remove(idx));
+    if let Some(prev) = prev_anim.as_mut()
+        && let Some(button) = prev.release_button_on_finish.take()
+    {
+        release_pointer_button(state, &ws_id, &button);
+    }
 
     let current_ws_pos = state
         .agent_cursors
@@ -880,10 +885,31 @@ pub(crate) fn queue_pointer_path_trajectory(
     Ok(count)
 }
 
+fn finalize_workspace_pointer_animations(state: &mut KomaState, ws_id: &WorkspaceId) {
+    let mut idx = 0;
+    while idx < state.pointer_animations.len() {
+        if &state.pointer_animations[idx].ws_id == ws_id {
+            let anim = state.pointer_animations.swap_remove(idx);
+            apply_vseat_pointer_motion(
+                state,
+                ws_id,
+                anim.track.target_point(),
+                LogicalPoint { x: 0.0, y: 0.0 },
+                None,
+            );
+            if let Some(button) = anim.release_button_on_finish {
+                release_pointer_button(state, ws_id, &button);
+            }
+        } else {
+            idx += 1;
+        }
+    }
+}
+
 pub(crate) fn settle_agent_cursor(state: &mut KomaState, ws_id: &WorkspaceId, immediate: bool) {
     let now_ms = state.elapsed_ms();
     if immediate {
-        state.pointer_animations.retain(|a| &a.ws_id != ws_id);
+        finalize_workspace_pointer_animations(state, ws_id);
     }
     if let Some(ac) = state.agent_cursors.get_mut(ws_id) {
         ac.visual.begin_settle(now_ms, immediate);
@@ -1095,9 +1121,7 @@ fn apply_vseat_pointer_motion(
 
     let delivery_pos = ws_local + out_origin;
     let under = hit.map(|(_, surf, origin)| (surf, origin));
-    if let Some(pointer) = state.seat.get_pointer()
-        && !pointer.is_grabbed()
-    {
+    if let Some(pointer) = state.seat.get_pointer() {
         let serial = SERIAL_COUNTER.next_serial();
         let time = InputTime::now();
         pointer.motion(
@@ -1150,9 +1174,7 @@ fn apply_vseat_pointer_button(
         ac.visual.trigger_click(ws_local_pt, now_ms, &ac_cfg);
     }
 
-    if let Some(pointer) = state.seat.get_pointer()
-        && !pointer.is_grabbed()
-    {
+    if let Some(pointer) = state.seat.get_pointer() {
         let serial = SERIAL_COUNTER.next_serial();
         let time = InputTime::now();
         pointer.button(

@@ -3092,6 +3092,128 @@ mod kom_0024_compat_tests {
     }
 
     #[test]
+    fn vseat_click_and_drag_path_deliver_press_motion_and_release_through_smithay_click_grab() {
+        let mut env = CompatEnv::new(false);
+        let (_surf, _xs, _tl, _win_id) = env.spawn_window("paint", "paint-test", false);
+        let ws_id = env.state.active_ws_id.clone();
+        let expected_epoch = env.state.workspaces[&ws_id].lease.epoch();
+        let human_pos = env.state.pointer_location;
+
+        crate::macro_runtime::dispatch_single_host_action(
+            &mut env.state,
+            koma_lua::phodopus_bridge::QueuedHostAction::ClickPointer {
+                ws_id: ws_id.clone(),
+                expected_epoch,
+                target: koma_model::AnchorPoint::AnchorOffset {
+                    anchor: koma_model::Anchor9::TopLeft,
+                    dx: 12.0,
+                    dy: 12.0,
+                },
+                opts: koma_lua::schema::LuaClickOptsInput::default(),
+            },
+        );
+        env.pump();
+
+        assert_eq!(
+            env.client.pointer_buttons,
+            vec![
+                (272, wl_pointer::ButtonState::Pressed),
+                (272, wl_pointer::ButtonState::Released),
+            ],
+            "vseat click must deliver both press and release through Smithay ClickGrab"
+        );
+        assert!(
+            !env.state.seat.get_pointer().expect("pointer").is_grabbed(),
+            "ClickGrab must clear once click release is delivered"
+        );
+        assert_eq!(env.state.pointer_location, human_pos);
+
+        env.client.pointer_buttons.clear();
+        env.client.pointer_motions = 0;
+
+        let waypoints = vec![
+            koma_model::AnchorPoint::AnchorOffset {
+                anchor: koma_model::Anchor9::TopLeft,
+                dx: 16.0,
+                dy: 16.0,
+            },
+            koma_model::AnchorPoint::AnchorOffset {
+                anchor: koma_model::Anchor9::TopLeft,
+                dx: 32.0,
+                dy: 28.0,
+            },
+            koma_model::AnchorPoint::AnchorOffset {
+                anchor: koma_model::Anchor9::TopLeft,
+                dx: 48.0,
+                dy: 44.0,
+            },
+        ];
+        crate::macro_runtime::queue_pointer_path_trajectory(
+            &mut env.state,
+            ws_id,
+            expected_epoch,
+            waypoints,
+            crate::macro_runtime::PointerPathLaunchOpts {
+                spline: koma_model::PathSplineKind::CatmullRom,
+                kinematics: koma_lua::schema::LuaKinematicsInput {
+                    duration_ms: Some(20),
+                    ..Default::default()
+                },
+                hold_start_ms: 0,
+                hold_end_ms: 0,
+                press_button_at_start: Some("left".to_owned()),
+                release_button_on_finish: Some("left".to_owned()),
+            },
+        )
+        .expect("queue drag path");
+        env.pump();
+
+        assert_eq!(
+            env.client.pointer_buttons,
+            vec![(272, wl_pointer::ButtonState::Pressed)]
+        );
+        assert!(
+            env.state.seat.get_pointer().expect("pointer").is_grabbed(),
+            "Smithay ClickGrab should be active while left drag button is held"
+        );
+
+        for _ in 0..30 {
+            std::thread::sleep(Duration::from_millis(5));
+            crate::macro_runtime::drive_macro_tick(&mut env.state, &[]);
+            env.pump();
+            if env.state.pointer_animations.is_empty() {
+                break;
+            }
+        }
+
+        assert!(
+            env.state.pointer_animations.is_empty(),
+            "drag path trajectory should finish within test budget"
+        );
+        assert!(
+            env.client.pointer_motions >= 2,
+            "drag path must deliver motion events while left button grab is active; got {}",
+            env.client.pointer_motions
+        );
+        assert_eq!(
+            env.client.pointer_buttons,
+            vec![
+                (272, wl_pointer::ButtonState::Pressed),
+                (272, wl_pointer::ButtonState::Released),
+            ],
+            "drag path finish must deliver release button through Smithay ClickGrab"
+        );
+        assert!(
+            !env.state.seat.get_pointer().expect("pointer").is_grabbed(),
+            "ClickGrab must clear once drag path release finishes"
+        );
+        assert_eq!(
+            env.state.pointer_location, human_pos,
+            "virtual cursor drag must keep hardware cursor parked"
+        );
+    }
+
+    #[test]
     fn keyboard_shortcuts_inhibit_forwards_wm_binds_but_preserves_mod_g_preempt() {
         let mut env = CompatEnv::new(false);
         let (surf, _xs, _tl, win_id) = env.spawn_window("Remote", "com.rustdesk.RustDesk", false);
