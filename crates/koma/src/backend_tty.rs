@@ -1611,14 +1611,19 @@ fn discover_primary_gpu(seat_name: &str) -> anyhow::Result<PrimaryGpuDiscovery> 
     })
 }
 
+#[allow(unsafe_code)]
+fn create_egl_display_from_gbm(gbm: &GbmDevice<DeviceFd>) -> anyhow::Result<EGLDisplay> {
+    // SAFETY: the GBM device wraps a DRM fd that stays open for the device lifetime.
+    Ok(unsafe { EGLDisplay::new(gbm.clone())? })
+}
+
 fn try_register_egl_render_node(
     gpu_manager: &mut GpuManager<GbmGlesBackend<GlesRenderer, DeviceFd>>,
     gbm: &GbmDevice<DeviceFd>,
     fallback_node: DrmNode,
     allow_software: bool,
 ) -> anyhow::Result<DrmNode> {
-    // SAFETY: the GBM device wraps a DRM fd that stays open for the device lifetime.
-    let display = unsafe { EGLDisplay::new(gbm.clone())? };
+    let display = create_egl_display_from_gbm(gbm)?;
     let egl_device = EGLDevice::device_for_display(&display)?;
     let is_software = egl_device.is_software();
     ensure!(
@@ -1675,6 +1680,7 @@ const DRM_IOCTL_AUTH_MAGIC: libc::c_ulong = 0x8004_6411;
 
 /// Mirrors libdrm's `drmIsMaster`: authenticating magic `0` fails with `EINVAL` for a master
 /// (unknown token) and with `EACCES` for a non-master, without changing any state.
+#[allow(unsafe_code)]
 fn drm_fd_is_master(fd: BorrowedFd<'_>) -> std::io::Result<bool> {
     let mut magic: u32 = 0;
     // SAFETY: `fd` is a valid open DRM fd and `magic` matches `struct drm_auth` (one `u32`).

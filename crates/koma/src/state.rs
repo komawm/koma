@@ -3057,26 +3057,24 @@ impl KomaState {
         cmd: &mut std::process::Command,
         target_ws: Option<&WorkspaceId>,
     ) {
-        if let Some(jail) = target_ws.and_then(|ws_id| self.jailed_wayland_sockets.get(ws_id)) {
-            cmd.env("WAYLAND_DISPLAY", &jail.socket_path);
-        } else {
-            cmd.env("WAYLAND_DISPLAY", &self.socket_name);
-        }
-
-        if let Some(sig) = &self.instance_signature {
-            cmd.env("KOMA_INSTANCE_SIGNATURE", sig);
-        }
+        let wayland_display = target_ws
+            .and_then(|ws_id| self.jailed_wayland_sockets.get(ws_id))
+            .map_or(self.socket_name.as_os_str(), |jail| {
+                jail.socket_path.as_os_str()
+            });
 
         let x11_display = target_ws
             .and_then(|ws_id| self.workspace_satellites.get(ws_id))
             .or(self.primary_satellite.as_ref())
             .map(|s| s.display_name());
 
-        if let Some(disp) = x11_display {
-            cmd.env("DISPLAY", disp);
-        } else {
-            cmd.env_remove("DISPLAY");
-        }
+        crate::child_env::apply_base_compositor_env_to_command(
+            cmd,
+            crate::child_env::is_session_mode(),
+            wayland_display,
+            x11_display,
+            self.instance_signature.as_deref(),
+        );
 
         for (k, v) in &self.lua_sandbox.config_snapshot().env_vars {
             cmd.env(k, v);

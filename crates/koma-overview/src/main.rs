@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Standalone `wlr-layer-shell` companion daemon & CLI trigger for `Koma` (`ARCHITECTURE.md` §3.3).
 //!
 //! Commands:

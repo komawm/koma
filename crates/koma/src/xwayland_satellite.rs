@@ -340,13 +340,12 @@ fn spawn_satellite_supervisor_thread(
     let mut process = Command::new(&path);
     process
         .arg(&display_name)
-        .env("WAYLAND_DISPLAY", &wayland_socket)
-        .env_remove("DISPLAY")
         .env_remove("RUST_BACKTRACE")
         .env_remove("RUST_LIB_BACKTRACE")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    crate::child_env::apply_satellite_env_to_command(&mut process, &wayland_socket);
 
     let spawn_res = thread::Builder::new()
         .name(format!("koma-xwl-{display_name}"))
@@ -364,20 +363,12 @@ fn spawn_satellite_supervisor_thread(
     }
 }
 
-fn spawn_and_wait_listenfd(
-    path: &Path,
-    mut process: Command,
-    abstract_fd: Option<OwnedFd>,
-    unix_fd: OwnedFd,
+#[allow(unsafe_code)]
+fn clear_cloexec_for_listenfds(
+    process: &mut Command,
+    unix_raw: std::os::fd::RawFd,
+    abstract_raw: Option<std::os::fd::RawFd>,
 ) {
-    let abstract_raw = abstract_fd.as_ref().map(|fd| fd.as_raw_fd());
-    let unix_raw = unix_fd.as_raw_fd();
-
-    process.arg("-listenfd").arg(unix_raw.to_string());
-    if let Some(abs_raw) = abstract_raw {
-        process.arg("-listenfd").arg(abs_raw.to_string());
-    }
-
     // SAFETY: Inside forked child right before `execve`, clear `FD_CLOEXEC` ONLY on the two
     // X11 listener FDs handed to `xwayland-satellite` (`niri/src/utils/xwayland/satellite.rs` L250).
     unsafe {
@@ -393,6 +384,23 @@ fn spawn_and_wait_listenfd(
             Ok(())
         });
     }
+}
+
+fn spawn_and_wait_listenfd(
+    path: &Path,
+    mut process: Command,
+    abstract_fd: Option<OwnedFd>,
+    unix_fd: OwnedFd,
+) {
+    let abstract_raw = abstract_fd.as_ref().map(|fd| fd.as_raw_fd());
+    let unix_raw = unix_fd.as_raw_fd();
+
+    process.arg("-listenfd").arg(unix_raw.to_string());
+    if let Some(abs_raw) = abstract_raw {
+        process.arg("-listenfd").arg(abs_raw.to_string());
+    }
+
+    clear_cloexec_for_listenfds(&mut process, unix_raw, abstract_raw);
 
     let mut child = match process.spawn() {
         Ok(c) => c,
@@ -548,6 +556,8 @@ fn probe_listenfd_support(path: &Path) -> bool {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .env_remove("DISPLAY")
+        .env_remove("NOTIFY_FD")
+        .env_remove("WAYLAND_SOCKET")
         .env_remove("RUST_BACKTRACE")
         .env_remove("RUST_LIB_BACKTRACE");
 

@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Standard `stdio` Model Context Protocol server bridging `koma-agent.sock` to AI agents (`Tier 3`).
 //!
 //! Usage:

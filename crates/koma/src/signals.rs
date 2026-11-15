@@ -13,12 +13,13 @@
 use std::{
     fs::File,
     io::{self, Read as _},
-    os::fd::{FromRawFd as _, OwnedFd},
+    os::fd::OwnedFd,
     sync::atomic::{AtomicI32, Ordering},
 };
 
 use anyhow::Context as _;
 use calloop::{Interest, LoopHandle, Mode, PostAction, generic::Generic};
+use rustix::pipe::{PipeFlags, pipe_with};
 use tracing::{info, warn};
 
 use crate::state::KomaState;
@@ -29,6 +30,7 @@ pub const TERMINATION_SIGNALS: [libc::c_int; 3] = [libc::SIGTERM, libc::SIGINT, 
 /// Write end of the self-pipe, read by the signal handler (`-1` until installed).
 static PIPE_WRITE_FD: AtomicI32 = AtomicI32::new(-1);
 
+#[allow(unsafe_code)]
 extern "C" fn on_termination_signal(signum: libc::c_int) {
     let fd = PIPE_WRITE_FD.load(Ordering::Relaxed);
     if fd >= 0 {
@@ -53,15 +55,11 @@ pub fn signal_name(signum: i32) -> &'static str {
 }
 
 fn create_self_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
-    let mut fds = [-1 as libc::c_int; 2];
-    // SAFETY: `fds` is a valid two-element buffer for `pipe2`.
-    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: `pipe2` succeeded and returned two fresh descriptors owned by nobody else.
-    Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
+    pipe_with(PipeFlags::CLOEXEC | PipeFlags::NONBLOCK)
+        .map_err(|e| io::Error::from_raw_os_error(e.raw_os_error()))
 }
 
+#[allow(unsafe_code)]
 fn install_handler(signum: libc::c_int) -> io::Result<()> {
     // SAFETY: `sigaction` is zero-initializable; the handler only performs async-signal-safe work.
     unsafe {
@@ -143,12 +141,10 @@ mod tests {
     fn self_pipe_is_nonblocking_and_cloexec() {
         let (read_end, write_end) = create_self_pipe().expect("pipe2");
         for fd in [&read_end, &write_end] {
-            let raw = std::os::fd::AsRawFd::as_raw_fd(fd);
-            // SAFETY: `raw` is a valid open descriptor for the duration of the call.
-            let fl = unsafe { libc::fcntl(raw, libc::F_GETFL) };
-            let fd_flags = unsafe { libc::fcntl(raw, libc::F_GETFD) };
-            assert_ne!(fl & libc::O_NONBLOCK, 0);
-            assert_ne!(fd_flags & libc::FD_CLOEXEC, 0);
+            let fl = rustix::fs::fcntl_getfl(fd).expect("fcntl_getfl");
+            let fd_flags = rustix::io::fcntl_getfd(fd).expect("fcntl_getfd");
+            assert!(fl.contains(rustix::fs::OFlags::NONBLOCK));
+            assert!(fd_flags.contains(rustix::io::FdFlags::CLOEXEC));
         }
         let mut reader = File::from(read_end);
         let mut buf = [0_u8; 1];

@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Pure-Rust compositor domain model (`Tier 0`).
 //!
 //! Combines Hyprland's `CSpace` dual-layer architecture (`DwindleTree` dynamic binary splits +

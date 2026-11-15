@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Seat multiplexing (`seat0` + per-workspace `vSeat`) and 3-tier Zero-IME text injection (`Tier 2`).
 
 use std::collections::BTreeSet;

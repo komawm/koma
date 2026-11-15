@@ -11,7 +11,7 @@ use std::{
     io::{self, IoSlice, IoSliceMut, Seek as _, SeekFrom, Write as _},
     mem::MaybeUninit,
     os::{
-        fd::{AsFd as _, AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd},
+        fd::{AsFd as _, BorrowedFd, OwnedFd},
         unix::net::UnixStream,
     },
     sync::atomic::{AtomicU64, Ordering},
@@ -25,6 +25,7 @@ use rustix::{
         SendAncillaryMessage, SendFlags, recvmsg, sendmsg,
     },
     process::getuid,
+    shm,
 };
 use serde::{Serialize, de::DeserializeOwned};
 
@@ -70,6 +71,7 @@ fn query_socket_peer_creds_impl(stream: &UnixStream) -> io::Result<SocketPeerCre
 }
 
 #[cfg(target_os = "freebsd")]
+#[allow(unsafe_code)]
 fn query_socket_peer_creds_impl(stream: &UnixStream) -> io::Result<SocketPeerCreds> {
     use std::os::fd::AsRawFd as _;
 
@@ -118,6 +120,7 @@ fn query_socket_peer_creds_impl(stream: &UnixStream) -> io::Result<SocketPeerCre
 }
 
 #[cfg(target_os = "openbsd")]
+#[allow(unsafe_code)]
 fn query_socket_peer_creds_impl(stream: &UnixStream) -> io::Result<SocketPeerCreds> {
     use std::os::fd::AsRawFd as _;
 
@@ -160,6 +163,7 @@ fn query_socket_peer_creds_impl(stream: &UnixStream) -> io::Result<SocketPeerCre
     target_os = "cygwin",
     target_os = "nto"
 ))]
+#[allow(unsafe_code)]
 fn query_socket_peer_creds_impl(stream: &UnixStream) -> io::Result<SocketPeerCreds> {
     use std::os::fd::AsRawFd as _;
 
@@ -229,21 +233,14 @@ struct ShmUnlinkGuard(Option<CString>);
 
 impl ShmUnlinkGuard {
     #[cfg_attr(any(target_os = "linux", target_os = "freebsd"), allow(dead_code))]
-    fn as_ptr(&self) -> *const libc::c_char {
-        self.0
-            .as_ref()
-            .expect("ShmUnlinkGuard path still present")
-            .as_ptr()
+    fn name(&self) -> &CString {
+        self.0.as_ref().expect("ShmUnlinkGuard path still present")
     }
 
     #[cfg_attr(any(target_os = "linux", target_os = "freebsd"), allow(dead_code))]
     fn unlink(mut self) -> io::Result<()> {
         if let Some(cname) = self.0.take() {
-            // SAFETY: `cname` is a NUL-terminated POSIX SHM name created by `open_populated_posix_shm_rw`.
-            let rc = unsafe { libc::shm_unlink(cname.as_ptr()) };
-            if rc != 0 {
-                return Err(io::Error::last_os_error());
-            }
+            shm::unlink(&cname).map_err(errno_to_io_error)?;
         }
         Ok(())
     }
@@ -252,8 +249,7 @@ impl ShmUnlinkGuard {
 impl Drop for ShmUnlinkGuard {
     fn drop(&mut self) {
         if let Some(cname) = self.0.take() {
-            // SAFETY: Best-effort cleanup of the SHM directory entry on early error or unwind.
-            let _ = unsafe { libc::shm_unlink(cname.as_ptr()) };
+            let _ = shm::unlink(&cname);
         }
     }
 }
@@ -308,56 +304,29 @@ fn open_populated_posix_shm_rw(payload: &[u8]) -> io::Result<(File, ShmUnlinkGua
         let cname =
             CString::new(name).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
 
-        // SAFETY: `cname` is NUL-terminated and flags open an exclusive read-write SHM object.
-        let raw_fd = unsafe {
-            libc::shm_open(
-                cname.as_ptr(),
-                libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC,
-                0o600 as libc::mode_t,
-            )
+        let fd = match shm::open(
+            &cname,
+            shm::OFlags::RDWR | shm::OFlags::CREATE | shm::OFlags::EXCL,
+            shm::Mode::RUSR | shm::Mode::WUSR,
+        ) {
+            Ok(fd) => fd,
+            Err(Errno::EXIST) if attempt + 1 < POSIX_SHM_MAX_ATTEMPTS => continue,
+            Err(err) => return Err(errno_to_io_error(err)),
         };
-        if raw_fd < 0 {
-            let err = io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::EEXIST) && attempt + 1 < POSIX_SHM_MAX_ATTEMPTS {
-                continue;
-            }
-            return Err(err);
-        }
 
         let guard = ShmUnlinkGuard(Some(cname));
-        // SAFETY: `shm_open` returned a fresh, unowned file descriptor on success.
-        let rw_file = File::from(unsafe { OwnedFd::from_raw_fd(raw_fd) });
-        let len_off = libc::off_t::try_from(payload.len()).map_err(|_| {
+        let mut rw_file = File::from(fd);
+        let len_u64 = u64::try_from(payload.len()).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "POSIX SHM payload exceeds off_t range",
+                "POSIX SHM payload exceeds u64 range",
             )
         })?;
         // POSIX `shm_open` objects start at 0 bytes; FreeBSD/POSIX do not extend them via `write()`.
-        // SAFETY: `rw_file` is an open `O_RDWR` SHM descriptor and `len_off >= 0`.
-        if unsafe { libc::ftruncate(rw_file.as_raw_fd(), len_off) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
+        rw_file.set_len(len_u64)?;
         if !payload.is_empty() {
-            // SAFETY: `rw_file` was resized to `payload.len()` bytes with `O_RDWR`, so shared
-            // writable mapping and initialization over `payload.len()` bytes remain in bounds.
-            unsafe {
-                let mapped = libc::mmap(
-                    std::ptr::null_mut(),
-                    payload.len(),
-                    libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_SHARED,
-                    rw_file.as_raw_fd(),
-                    0,
-                );
-                if mapped == libc::MAP_FAILED {
-                    return Err(io::Error::last_os_error());
-                }
-                std::ptr::copy_nonoverlapping(payload.as_ptr(), mapped.cast::<u8>(), payload.len());
-                if libc::munmap(mapped, payload.len()) != 0 {
-                    return Err(io::Error::last_os_error());
-                }
-            }
+            rw_file.write_all(payload)?;
+            rw_file.seek(SeekFrom::Start(0))?;
         }
         return Ok((rw_file, guard));
     }
@@ -373,13 +342,9 @@ fn create_shm_readonly_fd(_label: &str, payload: &[u8]) -> io::Result<OwnedFd> {
     let (rw_file, guard) = open_populated_posix_shm_rw(payload)?;
 
     // Keep `rw_file` alive across the `O_RDONLY` reopen so the kernel retains the object before unlink.
-    // SAFETY: `guard.as_ptr()` names the live SHM object created above.
-    let ro_raw = unsafe { libc::shm_open(guard.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC, 0) };
-    if ro_raw < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: `shm_open` returned a fresh, unowned `O_RDONLY` descriptor on success.
-    let mut ro_file = File::from(unsafe { OwnedFd::from_raw_fd(ro_raw) });
+    let ro_fd = shm::open(guard.name(), shm::OFlags::RDONLY, shm::Mode::empty())
+        .map_err(errno_to_io_error)?;
+    let mut ro_file = File::from(ro_fd);
     guard.unlink()?;
     drop(rw_file);
     ro_file.seek(SeekFrom::Start(0))?;
@@ -787,30 +752,17 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn shm_readonly_fallback_blocks_writes_and_prot_write_mmap() {
-        use std::os::fd::AsRawFd as _;
-
         let pixels = b"KOMA_ZERO_COPY_POSIX_SHM_RGBA8_DATA";
         let shm_fd = create_shm_readonly_fd("ws_01_bsd", pixels).unwrap();
-        let received_file = assert_readonly_fd_transfers_over_scm_rights(shm_fd, pixels);
+        let mut received_file = assert_readonly_fd_transfers_over_scm_rights(shm_fd, pixels);
 
-        // SAFETY: Testing that `mmap(..., PROT_WRITE, MAP_SHARED)` fails on an `O_RDONLY` SHM FD.
-        let mapped = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                pixels.len(),
-                libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                received_file.as_raw_fd(),
-                0,
-            )
-        };
-        if mapped != libc::MAP_FAILED {
-            // SAFETY: Clean up mapping before panicking if the kernel unexpectedly allowed it.
-            unsafe {
-                let _ = libc::munmap(mapped, pixels.len());
-            }
-            panic!("POSIX SHM O_RDONLY fallback must reject PROT_WRITE + MAP_SHARED mmap");
-        }
+        let err = received_file
+            .write(b"mutated")
+            .expect_err("POSIX SHM O_RDONLY fallback must reject writes");
+        assert!(
+            err.raw_os_error().is_some(),
+            "expected OS error on O_RDONLY write, got: {err:?}"
+        );
     }
 
     #[cfg(unix)]

@@ -1,4 +1,4 @@
-//! Self-contained RFC-2083 (`image/png`) encoder & zero-copy sealed `memfd` `mmap` reader.
+//! Self-contained RFC-2083 (`image/png`) encoder & safe sealed `memfd` reader.
 //!
 //! Converts raw `RGBA8` scanlines from `koma`'s write-sealed `SCM_RIGHTS` `memfd` directly into
 //! standard PNG bytes (with optional `max_edge` box/nearest downscaling) using zero external C
@@ -7,13 +7,17 @@
 use std::io;
 
 #[cfg(unix)]
-use std::os::fd::OwnedFd;
+use std::{
+    fs::File,
+    io::{Read as _, Seek as _, SeekFrom},
+    os::fd::OwnedFd,
+};
 
 const PNG_SIGNATURE: [u8; 8] = [137, 80, 78, 71, 13, 10, 26, 10];
 const MAX_DEFLATE_STORE_BLOCK: usize = 65_535;
 
-/// Maps a write-sealed `SCM_RIGHTS` `memfd` (`PROT_READ`, `MAP_PRIVATE`) with zero kernel-to-user
-/// buffer copy, optionally downscales if `max_edge > 0`, and encodes an RFC-2083 `image/png`.
+/// Reads a write-sealed `SCM_RIGHTS` `memfd` safely into memory, optionally downscales if
+/// `max_edge > 0`, and encodes an RFC-2083 `image/png`.
 #[cfg(unix)]
 pub fn read_sealed_memfd_and_encode_png(
     fd: OwnedFd,
@@ -22,9 +26,6 @@ pub fn read_sealed_memfd_and_encode_png(
     byte_len: usize,
     max_edge: u32,
 ) -> io::Result<(u32, u32, Vec<u8>)> {
-    use rustix::mm::{MapFlags, ProtFlags, mmap, munmap};
-    use std::ptr;
-
     let expected = (width as usize)
         .checked_mul(height as usize)
         .and_then(|px| px.checked_mul(4))
@@ -36,45 +37,25 @@ pub fn read_sealed_memfd_and_encode_png(
         ));
     }
 
-    // SAFETY: `koma` seals every exported `memfd` with `F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE | F_SEAL_SEAL`
-    // prior to sending over `SCM_RIGHTS`, guaranteeing immutable size & contents for the duration of `mmap`.
-    let mapped_ptr = unsafe {
-        mmap(
-            ptr::null_mut(),
-            expected,
-            ProtFlags::READ,
-            MapFlags::PRIVATE,
-            &fd,
-            0,
-        )
-        .map_err(|e| io::Error::from_raw_os_error(e.raw_os_error()))?
+    let mut f = File::from(fd);
+    f.seek(SeekFrom::Start(0))?;
+    let mut buf = vec![0_u8; expected];
+    f.read_exact(&mut buf)?;
+
+    let (out_w, out_h, scaled_buf);
+    let target_pixels: &[u8] = if max_edge > 0 && (width > max_edge || height > max_edge) {
+        let (dw, dh, scaled) = downscale_rgba8(&buf, width, height, max_edge);
+        out_w = dw;
+        out_h = dh;
+        scaled_buf = scaled;
+        &scaled_buf
+    } else {
+        out_w = width;
+        out_h = height;
+        &buf
     };
-
-    let encode_result = {
-        // SAFETY: `mapped_ptr` points to `expected` initialized immutable bytes until `munmap` below.
-        let rgba_slice = unsafe { std::slice::from_raw_parts(mapped_ptr.cast::<u8>(), expected) };
-        let (out_w, out_h, scaled_buf);
-        let target_pixels: &[u8] = if max_edge > 0 && (width > max_edge || height > max_edge) {
-            let (dw, dh, buf) = downscale_rgba8(rgba_slice, width, height, max_edge);
-            out_w = dw;
-            out_h = dh;
-            scaled_buf = buf;
-            &scaled_buf
-        } else {
-            out_w = width;
-            out_h = height;
-            rgba_slice
-        };
-        let png_bytes = encode_rgba8_to_png(out_w, out_h, target_pixels)?;
-        (out_w, out_h, png_bytes)
-    };
-
-    // SAFETY: `mapped_ptr` and `expected` match the exact `mmap` call above, and no slice references escape.
-    unsafe {
-        let _ = munmap(mapped_ptr, expected);
-    }
-
-    Ok(encode_result)
+    let png_bytes = encode_rgba8_to_png(out_w, out_h, target_pixels)?;
+    Ok((out_w, out_h, png_bytes))
 }
 
 #[must_use]
