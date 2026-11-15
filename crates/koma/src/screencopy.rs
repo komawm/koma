@@ -977,6 +977,7 @@ fn build_screencopy_elements<'a>(
     elements
 }
 
+#[allow(unsafe_code)]
 fn write_pixels_to_shm(
     ptr: *mut u8,
     pool_len: usize,

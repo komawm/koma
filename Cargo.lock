@@ -693,7 +693,6 @@ dependencies = [
  "base64",
  "koma-lua",
  "koma-proto",
- "rustix 1.1.6",
  "serde",
  "serde_json",
  "thiserror 2.0.21",

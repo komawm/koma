@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Sandboxed Lua 5.4 Configuration & Timed Macro Engine (`Tier 1`).
 //!
 //! Bridges `Phodopus` (`SequencePoll::Suspend(HostOpHandle)`, `Fuel`, and `MemoryLimit`)

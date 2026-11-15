@@ -1,3 +1,5 @@
+#![deny(unsafe_code)]
+
 //! Ring 0 Wayland compositor entry point (`koma`).
 //!
 //! ```text
@@ -69,6 +71,8 @@ mod backend_tty;
 #[cfg(feature = "smithay-winit")]
 mod backend_winit;
 #[cfg(feature = "smithay-winit")]
+mod child_env;
+#[cfg(feature = "smithay-winit")]
 mod config_watcher;
 #[cfg(feature = "smithay-winit")]
 mod cursor;
@@ -120,7 +124,7 @@ use crate::cli::{CliAction, LaunchMode, RunOptions};
 /// `xdg-desktop-portal`, `koma-overview`) receive valid `WAYLAND_DISPLAY` and `DISPLAY` values
 /// (`niri/src/main.rs` `import_environment`).
 #[cfg(feature = "smithay-winit")]
-fn import_session_environment() {
+fn import_session_environment(state: &crate::state::KomaState) {
     use std::process::Command;
     use tracing::warn;
 
@@ -131,7 +135,10 @@ fn import_session_environment() {
         "if command -v systemctl >/dev/null 2>&1; then              systemctl --user import-environment {VARS};          fi;          if command -v dbus-update-activation-environment >/dev/null 2>&1; then              dbus-update-activation-environment {VARS};          fi"
     );
 
-    match Command::new("/bin/sh").args(["-c", &script]).spawn() {
+    let mut cmd = Command::new("/bin/sh");
+    cmd.args(["-c", &script]);
+    state.configure_child_env(&mut cmd, None);
+    match cmd.spawn() {
         Ok(mut child) => match child.wait() {
             Ok(status) if !status.success() => {
                 warn!(%status, "session environment import shell returned non-zero status");
@@ -167,15 +174,20 @@ fn parse_notify_socket_addr(
     std::os::unix::net::SocketAddr::from_pathname(std::path::Path::new(raw_sock))
 }
 
+#[cfg(feature = "smithay-winit")]
+#[allow(unsafe_code)]
+fn open_dinit_notify_pipe(raw_fd: i32) -> std::fs::File {
+    use std::os::fd::FromRawFd as _;
+
+    // SAFETY: `NOTIFY_FD` is an open pipe passed by `dinit` exclusively for readiness notification.
+    unsafe { std::fs::File::from_raw_fd(raw_fd) }
+}
+
 /// Sends `READY=1\n` over `$NOTIFY_SOCKET` (`sd_notify` protocol, supporting both path & abstract
 /// `@` Linux sockets) and `$NOTIFY_FD` (`dinit` readiness pipe) with zero external crate bloat.
 #[cfg(feature = "smithay-winit")]
 fn notify_service_manager_ready() {
-    use std::{
-        fs::File,
-        io::Write as _,
-        os::{fd::FromRawFd as _, unix::net::UnixDatagram},
-    };
+    use std::{io::Write as _, os::unix::net::UnixDatagram};
     use tracing::{debug, warn};
 
     if env::var_os("KOMA_DISABLE_SYSTEM_MANAGER_NOTIFY").is_some_and(|v| v == "1") {
@@ -199,37 +211,33 @@ fn notify_service_manager_ready() {
         }
     }
 
-    if let Ok(fd_str) = env::var("NOTIFY_FD") {
-        // SAFETY: Single-threaded startup prior to spawning background worker threads.
-        unsafe {
-            env::remove_var("NOTIFY_FD");
-        }
-        if let Ok(raw_fd) = fd_str.parse::<i32>() {
-            // SAFETY: `NOTIFY_FD` is an open pipe passed by `dinit` exclusively for readiness notification.
-            let mut pipe = unsafe { File::from_raw_fd(raw_fd) };
-            if let Err(err) = pipe.write_all(b"READY=1\n") {
-                warn!("failed writing READY=1 to NOTIFY_FD ({raw_fd}): {err}");
-            }
+    if let Ok(fd_str) = env::var("NOTIFY_FD")
+        && let Ok(raw_fd) = fd_str.parse::<i32>()
+    {
+        let mut pipe = open_dinit_notify_pipe(raw_fd);
+        if let Err(err) = pipe.write_all(b"READY=1\n") {
+            warn!("failed writing READY=1 to NOTIFY_FD ({raw_fd}): {err}");
         }
     }
 }
 
-/// Exports `WAYLAND_DISPLAY` and `DISPLAY` in the compositor process environment, imports them
-/// into `systemd --user` / D-Bus when `--session` is active, and signals `READY=1`.
+/// Records `WAYLAND_DISPLAY`, `DISPLAY`, and `KOMA_INSTANCE_SIGNATURE` in `child_env` without
+/// mutating process `environ`, imports them into `systemd --user` / D-Bus when `--session` is
+/// active, and signals `READY=1`.
 #[cfg(feature = "smithay-winit")]
 fn finalize_session_startup(state: &crate::state::KomaState, is_session: bool) {
-    // SAFETY: Called on the single-threaded compositor main thread before worker threads read env.
-    unsafe {
-        env::set_var("WAYLAND_DISPLAY", &state.socket_name);
-        if let Some(sat) = &state.primary_satellite {
-            env::set_var("DISPLAY", sat.display_name());
-        } else {
-            env::remove_var("DISPLAY");
-        }
-    }
+    crate::child_env::publish_compositor_env(crate::child_env::SessionChildEnv {
+        is_session,
+        wayland_display: state.socket_name.clone(),
+        x11_display: state
+            .primary_satellite
+            .as_ref()
+            .map(|sat| sat.display_name().to_owned()),
+        instance_signature: state.instance_signature.clone(),
+    });
 
     if is_session {
-        import_session_environment();
+        import_session_environment(state);
     }
     notify_service_manager_ready();
 }
@@ -262,6 +270,7 @@ fn bind_wayland_listening_socket(
             Generic::new(display, Interest::READ, Mode::Level),
             |_, display, state| {
                 // SAFETY: `Generic` wraps `Display` without moving or dropping its FD while registered.
+                #[allow(unsafe_code)]
                 unsafe {
                     display
                         .get_mut()
@@ -489,24 +498,19 @@ fn main() {
         config_override,
     } = opts;
 
-    // Match `niri/src/main.rs` `--session` semantics: scrub stale host display variables unless WSL,
-    // and export `XDG_CURRENT_DESKTOP=koma` + `XDG_SESSION_TYPE=wayland` for portals and autostart.
-    if is_session {
-        // SAFETY: Single-threaded CLI initialization before spawning any worker threads.
-        unsafe {
-            if env::var_os("WSL_DISTRO_NAME").is_none() && mode == LaunchMode::Auto {
-                env::remove_var("DISPLAY");
-                env::remove_var("WAYLAND_DISPLAY");
-                env::remove_var("WAYLAND_SOCKET");
-            }
-            env::set_var("XDG_CURRENT_DESKTOP", "koma");
-            env::set_var("XDG_SESSION_TYPE", "wayland");
-        }
-    }
+    // Match `niri/src/main.rs` `--session` semantics without mutating process-global `environ`:
+    // ignore stale host display variables on Auto launch unless WSL, and record `--session`
+    // so spawned child processes receive `XDG_CURRENT_DESKTOP=koma` + `XDG_SESSION_TYPE=wayland`.
+    #[cfg(feature = "smithay-winit")]
+    child_env::init_session_mode(is_session);
+
+    let ignore_host_display = is_session && env::var_os("WSL_DISTRO_NAME").is_none();
 
     let resolved_mode = match mode {
         LaunchMode::Auto => {
-            if env::var_os("WAYLAND_DISPLAY").is_some() || env::var_os("DISPLAY").is_some() {
+            if !ignore_host_display
+                && (env::var_os("WAYLAND_DISPLAY").is_some() || env::var_os("DISPLAY").is_some())
+            {
                 LaunchMode::Winit
             } else {
                 LaunchMode::Tty

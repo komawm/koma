@@ -165,10 +165,14 @@ struct DualKawaseProgramInner {
 #[derive(Debug, Clone)]
 pub struct DualKawaseProgram(Rc<DualKawaseProgramInner>);
 
+/// # Safety
+/// Caller must invoke this while a valid GLES2 context (`gl`) is current.
+#[allow(unsafe_code)]
 unsafe fn compile_kawase_pass(
     gl: &ffi::Gles2,
     frag_src: &str,
 ) -> Result<KawasePassLocations, GlesError> {
+    // SAFETY: Caller guarantees `gl` corresponds to the currently bound GLES2 context.
     let program = unsafe { link_program(gl, KAWASE_BLUR_VERT, frag_src)? };
     let vert = c"vert";
     let tex = c"tex";
@@ -178,22 +182,31 @@ unsafe fn compile_kawase_pass(
 
     Ok(KawasePassLocations {
         program,
+        // SAFETY: `program` was just linked on the active GLES2 context and uniform/attrib names are NUL-terminated.
         uniform_tex: unsafe { gl.GetUniformLocation(program, tex.as_ptr()) },
+        // SAFETY: Same active GLES2 context and NUL-terminated uniform name.
         uniform_half_pixel: unsafe { gl.GetUniformLocation(program, half_pixel.as_ptr()) },
+        // SAFETY: Same active GLES2 context and NUL-terminated uniform name.
         uniform_offset: unsafe { gl.GetUniformLocation(program, offset.as_ptr()) },
+        // SAFETY: Same active GLES2 context and NUL-terminated uniform name.
         uniform_vibrancy: unsafe { gl.GetUniformLocation(program, vibrancy.as_ptr()) },
+        // SAFETY: Same active GLES2 context and NUL-terminated attribute name.
         attrib_vert: unsafe { gl.GetAttribLocation(program, vert.as_ptr()) },
     })
 }
 
 impl DualKawaseProgram {
+    #[allow(unsafe_code)]
     pub fn compile(renderer: &mut GlesRenderer) -> anyhow::Result<Self> {
         renderer
-            .with_context(|gl| unsafe {
-                let down =
-                    compile_kawase_pass(gl, KAWASE_DOWN_FRAG).context("Kawase down shader")?;
-                let up = compile_kawase_pass(gl, KAWASE_UP_FRAG).context("Kawase up shader")?;
-                Ok(Self(Rc::new(DualKawaseProgramInner { down, up })))
+            .with_context(|gl| {
+                // SAFETY: `GlesRenderer::with_context` binds the GLES2 context before calling this closure.
+                unsafe {
+                    let down =
+                        compile_kawase_pass(gl, KAWASE_DOWN_FRAG).context("Kawase down shader")?;
+                    let up = compile_kawase_pass(gl, KAWASE_UP_FRAG).context("Kawase up shader")?;
+                    Ok(Self(Rc::new(DualKawaseProgramInner { down, up })))
+                }
             })
             .context("failed binding GLES context for DualKawaseProgram")?
     }
@@ -250,6 +263,7 @@ impl DualKawaseBlurEngine {
         Ok(())
     }
 
+    #[allow(unsafe_code)]
     pub fn execute_blur(
         &mut self,
         renderer: &mut GlesRenderer,
@@ -267,6 +281,8 @@ impl DualKawaseBlurEngine {
         let per_pass_vibrancy = cfg.vibrancy.clamp(0.0, 1.0) / f32::from(passes);
 
         renderer
+            // SAFETY: `with_profiled_context` binds the GLES2 context; `quad_verts` stays live on the
+            // stack across `glDrawArrays`, and all mip textures belong to `self.context_id`.
             .with_profiled_context(gpu_span_location!("DualKawaseBlur::execute"), |gl| unsafe {
                 while gl.GetError() != ffi::NO_ERROR {}
 

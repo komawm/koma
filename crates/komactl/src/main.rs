@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! `adb`-inspired CLI controller, config validator/reloader & sandbox container launcher for `Koma`.
 
 mod admin_rpc;

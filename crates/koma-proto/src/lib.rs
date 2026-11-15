@@ -1,3 +1,5 @@
+#![deny(unsafe_code)]
+
 //! Wire protocol, `SCM_RIGHTS` ancillary FD transport, capability tokens, and event rings for `Koma`.
 
 pub mod capability;

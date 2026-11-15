@@ -24,7 +24,7 @@
 //!      is staged in `deferred_lua_sandbox` and promoted automatically the instant `active_txs == 0`.
 
 #[cfg(target_os = "linux")]
-use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+use std::os::fd::OwnedFd;
 use std::{
     collections::BTreeMap,
     env, fs, io,
@@ -426,8 +426,8 @@ impl ConfigFsMonitor {
     }
 }
 
-/// Minimal zero-dependency Linux `inotify` wrapper using `libc` watching config & parent directories
-/// so atomic `rename(2)` saves in Neovim wake immediately (< 1 ms) without waiting for polling.
+/// Minimal Linux `inotify` wrapper using safe `rustix` abstractions watching config & parent
+/// directories so atomic `rename(2)` saves in Neovim wake immediately (< 1 ms) without polling.
 #[cfg(target_os = "linux")]
 struct LinuxInotifyMonitor {
     fd: OwnedFd,
@@ -437,13 +437,10 @@ struct LinuxInotifyMonitor {
 #[cfg(target_os = "linux")]
 impl LinuxInotifyMonitor {
     fn new() -> io::Result<Self> {
-        // SAFETY: `inotify_init1` with `IN_NONBLOCK | IN_CLOEXEC` returns a fresh owned file descriptor or -1.
-        let raw = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
-        if raw < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: Validated non-negative file descriptor exclusively owned here.
-        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        use rustix::fs::inotify::{CreateFlags, init as inotify_init};
+
+        let fd = inotify_init(CreateFlags::NONBLOCK | CreateFlags::CLOEXEC)
+            .map_err(|e| io::Error::from_raw_os_error(e.raw_os_error()))?;
         Ok(Self {
             fd,
             watched_dirs: Vec::new(),
@@ -451,44 +448,40 @@ impl LinuxInotifyMonitor {
     }
 
     fn sync_watches(&mut self, cfg_path: &KomaConfigPath) {
-        use std::ffi::CString;
-        use std::os::unix::ffi::OsStrExt as _;
+        use rustix::fs::inotify::{WatchFlags, add_watch as inotify_add_watch};
 
-        let mask = libc::IN_CLOSE_WRITE
-            | libc::IN_MOVED_TO
-            | libc::IN_CREATE
-            | libc::IN_DELETE
-            | libc::IN_ATTRIB
-            | libc::IN_DELETE_SELF
-            | libc::IN_MOVE_SELF;
+        let mask = WatchFlags::CLOSE_WRITE
+            | WatchFlags::MOVED_TO
+            | WatchFlags::CREATE
+            | WatchFlags::DELETE
+            | WatchFlags::ATTRIB
+            | WatchFlags::DELETE_SELF
+            | WatchFlags::MOVE_SELF;
 
         for dir in cfg_path.candidate_watch_dirs() {
             for candidate in [Some(dir.as_path()), dir.parent()].into_iter().flatten() {
                 if candidate.is_dir()
                     && !self.watched_dirs.iter().any(|d| d == candidate)
-                    && let Ok(c_path) = CString::new(candidate.as_os_str().as_bytes())
+                    && inotify_add_watch(&self.fd, candidate, mask).is_ok()
                 {
-                    // SAFETY: `self.fd` is a valid inotify FD and `c_path` is NUL-terminated.
-                    let wd = unsafe {
-                        libc::inotify_add_watch(self.fd.as_raw_fd(), c_path.as_ptr(), mask)
-                    };
-                    if wd >= 0 {
-                        self.watched_dirs.push(candidate.to_path_buf());
-                    }
+                    self.watched_dirs.push(candidate.to_path_buf());
                 }
             }
         }
     }
 
     fn wait_for_activity(&self, timeout_ms: i32) -> bool {
-        let mut pfd = libc::pollfd {
-            fd: self.fd.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: Single stack `pollfd` passed with `nfds = 1`.
-        let n = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
-        if n > 0 && (pfd.revents & libc::POLLIN) != 0 {
+        use rustix::event::{PollFd, PollFlags, Timespec, poll};
+
+        let mut pfds = [PollFd::new(&self.fd, PollFlags::IN)];
+        let timeout = (timeout_ms >= 0).then(|| Timespec {
+            tv_sec: i64::from(timeout_ms / 1000),
+            tv_nsec: (i64::from(timeout_ms % 1000) * 1_000_000) as _,
+        });
+        if let Ok(n) = poll(&mut pfds, timeout.as_ref())
+            && n > 0
+            && pfds[0].revents().contains(PollFlags::IN)
+        {
             self.drain_events();
             return true;
         }
@@ -498,16 +491,11 @@ impl LinuxInotifyMonitor {
     fn drain_events(&self) {
         let mut buf = [0_u8; 4096];
         loop {
-            // SAFETY: Reading into valid stack byte slice from non-blocking `inotify` FD.
-            let n = unsafe {
-                libc::read(
-                    self.fd.as_raw_fd(),
-                    buf.as_mut_ptr().cast::<libc::c_void>(),
-                    buf.len(),
-                )
-            };
-            if n <= 0 {
-                break;
+            match rustix::io::read(&self.fd, &mut buf) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(rustix::io::Errno::INTR) => continue,
+                Err(_) => break,
             }
         }
     }

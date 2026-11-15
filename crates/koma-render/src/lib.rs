@@ -1,3 +1,5 @@
+#![deny(unsafe_code)]
+
 //! Compositor rendering, first-frame scene assembly & `Render-on-Read` offscreen FBO pipeline (`Tier 2`).
 
 use std::collections::BTreeMap;

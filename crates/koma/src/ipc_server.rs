@@ -214,11 +214,7 @@ pub fn start_dual_socket_server(
     bind_nonblocking_listener(loop_handle, &admin_socket, SocketChannel::Admin)?;
     bind_nonblocking_listener(loop_handle, &agent_socket, SocketChannel::Agent)?;
 
-    // Export signature for child processes launched inside Koma (`IPC_SPEC.md` §2.1)
-    // SAFETY: Invoked on the single-threaded compositor main thread during startup before spawning workers.
-    unsafe {
-        env::set_var("KOMA_INSTANCE_SIGNATURE", &instance_signature);
-    }
+    // Delivered to child processes via `KomaState::configure_child_env` / `child_env` without mutating `environ`.
 
     info!(
         admin_sock = %admin_socket.display(),
