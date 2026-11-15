@@ -119,6 +119,7 @@ pub fn generate_luals_stubs() -> String {
 ---@field dwt? boolean
 ---@field disable_while_typing? boolean
 ---@field dwtp? boolean
+---@field disable_while_trackpointing? boolean
 ---@field natural_scroll? boolean
 ---@field accel_speed? number
 ---@field accel_profile? "adaptive"|"flat"
