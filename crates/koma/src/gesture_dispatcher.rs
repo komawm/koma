@@ -430,7 +430,7 @@ const fn action_supports_continuous_scrolling(action: &ActionDescriptor) -> bool
 fn active_ws_is_preempted(state: &KomaState) -> bool {
     state
         .workspaces
-        .get(&state.active_ws_id)
+        .get(&state.effective_interactive_ws_id())
         .is_some_and(|w| w.lease.is_human_preempted())
 }
 

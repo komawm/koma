@@ -23,7 +23,8 @@ use std::{
 
 use anyhow::{Context as _, anyhow, bail, ensure};
 use calloop::{Dispatcher, LoopHandle, RegistrationToken};
-use koma_model::LogicalViewport;
+use koma_lua::schema::{MonitorScaleSpec, MonitorSpec};
+use koma_model::{LogicalViewport, OutputTransform, closest_representable_scale};
 use koma_proto::OverlayKind;
 use koma_render::{
     RenderTargetKind,
@@ -67,7 +68,7 @@ use smithay::{
     input::keyboard::KeyboardSource,
     output::{Mode, Output, OutputModeSource, PhysicalProperties, Scale},
     reexports::{
-        drm::control::{self, Device as _, ModeFlags, ModeTypeFlags, connector, crtc},
+        drm::control::{self, Device as _, ModeFlags, ModeTypeFlags, connector, crtc, property},
         gbm::Modifier,
         input::Libinput,
         rustix::{fs::OFlags, io::Errno},
@@ -87,7 +88,8 @@ use crate::{
         append_ime_popup_elements, append_layer_tier_elements, assemble_locked_frame_elements,
         dispatch_output_frame_callbacks_filtered,
     },
-    state::{ActiveBackend, KomaState},
+    edid::ParsedEdid,
+    state::{ActiveBackend, KomaState, koma_transform_to_smithay},
 };
 
 /// Hybrid NVIDIA dGPU -> Intel/AMD iGPU cross-device copies require `Abgr` formats alongside `Argb`
@@ -133,6 +135,13 @@ pub struct DrmOutputSurface {
     // Physical connector handle retained for DRM hotplug, DPMS, and output lifecycle tracking.
     pub connector: connector::Handle,
     pub connector_name: String,
+    pub make: String,
+    pub model: String,
+    pub serial_number: String,
+    pub phys_mm: (i32, i32),
+    pub panel_orientation: Option<OutputTransform>,
+    pub available_modes: Vec<Mode>,
+    pub drm_modes: Vec<control::Mode>,
     pub output: Output,
     pub wl_global: Option<GlobalId>,
     pub compositor: GbmDrmCompositor,
@@ -157,6 +166,159 @@ pub struct DrmOutputDevice {
     pub allocator: GbmAllocator<DeviceFd>,
 }
 
+/// Tracks split display/render DRM nodes, hardware render-node promotion (Apple Silicon
+/// `apple-drm` + `asahi` AGX, dual-GPU `i915` + `amdgpu`), and shared `render_node` refcounting
+/// across hot-unplug cycles.
+#[derive(Debug, Clone)]
+pub(crate) struct RenderNodeRegistry<N = DrmNode>
+where
+    N: Copy + Eq + std::hash::Hash,
+{
+    pub primary_render_node: N,
+    pub has_hardware_primary: bool,
+    pub primary_uses_software: bool,
+    pub explicit_render_override: Option<N>,
+    pub render_refcounts: HashMap<N, usize>,
+    pub card_render_target: HashMap<N, N>,
+    pub card_hardware_render: HashMap<N, Option<N>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RenderRegistrationOutcome<N = DrmNode> {
+    pub target_render_node: N,
+    pub promoted_from: Option<N>,
+    pub nodes_to_remove: Vec<N>,
+}
+
+impl<N> RenderNodeRegistry<N>
+where
+    N: Copy + Eq + std::hash::Hash,
+{
+    pub(crate) fn new(initial_render_node: N, explicit_render_override: Option<N>) -> Self {
+        let mut render_refcounts = HashMap::new();
+        let has_hardware_primary = explicit_render_override.is_some();
+        if let Some(rn) = explicit_render_override {
+            render_refcounts.insert(rn, 1);
+        }
+        Self {
+            primary_render_node: explicit_render_override.unwrap_or(initial_render_node),
+            has_hardware_primary,
+            primary_uses_software: false,
+            explicit_render_override,
+            render_refcounts,
+            card_render_target: HashMap::new(),
+            card_hardware_render: HashMap::new(),
+        }
+    }
+
+    pub(crate) fn register_card(
+        &mut self,
+        card: N,
+        hardware_render: Option<N>,
+        software_render: Option<N>,
+    ) -> RenderRegistrationOutcome<N> {
+        let mut promoted_from = None;
+        let mut nodes_to_remove = Vec::new();
+
+        if let Some(prev_target) = self.card_render_target.remove(&card) {
+            Self::dec_refcount(
+                &mut self.render_refcounts,
+                prev_target,
+                &mut nodes_to_remove,
+            );
+        }
+
+        let target = if let Some(hw_rn) = hardware_render {
+            *self.render_refcounts.entry(hw_rn).or_insert(0) += 1;
+            self.card_render_target.insert(card, hw_rn);
+            self.card_hardware_render.insert(card, Some(hw_rn));
+
+            if !self.has_hardware_primary && self.explicit_render_override.is_none() {
+                let old_primary = self.primary_render_node;
+                self.primary_render_node = hw_rn;
+                self.has_hardware_primary = true;
+                self.primary_uses_software = false;
+                if old_primary != hw_rn {
+                    promoted_from = Some(old_primary);
+                }
+
+                let borrowed_cards: Vec<N> = self
+                    .card_hardware_render
+                    .iter()
+                    .filter(|(c, own)| **c != card && own.is_none())
+                    .map(|(c, _)| *c)
+                    .collect();
+                for c in borrowed_cards {
+                    if let Some(&old_target) = self.card_render_target.get(&c)
+                        && old_target != hw_rn
+                    {
+                        Self::dec_refcount(
+                            &mut self.render_refcounts,
+                            old_target,
+                            &mut nodes_to_remove,
+                        );
+                        *self.render_refcounts.entry(hw_rn).or_insert(0) += 1;
+                        self.card_render_target.insert(c, hw_rn);
+                    }
+                }
+            }
+            hw_rn
+        } else if let Some(sw_rn) = software_render {
+            *self.render_refcounts.entry(sw_rn).or_insert(0) += 1;
+            self.card_render_target.insert(card, sw_rn);
+            self.card_hardware_render.insert(card, None);
+            if !self.has_hardware_primary && self.explicit_render_override.is_none() {
+                self.primary_render_node = sw_rn;
+                self.primary_uses_software = true;
+            }
+            sw_rn
+        } else {
+            let borrowed = self.primary_render_node;
+            *self.render_refcounts.entry(borrowed).or_insert(0) += 1;
+            self.card_render_target.insert(card, borrowed);
+            self.card_hardware_render.insert(card, None);
+            borrowed
+        };
+
+        nodes_to_remove
+            .retain(|rn| *rn != target && self.render_refcounts.get(rn).copied().unwrap_or(0) == 0);
+        RenderRegistrationOutcome {
+            target_render_node: target,
+            promoted_from,
+            nodes_to_remove,
+        }
+    }
+
+    pub(crate) fn unregister_card(&mut self, card: N) -> Option<N> {
+        self.card_hardware_render.remove(&card);
+        let rn = self.card_render_target.remove(&card)?;
+        let mut removed = Vec::new();
+        Self::dec_refcount(&mut self.render_refcounts, rn, &mut removed);
+        if removed.contains(&rn) {
+            if self.primary_render_node == rn
+                && self.explicit_render_override.is_none()
+                && let Some(replacement) =
+                    self.card_hardware_render.values().flatten().copied().next()
+            {
+                self.primary_render_node = replacement;
+            }
+            Some(rn)
+        } else {
+            None
+        }
+    }
+
+    fn dec_refcount(refcounts: &mut HashMap<N, usize>, rn: N, zeroed: &mut Vec<N>) {
+        if let Some(count) = refcounts.get_mut(&rn) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                refcounts.remove(&rn);
+                zeroed.push(rn);
+            }
+        }
+    }
+}
+
 /// Bare-metal TTY display & input backend state owned by `KomaState`.
 pub struct TtyBackendState {
     pub session: LibSeatSession,
@@ -167,6 +329,8 @@ pub struct TtyBackendState {
     pub gpu_manager: GpuManager<GbmGlesBackend<GlesRenderer, DeviceFd>>,
     pub primary_node: DrmNode,
     pub primary_render_node: DrmNode,
+    pub(crate) render_registry: RenderNodeRegistry,
+    explicit_render_gbm: Option<GbmDevice<DeviceFd>>,
     pub devices: HashMap<DrmNode, DrmOutputDevice>,
     pub dmabuf_global: Option<DmabufGlobal>,
     /// Connector configuration failures since the last enumeration, reported if no output works.
@@ -227,11 +391,19 @@ impl TtyBackendState {
             GpuManager::new(gbm_api).context("failed initializing Smithay GpuManager")?;
 
         // 5. Discover primary GPU (`KOMA_DRM_DEVICE` override -> `udev::primary_gpu(&seat_name)`)
-        let (primary_node, primary_render_node) = discover_primary_gpu(&seat_name)?;
+        let PrimaryGpuDiscovery {
+            primary_node,
+            primary_render_node,
+            explicit_render_override,
+        } = discover_primary_gpu(&seat_name)?;
+        let render_registry = RenderNodeRegistry::new(
+            primary_render_node,
+            explicit_render_override.as_ref().map(|(_, node)| *node),
+        );
         info!(
             seat = %seat_name,
             primary_node = ?primary_node,
-            primary_render_node = ?primary_render_node,
+            primary_render_node = ?render_registry.primary_render_node,
             "initialized bare-metal TTY session & primary render GPU"
         );
 
@@ -243,7 +415,9 @@ impl TtyBackendState {
             libinput_devices: Vec::new(),
             gpu_manager,
             primary_node,
-            primary_render_node,
+            primary_render_node: render_registry.primary_render_node,
+            render_registry,
+            explicit_render_gbm: None,
             devices: HashMap::new(),
             dmabuf_global: None,
             connector_errors: Vec::new(),
@@ -286,6 +460,14 @@ impl TtyBackendState {
             return Ok(());
         }
 
+        if let Some((render_path, explicit_rn)) = env::var_os("KOMA_RENDER_DRM_DEVICE")
+            .map(PathBuf::from)
+            .zip(self.render_registry.explicit_render_override)
+            && self.explicit_render_gbm.is_none()
+        {
+            self.init_explicit_render_device(&render_path, explicit_rn)?;
+        }
+
         let snapshot: Vec<(dev_t, PathBuf)> = self
             .udev_dispatcher
             .as_source_ref()
@@ -298,7 +480,7 @@ impl TtyBackendState {
         if let Some((prim_id, prim_path)) = snapshot
             .iter()
             .find(|(id, _)| *id == self.primary_node.dev_id())
-            && let Err(err) = self.device_added(*prim_id, prim_path, state)
+            && let Err(err) = self.add_device_internal(*prim_id, prim_path, state, false)
         {
             warn!("failed initializing primary DRM node {prim_path:?}: {err:#}");
             failures.push(format!("{}: {err:#}", prim_path.display()));
@@ -308,10 +490,32 @@ impl TtyBackendState {
             if *dev_id == self.primary_node.dev_id() {
                 continue;
             }
-            if let Err(err) = self.device_added(*dev_id, path, state) {
+            if let Err(err) = self.add_device_internal(*dev_id, path, state, false) {
                 warn!("failed initializing secondary DRM node {path:?}: {err:#}");
                 failures.push(format!("{}: {err:#}", path.display()));
             }
+        }
+
+        if !self.render_registry.has_hardware_primary
+            && !self.render_registry.primary_uses_software
+            && self.devices.contains_key(&self.primary_node)
+        {
+            self.enable_software_fallback_on_primary()?;
+        }
+
+        self.ensure_hardware_dmabuf_global(state)?;
+
+        if let Some((prim_id, _)) = snapshot
+            .iter()
+            .find(|(id, _)| *id == self.primary_node.dev_id())
+        {
+            self.device_changed(*prim_id, state);
+        }
+        for (dev_id, _) in &snapshot {
+            if *dev_id == self.primary_node.dev_id() {
+                continue;
+            }
+            self.device_changed(*dev_id, state);
         }
 
         failures.append(&mut self.connector_errors);
@@ -422,44 +626,133 @@ impl TtyBackendState {
         }
     }
 
-    /// Live-updates fractional scale & VRR on connected KMS outputs during `init.lua` hot-reload
-    /// without dropping client surfaces or resetting DRM devices (`niri.rs` `reload_output_config`).
+    /// Live-updates scale, transform, 2D position, and `safe_area` on connected KMS outputs during
+    /// `init.lua` hot-reload without dropping client surfaces or resetting DRM devices.
     pub fn apply_hot_reloaded_monitors(
         &mut self,
         registry: &koma_lua::KomaConfigRegistry,
-    ) -> Vec<(Output, u32, u32, f64)> {
-        let mut resized = Vec::new();
+    ) -> Vec<HotReloadedMonitorUpdate> {
+        let mut updated = Vec::new();
         for device in self.devices.values_mut() {
             for surface in device.surfaces.values_mut() {
-                let Some(spec) = registry.find_monitor(&surface.connector_name) else {
-                    continue;
-                };
-                if spec.off {
+                let spec = registry.find_monitor_for_output(
+                    &surface.connector_name,
+                    Some(&surface.make),
+                    Some(&surface.model),
+                    Some(&surface.serial_number),
+                );
+                if spec.is_some_and(|s| s.off) {
                     continue;
                 }
-                let new_scale = if (0.5..=4.0).contains(&spec.scale) {
-                    spec.scale
-                } else {
-                    1.0
-                };
+                let wl_mode = surface.output.current_mode().unwrap_or(Mode {
+                    size: (1920, 1080).into(),
+                    refresh: 60_000,
+                });
+                let new_scale = resolve_connector_scale(
+                    spec,
+                    wl_mode.size.w.max(1) as u32,
+                    wl_mode.size.h.max(1) as u32,
+                    surface.phys_mm.0,
+                    surface.phys_mm.1,
+                );
+                let new_transform = koma_transform_to_smithay(resolve_connector_transform(
+                    spec,
+                    surface.panel_orientation,
+                ));
+                let explicit_pos = spec.and_then(MonitorSpec::resolved_position);
+                let safe_area = spec.map(|s| s.safe_area).unwrap_or_default();
+
                 let cur_scale = surface.output.current_scale().fractional_scale();
-                if (cur_scale - new_scale).abs() > 1e-4 {
+                let cur_transform = surface.output.current_transform();
+                if (cur_scale - new_scale).abs() > 1e-4 || cur_transform != new_transform {
                     surface.output.change_current_state(
                         None,
-                        None,
+                        Some(new_transform),
                         Some(Scale::Fractional(new_scale)),
                         None,
                     );
-                    if let Some(wl_mode) = surface.output.current_mode() {
-                        let lw = (f64::from(wl_mode.size.w) / new_scale).round().max(64.0) as u32;
-                        let lh = (f64::from(wl_mode.size.h) / new_scale).round().max(64.0) as u32;
-                        resized.push((surface.output.clone(), lw, lh, new_scale));
-                    }
                     surface.redraw_state = SurfaceRedrawState::Queued;
+                }
+                let phys_transformed = new_transform.transform_size(wl_mode.size);
+                let lw = (f64::from(phys_transformed.w) / new_scale)
+                    .round()
+                    .max(64.0) as u32;
+                let lh = (f64::from(phys_transformed.h) / new_scale)
+                    .round()
+                    .max(64.0) as u32;
+                updated.push(HotReloadedMonitorUpdate {
+                    output: surface.output.clone(),
+                    logical_w: lw,
+                    logical_h: lh,
+                    scale: new_scale,
+                    explicit_pos,
+                    safe_area,
+                });
+            }
+        }
+        updated
+    }
+
+    /// Returns the DRM connector modes discovered for `output`.
+    #[must_use]
+    pub fn available_modes_for_output(&self, output: &Output) -> Vec<Mode> {
+        let name = output.name();
+        for device in self.devices.values() {
+            for surf in device.surfaces.values() {
+                if surf.output == *output || surf.output.name() == name {
+                    return surf.available_modes.clone();
                 }
             }
         }
-        resized
+        Vec::new()
+    }
+
+    /// Requests a live KMS modeset on `output` for the given Wayland `Mode` (`zwlr_output_manager_v1`).
+    pub fn apply_output_mode(&mut self, output: &Output, mode: Mode) -> Result<(), String> {
+        let name = output.name();
+        for device in self.devices.values_mut() {
+            if let Some(surface) = device
+                .surfaces
+                .values_mut()
+                .find(|s| s.output == *output || s.output.name() == name)
+            {
+                let target_w =
+                    u16::try_from(mode.size.w).map_err(|_| "mode width out of range".to_owned())?;
+                let target_h = u16::try_from(mode.size.h)
+                    .map_err(|_| "mode height out of range".to_owned())?;
+                let drm_mode = surface
+                    .drm_modes
+                    .iter()
+                    .copied()
+                    .find(|m| Mode::from(*m) == mode)
+                    .or_else(|| {
+                        surface
+                            .drm_modes
+                            .iter()
+                            .copied()
+                            .filter(|m| m.size() == (target_w, target_h))
+                            .filter(|m| {
+                                mode.refresh <= 0
+                                    || (Mode::from(*m).refresh - mode.refresh).abs() <= 500
+                            })
+                            .max_by_key(|m| m.vrefresh())
+                    })
+                    .ok_or_else(|| {
+                        format!(
+                            "mode {}x{}@{}mHz is not supported by DRM connector {}",
+                            mode.size.w, mode.size.h, mode.refresh, surface.connector_name
+                        )
+                    })?;
+
+                surface.compositor.use_mode(drm_mode).map_err(|err| {
+                    format!("DRM modeset failed on {}: {err:?}", surface.connector_name)
+                })?;
+                surface.refresh_mhz = Mode::from(drm_mode).refresh;
+                surface.redraw_state = SurfaceRedrawState::Queued;
+                return Ok(());
+            }
+        }
+        Err(format!("unknown TTY output `{name}`"))
     }
 
     /// Switches Linux virtual terminal (`Ctrl + Alt + F1..F12` -> `VT 1..12`).
@@ -473,11 +766,111 @@ impl TtyBackendState {
         }
     }
 
+    fn init_explicit_render_device(
+        &mut self,
+        render_path: &Path,
+        explicit_rn: DrmNode,
+    ) -> anyhow::Result<()> {
+        let open_flags = OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOCTTY | OFlags::NONBLOCK;
+        let fd = self
+            .session
+            .open(render_path, open_flags)
+            .with_context(|| format!("LibSeatSession::open({render_path:?}) failed"))?;
+        let raw_device_fd = DeviceFd::from(fd);
+        let gbm = GbmDevice::new(raw_device_fd).context("GbmDevice::new(render) failed")?;
+        let rn = try_register_egl_render_node(&mut self.gpu_manager, &gbm, explicit_rn, false)
+            .with_context(|| {
+                format!("failed initializing KOMA_RENDER_DRM_DEVICE EGL on {render_path:?}")
+            })?;
+        self.render_registry.explicit_render_override = Some(rn);
+        self.render_registry.primary_render_node = rn;
+        self.render_registry.has_hardware_primary = true;
+        self.render_registry.primary_uses_software = false;
+        self.render_registry.render_refcounts.insert(rn, 1);
+        self.primary_render_node = rn;
+        self.explicit_render_gbm = Some(gbm);
+        info!(?rn, path = ?render_path, "initialized KOMA_RENDER_DRM_DEVICE hardware renderer");
+        Ok(())
+    }
+
+    fn enable_software_fallback_on_primary(&mut self) -> anyhow::Result<()> {
+        if !software_rendering_allowed() {
+            bail!(
+                "primary DRM device {:?} has no hardware renderer and software rendering is disabled",
+                self.primary_node
+            );
+        }
+        let primary_gbm = self
+            .devices
+            .get(&self.primary_node)
+            .map(|d| d.gbm.clone())
+            .ok_or_else(|| anyhow!("missing primary DRM device {:?}", self.primary_node))?;
+        warn!(
+            node = ?self.primary_node,
+            "no hardware EGL renderer found across DRM devices; falling back to software rendering (llvmpipe). Expect high CPU use; set KOMA_DISABLE_SOFTWARE_RENDERING=1 to fail instead"
+        );
+        let rn = try_register_egl_render_node(
+            &mut self.gpu_manager,
+            &primary_gbm,
+            self.primary_node,
+            true,
+        )
+        .context("software (llvmpipe) EGL fallback on display-only primary DRM device failed")?;
+        let outcome = self
+            .render_registry
+            .register_card(self.primary_node, None, Some(rn));
+        self.primary_render_node = self.render_registry.primary_render_node;
+        for dead in outcome.nodes_to_remove {
+            self.gpu_manager.as_mut().remove_node(&dead);
+        }
+        if let Some(dev) = self.devices.get_mut(&self.primary_node) {
+            dev.render_node = Some(rn);
+            dev.software_rendering = true;
+        }
+        Ok(())
+    }
+
+    fn ensure_hardware_dmabuf_global(&mut self, state: &mut KomaState) -> anyhow::Result<()> {
+        if self.render_registry.primary_uses_software
+            || !self.render_registry.has_hardware_primary
+            || self.dmabuf_global.is_some()
+        {
+            return Ok(());
+        }
+        let renderer = self
+            .gpu_manager
+            .single_renderer(&self.primary_render_node)
+            .context("failed obtaining primary GlesRenderer")?;
+        let primary_formats = renderer.dmabuf_formats();
+        let default_feedback =
+            DmabufFeedbackBuilder::new(self.primary_render_node.dev_id(), primary_formats)
+                .build()
+                .context("failed building default DmabufFeedback")?;
+        let global = state
+            .dmabuf_state
+            .create_global_with_default_feedback::<KomaState>(
+                &state.display_handle,
+                &default_feedback,
+            );
+        self.dmabuf_global = Some(global);
+        Ok(())
+    }
+
     fn device_added(
         &mut self,
         device_id: dev_t,
         path: &Path,
         state: &mut KomaState,
+    ) -> anyhow::Result<()> {
+        self.add_device_internal(device_id, path, state, true)
+    }
+
+    fn add_device_internal(
+        &mut self,
+        device_id: dev_t,
+        path: &Path,
+        state: &mut KomaState,
+        scan_connectors: bool,
     ) -> anyhow::Result<()> {
         let node = DrmNode::from_dev_id(device_id)?;
         if node.ty() != NodeType::Primary {
@@ -501,86 +894,83 @@ impl TtyBackendState {
             DrmDevice::new(device_fd.clone(), false).context("DrmDevice::new failed")?;
         let gbm = GbmDevice::new(device_fd.device_fd()).context("GbmDevice::new failed")?;
 
-        // Initialize hardware EGL render node (rejecting software `llvmpipe` per
-        // `niri/src/backend/tty.rs`). A display-only primary device (bochs-drm, simpledrm,
-        // virtio-gpu without virgl) has no hardware renderer to borrow, so it falls back to Mesa's
-        // software rasterizer through GBM on its own card node (`kms_swrast` + llvmpipe dumb
-        // buffers). Secondary display-only devices keep borrowing the primary GPU.
+        // Attempt hardware EGL first. During initial boot enumeration (`!scan_connectors`) or when
+        // split display+render cards exist (`apple-drm` + `asahi` AGX, `i915` + `amdgpu`), a
+        // display-only primary card defers software fallback until any companion render node is
+        // checked and will promote cleanly when the render card is registered.
         let is_primary = node == self.primary_node;
-        let (render_node, software_rendering) = match try_register_egl_render_node(
-            &mut self.gpu_manager,
-            &gbm,
-            node,
-            false,
-        ) {
-            Ok(rn) => {
-                debug!(?node, ?rn, "registered hardware EGL render node");
-                (Some(rn), false)
-            }
-            Err(err) if is_primary && software_rendering_allowed() => {
-                warn!(
-                    ?node,
-                    "primary DRM device has no hardware renderer ({err:#}); falling back to software rendering (llvmpipe). Expect high CPU use; set KOMA_DISABLE_SOFTWARE_RENDERING=1 to fail instead"
-                );
-                let rn = try_register_egl_render_node(&mut self.gpu_manager, &gbm, node, true)
-                    .context("software (llvmpipe) EGL fallback on display-only primary DRM device failed")?;
-                if rn != self.primary_render_node {
-                    info!(old = ?self.primary_render_node, new = ?rn, "using software render node as primary renderer");
-                    self.primary_render_node = rn;
+        let (hw_render_node, sw_render_node, render_node, software_rendering) =
+            match try_register_egl_render_node(&mut self.gpu_manager, &gbm, node, false) {
+                Ok(rn) => {
+                    debug!(?node, ?rn, "registered hardware EGL render node");
+                    (Some(rn), None, Some(rn), false)
                 }
-                (Some(rn), true)
-            }
-            Err(err) => {
-                if is_primary {
-                    bail!(
-                        "primary DRM device {node:?} has no hardware renderer and software rendering is disabled: {err:#}"
+                Err(err)
+                    if scan_connectors
+                        && is_primary
+                        && !self.render_registry.has_hardware_primary
+                        && software_rendering_allowed() =>
+                {
+                    warn!(
+                        ?node,
+                        "primary DRM device has no hardware renderer ({err:#}); falling back to software rendering (llvmpipe). Expect high CPU use; set KOMA_DISABLE_SOFTWARE_RENDERING=1 to fail instead"
                     );
+                    let rn =
+                        try_register_egl_render_node(&mut self.gpu_manager, &gbm, node, true)
+                            .context(
+                                "software (llvmpipe) EGL fallback on display-only primary DRM device failed",
+                            )?;
+                    (None, Some(rn), Some(rn), true)
                 }
-                debug!(
-                    ?node,
-                    "display-only or software DRM device; falling back to primary GPU: {err:#}"
-                );
-                (None, false)
+                Err(err) => {
+                    if scan_connectors && is_primary && !self.render_registry.has_hardware_primary {
+                        bail!(
+                            "primary DRM device {node:?} has no hardware renderer and software rendering is disabled: {err:#}"
+                        );
+                    }
+                    debug!(
+                        ?node,
+                        "display-only DRM device; borrowing primary render node: {err:#}"
+                    );
+                    (None, None, None, false)
+                }
+            };
+
+        let outcome = self
+            .render_registry
+            .register_card(node, hw_render_node, sw_render_node);
+        self.primary_render_node = self.render_registry.primary_render_node;
+        if let Some(old_rn) = outcome.promoted_from {
+            info!(
+                old = ?old_rn,
+                new = ?self.primary_render_node,
+                "promoted primary render node to newly discovered hardware GPU"
+            );
+            for dev in self.devices.values_mut() {
+                if dev.render_node == Some(old_rn) && dev.software_rendering {
+                    dev.render_node = None;
+                    dev.software_rendering = false;
+                }
             }
-        };
-
-        // Advertise `zwp_linux_dmabuf_v1` global once the primary render node comes online.
-        // Skipped for software rendering: llvmpipe cannot reliably import client dmabufs (niri
-        // rejects software renderers for the same reason), so clients fall back to `wl_shm`.
-        if render_node == Some(self.primary_render_node)
-            && !software_rendering
-            && self.dmabuf_global.is_none()
-        {
-            let renderer = self
-                .gpu_manager
-                .single_renderer(&self.primary_render_node)
-                .context("failed obtaining primary GlesRenderer")?;
-
-            // `zwp_linux_dmabuf_v1` below exposes GPU buffers directly without legacy `wl_drm` (`use_system_lib`).
-            let primary_formats = renderer.dmabuf_formats();
-            let default_feedback =
-                DmabufFeedbackBuilder::new(self.primary_render_node.dev_id(), primary_formats)
-                    .build()
-                    .context("failed building default DmabufFeedback")?;
-            let global = state
-                .dmabuf_state
-                .create_global_with_default_feedback::<KomaState>(
-                    &state.display_handle,
-                    &default_feedback,
-                );
-            self.dmabuf_global = Some(global);
+        }
+        for dead in outcome.nodes_to_remove {
+            self.gpu_manager.as_mut().remove_node(&dead);
         }
 
-        // The primary device never borrows from itself: it is not yet in `self.devices` here, so
-        // a display-only primary must allocate from its own GBM device (komawm/koma#2).
+        if scan_connectors && let Err(err) = self.ensure_hardware_dmabuf_global(state) {
+            warn!("failed initializing dmabuf global after render node promotion: {err:#}");
+        }
+
+        // A display-only primary must allocate scanout buffers from its own GBM device or an
+        // explicit render override (`komawm/koma#2`, Apple Silicon `apple-drm` + `asahi`).
         let allocator_gbm = if render_node.is_some() || is_primary {
             gbm.clone()
+        } else if let Some(explicit_gbm) = &self.explicit_render_gbm {
+            explicit_gbm.clone()
         } else if let Some(primary_dev) = self.devices.get(&self.primary_node) {
             primary_dev.gbm.clone()
         } else {
-            bail!(
-                "no GBM allocator available for display-only DRM node {node:?} (primary DRM node is not initialized)"
-            );
+            gbm.clone()
         };
         let allocator = GbmAllocator::new(
             allocator_gbm,
@@ -618,7 +1008,9 @@ impl TtyBackendState {
             },
         );
 
-        self.device_changed(device_id, state);
+        if scan_connectors {
+            self.device_changed(device_id, state);
+        }
         Ok(())
     }
 
@@ -705,13 +1097,15 @@ impl TtyBackendState {
             state
                 .gamma_control_state
                 .notify_output_removed(&output_name);
+            state.unregister_output(&surf.output);
             if let Some(global) = surf.wl_global {
                 state.display_handle.remove_global::<KomaState>(global);
             }
         }
-        if let Some(rn) = device.render_node {
-            self.gpu_manager.as_mut().remove_node(&rn);
+        if let Some(unused_rn) = self.render_registry.unregister_card(node) {
+            self.gpu_manager.as_mut().remove_node(&unused_rn);
         }
+        self.primary_render_node = self.render_registry.primary_render_node;
         if let Some(lh) = &state.loop_handle {
             lh.remove(device.token);
         }
@@ -730,15 +1124,66 @@ impl TtyBackendState {
             connector.interface().as_str(),
             connector.interface_id()
         );
+        let fallback_serial = format!("{node:?}-{crtc:?}");
+        let meta = self
+            .devices
+            .get(&node)
+            .map(|dev| query_connector_metadata(&dev.drm, connector.handle()))
+            .unwrap_or_default();
 
-        // Consult declarative `koma.monitor({ output = "eDP-1", mode = "2560x1600@240", scale = 1.6, ... })`
+        let (make, model, serial_number, phys_mm) = if let Some(edid) = &meta.edid {
+            let edid_mm = edid.physical_size_mm();
+            let fallback_mm = connector
+                .size()
+                .map(|(w, h)| (w as i32, h as i32))
+                .unwrap_or((0, 0));
+            let mm = if edid_mm.0 > 0 && edid_mm.1 > 0 {
+                edid_mm
+            } else {
+                fallback_mm
+            };
+            let sn = edid.display_serial();
+            (
+                edid.display_make().to_owned(),
+                edid.display_model(&connector_name),
+                if sn.is_empty() { fallback_serial } else { sn },
+                mm,
+            )
+        } else {
+            let fallback_mm = connector
+                .size()
+                .map(|(w, h)| (w as i32, h as i32))
+                .unwrap_or((0, 0));
+            (
+                "DRM".to_owned(),
+                connector_name.clone(),
+                fallback_serial,
+                fallback_mm,
+            )
+        };
+
+        // Consult declarative `koma.monitor` rules matching connector name or EDID identity
         let lua_out_cfg = state
             .lua_sandbox
             .config_snapshot()
-            .find_monitor(&connector_name)
+            .find_monitor_for_output(
+                &connector_name,
+                Some(&make),
+                Some(&model),
+                Some(&serial_number),
+            )
             .cloned();
         if lua_out_cfg.as_ref().is_some_and(|c| c.off) {
             info!(connector = %connector_name, "connector disabled (`off = true`) by init.lua koma.monitor rule");
+            return Ok(());
+        }
+        if connector_should_be_skipped(meta.non_desktop, lua_out_cfg.as_ref()) {
+            info!(
+                connector = %connector_name,
+                make = %make,
+                model = %model,
+                "skipping DRM non-desktop connector (Touch Bar / HMD); set `non_desktop = true` in koma.monitor to opt in"
+            );
             return Ok(());
         }
 
@@ -749,12 +1194,26 @@ impl TtyBackendState {
         let drm_mode = pick_connector_mode(&connector, requested_mode).ok_or_else(|| {
             anyhow!("connector `{connector_name}` advertised zero usable KMS modes")
         })?;
+        let drm_modes = connector.modes().to_vec();
         let wl_mode = Mode::from(drm_mode);
-        let scale_factor = lua_out_cfg
+        let available_modes: Vec<Mode> = drm_modes.iter().copied().map(Mode::from).collect();
+        let scale_factor = resolve_connector_scale(
+            lua_out_cfg.as_ref(),
+            wl_mode.size.w.max(1) as u32,
+            wl_mode.size.h.max(1) as u32,
+            phys_mm.0,
+            phys_mm.1,
+        );
+        let output_transform =
+            resolve_connector_transform(lua_out_cfg.as_ref(), meta.panel_orientation);
+        let smithay_transform = koma_transform_to_smithay(output_transform);
+        let explicit_pos = lua_out_cfg
             .as_ref()
-            .map(|c| c.scale)
-            .filter(|&s| (0.5..=4.0).contains(&s))
-            .unwrap_or(1.0);
+            .and_then(MonitorSpec::resolved_position);
+        let safe_area = lua_out_cfg
+            .as_ref()
+            .map(|c| c.safe_area)
+            .unwrap_or_default();
 
         let target_render_node = self
             .devices
@@ -797,24 +1256,28 @@ impl TtyBackendState {
                 .collect()
         };
 
-        let (phys_w, phys_h) = connector.size().unwrap_or((0, 0));
         let output = Output::new(
             connector_name.clone(),
             PhysicalProperties {
-                size: (phys_w as i32, phys_h as i32).into(),
+                size: phys_mm.into(),
                 subpixel: connector.subpixel().into(),
-                make: "DRM".to_owned(),
-                model: connector_name.clone(),
-                serial_number: format!("{node:?}-{crtc:?}"),
+                make: make.clone(),
+                model: model.clone(),
+                serial_number: serial_number.clone(),
             },
         );
         output.change_current_state(
             Some(wl_mode),
-            None,
+            Some(smithay_transform),
             Some(Scale::Fractional(scale_factor)),
             Some((0, 0).into()),
         );
         output.set_preferred(wl_mode);
+        for &m in &available_modes {
+            if m != wl_mode {
+                output.add_mode(m);
+            }
+        }
         output
             .user_data()
             .insert_if_missing(|| TtyOutputTag { node, crtc });
@@ -899,14 +1362,14 @@ impl TtyBackendState {
 
         let wl_global = Some(output.create_global::<KomaState>(&state.display_handle));
 
-        let logical_w = (f64::from(wl_mode.size.w) / scale_factor).round().max(64.0) as u32;
-        let logical_h = (f64::from(wl_mode.size.h) / scale_factor).round().max(64.0) as u32;
-
         info!(
             connector = %connector_name,
+            make = %make,
+            model = %model,
             mode = ?wl_mode.size,
             refresh_hz = (f64::from(wl_mode.refresh) / 1000.0),
             scale = scale_factor,
+            transform = ?output_transform,
             "initialized atomic KMS DrmCompositor surface"
         );
 
@@ -916,6 +1379,13 @@ impl TtyBackendState {
                 DrmOutputSurface {
                     connector: connector.handle(),
                     connector_name,
+                    make,
+                    model,
+                    serial_number,
+                    phys_mm,
+                    panel_orientation: meta.panel_orientation,
+                    available_modes,
+                    drm_modes,
                     output: output.clone(),
                     wl_global,
                     compositor,
@@ -926,7 +1396,7 @@ impl TtyBackendState {
             );
         }
 
-        state.handle_output_resized(&output, logical_w, logical_h, scale_factor);
+        state.register_or_update_output(&output, explicit_pos, safe_area, true);
         Ok(())
     }
 
@@ -940,6 +1410,7 @@ impl TtyBackendState {
             state
                 .gamma_control_state
                 .notify_output_removed(&output_name);
+            state.unregister_output(&removed.output);
             if let Some(global) = removed.wl_global {
                 state.display_handle.remove_global::<KomaState>(global);
             }
@@ -1073,8 +1544,26 @@ impl TtyBackendState {
     }
 }
 
-/// Discovers the primary DRM card + render node via `KOMA_DRM_DEVICE` or `udev::primary_gpu`.
-fn discover_primary_gpu(seat_name: &str) -> anyhow::Result<(DrmNode, DrmNode)> {
+/// Updated geometry, transform/scale, position, and notch safe-area snapshot produced when
+/// hot-reloading `MonitorSpec` rules onto live KMS outputs.
+pub struct HotReloadedMonitorUpdate {
+    pub output: Output,
+    pub logical_w: u32,
+    pub logical_h: u32,
+    pub scale: f64,
+    pub explicit_pos: Option<(i32, i32)>,
+    pub safe_area: koma_model::SafeAreaInsets,
+}
+
+struct PrimaryGpuDiscovery {
+    primary_node: DrmNode,
+    primary_render_node: DrmNode,
+    explicit_render_override: Option<(PathBuf, DrmNode)>,
+}
+
+/// Discovers the primary DRM card + render node via `KOMA_DRM_DEVICE` /
+/// `KOMA_RENDER_DRM_DEVICE` or `udev::primary_gpu`.
+fn discover_primary_gpu(seat_name: &str) -> anyhow::Result<PrimaryGpuDiscovery> {
     let primary_path = match env::var_os("KOMA_DRM_DEVICE") {
         Some(override_path) => PathBuf::from(override_path),
         None => udev::primary_gpu(seat_name)
@@ -1084,17 +1573,42 @@ fn discover_primary_gpu(seat_name: &str) -> anyhow::Result<(DrmNode, DrmNode)> {
 
     let primary_node = DrmNode::from_path(&primary_path)
         .with_context(|| format!("failed opening primary DRM node {primary_path:?}"))?;
-    let primary_render_node = primary_node
-        .node_with_type(NodeType::Render)
-        .and_then(Result::ok)
+
+    let explicit_render_override = match env::var_os("KOMA_RENDER_DRM_DEVICE") {
+        Some(override_path) => {
+            let render_path = PathBuf::from(override_path);
+            let explicit_node = DrmNode::from_path(&render_path).with_context(|| {
+                format!("failed opening KOMA_RENDER_DRM_DEVICE {render_path:?}")
+            })?;
+            let render_node = explicit_node
+                .node_with_type(NodeType::Render)
+                .and_then(Result::ok)
+                .unwrap_or(explicit_node);
+            Some((render_path, render_node))
+        }
+        None => None,
+    };
+
+    let primary_render_node = explicit_render_override
+        .as_ref()
+        .map(|(_, rn)| *rn)
         .unwrap_or_else(|| {
-            warn!(
-                ?primary_node,
-                "primary GPU has no dedicated renderD* node; reusing card node"
-            );
             primary_node
+                .node_with_type(NodeType::Render)
+                .and_then(Result::ok)
+                .unwrap_or_else(|| {
+                    warn!(
+                        ?primary_node,
+                        "primary GPU has no dedicated renderD* node; reusing card node"
+                    );
+                    primary_node
+                })
         });
-    Ok((primary_node, primary_render_node))
+    Ok(PrimaryGpuDiscovery {
+        primary_node,
+        primary_render_node,
+        explicit_render_override,
+    })
 }
 
 fn try_register_egl_render_node(
@@ -1288,6 +1802,110 @@ fn parse_mode_spec(spec: &str) -> Option<(u16, u16, Option<i32>)> {
         None => None,
     };
     Some((w, h, mhz))
+}
+
+#[derive(Debug, Default)]
+struct ConnectorDrmMetadata {
+    edid: Option<ParsedEdid>,
+    panel_orientation: Option<OutputTransform>,
+    non_desktop: bool,
+}
+
+fn panel_orientation_from_prop_name(name: &str) -> Option<OutputTransform> {
+    match name.trim() {
+        "Normal" => Some(OutputTransform::Normal),
+        "Upside Down" => Some(OutputTransform::Rotate180),
+        "Left Side Up" => Some(OutputTransform::Rotate90),
+        "Right Side Up" => Some(OutputTransform::Rotate270),
+        _ => None,
+    }
+}
+
+fn query_connector_metadata(drm: &DrmDevice, conn: connector::Handle) -> ConnectorDrmMetadata {
+    let mut meta = ConnectorDrmMetadata::default();
+    let Ok(props) = drm.get_properties(conn) else {
+        return meta;
+    };
+    let (handles, values) = props.as_props_and_values();
+    for (&handle, &raw_val) in handles.iter().zip(values.iter()) {
+        let Ok(info) = drm.get_property(handle) else {
+            continue;
+        };
+        let prop_name = info.name().to_bytes();
+        let value_type = info.value_type();
+        let val = value_type.convert_value(raw_val);
+        if prop_name.eq_ignore_ascii_case(b"EDID") {
+            if let property::Value::Blob(blob_id) = val
+                && blob_id != 0
+                && let Ok(bytes) = drm.get_property_blob(blob_id)
+            {
+                meta.edid = ParsedEdid::parse(&bytes).ok();
+            }
+        } else if prop_name.eq_ignore_ascii_case(b"non-desktop") {
+            meta.non_desktop = match val {
+                property::Value::Boolean(b) => b,
+                property::Value::UnsignedRange(v) => v != 0,
+                property::Value::SignedRange(v) => v != 0,
+                property::Value::Enum(Some(ev)) => ev.value() != 0,
+                _ => false,
+            };
+        } else if prop_name.eq_ignore_ascii_case(b"panel orientation") {
+            meta.panel_orientation = match val {
+                property::Value::Enum(Some(ev)) => std::str::from_utf8(ev.name().to_bytes())
+                    .ok()
+                    .and_then(panel_orientation_from_prop_name)
+                    .or_else(|| match ev.value() {
+                        0 => Some(OutputTransform::Normal),
+                        1 => Some(OutputTransform::Rotate180),
+                        2 => Some(OutputTransform::Rotate90),
+                        3 => Some(OutputTransform::Rotate270),
+                        _ => None,
+                    }),
+                property::Value::UnsignedRange(v) => match v {
+                    0 => Some(OutputTransform::Normal),
+                    1 => Some(OutputTransform::Rotate180),
+                    2 => Some(OutputTransform::Rotate90),
+                    3 => Some(OutputTransform::Rotate270),
+                    _ => None,
+                },
+                _ => None,
+            };
+        }
+    }
+    meta
+}
+
+#[must_use]
+fn connector_should_be_skipped(non_desktop: bool, spec: Option<&MonitorSpec>) -> bool {
+    non_desktop && !spec.is_some_and(|s| s.allow_non_desktop)
+}
+
+#[must_use]
+fn resolve_connector_transform(
+    spec: Option<&MonitorSpec>,
+    panel_orientation: Option<OutputTransform>,
+) -> OutputTransform {
+    if let Some(spec) = spec
+        && spec.has_explicit_transform
+    {
+        return spec.parsed_transform().unwrap_or_default();
+    }
+    panel_orientation.unwrap_or(OutputTransform::Normal)
+}
+
+#[must_use]
+fn resolve_connector_scale(
+    spec: Option<&MonitorSpec>,
+    phys_w_px: u32,
+    phys_h_px: u32,
+    phys_w_mm: i32,
+    phys_h_mm: i32,
+) -> f64 {
+    let resolved = match spec {
+        Some(s) => s.scale.resolve(phys_w_px, phys_h_px, phys_w_mm, phys_h_mm),
+        None => MonitorScaleSpec::Auto.resolve(phys_w_px, phys_h_px, phys_w_mm, phys_h_mm),
+    };
+    closest_representable_scale(resolved)
 }
 
 fn on_udev_event_callback(state: &mut KomaState, event: UdevEvent) {
@@ -1487,24 +2105,23 @@ fn render_single_drm_surface(
     node: DrmNode,
     crtc: crtc::Handle,
 ) -> Option<(Output, Duration)> {
-    let ws = state.workspaces.get(&state.active_ws_id)?;
-    let viewport: LogicalViewport = ws.viewport;
-    let lease_state = ws.lease.state().clone();
-
     let device = tty.devices.get_mut(&node)?;
     if !device.drm.is_active() {
         return None;
     }
     let target_render_node = device.render_node.unwrap_or(tty.primary_render_node);
     let surface = device.surfaces.get_mut(&crtc)?;
-    if state
-        .output_power_state
-        .is_output_off(&surface.output.name())
-    {
+    let out_name = surface.output.name();
+    if state.output_power_state.is_output_off(&out_name) || !state.is_output_enabled(&out_name) {
         surface.redraw_state = SurfaceRedrawState::Idle;
         return None;
     }
+    let out_ws_id = state.active_workspace_for_output(&out_name);
+    let ws = state.workspaces.get(&out_ws_id)?;
+    let viewport: LogicalViewport = state.viewport_for_output(&surface.output);
+    let lease_state = ws.lease.state().clone();
     let output_scale = MathScale::from(surface.output.current_scale().fractional_scale());
+    let output_origin = surface.output.current_location().to_f64();
 
     let mut renderer: TtyRenderer<'_> = match tty.gpu_manager.renderer(
         &tty.primary_render_node,
@@ -1526,7 +2143,7 @@ fn render_single_drm_surface(
     if !locked {
         state.tick_frame_animations_and_edge_scroll();
     }
-    let pointer_loc = state.pointer_location;
+    let pointer_loc = state.pointer_location - output_origin;
     let now_ms = state.elapsed_ms();
     let cursor_elems =
         state
@@ -1551,7 +2168,7 @@ fn render_single_drm_surface(
             Color32F::new(0.0, 0.0, 0.0, 1.0),
         )
     } else {
-        let (base_scene_items, special_overlay) = state.collect_physical_scene_items();
+        let (base_scene_items, special_overlay) = state.collect_output_scene_items(&out_name);
         let blur_cfg = state.lua_sandbox.config_snapshot().appearance.blur;
         let any_window_needs_blur = blur_cfg.enabled
             && base_scene_items
@@ -1563,7 +2180,7 @@ fn render_single_drm_surface(
             let phys_sz = surface
                 .output
                 .current_mode()
-                .map(|m| m.size)
+                .map(|m| surface.output.current_transform().transform_size(m.size))
                 .unwrap_or_else(|| (1920, 1080).into());
             let mut gles_bg_elems: Vec<KomaRenderElement<GlesRenderer>> = Vec::new();
             append_layer_tier_elements(
@@ -1629,7 +2246,7 @@ fn render_single_drm_surface(
             append_scratchpad_dim_scrim(viewport, &mut elements);
         }
 
-        if let Some(ws) = state.workspaces.get(&state.active_ws_id)
+        if let Some(ws) = state.workspaces.get(&out_ws_id)
             && ws.layout_mode == koma_model::LayoutMode::Scrolling
             && ws.fullscreen_window.is_none()
         {
@@ -1637,7 +2254,7 @@ fn render_single_drm_surface(
             let tab_segs = ws.scrolling.tab_indicator_segments_at(viewport, cam_x);
             append_tab_indicator_elements(&mut renderer, output_scale, &tab_segs, &mut elements);
         }
-        let base_drop = state.drop_preview_for_workspace(&state.active_ws_id);
+        let base_drop = state.drop_preview_for_workspace(&out_ws_id);
         let ws_elements = assemble_workspace_elements(
             &mut renderer,
             viewport,
@@ -1752,13 +2369,18 @@ where
 
         // Drawing tablets (e.g. Wacom CTL-472 / OpenTabletDriver) & touchscreens
         InputEvent::PointerMotionAbsolute { event } => {
-            let out_geo_size = state
-                .workspaces
-                .get(&state.active_ws_id)
-                .map(|ws| (ws.viewport.width as i32, ws.viewport.height as i32))
-                .unwrap_or((1920, 1080));
-            let pos: Point<f64, _> = event.position_transformed(out_geo_size.into());
-            state.handle_pointer_absolute_motion(pos, event.time());
+            let rect = state
+                .focused_output()
+                .or_else(|| state.all_outputs().into_iter().next())
+                .map(|out| state.output_logical_rect(&out))
+                .unwrap_or_else(|| smithay::utils::Rectangle::from_size((1920, 1080).into()));
+            let local_pos: Point<f64, _> = event.position_transformed(rect.size);
+            let global_pos: Point<f64, _> = (
+                local_pos.x + f64::from(rect.loc.x),
+                local_pos.y + f64::from(rect.loc.y),
+            )
+                .into();
+            state.handle_pointer_absolute_motion(global_pos, event.time());
         }
 
         InputEvent::PointerButton { event } => {
@@ -2041,5 +2663,118 @@ mod tests {
     fn drm_master_query_rejects_non_drm_fd() {
         let file = std::fs::File::open("/dev/null").expect("open /dev/null");
         assert!(drm_fd_is_master(file.as_fd()).is_err());
+    }
+
+    #[test]
+    fn render_node_registry_promotes_split_display_render_gpu() {
+        const APPLE_DRM_CARD: u32 = 1;
+        const ASAHI_CARD: u32 = 2;
+        const ASAHI_RENDER: u32 = 128;
+
+        let mut reg = RenderNodeRegistry::new(APPLE_DRM_CARD, None);
+        let display_only = reg.register_card(APPLE_DRM_CARD, None, None);
+        assert_eq!(display_only.target_render_node, APPLE_DRM_CARD);
+        assert_eq!(display_only.promoted_from, None);
+        assert!(!reg.has_hardware_primary);
+
+        let companion = reg.register_card(ASAHI_CARD, Some(ASAHI_RENDER), None);
+        assert_eq!(companion.target_render_node, ASAHI_RENDER);
+        assert_eq!(companion.promoted_from, Some(APPLE_DRM_CARD));
+        assert!(reg.has_hardware_primary);
+        assert_eq!(reg.primary_render_node, ASAHI_RENDER);
+        assert_eq!(
+            reg.card_render_target.get(&APPLE_DRM_CARD),
+            Some(&ASAHI_RENDER)
+        );
+        assert_eq!(reg.card_render_target.get(&ASAHI_CARD), Some(&ASAHI_RENDER));
+        assert_eq!(reg.render_refcounts.get(&ASAHI_RENDER), Some(&2));
+    }
+
+    #[test]
+    fn render_node_registry_refcounts_shared_render_node_on_hot_unplug() {
+        const IGPU_CARD: u32 = 1;
+        const DGPU_CARD: u32 = 2;
+        const SHARED_RENDER: u32 = 128;
+        const DGPU_RENDER: u32 = 129;
+
+        let mut reg = RenderNodeRegistry::new(SHARED_RENDER, None);
+        reg.register_card(IGPU_CARD, Some(SHARED_RENDER), None);
+        reg.register_card(DGPU_CARD, None, None);
+        assert_eq!(reg.render_refcounts.get(&SHARED_RENDER), Some(&2));
+
+        // Removing iGPU card while dGPU display-only card still borrows `SHARED_RENDER` keeps refcount == 1.
+        assert_eq!(reg.unregister_card(IGPU_CARD), None);
+        assert_eq!(reg.render_refcounts.get(&SHARED_RENDER), Some(&1));
+
+        // Removing the final borrower drops refcount to 0 and returns `Some(SHARED_RENDER)` for removal.
+        assert_eq!(reg.unregister_card(DGPU_CARD), Some(SHARED_RENDER));
+        assert!(!reg.render_refcounts.contains_key(&SHARED_RENDER));
+
+        // Independent hardware card uses its own render node without affecting others.
+        let other = reg.register_card(DGPU_CARD, Some(DGPU_RENDER), None);
+        assert_eq!(other.target_render_node, DGPU_RENDER);
+        assert_eq!(reg.unregister_card(DGPU_CARD), Some(DGPU_RENDER));
+    }
+
+    #[test]
+    fn connector_policy_filters_non_desktop_unless_opted_in() {
+        assert!(!connector_should_be_skipped(false, None));
+        assert!(connector_should_be_skipped(true, None));
+
+        let mut spec = MonitorSpec::default();
+        assert!(connector_should_be_skipped(true, Some(&spec)));
+
+        spec.allow_non_desktop = true;
+        assert!(!connector_should_be_skipped(true, Some(&spec)));
+    }
+
+    #[test]
+    fn panel_orientation_honored_when_monitor_spec_has_no_explicit_transform() {
+        assert_eq!(
+            resolve_connector_transform(None, Some(OutputTransform::Rotate270)),
+            OutputTransform::Rotate270
+        );
+
+        let mut spec = MonitorSpec {
+            has_explicit_transform: false,
+            transform: "normal".to_owned(),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_connector_transform(Some(&spec), Some(OutputTransform::Rotate90)),
+            OutputTransform::Rotate90
+        );
+
+        spec.has_explicit_transform = true;
+        spec.transform = "180".to_owned();
+        assert_eq!(
+            resolve_connector_transform(Some(&spec), Some(OutputTransform::Rotate90)),
+            OutputTransform::Rotate180
+        );
+    }
+
+    #[test]
+    fn auto_scale_resolves_retina_and_zero_mm_fallback() {
+        let auto_spec = MonitorSpec {
+            scale: MonitorScaleSpec::Auto,
+            ..Default::default()
+        };
+
+        // 14" MacBook Pro Retina (3024x1964 in 302x196 mm, ~254 DPI) -> 2.0
+        assert!(
+            (resolve_connector_scale(Some(&auto_spec), 3024, 1964, 302, 196) - 2.0).abs() < 1e-6
+        );
+        // Zero / unknown physical mm (virtual/EDID-less) -> safe 1.0 fallback
+        assert!((resolve_connector_scale(Some(&auto_spec), 2560, 1440, 0, 0) - 1.0).abs() < 1e-6);
+        // Unconfigured Retina display -> automatic 2.0 out-of-the-box
+        assert!((resolve_connector_scale(None, 2880, 1800, 331, 207) - 2.0).abs() < 1e-6);
+        // Explicit fixed scale overrides auto DPI
+        let fixed_spec = MonitorSpec {
+            scale: MonitorScaleSpec::Fixed(1.5),
+            ..Default::default()
+        };
+        assert!(
+            (resolve_connector_scale(Some(&fixed_spec), 3024, 1964, 302, 196) - 1.5).abs() < 1e-6
+        );
     }
 }

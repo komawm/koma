@@ -203,6 +203,14 @@ impl WinitBackendState {
 
         self.output
             .create_global::<KomaState>(&state.display_handle);
+        let mon_cfg = state
+            .lua_sandbox
+            .config_snapshot()
+            .find_monitor(&self.output.name())
+            .cloned();
+        let safe_area = mon_cfg.as_ref().map(|c| c.safe_area).unwrap_or_default();
+        let explicit_pos = mon_cfg.as_ref().and_then(|c| c.resolved_position());
+        state.register_or_update_output(&self.output, explicit_pos, safe_area, true);
     }
 
     pub fn request_redraw(&self) {
@@ -345,7 +353,7 @@ pub(crate) fn dispatch_output_frame_callbacks_filtered(
         return;
     }
 
-    for wl_surf in state.visible_physical_toplevel_surfaces() {
+    for wl_surf in state.visible_physical_toplevel_surfaces_for_output(&output.name()) {
         send_frames_surface_tree(&wl_surf, output, elapsed, throttle, |_, _| {
             Some(output.clone())
         });
@@ -370,19 +378,21 @@ pub fn render_winit_frame(state: &mut KomaState) -> anyhow::Result<()> {
         state.tick_frame_animations_and_edge_scroll();
     }
 
-    let Some(ws) = state.workspaces.get(&state.active_ws_id) else {
+    let Some(ActiveBackend::Winit(mut winit_state)) = state.backend.take() else {
+        return Ok(());
+    };
+    let out_name = winit_state.output.name();
+    let out_ws_id = state.active_workspace_for_output(&out_name);
+    let Some(ws) = state.workspaces.get(&out_ws_id) else {
+        state.backend = Some(ActiveBackend::Winit(winit_state));
         return Ok(());
     };
     let viewport = ws.viewport;
     let lease_state = ws.lease.state().clone();
-
-    let Some(ActiveBackend::Winit(mut winit_state)) = state.backend.take() else {
-        return Ok(());
-    };
     let output_scale =
         smithay::utils::Scale::from(winit_state.output.current_scale().fractional_scale());
 
-    let pointer_loc = state.pointer_location;
+    let pointer_loc = state.pointer_location - winit_state.output.current_location().to_f64();
     let now_ms = state.elapsed_ms();
     let cursor_elems = state.cursor_manager.render_elements(
         winit_state.backend.renderer(),
@@ -412,7 +422,7 @@ pub fn render_winit_frame(state: &mut KomaState) -> anyhow::Result<()> {
                 Color32F::new(0.0, 0.0, 0.0, 1.0),
             )
         } else {
-            let (base_scene_items, special_overlay) = state.collect_physical_scene_items();
+            let (base_scene_items, special_overlay) = state.collect_output_scene_items(&out_name);
             let blur_cfg = state.lua_sandbox.config_snapshot().appearance.blur;
             let any_window_needs_blur = blur_cfg.enabled
                 && base_scene_items
@@ -487,7 +497,7 @@ pub fn render_winit_frame(state: &mut KomaState) -> anyhow::Result<()> {
                 append_scratchpad_dim_scrim(viewport, &mut elements);
             }
 
-            if let Some(ws) = state.workspaces.get(&state.active_ws_id)
+            if let Some(ws) = state.workspaces.get(&out_ws_id)
                 && ws.layout_mode == koma_model::LayoutMode::Scrolling
                 && ws.fullscreen_window.is_none()
             {
@@ -500,7 +510,7 @@ pub fn render_winit_frame(state: &mut KomaState) -> anyhow::Result<()> {
                     &mut elements,
                 );
             }
-            let base_drop = state.drop_preview_for_workspace(&state.active_ws_id);
+            let base_drop = state.drop_preview_for_workspace(&out_ws_id);
             let ws_elements = assemble_workspace_elements(
                 winit_state.backend.renderer(),
                 viewport,
@@ -620,16 +630,13 @@ where
             );
         }
         InputEvent::PointerMotionAbsolute { event } => {
-            if !matches!(state.backend, Some(ActiveBackend::Winit(_))) {
+            let Some(ActiveBackend::Winit(winit_state)) = state.backend.as_ref() else {
                 return;
-            }
-            let out_geo_size = state
-                .workspaces
-                .get(&state.active_ws_id)
-                .map(|ws| (ws.viewport.width as i32, ws.viewport.height as i32))
-                .unwrap_or((1280, 800));
-            let pos: Point<f64, _> = event.position_transformed(out_geo_size.into());
-            state.handle_pointer_absolute_motion(pos, event.time());
+            };
+            let winit_out = winit_state.output.clone();
+            let rect = state.output_logical_rect(&winit_out);
+            let local_pos: Point<f64, _> = event.position_transformed(rect.size);
+            state.handle_pointer_absolute_motion(local_pos + rect.loc.to_f64(), event.time());
         }
         InputEvent::PointerButton { event } => {
             crate::keybind_dispatcher::process_pointer_button_event(

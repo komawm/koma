@@ -13,6 +13,7 @@ pub mod geometry;
 pub mod kinematics;
 pub mod layout;
 pub mod lease;
+pub mod output_layout;
 pub mod rules;
 pub mod scrolling;
 pub mod workspace;
@@ -27,10 +28,14 @@ pub use crate::{
         CardinalDir, DropZonePreview, DwindleConfig, DwindleInsertOutcome, DwindleTree,
         ResizeCorner,
     },
-    geometry::{Anchor9, AnchorPoint, LogicalPoint, LogicalRect, LogicalViewport},
+    geometry::{Anchor9, AnchorPoint, LogicalPoint, LogicalRect, LogicalViewport, SafeAreaInsets},
     kinematics::{MinimumJerkSolver, SpringSolver, TrajectorySolver},
     layout::{DeckStashStack, FloatingEntry, FloatingStack, LayoutMode},
     lease::{PreemptEffects, WorkspaceLease, WorkspaceLeaseState},
+    output_layout::{
+        OutputLayout, OutputLayoutEntry, OutputLayoutSpec, OutputTransform, SavedOutputConfig,
+        closest_representable_scale, compute_auto_scale,
+    },
     rules::{
         BlockOutPolicy, DynamicWindowRules, InitialWindowRules, OpenMode,
         ProtectedSurfaceClassifier, WindowMatchContext, WindowMatchSpec, WindowRuleEngine,

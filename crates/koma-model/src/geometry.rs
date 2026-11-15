@@ -32,6 +32,34 @@ impl LogicalRect {
     }
 }
 
+/// Logical safe-area insets (e.g. MacBook Pro camera notch / rounded screen cutouts)
+/// subtracted in addition to `wlr-layer-shell` `exclusive_zone` when computing `work_area`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SafeAreaInsets {
+    pub top: i32,
+    pub bottom: i32,
+    pub left: i32,
+    pub right: i32,
+}
+
+impl SafeAreaInsets {
+    #[must_use]
+    pub fn clamped_non_negative(self) -> Self {
+        Self {
+            top: self.top.max(0),
+            bottom: self.bottom.max(0),
+            left: self.left.max(0),
+            right: self.right.max(0),
+        }
+    }
+
+    #[must_use]
+    pub const fn is_zero(self) -> bool {
+        self.top <= 0 && self.bottom <= 0 && self.left <= 0 && self.right <= 0
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct LogicalViewport {
     pub width: u32,
@@ -119,6 +147,42 @@ impl LogicalViewport {
     #[must_use]
     pub fn with_work_area_zone(mut self, loc_x: i32, loc_y: i32, width: i32, height: i32) -> Self {
         self.work_area = Some(self.sanitized_work_area(loc_x, loc_y, width, height));
+        self
+    }
+
+    /// Composes `wlr-layer-shell` `non_exclusive_zone` with monitor `safe_area` insets so
+    /// tiled windows avoid both panels and hardware cutouts (such as a camera notch).
+    #[must_use]
+    pub fn with_work_area_zone_and_safe_area(
+        mut self,
+        loc_x: i32,
+        loc_y: i32,
+        width: i32,
+        height: i32,
+        safe_area: SafeAreaInsets,
+    ) -> Self {
+        let layer_rect = self.sanitized_work_area(loc_x, loc_y, width, height);
+        let safe = safe_area.clamped_non_negative();
+        if safe.is_zero() {
+            self.work_area = Some(layer_rect);
+            return self;
+        }
+        let out_w = self.width.max(1).min(i32::MAX as u32) as i32;
+        let out_h = self.height.max(1).min(i32::MAX as u32) as i32;
+        let safe_x0 = safe.left.clamp(0, out_w - 1);
+        let safe_y0 = safe.top.clamp(0, out_h - 1);
+        let safe_x1 = (out_w - safe.right).clamp(safe_x0 + 1, out_w);
+        let safe_y1 = (out_h - safe.bottom).clamp(safe_y0 + 1, out_h);
+
+        let x0 = layer_rect.x.max(safe_x0).clamp(0, out_w - 1);
+        let y0 = layer_rect.y.max(safe_y0).clamp(0, out_h - 1);
+        let x1 = (layer_rect.x + layer_rect.w.min(i32::MAX as u32) as i32)
+            .min(safe_x1)
+            .clamp(x0 + 1, out_w);
+        let y1 = (layer_rect.y + layer_rect.h.min(i32::MAX as u32) as i32)
+            .min(safe_y1)
+            .clamp(y0 + 1, out_h);
+        self.work_area = Some(LogicalRect::new(x0, y0, (x1 - x0) as u32, (y1 - y0) as u32));
         self
     }
 }
@@ -284,6 +348,52 @@ mod tests {
         assert_eq!(
             with_bar.work_area_rect(),
             LogicalRect::new(0, 36, 1920, 1044)
+        );
+    }
+
+    #[test]
+    fn safe_area_composes_cleanly_with_layer_shell_exclusive_zone() {
+        // 14" MacBook Pro logical size (1512x982) with top camera notch safe_area.top = 38.
+        let vp = LogicalViewport::new(1512, 982, 2.0);
+        let notch = SafeAreaInsets {
+            top: 38,
+            bottom: 0,
+            left: 0,
+            right: 0,
+        };
+
+        // No exclusive layer panels -> notch safe_area reserves top 38px.
+        let notch_only = vp.with_work_area_zone_and_safe_area(0, 0, 1512, 982, notch);
+        assert_eq!(
+            notch_only.work_area_rect(),
+            LogicalRect::new(0, 38, 1512, 944)
+        );
+
+        // Top panel smaller than notch (30px) still leaves notch top=38 protected.
+        let short_bar = vp.with_work_area_zone_and_safe_area(0, 30, 1512, 952, notch);
+        assert_eq!(
+            short_bar.work_area_rect(),
+            LogicalRect::new(0, 38, 1512, 944)
+        );
+
+        // Taller top panel (48px) + bottom bar (32px) reserves both beyond the notch.
+        let tall_bars = vp.with_work_area_zone_and_safe_area(0, 48, 1512, 902, notch);
+        assert_eq!(
+            tall_bars.work_area_rect(),
+            LogicalRect::new(0, 48, 1512, 902)
+        );
+
+        // Left/right/bottom safe_area + top layer panel compose via intersection.
+        let multi_inset = SafeAreaInsets {
+            top: 38,
+            bottom: 16,
+            left: 12,
+            right: 14,
+        };
+        let composed = vp.with_work_area_zone_and_safe_area(20, 30, 1492, 952, multi_inset);
+        assert_eq!(
+            composed.work_area_rect(),
+            LogicalRect::new(20, 38, 1478, 928)
         );
     }
 }

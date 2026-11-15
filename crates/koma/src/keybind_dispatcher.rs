@@ -1866,7 +1866,39 @@ pub fn execute_action_descriptor(
         ActionDescriptor::WindowMoveToWorkspace(target_name) => {
             let dst_ws_id = state.ensure_workspace_by_name_or_id(&target_name);
             let src_ws_id = state.effective_interactive_ws_id();
-            move_active_window_between_workspaces(state, &src_ws_id, &dst_ws_id);
+            let _ = state.move_active_window_between_workspaces(&src_ws_id, &dst_ws_id);
+        }
+
+        ActionDescriptor::WindowMoveToMonitor(target_monitor) => {
+            let _ = state.move_active_window_to_output(&target_monitor);
+        }
+
+        ActionDescriptor::WindowMoveToMonitorDirection(dir_raw) => {
+            if let Some(dir) = CardinalDir::parse(&dir_raw)
+                && let Some(cur_out) = state.focused_output_name()
+                && let Some(next_out) = state
+                    .output_layout
+                    .neighbor_in_direction(&cur_out, dir)
+                    .map(str::to_owned)
+            {
+                let _ = state.move_active_window_to_output(&next_out);
+            }
+        }
+
+        ActionDescriptor::MonitorFocus(target_monitor) => {
+            let _ = state.focus_output(&target_monitor);
+        }
+
+        ActionDescriptor::MonitorFocusDirection(dir_raw) => {
+            if let Some(dir) = CardinalDir::parse(&dir_raw)
+                && let Some(cur_out) = state.focused_output_name()
+                && let Some(next_out) = state
+                    .output_layout
+                    .neighbor_in_direction(&cur_out, dir)
+                    .map(str::to_owned)
+            {
+                let _ = state.focus_output(&next_out);
+            }
         }
 
         ActionDescriptor::FocusDirection(dir_raw) => {
@@ -2141,9 +2173,9 @@ pub fn execute_action_descriptor(
             let src_ws_id = state.effective_interactive_ws_id();
             if src_ws_id == sp_id {
                 let dst_ws_id = state.active_ws_id.clone();
-                move_active_window_between_workspaces(state, &sp_id, &dst_ws_id);
+                let _ = state.move_active_window_between_workspaces(&sp_id, &dst_ws_id);
             } else {
-                move_active_window_between_workspaces(state, &src_ws_id, &sp_id);
+                let _ = state.move_active_window_between_workspaces(&src_ws_id, &sp_id);
                 if !silent {
                     state.active_special_ws_id = Some(sp_id);
                 }
@@ -2214,8 +2246,36 @@ pub fn execute_action_descriptor(
                 state.queue_redraw();
             } else {
                 let ws_id = state.ensure_workspace_by_name_or_id(&target);
+                if let Some(hosting_out) = state
+                    .output_workspaces
+                    .iter()
+                    .find(|(_, id)| *id == &ws_id)
+                    .map(|(name, _)| name.clone())
+                {
+                    let _ = state.focus_output(&hosting_out);
+                    return;
+                }
                 state.active_special_ws_id = None;
-                state.active_ws_id = ws_id;
+                state.active_ws_id = ws_id.clone();
+                if let Some(focused_out) = state.focused_output() {
+                    let out_name = focused_out.name();
+                    state
+                        .output_workspaces
+                        .insert(out_name.clone(), ws_id.clone());
+                    let vp = state.viewport_for_output(&focused_out);
+                    let now_ms = state.elapsed_ms();
+                    if let Some(ws) = state.workspaces.get_mut(&ws_id) {
+                        ws.presentation = koma_model::PresentationTarget::Physical(
+                            koma_proto::OutputId::new(&out_name),
+                        );
+                        if ws.viewport != vp {
+                            ws.viewport = vp;
+                            ws.recalculate(now_ms);
+                        }
+                    }
+                    state.sync_workspace_geometries(&ws_id);
+                    state.sync_window_output_membership(&ws_id);
+                }
                 state.focus_active_deck_window();
                 state.reconcile_idle_inhibitors();
                 state.sync_foreign_toplevels();
@@ -2347,61 +2407,6 @@ pub fn execute_action_descriptor(
     }
 }
 
-fn move_active_window_between_workspaces(
-    state: &mut KomaState,
-    src_ws_id: &WorkspaceId,
-    dst_ws_id: &WorkspaceId,
-) {
-    if src_ws_id == dst_ws_id {
-        return;
-    }
-    let now_ms = state.elapsed_ms();
-    let active_win = state.workspaces.get_mut(src_ws_id).and_then(|ws| {
-        let cur = ws.active_window()?;
-        let was_float = ws.floating.contains(cur);
-        ws.remove_window(cur, now_ms);
-        Some((cur, was_float))
-    });
-
-    let Some((win_id, was_float)) = active_win else {
-        return;
-    };
-    let pref = state
-        .mapped_windows
-        .iter()
-        .find(|m| m.win_id == win_id)
-        .map(|m| m.preferred_size);
-    let cursor = LogicalPoint {
-        x: state.pointer_location.x,
-        y: state.pointer_location.y,
-    };
-
-    let now_float = if let Some(dst) = state.workspaces.get_mut(dst_ws_id) {
-        dst.insert_window(
-            win_id,
-            was_float,
-            None,
-            None,
-            pref,
-            Some(cursor),
-            false,
-            true,
-            now_ms,
-        )
-    } else {
-        was_float
-    };
-
-    if let Some(m) = state.mapped_windows.iter_mut().find(|m| m.win_id == win_id) {
-        m.ws_id = dst_ws_id.clone();
-        m.is_floating = now_float;
-    }
-    state.sync_workspace_geometries(src_ws_id);
-    state.sync_workspace_geometries(dst_ws_id);
-    state.focus_active_deck_window();
-    state.queue_redraw();
-}
-
 fn cycle_workspace_focus(state: &mut KomaState, forward: bool) {
     let mut ids: Vec<WorkspaceId> = state
         .workspaces
@@ -2424,9 +2429,38 @@ fn cycle_workspace_focus(state: &mut KomaState, forward: bool) {
     } else {
         (cur_pos + ids.len() - 1) % ids.len()
     };
+    let next_ws = ids[next_pos].clone();
+    if let Some(hosting_out) = state
+        .output_workspaces
+        .iter()
+        .find(|(_, id)| *id == &next_ws)
+        .map(|(name, _)| name.clone())
+        && state.focused_output_name().as_deref() != Some(hosting_out.as_str())
+    {
+        let _ = state.focus_output(&hosting_out);
+        return;
+    }
     state.break_active_pointer_constraints();
     state.active_special_ws_id = None;
-    state.active_ws_id = ids[next_pos].clone();
+    state.active_ws_id = next_ws.clone();
+    if let Some(focused_out) = state.focused_output() {
+        let out_name = focused_out.name();
+        state
+            .output_workspaces
+            .insert(out_name.clone(), next_ws.clone());
+        let vp = state.viewport_for_output(&focused_out);
+        let now_ms = state.elapsed_ms();
+        if let Some(ws) = state.workspaces.get_mut(&next_ws) {
+            ws.presentation =
+                koma_model::PresentationTarget::Physical(koma_proto::OutputId::new(&out_name));
+            if ws.viewport != vp {
+                ws.viewport = vp;
+                ws.recalculate(now_ms);
+            }
+        }
+        state.sync_workspace_geometries(&next_ws);
+        state.sync_window_output_membership(&next_ws);
+    }
     state.focus_active_deck_window();
     state.reconcile_idle_inhibitors();
     state.sync_foreign_toplevels();

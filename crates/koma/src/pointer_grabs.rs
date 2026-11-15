@@ -330,10 +330,12 @@ impl MoveWindowGrab {
             .map(|t| read_toplevel_min_max_size(t.wl_surface()).0)
             .unwrap_or((160, 120));
 
+        let origin = state.workspace_output_origin(&ws_id);
+        let local_start = start_data.location - origin;
         let grab_hotspot = Point::from((
-            (start_data.location.x - f64::from(initial_rect.x))
+            (local_start.x - f64::from(initial_rect.x))
                 .clamp(0.0, f64::from(initial_rect.w.max(1))),
-            (start_data.location.y - f64::from(initial_rect.y))
+            (local_start.y - f64::from(initial_rect.y))
                 .clamp(0.0, f64::from(initial_rect.h.max(1))),
         ));
 
@@ -357,9 +359,10 @@ impl MoveWindowGrab {
     }
 
     fn detach_tiled_into_floating(&mut self, state: &mut KomaState) -> bool {
+        let local_cursor = self.current_location - state.workspace_output_origin(&self.ws_id);
         let cursor = LogicalPoint {
-            x: self.current_location.x,
-            y: self.current_location.y,
+            x: local_cursor.x,
+            y: local_cursor.y,
         };
         let Some(ws) = state.workspaces.get_mut(&self.ws_id) else {
             return false;
@@ -403,9 +406,10 @@ impl MoveWindowGrab {
         }
 
         let now_ms = state.elapsed_ms();
+        let local_cursor = self.current_location - state.workspace_output_origin(&self.ws_id);
         let cursor = LogicalPoint {
-            x: self.current_location.x,
-            y: self.current_location.y,
+            x: local_cursor.x,
+            y: local_cursor.y,
         };
         let Some(ws) = state.workspaces.get_mut(&self.ws_id) else {
             self.active_drop_zone = None;
@@ -490,8 +494,9 @@ impl MoveWindowGrab {
             }
         }
 
-        let target_x = (self.current_location.x - self.grab_hotspot.x).round() as i32;
-        let target_y = (self.current_location.y - self.grab_hotspot.y).round() as i32;
+        let local_cursor = self.current_location - state.workspace_output_origin(&self.ws_id);
+        let target_x = (local_cursor.x - self.grab_hotspot.x).round() as i32;
+        let target_y = (local_cursor.y - self.grab_hotspot.y).round() as i32;
 
         if let Some(ws) = state.workspaces.get_mut(&self.ws_id) {
             let vp = ws.viewport;
@@ -520,9 +525,10 @@ impl MoveWindowGrab {
         }
 
         if self.will_tile_on_drop {
+            let local_cursor = self.current_location - state.workspace_output_origin(&self.ws_id);
             let cursor = LogicalPoint {
-                x: self.current_location.x,
-                y: self.current_location.y,
+                x: local_cursor.x,
+                y: local_cursor.y,
             };
             if let Some(ws) = state.workspaces.get_mut(&self.ws_id) {
                 let vp = ws.viewport;
@@ -778,12 +784,13 @@ impl ResizeWindowGrab {
             .map(|t| read_toplevel_min_max_size(t.wl_surface()))
             .unwrap_or(((96, 72), (0, 0)));
 
+        let local_start = start_data.location - state.workspace_output_origin(&ws_id);
         let corner = explicit_corner.unwrap_or_else(|| {
             ResizeCorner::nearest_quadrant(
                 initial_rect,
                 LogicalPoint {
-                    x: start_data.location.x,
-                    y: start_data.location.y,
+                    x: local_start.x,
+                    y: local_start.y,
                 },
             )
         });

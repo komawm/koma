@@ -179,9 +179,47 @@ function MacroContext:text(utf8, opts) end
 ---@param payload string
 function MacroContext:paste_mime(mime_type, payload) end
 
+---@alias KomaMonitorTransform "normal"|"90"|"180"|"270"|"flipped"|"flipped_90"|"flipped-90"|"flipped_180"|"flipped-180"|"flipped_270"|"flipped-270"
+
+---@class KomaSafeAreaInsets
+---@field top? integer
+---@field bottom? integer
+---@field left? integer
+---@field right? integer
+
+---@class KomaMonitorPosition
+---@field x? integer
+---@field y? integer
+---@field [1]? integer
+---@field [2]? integer
+
+---@class KomaEdidMatchSpec
+---@field make? string
+---@field model? string
+---@field serial? string
+
+---@class KomaMonitorSpec
+---@field output? string
+---@field match? KomaEdidMatchSpec
+---@field mode? string
+---@field scale? number|"auto"
+---@field transform? KomaMonitorTransform
+---@field position? KomaMonitorPosition
+---@field x? integer
+---@field y? integer
+---@field allow_non_desktop? boolean
+---@field non_desktop? boolean
+---@field safe_area? KomaSafeAreaInsets
+---@field vrr? boolean|"on_demand"
+---@field max_bpc? integer
+---@field drm_lease? boolean
+---@field off? boolean
+---@field focus_at_startup? boolean
+---@field backdrop_color? string
+
 ---@class KomaGlobal
 ---@field layout fun(mode: KomaLayoutMode)
----@field monitor fun(spec: table)
+---@field monitor fun(spec: KomaMonitorSpec)
 ---@field workspace fun(spec: table)
 ---@field dwindle fun(spec: { force_split?: 0|1|2, preserve_split?: boolean, smart_split?: boolean, use_active_for_splits?: boolean, default_split_ratio?: number, split_width_multiplier?: number, smart_resizing?: boolean, pseudotile?: boolean, inner_gap?: integer, outer_gap?: integer })
 ---@field scrolling fun(spec: { preset_column_widths?: KomaPresetColumnWidth[], preset_window_heights?: KomaPresetColumnWidth[], default_column_width?: KomaPresetColumnWidth, default_column_display?: KomaColumnDisplay, tab_indicator?: { enabled?: boolean, hide_when_single_tab?: boolean, place_within_column?: boolean, position?: KomaTabIndicatorPosition, width?: number, gap?: number, gaps_between_tabs?: number, length_proportion?: number, corner_radius?: number }, center_focused_column?: KomaCenterFocusedColumn, always_center_single_column?: boolean, camera_damping_ratio?: number, camera_stiffness?: number, swipe_working_area_movement?: number, inner_gap?: integer, outer_gap?: integer, edge_auto_scroll?: { enabled?: boolean, trigger_width?: number, delay_ms?: number, max_speed?: number } })
@@ -195,7 +233,7 @@ function MacroContext:paste_mime(mime_type, payload) end
 ---@field mode fun(name: string, spec: table)
 ---@field gesture fun(spec: { fingers: 2|3|4|5, direction: "left"|"right"|"up"|"down"|"horizontal"|"vertical"|"pinch_in"|"pinch_out", action: KomaAction|fun(ctx: KomaMacroContext), cooldown_ms?: integer, allow_when_locked?: boolean, when_preempted?: "allow"|"ignore", desc?: string }): KomaHandle
 ---@field on fun(event: string, callback: fun(ctx: KomaMacroContext))
----@field act { spawn: fun(argv: string[]): KomaAction, window: { close: fun(): KomaAction, float_toggle: fun(): KomaAction, pseudotile_toggle: fun(): KomaAction, fullscreen_toggle: fun(): KomaAction, drag_move: fun(): KomaAction, drag_resize: fun(): KomaAction, resize: fun(spec: { width?: integer, height?: integer }): KomaAction, move_direction: fun(dir: string): KomaAction, swap_direction: fun(dir: string): KomaAction, move_to_workspace: fun(ws: string): KomaAction }, dwindle: table, scrolling: { switch_preset_column_width: fun(): KomaAction, switch_preset_column_width_back: fun(): KomaAction, switch_preset_window_height: fun(): KomaAction, toggle_column_tabbed_display: fun(): KomaAction, switch_preset_window_height_back: fun(): KomaAction, reset_window_height: fun(): KomaAction, maximize_column: fun(): KomaAction, center_column: fun(): KomaAction, move_column_left: fun(): KomaAction, move_column_right: fun(): KomaAction, consume_window_into_column: fun(): KomaAction, expel_window_from_column: fun(): KomaAction, consume_or_expel_window_left: fun(): KomaAction, consume_or_expel_window_right: fun(): KomaAction, swipe: fun(): KomaAction }, scratchpad: table, focus: table, workspace: table, deck: table, scroll_strip: table, overview: table, mode: table, macro: table, compositor: table }
+---@field act { spawn: fun(argv: string[]): KomaAction, window: { close: fun(): KomaAction, float_toggle: fun(): KomaAction, pseudotile_toggle: fun(): KomaAction, fullscreen_toggle: fun(): KomaAction, drag_move: fun(): KomaAction, drag_resize: fun(): KomaAction, resize: fun(spec: { width?: integer, height?: integer }): KomaAction, move_direction: fun(dir: string): KomaAction, swap_direction: fun(dir: string): KomaAction, move_to_workspace: fun(ws: string): KomaAction, move_to_monitor: fun(name: string): KomaAction, move_to_monitor_direction: fun(dir: string): KomaAction, move_to_monitor_left: fun(): KomaAction, move_to_monitor_right: fun(): KomaAction, move_to_monitor_up: fun(): KomaAction, move_to_monitor_down: fun(): KomaAction }, monitor: { focus: fun(name: string): KomaAction, focus_direction: fun(dir: string): KomaAction, focus_left: fun(): KomaAction, focus_right: fun(): KomaAction, focus_up: fun(): KomaAction, focus_down: fun(): KomaAction }, dwindle: table, scrolling: { switch_preset_column_width: fun(): KomaAction, switch_preset_column_width_back: fun(): KomaAction, switch_preset_window_height: fun(): KomaAction, toggle_column_tabbed_display: fun(): KomaAction, switch_preset_window_height_back: fun(): KomaAction, reset_window_height: fun(): KomaAction, maximize_column: fun(): KomaAction, center_column: fun(): KomaAction, move_column_left: fun(): KomaAction, move_column_right: fun(): KomaAction, consume_window_into_column: fun(): KomaAction, expel_window_from_column: fun(): KomaAction, consume_or_expel_window_left: fun(): KomaAction, consume_or_expel_window_right: fun(): KomaAction, swipe: fun(): KomaAction }, scratchpad: table, focus: table, workspace: table, deck: table, scroll_strip: table, overview: table, mode: table, macro: table, compositor: table }
 ---@field rule { window: fun(spec: table): KomaHandle, layer: fun(spec: table): KomaHandle }
 ---@field macro { define: fun(spec: table): KomaHandle }
 koma = {}

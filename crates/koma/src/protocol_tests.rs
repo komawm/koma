@@ -19,6 +19,9 @@ use smithay::reexports::wayland_protocols::ext::foreign_toplevel_list::v1::clien
 use smithay::reexports::wayland_protocols::ext::idle_notify::v1::client::{
     ext_idle_notification_v1, ext_idle_notifier_v1,
 };
+use smithay::reexports::wayland_protocols::wp::fractional_scale::v1::client::{
+    wp_fractional_scale_manager_v1, wp_fractional_scale_v1,
+};
 use smithay::reexports::wayland_protocols::wp::idle_inhibit::zv1::client::{
     zwp_idle_inhibit_manager_v1, zwp_idle_inhibitor_v1,
 };
@@ -58,6 +61,11 @@ use wayland_protocols_wlr::foreign_toplevel::v1::client::{
 };
 use wayland_protocols_wlr::gamma_control::v1::client::{
     zwlr_gamma_control_manager_v1, zwlr_gamma_control_v1,
+};
+use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
+use wayland_protocols_wlr::output_management::v1::client::{
+    zwlr_output_configuration_head_v1, zwlr_output_configuration_v1, zwlr_output_head_v1,
+    zwlr_output_manager_v1, zwlr_output_mode_v1,
 };
 use wayland_protocols_wlr::output_power_management::v1::client::{
     zwlr_output_power_manager_v1, zwlr_output_power_v1,
@@ -129,6 +137,34 @@ struct ScreencopyBufferOffer {
     stride: u32,
 }
 
+#[derive(Debug, Clone, Default)]
+struct CapturedOutputMode {
+    proxy: Option<zwlr_output_mode_v1::ZwlrOutputModeV1>,
+    width: i32,
+    height: i32,
+    refresh: i32,
+    preferred: bool,
+    finished: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct CapturedOutputHead {
+    proxy: Option<zwlr_output_head_v1::ZwlrOutputHeadV1>,
+    name: String,
+    description: String,
+    make: String,
+    model: String,
+    serial_number: String,
+    phys_mm: (i32, i32),
+    enabled: Option<bool>,
+    current_mode_id: Option<u32>,
+    position: Option<(i32, i32)>,
+    transform: Option<WEnum<wl_output::Transform>>,
+    scale: Option<f64>,
+    mode_ids: Vec<u32>,
+    finished: bool,
+}
+
 #[derive(Default)]
 struct ClientHarness {
     sync_done: bool,
@@ -159,6 +195,12 @@ struct ClientHarness {
     relative_motions: Vec<(f64, f64, f64, f64)>,
     icon_sizes: Vec<i32>,
     icon_done_count: usize,
+    output_heads: BTreeMap<u32, CapturedOutputHead>,
+    output_modes: BTreeMap<u32, CapturedOutputMode>,
+    output_manager_serials: Vec<u32>,
+    output_config_results: BTreeMap<u32, &'static str>,
+    fractional_scales: Vec<u32>,
+    layer_configures: usize,
 }
 
 impl ClientHarness {
@@ -746,6 +788,167 @@ delegate_noop!(ClientHarness: ignore zwlr_output_power_manager_v1::ZwlrOutputPow
 delegate_noop!(ClientHarness: ignore zwlr_gamma_control_manager_v1::ZwlrGammaControlManagerV1);
 delegate_noop!(ClientHarness: ignore zwp_pointer_constraints_v1::ZwpPointerConstraintsV1);
 delegate_noop!(ClientHarness: ignore zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1);
+delegate_noop!(ClientHarness: ignore wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1);
+delegate_noop!(ClientHarness: ignore zwlr_layer_shell_v1::ZwlrLayerShellV1);
+delegate_noop!(ClientHarness: ignore zwlr_output_configuration_head_v1::ZwlrOutputConfigurationHeadV1);
+
+impl Dispatch<wp_fractional_scale_v1::WpFractionalScaleV1, ()> for ClientHarness {
+    fn event(
+        state: &mut Self,
+        _: &wp_fractional_scale_v1::WpFractionalScaleV1,
+        event: wp_fractional_scale_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &wayland_client::QueueHandle<Self>,
+    ) {
+        if let wp_fractional_scale_v1::Event::PreferredScale { scale } = event {
+            state.fractional_scales.push(scale);
+        }
+    }
+}
+
+impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, ()> for ClientHarness {
+    fn event(
+        state: &mut Self,
+        surface: &zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
+        event: zwlr_layer_surface_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &wayland_client::QueueHandle<Self>,
+    ) {
+        if let zwlr_layer_surface_v1::Event::Configure { serial, .. } = event {
+            state.layer_configures += 1;
+            surface.ack_configure(serial);
+        }
+    }
+}
+
+impl Dispatch<zwlr_output_manager_v1::ZwlrOutputManagerV1, ()> for ClientHarness {
+    fn event(
+        state: &mut Self,
+        _: &zwlr_output_manager_v1::ZwlrOutputManagerV1,
+        event: zwlr_output_manager_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &wayland_client::QueueHandle<Self>,
+    ) {
+        match event {
+            zwlr_output_manager_v1::Event::Head { head } => {
+                let id = head.id().protocol_id();
+                state.output_heads.entry(id).or_default().proxy = Some(head);
+            }
+            zwlr_output_manager_v1::Event::Done { serial } => {
+                state.output_manager_serials.push(serial);
+            }
+            _ => {}
+        }
+    }
+
+    event_created_child!(ClientHarness, zwlr_output_manager_v1::ZwlrOutputManagerV1, [
+        zwlr_output_manager_v1::EVT_HEAD_OPCODE => (zwlr_output_head_v1::ZwlrOutputHeadV1, ())
+    ]);
+}
+
+impl Dispatch<zwlr_output_head_v1::ZwlrOutputHeadV1, ()> for ClientHarness {
+    fn event(
+        state: &mut Self,
+        head: &zwlr_output_head_v1::ZwlrOutputHeadV1,
+        event: zwlr_output_head_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &wayland_client::QueueHandle<Self>,
+    ) {
+        let head_id = head.id().protocol_id();
+        if let zwlr_output_head_v1::Event::Mode { mode } = &event {
+            let mode_id = mode.id().protocol_id();
+            state.output_modes.entry(mode_id).or_default().proxy = Some(mode.clone());
+            state
+                .output_heads
+                .entry(head_id)
+                .or_default()
+                .mode_ids
+                .push(mode_id);
+            return;
+        }
+        let entry = state.output_heads.entry(head_id).or_default();
+        match event {
+            zwlr_output_head_v1::Event::Name { name } => entry.name = name,
+            zwlr_output_head_v1::Event::Description { description } => {
+                entry.description = description;
+            }
+            zwlr_output_head_v1::Event::PhysicalSize { width, height } => {
+                entry.phys_mm = (width, height);
+            }
+            zwlr_output_head_v1::Event::Enabled { enabled } => entry.enabled = Some(enabled != 0),
+            zwlr_output_head_v1::Event::CurrentMode { mode } => {
+                entry.current_mode_id = Some(mode.id().protocol_id());
+            }
+            zwlr_output_head_v1::Event::Position { x, y } => entry.position = Some((x, y)),
+            zwlr_output_head_v1::Event::Transform { transform } => {
+                entry.transform = Some(transform);
+            }
+            zwlr_output_head_v1::Event::Scale { scale } => entry.scale = Some(scale),
+            zwlr_output_head_v1::Event::Make { make } => entry.make = make,
+            zwlr_output_head_v1::Event::Model { model } => entry.model = model,
+            zwlr_output_head_v1::Event::SerialNumber { serial_number } => {
+                entry.serial_number = serial_number;
+            }
+            zwlr_output_head_v1::Event::Finished => entry.finished = true,
+            _ => {}
+        }
+    }
+
+    event_created_child!(ClientHarness, zwlr_output_head_v1::ZwlrOutputHeadV1, [
+        zwlr_output_head_v1::EVT_MODE_OPCODE => (zwlr_output_mode_v1::ZwlrOutputModeV1, ())
+    ]);
+}
+
+impl Dispatch<zwlr_output_mode_v1::ZwlrOutputModeV1, ()> for ClientHarness {
+    fn event(
+        state: &mut Self,
+        mode: &zwlr_output_mode_v1::ZwlrOutputModeV1,
+        event: zwlr_output_mode_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &wayland_client::QueueHandle<Self>,
+    ) {
+        let entry = state
+            .output_modes
+            .entry(mode.id().protocol_id())
+            .or_default();
+        match event {
+            zwlr_output_mode_v1::Event::Size { width, height } => {
+                entry.width = width;
+                entry.height = height;
+            }
+            zwlr_output_mode_v1::Event::Refresh { refresh } => entry.refresh = refresh,
+            zwlr_output_mode_v1::Event::Preferred => entry.preferred = true,
+            zwlr_output_mode_v1::Event::Finished => entry.finished = true,
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<zwlr_output_configuration_v1::ZwlrOutputConfigurationV1, ()> for ClientHarness {
+    fn event(
+        state: &mut Self,
+        cfg: &zwlr_output_configuration_v1::ZwlrOutputConfigurationV1,
+        event: zwlr_output_configuration_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &wayland_client::QueueHandle<Self>,
+    ) {
+        let result = match event {
+            zwlr_output_configuration_v1::Event::Succeeded => "succeeded",
+            zwlr_output_configuration_v1::Event::Failed => "failed",
+            zwlr_output_configuration_v1::Event::Cancelled => "cancelled",
+            _ => return,
+        };
+        state
+            .output_config_results
+            .insert(cfg.id().protocol_id(), result);
+    }
+}
 
 #[test]
 fn all_kom_0018_protocols_registered_and_sandbox_filtered() {
@@ -781,8 +984,11 @@ fn all_kom_0018_protocols_registered_and_sandbox_filtered() {
         "ext_foreign_toplevel_list_v1",
         "ext_idle_notifier_v1",
         "zwp_idle_inhibit_manager_v1",
+        "zwlr_output_manager_v1",
         "zwlr_output_power_manager_v1",
         "zwlr_gamma_control_manager_v1",
+        "wp_fractional_scale_manager_v1",
+        "wp_viewporter",
         "zwp_pointer_constraints_v1",
         "zwp_relative_pointer_manager_v1",
     ];
@@ -798,6 +1004,7 @@ fn all_kom_0018_protocols_registered_and_sandbox_filtered() {
         "zwlr_screencopy_manager_v1",
         "zwlr_foreign_toplevel_manager_v1",
         "ext_foreign_toplevel_list_v1",
+        "zwlr_output_manager_v1",
         "zwlr_output_power_manager_v1",
         "zwlr_gamma_control_manager_v1",
     ] {
@@ -812,6 +1019,8 @@ fn all_kom_0018_protocols_registered_and_sandbox_filtered() {
         "xdg_activation_v1",
         "ext_idle_notifier_v1",
         "zwp_idle_inhibit_manager_v1",
+        "wp_fractional_scale_manager_v1",
+        "wp_viewporter",
         "zwp_pointer_constraints_v1",
         "zwp_relative_pointer_manager_v1",
     ] {
@@ -1084,12 +1293,55 @@ fn xdg_decoration_and_toplevel_icon_negotiation_and_validation() {
     env.pump();
     assert!(env.state.mapped_windows[0].icon.is_none());
 
-    good_buf.destroy();
-    good_pool.destroy();
+    deco.destroy();
     empty_icon.destroy();
     blank_name_icon.destroy();
     valid_icon.destroy();
-    deco.destroy();
+    good_buf.destroy();
+    good_pool.destroy();
+
+    // Pre-map xdg_toplevel_icon_v1 attached before the first buffer commit must survive
+    // unmapped -> mapped promotion.
+    let compositor = env.client.compositor.clone().expect("compositor");
+    let wm_base = env.client.xdg_wm_base.clone().expect("wm_base");
+    let pre_surf = compositor.create_surface(&qh, ());
+    let pre_xs = wm_base.get_xdg_surface(&pre_surf, &qh, ());
+    let pre_tl = pre_xs.get_toplevel(&qh, ());
+    let pre_icon = icon_mgr.create_icon(&qh, ());
+    pre_icon.set_name("premap-icon".to_owned());
+    let pre_icon_fd = create_portable_shm_fd(16 * 16 * 4, None);
+    let pre_icon_pool = shm.create_pool(pre_icon_fd.as_fd(), 16 * 16 * 4, &qh, ());
+    let pre_icon_buf =
+        pre_icon_pool.create_buffer(0, 16, 16, 16 * 4, wl_shm::Format::Argb8888, &qh, ());
+    pre_icon.add_buffer(&pre_icon_buf, 1);
+    icon_mgr.set_icon(&pre_tl, Some(&pre_icon));
+    pre_surf.commit();
+    env.pump();
+    assert_eq!(env.state.unmapped_windows.len(), 1);
+
+    let win_fd = create_portable_shm_fd(64 * 64 * 4, None);
+    let win_pool = shm.create_pool(win_fd.as_fd(), 64 * 64 * 4, &qh, ());
+    let win_buf = win_pool.create_buffer(0, 64, 64, 64 * 4, wl_shm::Format::Argb8888, &qh, ());
+    pre_surf.attach(Some(&win_buf), 0, 0);
+    pre_surf.commit();
+    env.pump();
+
+    assert_eq!(env.state.mapped_windows.len(), 2);
+    assert_eq!(
+        env.state.mapped_windows[1]
+            .icon
+            .as_ref()
+            .and_then(|i| i.name.as_deref()),
+        Some("premap-icon")
+    );
+    pre_icon.destroy();
+    pre_icon_buf.destroy();
+    pre_icon_pool.destroy();
+    pre_tl.destroy();
+    pre_xs.destroy();
+    pre_surf.destroy();
+    win_buf.destroy();
+    win_pool.destroy();
 }
 
 #[test]
@@ -1179,6 +1431,33 @@ fn xdg_activation_token_validation_and_session_lock_deferral() {
     // Cross-jail activation (sandboxed token attempting to activate an unrestricted surface)
     // must be blocked.
     act_mgr.activate(sb_token, &surf_a);
+    env.pump();
+    assert_eq!(env.state.active_ws_id, ws2);
+
+    // Even if the sandboxed creator disconnects before `activate`, its snapshotted policy must
+    // still block cross-sandbox activation.
+    let req_sb_disc = sb_act.get_activation_token(&qh_sb, ());
+    req_sb_disc.set_serial(u32::from(SERIAL_COUNTER.next_serial()), &sb_seat);
+    req_sb_disc.set_surface(&sb_surf);
+    req_sb_disc.commit();
+    pump(
+        &conn_sb,
+        &mut q_sb,
+        &mut c_sb,
+        &mut env.display,
+        &mut env.event_loop,
+        &mut env.state,
+    );
+    let sb_token_disc = c_sb.activation_tokens.pop().expect("sandbox token 2");
+    drop(sb_xs);
+    drop(sb_surf);
+    drop(sb_seat);
+    drop(sb_act);
+    drop(q_sb);
+    drop(conn_sb);
+    env.pump();
+
+    act_mgr.activate(sb_token_disc, &surf_a);
     env.pump();
     assert_eq!(env.state.active_ws_id, ws2);
 
@@ -1586,4 +1865,434 @@ fn output_power_and_gamma_control_validation_and_transitions() {
     dup_power.destroy();
     power.destroy();
     gamma.destroy();
+}
+
+#[test]
+fn screencopy_copy_with_damage_waits_for_damage_and_minimizing_clears_focus() {
+    let mut env = ClientEnv::new();
+    let qh = env.queue.handle();
+
+    // Verify minimizing the active window excludes it from keyboard focus selection.
+    let (_s, _xs, _tl) = env.spawn_window("MinFocus", "org.koma.minfocus");
+    let win_id = env.state.mapped_windows[0].win_id;
+    env.state.reconcile_keyboard_focus();
+    assert!(
+        env.state
+            .seat
+            .get_keyboard()
+            .unwrap()
+            .current_focus()
+            .is_some()
+    );
+    env.state.set_window_minimized(win_id, true);
+    env.state.reconcile_keyboard_focus();
+    assert!(
+        env.state
+            .seat
+            .get_keyboard()
+            .unwrap()
+            .current_focus()
+            .is_none(),
+        "minimized active window must not retain keyboard focus"
+    );
+
+    // Verify copy_with_damage stays pending while there is no unseen damage.
+    let manager = env
+        .client
+        .bind::<zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1>(
+            &env.registry,
+            &qh,
+            "zwlr_screencopy_manager_v1",
+        );
+    let shm = env.client.shm.clone().expect("wl_shm bound");
+    let wl_out = env.client.outputs[0].clone();
+
+    let initial_frame = manager.capture_output(0, &wl_out, &qh, ());
+    env.pump();
+    let offer = env
+        .client
+        .screencopy_shm_offers
+        .last()
+        .expect("initial screencopy offer")
+        .clone();
+    let fd = create_portable_shm_fd((offer.stride * offer.height) as usize, None);
+    let pool = shm.create_pool(fd.as_fd(), (offer.stride * offer.height) as i32, &qh, ());
+    let buf = pool.create_buffer(
+        0,
+        offer.width as i32,
+        offer.height as i32,
+        offer.stride as i32,
+        offer.format,
+        &qh,
+        (),
+    );
+    initial_frame.copy(&buf);
+    env.pump();
+
+    // Next copy_with_damage happens when manager has already copied current damage epoch.
+    let dmg_frame = manager.capture_output(0, &wl_out, &qh, ());
+    env.pump();
+    dmg_frame.copy_with_damage(&buf);
+    env.pump();
+
+    crate::screencopy::flush_pending_screencopy_frames(&mut env.state);
+    crate::screencopy::flush_pending_screencopy_frames(&mut env.state);
+    assert_eq!(
+        env.state.screencopy_state.pending_damage_copies.len(),
+        1,
+        "copy_with_damage must stay pending without unseen damage"
+    );
+
+    // Once new damage occurs, locking or flushing processes the pending frame.
+    env.state.screencopy_state.mark_damage();
+    assert!(env.state.session_lock.try_lock(None));
+    crate::screencopy::flush_pending_screencopy_frames(&mut env.state);
+    assert!(env.state.screencopy_state.pending_damage_copies.is_empty());
+
+    buf.destroy();
+    pool.destroy();
+}
+
+#[test]
+fn wlr_output_manager_head_advertisement_test_apply_cancel_and_sandbox() {
+    use koma_model::SafeAreaInsets;
+    use smithay::{
+        output::{Mode, PhysicalProperties, Scale, Subpixel},
+        utils::Transform,
+    };
+
+    let (mut event_loop, mut display, mut state) = make_headless_test_state();
+
+    let edp = Output::new(
+        "eDP-1".to_owned(),
+        PhysicalProperties {
+            size: (302, 196).into(),
+            subpixel: Subpixel::HorizontalRgb,
+            make: "APP".to_owned(),
+            model: "Color LCD".to_owned(),
+            serial_number: "RETINA123".to_owned(),
+        },
+    );
+    let mode_native = Mode {
+        size: (3024, 1964).into(),
+        refresh: 120_000,
+    };
+    let mode_scaled = Mode {
+        size: (1920, 1200).into(),
+        refresh: 60_000,
+    };
+    edp.change_current_state(
+        Some(mode_native),
+        Some(Transform::Normal),
+        Some(Scale::Fractional(2.0)),
+        Some((0, 0).into()),
+    );
+    edp.set_preferred(mode_native);
+    edp.add_mode(mode_scaled);
+    let _edp_global = edp.create_global::<KomaState>(&state.display_handle);
+
+    let hdmi = test_output("HDMI-A-1");
+    let _hdmi_global = hdmi.create_global::<KomaState>(&state.display_handle);
+
+    state.test_outputs = vec![edp.clone(), hdmi.clone()];
+    state.register_or_update_output(&edp, Some((0, 0)), SafeAreaInsets::default(), true);
+    state.register_or_update_output(&hdmi, None, SafeAreaInsets::default(), true);
+
+    let (conn_r, mut q_r, mut c_r, _) = ClientHarness::connect(&display, true);
+    pump(
+        &conn_r,
+        &mut q_r,
+        &mut c_r,
+        &mut display,
+        &mut event_loop,
+        &mut state,
+    );
+    assert!(
+        !c_r.globals.contains_key("zwlr_output_manager_v1"),
+        "restricted sandbox client must not see zwlr_output_manager_v1"
+    );
+
+    let (conn, mut queue, mut client, registry) = ClientHarness::connect(&display, false);
+    pump(
+        &conn,
+        &mut queue,
+        &mut client,
+        &mut display,
+        &mut event_loop,
+        &mut state,
+    );
+
+    let qh = queue.handle();
+    let mgr = client.bind::<zwlr_output_manager_v1::ZwlrOutputManagerV1>(
+        &registry,
+        &qh,
+        "zwlr_output_manager_v1",
+    );
+    pump(
+        &conn,
+        &mut queue,
+        &mut client,
+        &mut display,
+        &mut event_loop,
+        &mut state,
+    );
+
+    assert_eq!(client.output_heads.len(), 2);
+    let initial_serial = *client
+        .output_manager_serials
+        .last()
+        .expect("done serial emitted on bind");
+
+    let edp_head = client
+        .output_heads
+        .values()
+        .find(|h| h.name == "eDP-1")
+        .expect("eDP-1 head advertised")
+        .clone();
+    assert_eq!(edp_head.make, "APP");
+    assert_eq!(edp_head.model, "Color LCD");
+    assert_eq!(edp_head.serial_number, "RETINA123");
+    assert_eq!(edp_head.phys_mm, (302, 196));
+    assert_eq!(edp_head.enabled, Some(true));
+    assert_eq!(edp_head.position, Some((0, 0)));
+    assert_eq!(edp_head.scale, Some(2.0));
+    assert_eq!(edp_head.mode_ids.len(), 2);
+
+    let alt_mode_id = *edp_head
+        .mode_ids
+        .iter()
+        .find(|mid| {
+            client
+                .output_modes
+                .get(mid)
+                .is_some_and(|m| m.width == 1920 && m.height == 1200)
+        })
+        .expect("secondary eDP-1 mode advertised");
+    let alt_mode_proxy = client.output_modes[&alt_mode_id]
+        .proxy
+        .clone()
+        .expect("mode proxy");
+
+    let hdmi_head = client
+        .output_heads
+        .values()
+        .find(|h| h.name == "HDMI-A-1")
+        .expect("HDMI-A-1 head advertised")
+        .clone();
+    assert_eq!(hdmi_head.position, Some((1512, 0)));
+
+    // 1. Test configuration validates without mutating state.
+    let edp_proxy = edp_head.proxy.clone().unwrap();
+    let hdmi_proxy = hdmi_head.proxy.clone().unwrap();
+    let cfg_test = mgr.create_configuration(initial_serial, &qh, ());
+    let cfg_test_edp = cfg_test.enable_head(&edp_proxy, &qh, ());
+    cfg_test_edp.set_mode(&alt_mode_proxy);
+    cfg_test_edp.set_transform(wl_output::Transform::_90);
+    cfg_test_edp.set_scale(1.5);
+    cfg_test.disable_head(&hdmi_proxy);
+    cfg_test.test();
+    pump(
+        &conn,
+        &mut queue,
+        &mut client,
+        &mut display,
+        &mut event_loop,
+        &mut state,
+    );
+    assert_eq!(
+        client
+            .output_config_results
+            .get(&cfg_test.id().protocol_id())
+            .copied(),
+        Some("succeeded")
+    );
+    assert_eq!(edp.current_mode(), Some(mode_native));
+    assert!(state.output_layout.entry("HDMI-A-1").unwrap().enabled);
+
+    // 2. Apply configuration mutates mode/transform/scale/position, disables HDMI-A-1, and bumps serial.
+    let cfg_apply = mgr.create_configuration(initial_serial, &qh, ());
+    let cfg_apply_edp = cfg_apply.enable_head(&edp_proxy, &qh, ());
+    cfg_apply_edp.set_mode(&alt_mode_proxy);
+    cfg_apply_edp.set_position(100, 50);
+    cfg_apply_edp.set_transform(wl_output::Transform::_90);
+    cfg_apply_edp.set_scale(1.5);
+    cfg_apply.disable_head(&hdmi_proxy);
+    cfg_apply.apply();
+    pump(
+        &conn,
+        &mut queue,
+        &mut client,
+        &mut display,
+        &mut event_loop,
+        &mut state,
+    );
+
+    assert_eq!(
+        client
+            .output_config_results
+            .get(&cfg_apply.id().protocol_id())
+            .copied(),
+        Some("succeeded")
+    );
+    assert_eq!(edp.current_mode(), Some(mode_scaled));
+    assert_eq!(edp.current_transform(), Transform::_90);
+    assert!((edp.current_scale().fractional_scale() - 1.5).abs() < 1e-4);
+    assert_eq!(edp.current_location(), Point::from((100, 50)));
+    assert!(!state.output_layout.entry("HDMI-A-1").unwrap().enabled);
+
+    let new_serial = *client.output_manager_serials.last().unwrap();
+    assert_ne!(new_serial, initial_serial);
+    let updated_hdmi = client
+        .output_heads
+        .values()
+        .find(|h| h.name == "HDMI-A-1")
+        .unwrap();
+    assert_eq!(updated_hdmi.enabled, Some(false));
+
+    // 3. Stale serial is rejected with `cancelled`.
+    let cfg_stale = mgr.create_configuration(initial_serial, &qh, ());
+    let _stale_edp = cfg_stale.enable_head(&edp_proxy, &qh, ());
+    let _stale_hdmi = cfg_stale.enable_head(&hdmi_proxy, &qh, ());
+    cfg_stale.apply();
+    pump(
+        &conn,
+        &mut queue,
+        &mut client,
+        &mut display,
+        &mut event_loop,
+        &mut state,
+    );
+    assert_eq!(
+        client
+            .output_config_results
+            .get(&cfg_stale.id().protocol_id())
+            .copied(),
+        Some("cancelled")
+    );
+
+    cfg_stale.destroy();
+    cfg_apply.destroy();
+    cfg_test.destroy();
+}
+
+#[test]
+fn multi_monitor_window_move_fractional_scale_and_notch_layer_shell_composition() {
+    use koma_model::SafeAreaInsets;
+    use smithay::output::Scale;
+
+    let mut env = ClientEnv::new();
+    let edp = env._output.clone();
+    let hdmi = test_output("HDMI-A-1");
+    let _hdmi_global = hdmi.create_global::<KomaState>(&env.state.display_handle);
+    env.state.test_outputs.push(hdmi.clone());
+
+    let notch = SafeAreaInsets {
+        top: 38,
+        bottom: 0,
+        left: 0,
+        right: 0,
+    };
+    env.state
+        .register_or_update_output(&edp, Some((0, 0)), notch, true);
+    env.state
+        .register_or_update_output(&hdmi, None, SafeAreaInsets::default(), true);
+    env.pump();
+
+    // Verify notch safe_area composes with wlr-layer-shell top bar exclusive_zone.
+    let qh = env.queue.handle();
+    let compositor =
+        env.client
+            .bind::<wl_compositor::WlCompositor>(&env.registry, &qh, "wl_compositor");
+    let layer_shell = env.client.bind::<zwlr_layer_shell_v1::ZwlrLayerShellV1>(
+        &env.registry,
+        &qh,
+        "zwlr_layer_shell_v1",
+    );
+    let shm = env
+        .client
+        .bind::<wl_shm::WlShm>(&env.registry, &qh, "wl_shm");
+    let frac_mgr = env
+        .client
+        .bind::<wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1>(
+            &env.registry,
+            &qh,
+            "wp_fractional_scale_manager_v1",
+        );
+    env.client.compositor = Some(compositor.clone());
+    env.client.shm = Some(shm.clone());
+
+    let bar_surf = compositor.create_surface(&qh, ());
+    let wl_out_edp = env.client.outputs[0].clone();
+    let layer_surf = layer_shell.get_layer_surface(
+        &bar_surf,
+        Some(&wl_out_edp),
+        zwlr_layer_shell_v1::Layer::Top,
+        "koma-bar".to_owned(),
+        &qh,
+        (),
+    );
+    layer_surf.set_size(1920, 24);
+    layer_surf.set_anchor(zwlr_layer_surface_v1::Anchor::Top);
+    layer_surf.set_exclusive_zone(24);
+    bar_surf.commit();
+    env.pump();
+
+    let bar_fd = create_portable_shm_fd(1920 * 24 * 4, None);
+    let bar_pool = shm.create_pool(bar_fd.as_fd(), 1920 * 24 * 4, &qh, ());
+    let bar_buf = bar_pool.create_buffer(0, 1920, 24, 1920 * 4, wl_shm::Format::Argb8888, &qh, ());
+    bar_surf.attach(Some(&bar_buf), 0, 0);
+    bar_surf.commit();
+    env.pump();
+
+    let edp_ws_id = env.state.active_workspace_for_output("DP-1");
+    let edp_ws = env.state.workspaces.get(&edp_ws_id).unwrap();
+    // 24px bar intersects cleanly with 38px camera notch (protected y=38).
+    assert_eq!(edp_ws.viewport.work_area.expect("work_area").y, 38);
+
+    // Increasing top exclusive_zone to 52px extends work_area below both notch and bar.
+    layer_surf.set_size(1920, 52);
+    layer_surf.set_exclusive_zone(52);
+    bar_surf.commit();
+    env.pump();
+    let bar2_fd = create_portable_shm_fd(1920 * 52 * 4, None);
+    let bar2_pool = shm.create_pool(bar2_fd.as_fd(), 1920 * 52 * 4, &qh, ());
+    let bar2_buf =
+        bar2_pool.create_buffer(0, 1920, 52, 1920 * 4, wl_shm::Format::Argb8888, &qh, ());
+    bar_surf.attach(Some(&bar2_buf), 0, 0);
+    bar_surf.commit();
+    env.pump();
+
+    let edp_ws = env.state.workspaces.get(&edp_ws_id).unwrap();
+    assert_eq!(edp_ws.viewport.work_area.expect("work_area").y, 52);
+
+    // Verify wp_fractional_scale_v1 receives initial scale (120) and updates when DP-1 scale changes to 1.5 (180).
+    let (win_surf, _xs, _tl) = env.spawn_window("CrossMon", "org.koma.cross");
+    let frac = frac_mgr.get_fractional_scale(&win_surf, &qh, ());
+    env.pump();
+    assert!(env.client.fractional_scales.contains(&120));
+
+    edp.change_current_state(None, None, Some(Scale::Fractional(1.5)), None);
+    env.state.handle_output_resized(&edp, 1280, 720, 1.5);
+    env.pump();
+    assert_eq!(env.client.fractional_scales.last().copied(), Some(180));
+
+    // Exercise WindowMoveToMonitorDirection("right") moving focused window from DP-1 to HDMI-A-1.
+    let hdmi_ws_id = env.state.active_workspace_for_output("HDMI-A-1");
+    assert_ne!(edp_ws_id, hdmi_ws_id);
+    assert_eq!(env.state.mapped_windows[0].ws_id, edp_ws_id);
+
+    execute_action_descriptor(
+        &mut env.state,
+        ActionDescriptor::WindowMoveToMonitorDirection("right".to_owned()),
+        false,
+    );
+    assert_eq!(env.state.mapped_windows[0].ws_id, hdmi_ws_id);
+    assert_eq!(env.state.focused_output_name().as_deref(), Some("HDMI-A-1"));
+
+    frac.destroy();
+    layer_surf.destroy();
+    bar2_buf.destroy();
+    bar2_pool.destroy();
+    bar_buf.destroy();
+    bar_pool.destroy();
 }

@@ -1722,12 +1722,13 @@ impl ScrollingStrip {
         let origin_y = wa.y + og;
         let usable_w = self.usable_width(viewport);
         let usable_h = self.usable_height(viewport);
+        let max_preview_w = (usable_w.round() as u32).max(1);
         let preview_w = (self
             .config
             .default_column_width
             .resolve_px(usable_w)
             .round() as u32)
-            .clamp(96, usable_w.round() as u32);
+            .clamp(96_u32.min(max_preview_w), max_preview_w);
 
         if self.columns.is_empty() {
             let px = if self.config.center_focused_column == CenterFocusedColumn::Always
@@ -2000,7 +2001,8 @@ impl ScrollingStrip {
             } else {
                 dx_px
             };
-            let next_px = (cur_px + signed_dx).clamp(96.0, usable_w);
+            let min_col_w = 96.0_f64.min(usable_w);
+            let next_px = (cur_px + signed_dx).clamp(min_col_w, usable_w);
             col.is_maximized_column = false;
             col.preset_width_idx = None;
             col.width = match col.width {
@@ -2486,5 +2488,36 @@ mod tests {
             strip.hit_test_tab_indicator(click_pt, vp, 0),
             Some(WindowId::new(1, 1))
         );
+    }
+
+    #[test]
+    fn tiny_64x48_work_area_does_not_panic_during_drop_zone_or_resize() {
+        let mut strip = ScrollingStrip::new(ScrollingConfig::default(), false);
+        let tiny_vp = LogicalViewport::new(64, 48, 1.0).with_work_area_zone(0, 0, 64, 48);
+        strip.insert_column(WindowId::new(1, 1), None, tiny_vp, 0);
+        strip.insert_column(WindowId::new(2, 1), None, tiny_vp, 1);
+
+        let vis = strip.visible_geometries(tiny_vp);
+        assert_eq!(vis.len(), 2);
+
+        let dz = strip.predict_drop_zone_2d(LogicalPoint { x: 16.0, y: 24.0 }, tiny_vp, 10);
+        assert!(dz.preview_rect.w >= 1);
+
+        assert!(strip.adjust_tile_or_column_size(
+            WindowId::new(1, 1),
+            -20.0,
+            -10.0,
+            ResizeCorner::BottomRight,
+            tiny_vp,
+            20,
+        ));
+        assert!(strip.adjust_tile_or_column_size(
+            WindowId::new(1, 1),
+            40.0,
+            20.0,
+            ResizeCorner::BottomRight,
+            tiny_vp,
+            30,
+        ));
     }
 }

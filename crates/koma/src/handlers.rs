@@ -198,7 +198,8 @@ impl CompositorHandler for KomaState {
         {
             if is_surface_mapped(&root_surface) {
                 unmapped.window.on_commit();
-                self.refresh_toplevel_icon(&root_surface);
+                unmapped.icon =
+                    crate::desktop_protocols::extract_validated_toplevel_icon(&root_surface);
                 self.promote_unmapped_to_mapped(unmapped);
                 self.reconcile_idle_inhibitors();
                 self.maybe_activate_pointer_constraint();
@@ -837,10 +838,7 @@ impl OutputHandler for KomaState {
 
 impl FractionalScaleHandler for KomaState {
     fn new_fractional_scale(&mut self, surface: WlSurface) {
-        let scale = self
-            .primary_output()
-            .map(|o| o.current_scale().fractional_scale())
-            .unwrap_or(1.0);
+        let scale = self.preferred_scale_for_surface(&surface);
         with_states(&surface, |states| {
             with_fractional_scale(states, |fractional| {
                 fractional.set_preferred_scale(scale);
@@ -886,6 +884,7 @@ impl WlrLayerShellHandler for KomaState {
             map.arrange();
         }
         self.sync_output_workarea(&output);
+        self.sync_output_layer_scales(&output);
         self.reconcile_idle_inhibitors();
         self.reconcile_keyboard_focus();
         self.queue_redraw();
