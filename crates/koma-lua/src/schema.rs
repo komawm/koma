@@ -1,10 +1,10 @@
 use std::collections::BTreeMap;
 
 use koma_model::{
-    Anchor9, AnchorPoint, AnimationConfig, BlockOutPolicy, BlurConfig, BorderConfig, CubicBezier,
-    CurveSpec, DimConfig, DwindleConfig, FocusRingConfig, FrameClockConfig, HookeSpringParams,
-    LayoutMode, LogicalViewport, OpenMode, OutputTransform, PointerTrajectorySpec, SafeAreaInsets,
-    ScrollingConfig, ShadowConfig,
+    AgentCursorConfig, Anchor9, AnchorPoint, AnimationConfig, BlockOutPolicy, BlurConfig,
+    BorderConfig, CubicBezier, CurveSpec, DimConfig, DwindleConfig, FocusRingConfig,
+    FrameClockConfig, HookeSpringParams, LayoutMode, LogicalViewport, OpenMode, OutputTransform,
+    PathSplineKind, PointerTrajectorySpec, SafeAreaInsets, ScrollingConfig, ShadowConfig,
 };
 use koma_proto::{KinematicProfileKind, MacroId, OutputId, TextInjectStrategy};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -849,6 +849,7 @@ pub struct AppearanceSpec {
     pub dim_strength: Option<f32>,
     pub blur: BlurConfig,
     pub animations: AnimationConfig,
+    pub agent_cursor: AgentCursorConfig,
 }
 
 impl Default for AppearanceSpec {
@@ -864,6 +865,7 @@ impl Default for AppearanceSpec {
             dim_strength: None,
             blur: BlurConfig::default(),
             animations: AnimationConfig::default(),
+            agent_cursor: AgentCursorConfig::default(),
         }
     }
 }
@@ -1372,6 +1374,60 @@ pub struct LuaDragSpecInput {
     pub kinematics: LuaKinematicsInput,
     #[serde(default = "default_hold_before_release")]
     pub hold_before_release_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LuaPathSpecInput {
+    pub waypoints: Vec<LuaAnchorPointInput>,
+    #[serde(default)]
+    pub spline: PathSplineKind,
+    #[serde(default)]
+    pub button: Option<String>,
+    #[serde(default, alias = "hold_start_ms")]
+    pub hold_before_move_ms: u64,
+    #[serde(default, alias = "hold_end_ms")]
+    pub hold_before_release_ms: u64,
+    #[serde(default)]
+    pub kinematics: LuaKinematicsInput,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LuaMovePathOptsInput {
+    pub spline: PathSplineKind,
+    pub kinematics: Option<LuaKinematicsInput>,
+    pub profile: Option<KinematicProfileKind>,
+    pub duration_ms: Option<u64>,
+    pub arc_curvature: Option<f64>,
+    pub curve: Option<String>,
+    pub mass: Option<f64>,
+    pub damping: Option<f64>,
+    pub damping_ratio: Option<f64>,
+    pub stiffness: Option<f64>,
+    pub epsilon: Option<f64>,
+    pub bezier: Option<[f64; 4]>,
+}
+
+impl LuaMovePathOptsInput {
+    #[must_use]
+    pub fn into_parts(self) -> (PathSplineKind, LuaKinematicsInput) {
+        let kin = match self.kinematics {
+            Some(k) => k,
+            None => LuaKinematicsInput {
+                profile: self.profile.unwrap_or(KinematicProfileKind::MinimumJerk),
+                duration_ms: self.duration_ms,
+                arc_curvature: self.arc_curvature,
+                curve: self.curve,
+                mass: self.mass,
+                damping: self.damping,
+                damping_ratio: self.damping_ratio,
+                stiffness: self.stiffness,
+                epsilon: self.epsilon,
+                bezier: self.bezier,
+            },
+        };
+        (self.spline, kin)
+    }
 }
 
 fn default_left_button() -> String {

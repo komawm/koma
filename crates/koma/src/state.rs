@@ -17,8 +17,9 @@ use koma_lua::{
     TrampolineScheduler, phodopus_bridge::PhodopusSandbox,
 };
 use koma_model::{
-    LayoutMode, LogicalPoint, LogicalRect, LogicalViewport, OpenMode, OutputLayout,
-    OutputTransform, PresentationTarget, SafeAreaInsets, SavedOutputConfig, WindowAnimationTable,
+    AgentCursorConfig, AgentCursorFrameSnapshot, AgentCursorVisualDynamics, LayoutMode,
+    LogicalPoint, LogicalRect, LogicalViewport, OpenMode, OutputLayout, OutputTransform,
+    PresentationTarget, SafeAreaInsets, SavedOutputConfig, WindowAnimationTable,
     WindowMatchContext, WindowRuleEngine, WorkspaceLeaseState, WorkspaceState,
     WorkspaceTransitionTable, is_waydroid_app_id,
 };
@@ -605,6 +606,33 @@ pub struct MappedWindow {
     pub icon: Option<StoredToplevelIcon>,
 }
 
+/// Per-workspace virtual/agent cursor runtime decoupled from physical human `pointer_location`.
+#[derive(Debug, Clone)]
+pub struct AgentCursorRuntime {
+    pub ws_local_pos: LogicalPoint,
+    /// Resting normalized window anchor `(win_id, u, v)` so scroll/re-tile keeps the virtual
+    /// pointer attached to its target surface.
+    pub anchored_window: Option<(WindowId, f64, f64)>,
+    pub visual: AgentCursorVisualDynamics,
+}
+
+impl Default for AgentCursorRuntime {
+    fn default() -> Self {
+        Self::new(LogicalPoint { x: 0.0, y: 0.0 })
+    }
+}
+
+impl AgentCursorRuntime {
+    #[must_use]
+    pub fn new(initial_pos: LogicalPoint) -> Self {
+        Self {
+            ws_local_pos: initial_pos,
+            anchored_window: None,
+            visual: AgentCursorVisualDynamics::new(),
+        }
+    }
+}
+
 pub struct KomaState {
     pub start_time: Instant,
     pub clock: Clock<Monotonic>,
@@ -723,6 +751,7 @@ pub struct KomaState {
     pub config_error_banner: Option<String>,
     pub damage_trackers: HashMap<WorkspaceId, WorkspaceDamageTracker>,
     pub pointer_animations: Vec<ActivePointerAnimation>,
+    pub agent_cursors: HashMap<WorkspaceId, AgentCursorRuntime>,
     pub window_animations: RefCell<WindowAnimationTable>,
     pub workspace_transitions: RefCell<WorkspaceTransitionTable>,
     pub last_notified_focus_win_id: Option<WindowId>,
@@ -954,6 +983,7 @@ impl KomaState {
             config_error_banner: None,
             damage_trackers: HashMap::new(),
             pointer_animations: Vec::new(),
+            agent_cursors: HashMap::new(),
             window_animations: RefCell::new(WindowAnimationTable::default()),
             workspace_transitions: RefCell::new(WorkspaceTransitionTable::default()),
             last_notified_focus_win_id: None,
@@ -2778,6 +2808,128 @@ impl KomaState {
         })
     }
 
+    #[must_use]
+    pub fn is_workspace_visible_anywhere(&self, ws_id: &WorkspaceId) -> bool {
+        *ws_id == self.active_ws_id
+            || Some(ws_id) == self.active_special_ws_id.as_ref()
+            || self.output_workspaces.values().any(|id| id == ws_id)
+    }
+
+    #[must_use]
+    pub fn agent_cursor_config(&self) -> AgentCursorConfig {
+        self.lua_sandbox
+            .config_snapshot()
+            .appearance
+            .agent_cursor
+            .clone()
+    }
+
+    /// Advances the visual cursor spring/trail/ripple state for `ws_id` if visible/enabled.
+    #[must_use]
+    pub fn step_agent_cursor_for_workspace(
+        &mut self,
+        ws_id: &WorkspaceId,
+    ) -> Option<AgentCursorFrameSnapshot> {
+        let now_ms = self.elapsed_ms();
+        let cfg = self.agent_cursor_config();
+        if !cfg.enabled {
+            return None;
+        }
+        self.agent_cursors
+            .get_mut(ws_id)?
+            .visual
+            .step_frame(now_ms, &cfg)
+    }
+
+    /// Advances the visual agent cursor snapshot for output `out_name`, preferring a focused
+    /// special scratchpad workspace if active on that output, otherwise `out_ws_id`.
+    #[must_use]
+    pub fn step_agent_cursor_for_output(
+        &mut self,
+        out_name: &str,
+        out_ws_id: &WorkspaceId,
+    ) -> Option<AgentCursorFrameSnapshot> {
+        let sp_snap = if self.focused_output_name().as_deref() == Some(out_name) {
+            self.active_special_ws_id
+                .clone()
+                .and_then(|sp| self.step_agent_cursor_for_workspace(&sp))
+        } else {
+            None
+        };
+        sp_snap.or_else(|| self.step_agent_cursor_for_workspace(out_ws_id))
+    }
+
+    fn hit_test_window_in_workspace(
+        &self,
+        ws_id: &WorkspaceId,
+        output_local: Point<f64, Logical>,
+        out_origin: Point<f64, Logical>,
+        b_off: f64,
+    ) -> Option<(WindowId, WlSurface, Point<f64, Logical>)> {
+        let ws = self.workspaces.get(ws_id)?;
+        for (win_id, rect, _) in ws
+            .compute_visible_geometries_at(self.elapsed_ms())
+            .into_iter()
+            .rev()
+        {
+            let Some(mapped) = self.mapped_windows.iter().find(|m| m.win_id == win_id) else {
+                continue;
+            };
+            if mapped.is_minimized {
+                continue;
+            }
+            let local_origin = Point::from((f64::from(rect.x) + b_off, f64::from(rect.y) + b_off));
+            let local_pos = output_local - local_origin;
+            let global_origin = local_origin + out_origin;
+            if let Some((surf, surf_offset)) = mapped
+                .window
+                .surface_under(local_pos, WindowSurfaceType::ALL)
+            {
+                return Some((win_id, surf, surf_offset.to_f64() + global_origin));
+            }
+            let in_frame = output_local.x >= f64::from(rect.x)
+                && output_local.x <= f64::from(rect.x + rect.w as i32)
+                && output_local.y >= f64::from(rect.y)
+                && output_local.y <= f64::from(rect.y + rect.h as i32);
+            let allow_frame_fallback = mapped.window.toplevel().is_some_and(|t| {
+                let root = t.wl_surface();
+                if surface_has_empty_input_region(root) {
+                    return false;
+                }
+                !is_surface_mapped(root)
+                    || local_pos.x < 0.0
+                    || local_pos.y < 0.0
+                    || local_pos.x >= f64::from(rect.w) - 2.0 * b_off
+                    || local_pos.y >= f64::from(rect.h) - 2.0 * b_off
+            });
+            if in_frame
+                && allow_frame_fallback
+                && let Some(toplevel) = mapped.window.toplevel()
+            {
+                return Some((win_id, toplevel.wl_surface().clone(), global_origin));
+            }
+        }
+        None
+    }
+
+    /// Resolves the front-to-back window surface under `ws_local_pos` inside `ws_id` without
+    /// reading or mutating global human `pointer_location`.
+    #[must_use]
+    pub fn surface_under_in_workspace(
+        &self,
+        ws_id: &WorkspaceId,
+        ws_local_pos: Point<f64, Logical>,
+    ) -> Option<(WindowId, WlSurface, Point<f64, Logical>)> {
+        let border_cfg = self.lua_sandbox.config_snapshot().appearance.border;
+        let b_off = if border_cfg.enabled {
+            f64::from(border_cfg.width.max(0.0))
+        } else {
+            0.0
+        };
+        let out_origin = self.workspace_output_origin(ws_id);
+        self.hit_test_window_in_workspace(ws_id, ws_local_pos, out_origin, b_off)
+    }
+
     /// Hit-tests `global_pos` across any open `special:<name>` Scratchpad first, then the output's
     /// active workspace, strictly in **front-to-back** Z-order (`FloatingStack` topmost -> bottom -> Tiled panes).
     #[must_use]
@@ -2820,51 +2972,10 @@ impl KomaState {
         };
 
         for ws_id in candidate_workspaces {
-            let Some(ws) = self.workspaces.get(&ws_id) else {
-                continue;
-            };
-            for (win_id, rect, _) in ws
-                .compute_visible_geometries_at(self.elapsed_ms())
-                .into_iter()
-                .rev()
+            if let Some((win_id, surf, origin)) =
+                self.hit_test_window_in_workspace(&ws_id, output_local, out_origin, b_off)
             {
-                let Some(mapped) = self.mapped_windows.iter().find(|m| m.win_id == win_id) else {
-                    continue;
-                };
-                if mapped.is_minimized {
-                    continue;
-                }
-                let local_origin =
-                    Point::from((f64::from(rect.x) + b_off, f64::from(rect.y) + b_off));
-                let local_pos = output_local - local_origin;
-                let global_origin = local_origin + out_origin;
-                if let Some((surf, surf_offset)) = mapped
-                    .window
-                    .surface_under(local_pos, WindowSurfaceType::ALL)
-                {
-                    return Some((win_id, ws_id, surf, surf_offset.to_f64() + global_origin));
-                }
-                let in_frame = output_local.x >= f64::from(rect.x)
-                    && output_local.x <= f64::from(rect.x + rect.w as i32)
-                    && output_local.y >= f64::from(rect.y)
-                    && output_local.y <= f64::from(rect.y + rect.h as i32);
-                let allow_frame_fallback = mapped.window.toplevel().is_some_and(|t| {
-                    let root = t.wl_surface();
-                    if surface_has_empty_input_region(root) {
-                        return false;
-                    }
-                    !is_surface_mapped(root)
-                        || local_pos.x < 0.0
-                        || local_pos.y < 0.0
-                        || local_pos.x >= f64::from(rect.w) - 2.0 * b_off
-                        || local_pos.y >= f64::from(rect.h) - 2.0 * b_off
-                });
-                if in_frame
-                    && allow_frame_fallback
-                    && let Some(toplevel) = mapped.window.toplevel()
-                {
-                    return Some((win_id, ws_id, toplevel.wl_surface().clone(), global_origin));
-                }
+                return Some((win_id, ws_id, surf, origin));
             }
         }
         None
@@ -3045,12 +3156,44 @@ impl KomaState {
             .and_then(|(id, rect)| (id == ws_id).then_some(*rect))
     }
 
-    /// Advances per-frame `ScrollingStrip::camera_spring` settlement and interactive drag edge
-    /// auto-scroll (`30 px` trigger zone, `100 ms` debounce, `1500 px/s` ramp) before rendering!
+    /// Advances per-frame `ScrollingStrip::camera_spring` settlement, keeps resting anchored agent
+    /// cursors aligned with moved/scrolled windows, and advances interactive drag edge auto-scroll
+    /// (`30 px` trigger zone, `100 ms` debounce, `1500 px/s` ramp) before rendering!
     pub fn tick_frame_animations_and_edge_scroll(&mut self) {
         let now_ms = self.elapsed_ms();
         for ws in self.workspaces.values_mut() {
             let _ = ws.scrolling.sample_camera_x(now_ms);
+        }
+
+        let active_anim_ws: Vec<WorkspaceId> = self
+            .pointer_animations
+            .iter()
+            .map(|a| a.ws_id.clone())
+            .collect();
+        for (ws_id, ac) in &mut self.agent_cursors {
+            if active_anim_ws.contains(ws_id) {
+                continue;
+            }
+            let Some((win_id, u, v)) = ac.anchored_window else {
+                continue;
+            };
+            if let Some(ws) = self.workspaces.get(ws_id)
+                && let Some((_, rect, _)) = ws
+                    .compute_visible_geometries_at(now_ms)
+                    .into_iter()
+                    .find(|(id, _, _)| *id == win_id)
+            {
+                let tracked = LogicalPoint {
+                    x: f64::from(rect.x) + u * f64::from(rect.w.max(1)),
+                    y: f64::from(rect.y) + v * f64::from(rect.h.max(1)),
+                };
+                if (tracked.x - ac.ws_local_pos.x).abs() > 0.25
+                    || (tracked.y - ac.ws_local_pos.y).abs() > 0.25
+                {
+                    ac.ws_local_pos = tracked;
+                    ac.visual.track_anchored_position(tracked, now_ms);
+                }
+            }
         }
 
         if let Some((drag_ws_id, cursor_x)) = self.active_drag_edge_scroll.clone()
@@ -3081,8 +3224,15 @@ impl KomaState {
             appearance.border.is_gradient_rotating()
                 && self.mapped_windows.iter().any(|m| !m.is_minimized)
         };
+        let ac_cfg = self.agent_cursor_config();
+        let agent_cursor_anim = ac_cfg.enabled
+            && self.agent_cursors.iter().any(|(ws_id, ac)| {
+                self.is_workspace_visible_anywhere(ws_id)
+                    && ac.visual.needs_animation_tick(now_ms, &ac_cfg)
+            });
         self.edge_scroll_keep_alive
             || rotating_border
+            || agent_cursor_anim
             || self
                 .window_animations
                 .borrow_mut()

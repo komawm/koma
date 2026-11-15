@@ -218,6 +218,52 @@ pub fn builtin_mcp_tool_schemas(dynamic_macros: &[MacroDefinition]) -> Vec<Value
                 }
             }
         }),
+        json!({
+            "name": "koma_path",
+            "description": "Moves or strokes the workspace agent cursor along a smooth multi-waypoint spline (`catmull_rom` or `bezier`) on `ws_id`'s isolated vSeat under Epoch fencing.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["ws_id", "waypoints"],
+                "properties": {
+                    "ws_id": { "type": "string" },
+                    "expected_epoch": { "type": "integer", "minimum": 1 },
+                    "waypoints": {
+                        "type": "array",
+                        "minItems": 2,
+                        "maxItems": 128,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "grid_225": { "type": "string" },
+                                "x": { "type": "number" },
+                                "y": { "type": "number" },
+                                "anchor": { "type": "string" },
+                                "dx": { "type": "number" },
+                                "dy": { "type": "number" }
+                            }
+                        }
+                    },
+                    "spline": { "type": "string", "enum": ["auto", "catmull_rom", "bezier"], "default": "auto" },
+                    "button": { "type": "string", "enum": ["left", "right", "middle"] },
+                    "hold_start_ms": { "type": "integer", "minimum": 0, "default": 0 },
+                    "hold_end_ms": { "type": "integer", "minimum": 0, "default": 0 },
+                    "duration_ms": { "type": "integer", "minimum": 0 },
+                    "kinematics": { "type": "object" }
+                }
+            }
+        }),
+        json!({
+            "name": "koma_cursor_settle",
+            "description": "Transitions the AI agent cursor on `ws_id` into settle fade-out (`280 ms` smooth fade or immediate hide).",
+            "inputSchema": {
+                "type": "object",
+                "required": ["ws_id"],
+                "properties": {
+                    "ws_id": { "type": "string" },
+                    "immediate": { "type": "boolean", "default": false }
+                }
+            }
+        }),
     ];
 
     for m in dynamic_macros {
@@ -393,8 +439,8 @@ fn dispatch_tool_call(session: &mut KomaAgentSession, name: &str, args: Value) -
             }
         }
 
-        "koma_click" | "koma_drag" | "koma_key" | "koma_inject_text" | "koma_paste_mime"
-        | "koma_win_activate" => {
+        "koma_click" | "koma_drag" | "koma_path" | "koma_key" | "koma_inject_text"
+        | "koma_paste_mime" | "koma_win_activate" => {
             let Some(ws_s) = args.get("ws_id").and_then(Value::as_str) else {
                 return mcp_text_result("missing required argument `ws_id`".into(), true);
             };
@@ -406,6 +452,7 @@ fn dispatch_tool_call(session: &mut KomaAgentSession, name: &str, args: Value) -
             let ipc_method = match name {
                 "koma_click" => "vseat.click",
                 "koma_drag" => "vseat.drag",
+                "koma_path" => "vseat.path",
                 "koma_key" => "vseat.key",
                 "koma_inject_text" => "vseat.inject_text",
                 "koma_paste_mime" => "vseat.paste_mime",
@@ -414,6 +461,23 @@ fn dispatch_tool_call(session: &mut KomaAgentSession, name: &str, args: Value) -
             };
             let outcome = session.execute_fenced_mutation(&ws_id, explicit_ep, ipc_method, args);
             format_mutate_outcome(outcome)
+        }
+
+        "koma_cursor_settle" => {
+            let Some(ws_s) = args.get("ws_id").and_then(Value::as_str) else {
+                return mcp_text_result("missing required argument `ws_id`".into(), true);
+            };
+            let immediate = args
+                .get("immediate")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            match session.raw_rpc(
+                "vseat.cursor_settle",
+                json!({ "ws_id": ws_s, "immediate": immediate }),
+            ) {
+                Ok(val) => mcp_text_result(serde_json::to_string_pretty(&val).unwrap(), false),
+                Err(err) => mcp_ipc_error_result(&err),
+            }
         }
 
         "koma_exec_macro" => {
@@ -562,4 +626,48 @@ fn mcp_ipc_error_result(err: &koma_proto::IpcError) -> Value {
         .unwrap(),
         true,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builtin_mcp_tool_schemas_expose_koma_path_and_cursor_settle() {
+        let schemas = builtin_mcp_tool_schemas(&[]);
+        let path_tool = schemas
+            .iter()
+            .find(|s| s.get("name").and_then(Value::as_str) == Some("koma_path"))
+            .expect("koma_path tool schema must exist");
+        let req = path_tool["inputSchema"]["required"].as_array().unwrap();
+        assert!(req.iter().any(|v| v.as_str() == Some("ws_id")));
+        assert!(req.iter().any(|v| v.as_str() == Some("waypoints")));
+        let props = path_tool["inputSchema"]["properties"].as_object().unwrap();
+        for key in [
+            "ws_id",
+            "expected_epoch",
+            "waypoints",
+            "spline",
+            "button",
+            "hold_start_ms",
+            "hold_end_ms",
+            "kinematics",
+        ] {
+            assert!(
+                props.contains_key(key),
+                "missing property {key} in koma_path"
+            );
+        }
+
+        let settle_tool = schemas
+            .iter()
+            .find(|s| s.get("name").and_then(Value::as_str) == Some("koma_cursor_settle"))
+            .expect("koma_cursor_settle tool schema must exist");
+        assert!(
+            settle_tool["inputSchema"]["properties"]
+                .as_object()
+                .unwrap()
+                .contains_key("immediate")
+        );
+    }
 }

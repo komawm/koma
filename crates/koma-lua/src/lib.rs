@@ -24,15 +24,16 @@ pub use crate::{
         ClickMethodSpec, DEFAULT_KEYBOARD_REPEAT_DELAY_MS, DEFAULT_KEYBOARD_REPEAT_RATE_HZ,
         DesktopQuerySnapshot, DeviceOverrideSpec, EffectiveLibinputSettings, GestureSpec,
         InputConfigSpec, KeyboardInputSpec, KomaConfigRegistry, KomaHandleRef, LibinputDeviceProbe,
-        LuaLayerRuleSpec, LuaOutputInfo, LuaWindowInfo, LuaWindowRuleSpec, LuaWorkspaceInfo,
-        MacroDefinition, MacroHandleId, MacroLimitsSpec, MacroParamSpec, MonitorPositionSpec,
-        MonitorScaleSpec, MonitorSpec, PointerInputSpec, RuleHandleId, ScrollMethodSpec,
-        TabletInputSpec, TouchpadInputSpec, WorkspaceSpec, XwaylandConfigSpec,
-        resolve_effective_libinput_settings, validate_gesture_spec,
+        LuaLayerRuleSpec, LuaMovePathOptsInput, LuaOutputInfo, LuaPathSpecInput, LuaWindowInfo,
+        LuaWindowRuleSpec, LuaWorkspaceInfo, MacroDefinition, MacroHandleId, MacroLimitsSpec,
+        MacroParamSpec, MonitorPositionSpec, MonitorScaleSpec, MonitorSpec, PointerInputSpec,
+        RuleHandleId, ScrollMethodSpec, TabletInputSpec, TouchpadInputSpec, WorkspaceSpec,
+        XwaylandConfigSpec, resolve_effective_libinput_settings, validate_gesture_spec,
     },
     typegen::generate_luals_stubs,
 };
 pub use koma_model::{
-    AnimationConfig, BlurConfig, BorderConfig, DimConfig, DwindleConfig, FocusRingConfig,
-    OutputTransform, SafeAreaInsets, ScrollingConfig, ShadowConfig,
+    AgentCursorConfig, AnimationConfig, BlurConfig, BorderConfig, DimConfig, DwindleConfig,
+    FocusRingConfig, OutputTransform, PathSplineKind, SafeAreaInsets, ScrollingConfig,
+    ShadowConfig,
 };

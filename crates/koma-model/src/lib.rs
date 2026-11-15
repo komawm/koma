@@ -10,6 +10,7 @@
 
 pub mod animation;
 pub mod clock;
+pub mod cursor_path;
 pub mod dwindle;
 pub mod geometry;
 pub mod kinematics;
@@ -29,6 +30,13 @@ pub use crate::{
         WindowOpenStyle, WorkspaceTransitionTable, parse_hex_color, resolve_named_curve,
     },
     clock::{AdaptiveFrameClock, FrameClockConfig, FrameClockTier, FrameTickDecision},
+    cursor_path::{
+        AgentCursorConfig, AgentCursorFrameSnapshot, AgentCursorVisualDynamics, ArcLengthSpline,
+        CURSOR_CLICK_PULSE_MS, CURSOR_CLICK_RIPPLE_MS, CURSOR_MAX_RIPPLES, CURSOR_SETTLE_FADE_MS,
+        CURSOR_TRAIL_LIFETIME_MS, CURSOR_TRAIL_MAX_SAMPLES, CURSOR_TRAIL_RENDER_POINTS,
+        CentripetalCatmullRom, CubicBezierSegment2D, HeadingArcChooser, PathSplineKind,
+        PointerPathTrack, VelocityVerletSpring1D, wrap_pi,
+    },
     dwindle::{
         CardinalDir, DropZonePreview, DwindleConfig, DwindleInsertOutcome, DwindleTree,
         ResizeCorner,

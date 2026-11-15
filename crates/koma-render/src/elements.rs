@@ -4,6 +4,7 @@
 //! 3. `KomaBlurredBackdropElement` — frosted-glass `Dual Kawase Blur` slice clipped to rounded window,
 //! 4. `KomaSolidColorElement` — fractional-scale solid rects (`#000000` Protected blackout, `grid_225`).
 
+use koma_model::{AgentCursorFrameSnapshot, LogicalPoint};
 use smithay::{
     backend::renderer::{
         Color32F, Frame, ImportAll, ImportMem, Renderer, buffer_y_inverted,
@@ -674,62 +675,262 @@ impl KomaDropShadowElement {
     }
 }
 
-impl Element for KomaDropShadowElement {
-    fn id(&self) -> &Id {
-        self.inner.id()
-    }
+macro_rules! impl_pixel_shader_wrapper {
+    ($ty:ident) => {
+        impl Element for $ty {
+            fn id(&self) -> &Id {
+                self.inner.id()
+            }
 
-    fn current_commit(&self) -> CommitCounter {
-        self.inner.current_commit()
-    }
+            fn current_commit(&self) -> CommitCounter {
+                self.inner.current_commit()
+            }
 
-    fn src(&self) -> Rectangle<f64, Buffer> {
-        self.inner.src()
-    }
+            fn src(&self) -> Rectangle<f64, Buffer> {
+                self.inner.src()
+            }
 
-    fn geometry(&self, scale: Scale<f64>) -> Rectangle<i32, Physical> {
-        self.inner.geometry(scale)
-    }
+            fn geometry(&self, scale: Scale<f64>) -> Rectangle<i32, Physical> {
+                self.inner.geometry(scale)
+            }
 
-    fn opaque_regions(&self, scale: Scale<f64>) -> OpaqueRegions<i32, Physical> {
-        self.inner.opaque_regions(scale)
-    }
+            fn opaque_regions(&self, scale: Scale<f64>) -> OpaqueRegions<i32, Physical> {
+                self.inner.opaque_regions(scale)
+            }
 
-    fn alpha(&self) -> f32 {
-        self.inner.alpha()
-    }
+            fn alpha(&self) -> f32 {
+                self.inner.alpha()
+            }
 
-    fn kind(&self) -> Kind {
-        self.inner.kind()
+            fn kind(&self) -> Kind {
+                self.inner.kind()
+            }
+        }
+
+        impl<R: KomaRenderTarget> RenderElement<R> for $ty {
+            fn draw(
+                &self,
+                frame: &mut R::Frame<'_, '_>,
+                src: Rectangle<f64, Buffer>,
+                dst: Rectangle<i32, Physical>,
+                damage: &[Rectangle<i32, Physical>],
+                opaque_regions: &[Rectangle<i32, Physical>],
+                cache: Option<&UserDataMap>,
+            ) -> Result<(), R::Error> {
+                RenderElement::<GlesRenderer>::draw(
+                    &self.inner,
+                    R::gles_frame_mut(frame),
+                    src,
+                    dst,
+                    damage,
+                    opaque_regions,
+                    cache,
+                )
+                .map_err(R::map_gles_error)
+            }
+
+            fn underlying_storage(&self, _renderer: &mut R) -> Option<UnderlyingStorage<'_>> {
+                None
+            }
+        }
+    };
+}
+
+impl_pixel_shader_wrapper!(KomaDropShadowElement);
+
+// ==============================================================================
+// 6. `KomaAgentCursorElement` & `KomaAgentTrailElement` (AI Virtual Cursor)
+// ==============================================================================
+
+/// Analytical SDF dart cursor, ambient aura fog, and expanding click-ripple shader element.
+#[derive(Debug, Clone)]
+pub struct KomaAgentCursorElement {
+    inner: PixelShaderElement,
+}
+
+impl KomaAgentCursorElement {
+    /// Builds an agent cursor render element covering the dart arrow, fog, and active ripples.
+    #[must_use]
+    pub fn from_snapshot(
+        snapshot: &AgentCursorFrameSnapshot,
+        scale: Scale<f64>,
+        program: GlesPixelProgram,
+    ) -> Self {
+        let tip_x = snapshot.tip_pos.x;
+        let tip_y = snapshot.tip_pos.y;
+        let body_cx = tip_x + snapshot.body_offset.x;
+        let body_cy = tip_y + snapshot.body_offset.y;
+        let body_pad = f64::from(snapshot.size * snapshot.body_scale.max(0.5) * 1.45) + 6.0;
+
+        let mut min_x = body_cx - body_pad;
+        let mut min_y = body_cy - body_pad;
+        let mut max_x = body_cx + body_pad;
+        let mut max_y = body_cy + body_pad;
+
+        if snapshot.fog_opacity > 0.001 {
+            let fog_cx = tip_x + snapshot.fog_offset.x;
+            let fog_cy = tip_y + snapshot.fog_offset.y;
+            let fog_pad = f64::from(snapshot.size * snapshot.fog_scale * 1.25) + 4.0;
+            min_x = min_x.min(fog_cx - fog_pad);
+            min_y = min_y.min(fog_cy - fog_pad);
+            max_x = max_x.max(fog_cx + fog_pad);
+            max_y = max_y.max(fog_cy + fog_pad);
+        }
+
+        for &(center, radius, alpha) in &snapshot.ripples {
+            if alpha > 0.001 && radius > 0.5 {
+                let r_pad = f64::from(radius) + 6.0;
+                min_x = min_x.min(center.x - r_pad);
+                min_y = min_y.min(center.y - r_pad);
+                max_x = max_x.max(center.x + r_pad);
+                max_y = max_y.max(center.y + r_pad);
+            }
+        }
+
+        let area_x = min_x.floor() as i32;
+        let area_y = min_y.floor() as i32;
+        let area_w = (max_x.ceil() as i32 - area_x).max(2);
+        let area_h = (max_y.ceil() as i32 - area_y).max(2);
+        let area = Rectangle::new(Point::from((area_x, area_y)), Size::from((area_w, area_h)));
+
+        let pack_ripple = |idx: usize| -> [f32; 4] {
+            snapshot
+                .ripples
+                .get(idx)
+                .map_or([0.0; 4], |&(center, radius, alpha)| {
+                    [
+                        (center.x - f64::from(area_x)) as f32,
+                        (center.y - f64::from(area_y)) as f32,
+                        radius,
+                        alpha,
+                    ]
+                })
+        };
+
+        let uniforms = vec![
+            Uniform::new("elem_size", (area_w as f32, area_h as f32)),
+            Uniform::new("koma_scale", scale.x.max(1.0) as f32),
+            Uniform::new(
+                "tip_local",
+                (
+                    (tip_x - f64::from(area_x)) as f32,
+                    (tip_y - f64::from(area_y)) as f32,
+                ),
+            ),
+            Uniform::new(
+                "body_offset",
+                (snapshot.body_offset.x as f32, snapshot.body_offset.y as f32),
+            ),
+            Uniform::new("cursor_rot", snapshot.rotation_rad),
+            Uniform::new("cursor_size", snapshot.size),
+            Uniform::new("body_scale", snapshot.body_scale),
+            Uniform::new("accent_color", snapshot.accent_rgba),
+            Uniform::new(
+                "fog_offset",
+                (snapshot.fog_offset.x as f32, snapshot.fog_offset.y as f32),
+            ),
+            Uniform::new("fog_scale", snapshot.fog_scale),
+            Uniform::new("fog_opacity", snapshot.fog_opacity),
+            Uniform::new("ripple0", pack_ripple(0)),
+            Uniform::new("ripple1", pack_ripple(1)),
+        ];
+
+        Self {
+            inner: PixelShaderElement::new(
+                program,
+                area,
+                None,
+                snapshot.opacity.clamp(0.0, 1.0),
+                uniforms,
+                Kind::Unspecified,
+            ),
+        }
     }
 }
 
-impl<R: KomaRenderTarget> RenderElement<R> for KomaDropShadowElement {
-    fn draw(
-        &self,
-        frame: &mut R::Frame<'_, '_>,
-        src: Rectangle<f64, Buffer>,
-        dst: Rectangle<i32, Physical>,
-        damage: &[Rectangle<i32, Physical>],
-        opaque_regions: &[Rectangle<i32, Physical>],
-        cache: Option<&UserDataMap>,
-    ) -> Result<(), R::Error> {
-        RenderElement::<GlesRenderer>::draw(
-            &self.inner,
-            R::gles_frame_mut(frame),
-            src,
-            dst,
-            damage,
-            opaque_regions,
-            cache,
-        )
-        .map_err(R::map_gles_error)
-    }
+impl_pixel_shader_wrapper!(KomaAgentCursorElement);
 
-    fn underlying_storage(&self, _renderer: &mut R) -> Option<UnderlyingStorage<'_>> {
-        None
+/// Tapered capsule motion-trail shader element supporting up to 8 control points.
+#[derive(Debug, Clone)]
+pub struct KomaAgentTrailElement {
+    inner: PixelShaderElement,
+}
+
+impl KomaAgentTrailElement {
+    /// Builds a tapered trail ribbon element when at least 2 active points exist.
+    #[must_use]
+    pub fn from_points(
+        points: &[(LogicalPoint, f32, f32)],
+        accent_rgba: [f32; 4],
+        opacity: f32,
+        scale: Scale<f64>,
+        program: GlesPixelProgram,
+    ) -> Option<Self> {
+        let count = points.len().min(8);
+        if count < 2 || opacity <= 0.001 {
+            return None;
+        }
+        let slice = &points[..count];
+
+        let mut min_x = f64::INFINITY;
+        let mut min_y = f64::INFINITY;
+        let mut max_x = f64::NEG_INFINITY;
+        let mut max_y = f64::NEG_INFINITY;
+        let mut max_hw = 1.0_f64;
+        for &(p, _, hw) in slice {
+            min_x = min_x.min(p.x);
+            min_y = min_y.min(p.y);
+            max_x = max_x.max(p.x);
+            max_y = max_y.max(p.y);
+            max_hw = max_hw.max(f64::from(hw));
+        }
+        let pad = max_hw + 4.0;
+        let area_x = (min_x - pad).floor() as i32;
+        let area_y = (min_y - pad).floor() as i32;
+        let area_w = ((max_x + pad).ceil() as i32 - area_x).max(2);
+        let area_h = ((max_y + pad).ceil() as i32 - area_y).max(2);
+        let area = Rectangle::new(Point::from((area_x, area_y)), Size::from((area_w, area_h)));
+
+        let pack_pt = |idx: usize| -> [f32; 4] {
+            slice.get(idx).map_or([0.0; 4], |&(p, pt_alpha, hw)| {
+                [
+                    (p.x - f64::from(area_x)) as f32,
+                    (p.y - f64::from(area_y)) as f32,
+                    pt_alpha,
+                    hw,
+                ]
+            })
+        };
+
+        let uniforms = vec![
+            Uniform::new("elem_size", (area_w as f32, area_h as f32)),
+            Uniform::new("koma_scale", scale.x.max(1.0) as f32),
+            Uniform::new("accent_color", accent_rgba),
+            Uniform::new("point_count", count as f32),
+            Uniform::new("trail_p0", pack_pt(0)),
+            Uniform::new("trail_p1", pack_pt(1)),
+            Uniform::new("trail_p2", pack_pt(2)),
+            Uniform::new("trail_p3", pack_pt(3)),
+            Uniform::new("trail_p4", pack_pt(4)),
+            Uniform::new("trail_p5", pack_pt(5)),
+            Uniform::new("trail_p6", pack_pt(6)),
+            Uniform::new("trail_p7", pack_pt(7)),
+        ];
+
+        Some(Self {
+            inner: PixelShaderElement::new(
+                program,
+                area,
+                None,
+                opacity.clamp(0.0, 1.0),
+                uniforms,
+                Kind::Unspecified,
+            ),
+        })
     }
 }
+
+impl_pixel_shader_wrapper!(KomaAgentTrailElement);
 
 render_elements! {
     pub KomaRenderElement<R> where R: KomaRenderTarget, R::TextureId: 'static;
@@ -738,6 +939,8 @@ render_elements! {
     RoundedBorder = KomaRoundedBorderElement,
     BlurredBackdrop = KomaBlurredBackdropElement,
     DropShadow = KomaDropShadowElement,
+    AgentCursor = KomaAgentCursorElement,
+    AgentTrail = KomaAgentTrailElement,
     CursorBuffer = MemoryRenderBufferRenderElement<R>,
     Solid = KomaSolidColorElement,
 }

@@ -9,8 +9,8 @@ use calloop::{
 };
 use koma_lua::{HostBridge, phodopus_bridge::QueuedHostAction, schema::LuaKinematicsInput};
 use koma_model::{
-    AnchorPoint, LogicalPoint, LogicalRect, PointerTrajectorySpec, PointerTrajectoryTrack,
-    WindowMatchContext,
+    AnchorPoint, LogicalPoint, LogicalRect, PathSplineKind, PointerPathTrack,
+    PointerTrajectorySpec, WindowMatchContext,
 };
 use koma_proto::{Epoch, EventTopic, IpcError, TextInjectStrategy, WorkspaceEvent, WorkspaceId};
 use regex::Regex;
@@ -25,7 +25,7 @@ use smithay::{
 };
 use tracing::{debug, info, warn};
 
-use crate::state::KomaState;
+use crate::state::{AgentCursorRuntime, KomaState};
 
 const KINEMATIC_TICK_MS: u64 = 8; // ~125 Hz smooth pointer interpolation step
 const DEFAULT_SETTLE_QUIET_MS: u64 = 40;
@@ -60,12 +60,26 @@ pub struct WorkspaceDamageTracker {
     pub settle_timer_token: Option<RegistrationToken>,
 }
 
-/// In-flight smooth `vSeat` pointer trajectory (`minimum_jerk`, `bezier`, or 2D damped Hooke `spring`).
+/// In-flight smooth `vSeat` pointer trajectory (`minimum_jerk`, `bezier`, or 2D damped Hooke `spring`)
+/// following a multi-waypoint spline (`ArcLengthSpline` + `PointerPathTrack`).
 #[derive(Debug, Clone)]
 pub struct ActivePointerAnimation {
     pub ws_id: WorkspaceId,
     pub expected_epoch: Epoch,
-    pub track: PointerTrajectoryTrack,
+    pub track: PointerPathTrack,
+    pub hold_end_ms: u64,
+    pub release_at_ms: Option<u64>,
+    pub release_button_on_finish: Option<String>,
+}
+
+/// Parameters controlling a queued single-target or multi-waypoint `vSeat` pointer trajectory.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PointerPathLaunchOpts {
+    pub spline: PathSplineKind,
+    pub kinematics: LuaKinematicsInput,
+    pub hold_start_ms: u64,
+    pub hold_end_ms: u64,
+    pub press_button_at_start: Option<String>,
     pub release_button_on_finish: Option<String>,
 }
 
@@ -365,6 +379,39 @@ pub(crate) fn dispatch_single_host_action(state: &mut KomaState, action: QueuedH
             }
         }
 
+        QueuedHostAction::MovePointerPath {
+            ws_id,
+            expected_epoch,
+            waypoints,
+            spline,
+            kinematics,
+        } => {
+            if let Err(err) = queue_pointer_path_trajectory(
+                state,
+                ws_id,
+                expected_epoch,
+                waypoints,
+                PointerPathLaunchOpts {
+                    spline,
+                    kinematics,
+                    ..Default::default()
+                },
+            ) {
+                warn!("{}", err.message);
+            }
+        }
+
+        QueuedHostAction::SettleAgentCursor {
+            ws_id,
+            expected_epoch,
+            immediate,
+        } => {
+            if !verify_action_epoch_and_protection(state, &ws_id, expected_epoch) {
+                return;
+            }
+            settle_agent_cursor(state, &ws_id, immediate);
+        }
+
         QueuedHostAction::PointerButton {
             ws_id,
             expected_epoch,
@@ -384,8 +431,9 @@ pub(crate) fn dispatch_single_host_action(state: &mut KomaState, action: QueuedH
                     ledger.record_button_up(btn_code);
                 }
             }
-            apply_pointer_button(
+            apply_vseat_pointer_button(
                 state,
+                &ws_id,
                 btn_code,
                 if pressed {
                     ButtonState::Pressed
@@ -406,11 +454,17 @@ pub(crate) fn dispatch_single_host_action(state: &mut KomaState, action: QueuedH
             }
             let win_rect = target_window_rect(state, &ws_id);
             if let Ok(dst_pt) = target.resolve_in(win_rect) {
-                apply_pointer_motion(state, dst_pt);
+                apply_vseat_pointer_motion(
+                    state,
+                    &ws_id,
+                    dst_pt,
+                    LogicalPoint { x: 0.0, y: 0.0 },
+                    None,
+                );
                 let btn_code = linux_button_code(&opts.button);
                 for _ in 0..opts.clicks.max(1) {
-                    apply_pointer_button(state, btn_code, ButtonState::Pressed);
-                    apply_pointer_button(state, btn_code, ButtonState::Released);
+                    apply_vseat_pointer_button(state, &ws_id, btn_code, ButtonState::Pressed);
+                    apply_vseat_pointer_button(state, &ws_id, btn_code, ButtonState::Released);
                 }
             }
         }
@@ -424,7 +478,9 @@ pub(crate) fn dispatch_single_host_action(state: &mut KomaState, action: QueuedH
             if !verify_action_epoch_and_protection(state, &ws_id, expected_epoch) {
                 return;
             }
-            if let Some(pointer) = state.seat.get_pointer() {
+            if let Some(pointer) = state.seat.get_pointer()
+                && !pointer.is_grabbed()
+            {
                 let mut frame = AxisFrame::new(InputTime::now()).source(AxisSource::Wheel);
                 if dx.abs() > f64::EPSILON {
                     frame = frame
@@ -600,62 +656,186 @@ fn apply_move_pointer(
     kinematics: &LuaKinematicsInput,
     release_button_on_finish: Option<String>,
 ) -> Result<(), String> {
-    let win_rect = target_window_rect(state, &ws_id);
-    let dst_pt = target
-        .resolve_in(win_rect)
-        .map_err(|e| format!("invalid grid_225 label in MovePointer for {ws_id}: {e}"))?;
-    let anim_cfg = state.lua_sandbox.animations_snapshot();
-    let spec = kinematics.resolve_spec(&anim_cfg);
-    let now_ms = state.elapsed_ms();
+    launch_pointer_path_inner(
+        state,
+        ws_id,
+        expected_epoch,
+        &[target],
+        PointerPathLaunchOpts {
+            spline: PathSplineKind::Auto,
+            kinematics: kinematics.clone(),
+            release_button_on_finish,
+            ..Default::default()
+        },
+    )
+    .map(|_| ())
+}
 
-    if matches!(spec, PointerTrajectorySpec::Instant) {
-        state.pointer_animations.retain(|a| a.ws_id != ws_id);
-        apply_pointer_motion(state, dst_pt);
-        if let Some(button) = release_button_on_finish {
-            release_pointer_button(state, &ws_id, &button);
-        }
-        return Ok(());
+fn launch_pointer_path_inner(
+    state: &mut KomaState,
+    ws_id: WorkspaceId,
+    expected_epoch: Epoch,
+    waypoints: &[AnchorPoint],
+    opts: PointerPathLaunchOpts,
+) -> Result<usize, String> {
+    if waypoints.is_empty() {
+        return Err("pointer trajectory requires at least one waypoint".to_owned());
+    }
+    let win_rect = target_window_rect(state, &ws_id);
+    let mut resolved_pts = Vec::with_capacity(waypoints.len());
+    for wp in waypoints {
+        let pt = wp
+            .resolve_in(win_rect)
+            .map_err(|e| format!("invalid waypoint anchor for {ws_id}: {e}"))?;
+        resolved_pts.push(pt);
     }
 
-    if let Some(existing) = state
-        .pointer_animations
-        .iter_mut()
-        .find(|a| a.ws_id == ws_id)
+    let anim_cfg = state.lua_sandbox.animations_snapshot();
+    let spec = opts.kinematics.resolve_spec(&anim_cfg);
+    let now_ms = state.elapsed_ms();
+    let bounds = state
+        .workspaces
+        .get(&ws_id)
+        .map(|ws| ws.viewport.full_rect());
+
+    if let Some(btn) = &opts.press_button_at_start {
+        apply_vseat_pointer_motion(
+            state,
+            &ws_id,
+            resolved_pts[0],
+            LogicalPoint { x: 0.0, y: 0.0 },
+            None,
+        );
+        let btn_code = linux_button_code(btn);
+        if let Some(ws) = state.workspaces.get(&ws_id)
+            && let Some(ledger) = state.vseats.get_mut(&ws.vseat_id)
+        {
+            ledger.record_button_down(btn_code);
+        }
+        apply_vseat_pointer_button(state, &ws_id, btn_code, ButtonState::Pressed);
+    }
+
+    if matches!(spec, PointerTrajectorySpec::Instant)
+        && opts.hold_start_ms == 0
+        && opts.hold_end_ms == 0
+    {
+        state.pointer_animations.retain(|a| a.ws_id != ws_id);
+        let last = *resolved_pts.last().expect("checked non-empty");
+        apply_vseat_pointer_motion(state, &ws_id, last, LogicalPoint { x: 0.0, y: 0.0 }, None);
+        if let Some(button) = opts.release_button_on_finish {
+            release_pointer_button(state, &ws_id, &button);
+        }
+        return Ok(resolved_pts.len());
+    }
+
+    if resolved_pts.len() == 1
+        && opts.hold_start_ms == 0
+        && opts.hold_end_ms == 0
+        && opts.press_button_at_start.is_none()
+        && let Some(existing) = state
+            .pointer_animations
+            .iter_mut()
+            .find(|a| a.ws_id == ws_id)
     {
         existing.expected_epoch = expected_epoch;
-        existing.track.retarget(dst_pt, now_ms, spec);
-        existing.release_button_on_finish = release_button_on_finish;
+        existing
+            .track
+            .retarget_waypoints(&resolved_pts, opts.spline, bounds, now_ms, spec);
+        existing.hold_end_ms = 0;
+        existing.release_at_ms = None;
+        existing.release_button_on_finish = opts.release_button_on_finish;
         if existing.track.is_settled() {
             let release_btn = existing.release_button_on_finish.take();
             state.pointer_animations.retain(|a| a.ws_id != ws_id);
-            apply_pointer_motion(state, dst_pt);
+            apply_vseat_pointer_motion(
+                state,
+                &ws_id,
+                resolved_pts[0],
+                LogicalPoint { x: 0.0, y: 0.0 },
+                None,
+            );
             if let Some(button) = release_btn {
                 release_pointer_button(state, &ws_id, &button);
             }
         }
-        return Ok(());
+        return Ok(1);
     }
 
-    let from = LogicalPoint {
-        x: state.pointer_location.x,
-        y: state.pointer_location.y,
+    let prev_anim = state
+        .pointer_animations
+        .iter()
+        .position(|a| a.ws_id == ws_id)
+        .map(|idx| state.pointer_animations.swap_remove(idx));
+
+    let current_ws_pos = state
+        .agent_cursors
+        .get(&ws_id)
+        .map(|ac| ac.ws_local_pos)
+        .unwrap_or(LogicalPoint { x: 0.0, y: 0.0 });
+
+    let launch_pts: Vec<LogicalPoint> = if resolved_pts.len() == 1 {
+        vec![current_ws_pos, resolved_pts[0]]
+    } else {
+        resolved_pts.clone()
     };
-    let track =
-        PointerTrajectoryTrack::launch(from, dst_pt, LogicalPoint { x: 0.0, y: 0.0 }, now_ms, spec);
-    if track.is_settled() {
-        apply_pointer_motion(state, dst_pt);
-        if let Some(button) = release_button_on_finish {
+
+    let (init_vel, init_heading) = match (&opts.press_button_at_start, prev_anim.as_ref()) {
+        (None, Some(prev)) => {
+            let prev_pos = prev.track.target_point();
+            let p0 = launch_pts[0];
+            if (prev_pos.x - p0.x).hypot(prev_pos.y - p0.y) <= 2.0 || resolved_pts.len() == 1 {
+                (
+                    prev.track.current_velocity(),
+                    prev.track.current_heading_rad(),
+                )
+            } else {
+                (LogicalPoint { x: 0.0, y: 0.0 }, None)
+            }
+        }
+        _ => (LogicalPoint { x: 0.0, y: 0.0 }, None),
+    };
+
+    if resolved_pts.len() >= 2 && opts.press_button_at_start.is_none() {
+        apply_vseat_pointer_motion(state, &ws_id, launch_pts[0], init_vel, init_heading);
+    }
+
+    let launch_ms = now_ms.saturating_add(opts.hold_start_ms);
+    let track = PointerPathTrack::launch_waypoints(
+        &launch_pts,
+        opts.spline,
+        init_vel,
+        init_heading,
+        bounds,
+        launch_ms,
+        spec,
+    );
+
+    if track.is_settled() && opts.hold_start_ms == 0 && opts.hold_end_ms == 0 {
+        let last = track.target_point();
+        apply_vseat_pointer_motion(state, &ws_id, last, LogicalPoint { x: 0.0, y: 0.0 }, None);
+        if let Some(button) = opts.release_button_on_finish {
             release_pointer_button(state, &ws_id, &button);
         }
     } else {
+        let release_at_ms = if track.is_settled() && opts.release_button_on_finish.is_some() {
+            Some(launch_ms.saturating_add(opts.hold_end_ms))
+        } else {
+            None
+        };
+        if track.is_settled() {
+            let last = track.target_point();
+            apply_vseat_pointer_motion(state, &ws_id, last, LogicalPoint { x: 0.0, y: 0.0 }, None);
+        }
         state.pointer_animations.push(ActivePointerAnimation {
             ws_id,
             expected_epoch,
             track,
-            release_button_on_finish,
+            hold_end_ms: opts.hold_end_ms,
+            release_at_ms,
+            release_button_on_finish: opts.release_button_on_finish,
         });
     }
-    Ok(())
+    Ok(resolved_pts.len())
 }
 
 pub(crate) fn queue_pointer_trajectory(
@@ -666,23 +846,49 @@ pub(crate) fn queue_pointer_trajectory(
     kinematics: &LuaKinematicsInput,
     release_button_on_finish: Option<String>,
 ) -> Result<(), IpcError> {
+    queue_pointer_path_trajectory(
+        state,
+        ws_id,
+        expected_epoch,
+        vec![target],
+        PointerPathLaunchOpts {
+            spline: PathSplineKind::Auto,
+            kinematics: kinematics.clone(),
+            release_button_on_finish,
+            ..Default::default()
+        },
+    )
+    .map(|_| ())
+}
+
+pub(crate) fn queue_pointer_path_trajectory(
+    state: &mut KomaState,
+    ws_id: WorkspaceId,
+    expected_epoch: Epoch,
+    waypoints: Vec<AnchorPoint>,
+    opts: PointerPathLaunchOpts,
+) -> Result<usize, IpcError> {
     if !verify_action_epoch_and_protection(state, &ws_id, expected_epoch) {
         return Err(IpcError::new(
             koma_proto::ErrorSymbol::ErrStaleEpoch,
             "workspace epoch mismatch or protected surface focused",
         ));
     }
-    apply_move_pointer(
-        state,
-        ws_id,
-        expected_epoch,
-        target,
-        kinematics,
-        release_button_on_finish,
-    )
-    .map_err(|msg| IpcError::new(koma_proto::ErrorSymbol::ErrInvalidParams, msg))?;
+    let count = launch_pointer_path_inner(state, ws_id, expected_epoch, &waypoints, opts)
+        .map_err(|msg| IpcError::new(koma_proto::ErrorSymbol::ErrInvalidParams, msg))?;
     rearm_trampoline_timer(state);
-    Ok(())
+    Ok(count)
+}
+
+pub(crate) fn settle_agent_cursor(state: &mut KomaState, ws_id: &WorkspaceId, immediate: bool) {
+    let now_ms = state.elapsed_ms();
+    if immediate {
+        state.pointer_animations.retain(|a| &a.ws_id != ws_id);
+    }
+    if let Some(ac) = state.agent_cursors.get_mut(ws_id) {
+        ac.visual.begin_settle(now_ms, immediate);
+    }
+    state.queue_redraw();
 }
 
 fn release_pointer_button(state: &mut KomaState, ws_id: &WorkspaceId, button: &str) {
@@ -692,7 +898,7 @@ fn release_pointer_button(state: &mut KomaState, ws_id: &WorkspaceId, button: &s
     {
         ledger.record_button_up(btn_code);
     }
-    apply_pointer_button(state, btn_code, ButtonState::Released);
+    apply_vseat_pointer_button(state, ws_id, btn_code, ButtonState::Released);
 }
 
 fn step_pointer_animations(state: &mut KomaState, now_ms: u64) {
@@ -706,7 +912,7 @@ fn step_pointer_animations(state: &mut KomaState, now_ms: u64) {
     }
 
     let mut remaining = Vec::new();
-    let mut latest_pos: Option<LogicalPoint> = None;
+    let mut motions: Vec<(WorkspaceId, LogicalPoint, LogicalPoint, Option<f64>)> = Vec::new();
     let mut finished_releases: Vec<(WorkspaceId, String)> = Vec::new();
 
     for mut anim in state.pointer_animations.drain(..) {
@@ -717,12 +923,32 @@ fn step_pointer_animations(state: &mut KomaState, now_ms: u64) {
             continue;
         }
 
+        if let Some(rel_ms) = anim.release_at_ms {
+            if now_ms >= rel_ms {
+                if let Some(btn) = anim.release_button_on_finish.take() {
+                    finished_releases.push((anim.ws_id.clone(), btn));
+                }
+            } else {
+                remaining.push(anim);
+            }
+            continue;
+        }
+
         let pt = anim.track.step(now_ms);
-        latest_pos = Some(pt);
+        let vel = anim.track.current_velocity();
+        let heading = anim.track.current_heading_rad();
+        motions.push((anim.ws_id.clone(), pt, vel, heading));
 
         if anim.track.is_settled() || now_ms >= anim.track.max_finish_at_ms() {
-            if let Some(btn) = anim.release_button_on_finish.take() {
-                finished_releases.push((anim.ws_id.clone(), btn));
+            if anim.release_button_on_finish.is_some() {
+                if anim.hold_end_ms == 0 {
+                    if let Some(btn) = anim.release_button_on_finish.take() {
+                        finished_releases.push((anim.ws_id.clone(), btn));
+                    }
+                } else {
+                    anim.release_at_ms = Some(now_ms.saturating_add(anim.hold_end_ms));
+                    remaining.push(anim);
+                }
             }
         } else {
             remaining.push(anim);
@@ -730,8 +956,8 @@ fn step_pointer_animations(state: &mut KomaState, now_ms: u64) {
     }
 
     state.pointer_animations = remaining;
-    if let Some(pt) = latest_pos {
-        apply_pointer_motion(state, pt);
+    for (ws_id, pt, vel, heading) in motions {
+        apply_vseat_pointer_motion(state, &ws_id, pt, vel, heading);
     }
     for (ws_id, btn) in finished_releases {
         release_pointer_button(state, &ws_id, &btn);
@@ -832,22 +1058,53 @@ fn target_window_rect(state: &KomaState, ws_id: &WorkspaceId) -> LogicalRect {
         .unwrap_or_else(|| LogicalRect::new(0, 0, 1920, 1080))
 }
 
-fn apply_pointer_motion(state: &mut KomaState, pt: LogicalPoint) {
+fn apply_vseat_pointer_motion(
+    state: &mut KomaState,
+    ws_id: &WorkspaceId,
+    pt: LogicalPoint,
+    vel: LogicalPoint,
+    heading_rad: Option<f64>,
+) {
     state.reconcile_session_lock();
     if state.is_locked_or_abandoned() {
         return;
     }
-    let pos = Point::from((pt.x, pt.y));
-    state.pointer_location = pos;
-    let under = state.surface_under(pos);
-    if let Some(pointer) = state.seat.get_pointer() {
+    let now_ms = state.elapsed_ms();
+    let ws_local = Point::from((pt.x, pt.y));
+    let out_origin = state.workspace_output_origin(ws_id);
+    let hit = state.surface_under_in_workspace(ws_id, ws_local);
+    let anchored_window = hit.as_ref().and_then(|(win_id, _, _)| {
+        let rect = state.workspaces.get(ws_id).and_then(|ws| {
+            ws.compute_visible_geometries_at(now_ms)
+                .into_iter()
+                .find(|(id, _, _)| *id == *win_id)
+                .map(|(_, r, _)| r)
+        })?;
+        let u = (pt.x - f64::from(rect.x)) / f64::from(rect.w.max(1));
+        let v = (pt.y - f64::from(rect.y)) / f64::from(rect.h.max(1));
+        Some((*win_id, u, v))
+    });
+
+    let ac = state
+        .agent_cursors
+        .entry(ws_id.clone())
+        .or_insert_with(|| AgentCursorRuntime::new(pt));
+    ac.ws_local_pos = pt;
+    ac.anchored_window = anchored_window;
+    ac.visual.set_target(pt, vel, heading_rad, now_ms);
+
+    let delivery_pos = ws_local + out_origin;
+    let under = hit.map(|(_, surf, origin)| (surf, origin));
+    if let Some(pointer) = state.seat.get_pointer()
+        && !pointer.is_grabbed()
+    {
         let serial = SERIAL_COUNTER.next_serial();
         let time = InputTime::now();
         pointer.motion(
             state,
             under,
             &MotionEvent {
-                location: pos,
+                location: delivery_pos,
                 serial,
                 time,
             },
@@ -857,16 +1114,45 @@ fn apply_pointer_motion(state: &mut KomaState, pt: LogicalPoint) {
     state.queue_redraw();
 }
 
-fn apply_pointer_button(state: &mut KomaState, button: u32, btn_state: ButtonState) {
+fn apply_vseat_pointer_button(
+    state: &mut KomaState,
+    ws_id: &WorkspaceId,
+    button: u32,
+    btn_state: ButtonState,
+) {
     state.reconcile_session_lock();
     if state.is_locked_or_abandoned() {
         return;
     }
+    let now_ms = state.elapsed_ms();
+    let ac_cfg = state.agent_cursor_config();
+    let ws_local_pt = state
+        .agent_cursors
+        .get(ws_id)
+        .map(|ac| ac.ws_local_pos)
+        .unwrap_or(LogicalPoint { x: 0.0, y: 0.0 });
+    let ws_local = Point::from((ws_local_pt.x, ws_local_pt.y));
+
     if btn_state == ButtonState::Pressed {
-        let pos = state.pointer_location;
-        state.handle_pointer_button_focus(pos);
+        if let Some((win_id, _, _)) = state.surface_under_in_workspace(ws_id, ws_local) {
+            if let Some(ws) = state.workspaces.get_mut(ws_id) {
+                ws.activate_window(win_id, now_ms);
+            }
+            state.sync_workspace_geometries(ws_id);
+            if *ws_id == state.effective_interactive_ws_id() {
+                state.focus_active_deck_window();
+            }
+        }
+        let ac = state
+            .agent_cursors
+            .entry(ws_id.clone())
+            .or_insert_with(|| AgentCursorRuntime::new(ws_local_pt));
+        ac.visual.trigger_click(ws_local_pt, now_ms, &ac_cfg);
     }
-    if let Some(pointer) = state.seat.get_pointer() {
+
+    if let Some(pointer) = state.seat.get_pointer()
+        && !pointer.is_grabbed()
+    {
         let serial = SERIAL_COUNTER.next_serial();
         let time = InputTime::now();
         pointer.button(
@@ -880,6 +1166,7 @@ fn apply_pointer_button(state: &mut KomaState, button: u32, btn_state: ButtonSta
         );
         pointer.frame(state);
     }
+    state.queue_redraw();
 }
 
 fn linux_button_code(name: &str) -> u32 {

@@ -20,7 +20,7 @@ use std::{
 use gc_arena::Rootable;
 use koma_model::{
     AnchorPoint, AnimationConfig, CubicBezier, CurveSpec, DwindleConfig, HookeSpringParams,
-    LayoutMode, PointerTrajectorySpec, ScrollingConfig,
+    LayoutMode, PathSplineKind, PointerTrajectorySpec, ScrollingConfig,
 };
 use koma_proto::{Epoch, ErrorSymbol, IpcError, MacroId, TextInjectStrategy, WorkspaceId};
 use phodopus::{
@@ -41,10 +41,10 @@ use crate::{
         ActionDescriptor, AppearanceSpec, BindHandleId, BindOptions, BindSpec,
         DesktopQuerySnapshot, DeviceOverrideSpec, GestureSpec, InputConfigSpec, KomaConfigRegistry,
         KomaHandleRef, LuaAnchorPointInput, LuaClickOptsInput, LuaDragSpecInput, LuaKeyOptsInput,
-        LuaKinematicsInput, LuaLayerRuleSpec, LuaScrollSpecInput, LuaSettleOptsInput,
-        LuaTextOptsInput, LuaWindowRuleSpec, MacroDefinition, MacroHandleId, MacroLimitsSpec,
-        MacroParamSpec, MonitorSpec, RuleHandleId, TriggerEdge, WorkspaceSpec, XwaylandConfigSpec,
-        validate_gesture_spec,
+        LuaKinematicsInput, LuaLayerRuleSpec, LuaMovePathOptsInput, LuaPathSpecInput,
+        LuaScrollSpecInput, LuaSettleOptsInput, LuaTextOptsInput, LuaWindowRuleSpec,
+        MacroDefinition, MacroHandleId, MacroLimitsSpec, MacroParamSpec, MonitorSpec, RuleHandleId,
+        TriggerEdge, WorkspaceSpec, XwaylandConfigSpec, validate_gesture_spec,
     },
 };
 
@@ -77,6 +77,18 @@ pub enum QueuedHostAction {
         expected_epoch: Epoch,
         target: AnchorPoint,
         kinematics: LuaKinematicsInput,
+    },
+    MovePointerPath {
+        ws_id: WorkspaceId,
+        expected_epoch: Epoch,
+        waypoints: Vec<AnchorPoint>,
+        spline: PathSplineKind,
+        kinematics: LuaKinematicsInput,
+    },
+    SettleAgentCursor {
+        ws_id: WorkspaceId,
+        expected_epoch: Epoch,
+        immediate: bool,
     },
     PointerButton {
         ws_id: WorkspaceId,
@@ -2546,6 +2558,232 @@ fn create_macro_context_userdata<'gc>(
         }),
     )?;
 
+    fn resolve_path_waypoints<'gc>(
+        inputs: Vec<LuaAnchorPointInput>,
+    ) -> Result<Vec<AnchorPoint>, LuaError<'gc>> {
+        if !(2..=128).contains(&inputs.len()) {
+            return Err(runtime_err(
+                "pointer path requires between 2 and 128 waypoints",
+            ));
+        }
+        inputs
+            .into_iter()
+            .map(|w| w.into_anchor_point().map_err(runtime_err))
+            .collect()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_path_callback<'gc>(
+        ctx: &Context<'gc>,
+        sc: MacroExecScope,
+        waypoints: Vec<AnchorPoint>,
+        spline: PathSplineKind,
+        button: Option<String>,
+        hold_before_move_ms: u64,
+        hold_before_release_ms: u64,
+        kinematics: LuaKinematicsInput,
+    ) -> CallbackReturn<'gc> {
+        let seq = async_sequence(ctx, |_, mut seq| async move {
+            if let Some(ref btn) = button {
+                let first = waypoints[0].clone();
+                let pre_handle = seq.try_enter(|_, _, _, _| {
+                    let mut inner = sc.state.borrow_mut();
+                    inner.host_actions.push_back(QueuedHostAction::MovePointer {
+                        ws_id: sc.ws_id.clone(),
+                        expected_epoch: sc.expected_epoch,
+                        target: first,
+                        kinematics: LuaKinematicsInput::instant(),
+                    });
+                    inner
+                        .host_actions
+                        .push_back(QueuedHostAction::PointerButton {
+                            ws_id: sc.ws_id.clone(),
+                            expected_epoch: sc.expected_epoch,
+                            button: btn.clone(),
+                            pressed: true,
+                        });
+                    if hold_before_move_ms > 0 {
+                        let deadline_ms = inner.now_ms.saturating_add(hold_before_move_ms);
+                        Ok::<_, LuaError<'_>>(Some(
+                            inner.park_host_op(&sc, PendingHostOp::SleepTimer { deadline_ms }),
+                        ))
+                    } else {
+                        Ok(None)
+                    }
+                })?;
+                if let Some(h) = pre_handle {
+                    seq.suspend(h).await?;
+                }
+            }
+
+            let traj_handle = seq.try_enter(|_, _, _, _| {
+                let mut inner = sc.state.borrow_mut();
+                let spec = kinematics.resolve_spec(&inner.config.appearance.animations);
+                let dur = spec.estimated_park_ms(512.0);
+                let settle_driven = matches!(
+                    spec,
+                    PointerTrajectorySpec::HookeSpring {
+                        duration_cap_ms: None,
+                        ..
+                    }
+                );
+                inner
+                    .host_actions
+                    .push_back(QueuedHostAction::MovePointerPath {
+                        ws_id: sc.ws_id.clone(),
+                        expected_epoch: sc.expected_epoch,
+                        waypoints,
+                        spline,
+                        kinematics,
+                    });
+                if dur > 0 {
+                    let started_at_ms = inner.now_ms;
+                    let finish_at_ms = started_at_ms.saturating_add(dur);
+                    let ws_id = sc.ws_id.clone();
+                    Ok::<_, LuaError<'_>>(Some(inner.park_host_op(
+                        &sc,
+                        PendingHostOp::PointerTrajectory {
+                            ws_id,
+                            started_at_ms,
+                            finish_at_ms,
+                            settle_driven,
+                        },
+                    )))
+                } else {
+                    Ok(None)
+                }
+            })?;
+            if let Some(h) = traj_handle {
+                seq.suspend(h).await?;
+            }
+
+            if let Some(btn) = button {
+                if hold_before_release_ms > 0 {
+                    let post_handle = seq.try_enter(|_, _, _, _| {
+                        let mut inner = sc.state.borrow_mut();
+                        let deadline_ms = inner.now_ms.saturating_add(hold_before_release_ms);
+                        Ok::<_, LuaError<'_>>(
+                            inner.park_host_op(&sc, PendingHostOp::SleepTimer { deadline_ms }),
+                        )
+                    })?;
+                    seq.suspend(post_handle).await?;
+                }
+                seq.try_enter(|_, _, _, _| {
+                    sc.state
+                        .borrow_mut()
+                        .host_actions
+                        .push_back(QueuedHostAction::PointerButton {
+                            ws_id: sc.ws_id.clone(),
+                            expected_epoch: sc.expected_epoch,
+                            button: btn,
+                            pressed: false,
+                        });
+                    Ok::<_, LuaError<'_>>(())
+                })?;
+            }
+
+            Ok(SequenceReturn::Return)
+        });
+        CallbackReturn::Sequence(seq)
+    }
+
+    methods.try_set_field(
+        ctx,
+        "move_path",
+        Callback::from_fn(&ctx, |ctx, _, mut stack| {
+            let ud: UserData = stack.from_front(ctx)?;
+            let (waypoints_val, opts_val): (Value, Option<Value>) = stack.consume(ctx)?;
+            let waypoints_in: Vec<LuaAnchorPointInput> =
+                from_value(waypoints_val).map_err(RuntimeError::new)?;
+            let waypoints = resolve_path_waypoints(waypoints_in)?;
+            let opts: LuaMovePathOptsInput = match opts_val {
+                Some(v) if !v.is_nil() => from_value(v).map_err(RuntimeError::new)?,
+                _ => LuaMovePathOptsInput::default(),
+            };
+            let (spline, kinematics) = opts.into_parts();
+            let sc = ud
+                .downcast_static::<MacroExecScope>()
+                .map_err(RuntimeError::new)?
+                .clone();
+            Ok(build_path_callback(
+                &ctx, sc, waypoints, spline, None, 0, 0, kinematics,
+            ))
+        }),
+    )?;
+
+    methods.try_set_field(
+        ctx,
+        "stroke_path",
+        Callback::from_fn(&ctx, |ctx, _, mut stack| {
+            let ud: UserData = stack.from_front(ctx)?;
+            let spec_val: Value = stack.consume(ctx)?;
+            let spec: LuaPathSpecInput = from_value(spec_val).map_err(RuntimeError::new)?;
+            let waypoints = resolve_path_waypoints(spec.waypoints)?;
+            let button = Some(spec.button.unwrap_or_else(|| "left".to_owned()));
+            let sc = ud
+                .downcast_static::<MacroExecScope>()
+                .map_err(RuntimeError::new)?
+                .clone();
+            Ok(build_path_callback(
+                &ctx,
+                sc,
+                waypoints,
+                spec.spline,
+                button,
+                spec.hold_before_move_ms,
+                spec.hold_before_release_ms,
+                spec.kinematics,
+            ))
+        }),
+    )?;
+
+    methods.try_set_field(
+        ctx,
+        "path",
+        Callback::from_fn(&ctx, |ctx, _, mut stack| {
+            let ud: UserData = stack.from_front(ctx)?;
+            let spec_val: Value = stack.consume(ctx)?;
+            let spec: LuaPathSpecInput = from_value(spec_val).map_err(RuntimeError::new)?;
+            let waypoints = resolve_path_waypoints(spec.waypoints)?;
+            let sc = ud
+                .downcast_static::<MacroExecScope>()
+                .map_err(RuntimeError::new)?
+                .clone();
+            Ok(build_path_callback(
+                &ctx,
+                sc,
+                waypoints,
+                spec.spline,
+                spec.button,
+                spec.hold_before_move_ms,
+                spec.hold_before_release_ms,
+                spec.kinematics,
+            ))
+        }),
+    )?;
+
+    methods.try_set_field(
+        ctx,
+        "settle_cursor",
+        Callback::from_fn(&ctx, |ctx, _, mut stack| {
+            let ud: UserData = stack.from_front(ctx)?;
+            let immediate: Option<bool> = stack.consume(ctx)?;
+            let sc = ud
+                .downcast_static::<MacroExecScope>()
+                .map_err(RuntimeError::new)?
+                .clone();
+            sc.state
+                .borrow_mut()
+                .host_actions
+                .push_back(QueuedHostAction::SettleAgentCursor {
+                    ws_id: sc.ws_id.clone(),
+                    expected_epoch: sc.expected_epoch,
+                    immediate: immediate.unwrap_or(false),
+                });
+            Ok(CallbackReturn::Return)
+        }),
+    )?;
+
     // 8. ctx:scroll({ dx, dy, steps, step_ms })
     methods.try_set_field(
         ctx,
@@ -3447,5 +3685,156 @@ mod tests {
 
         let r5 = sandbox.drive_ready_coroutines(1_650, &[], &SettleBridge(Epoch(1), false));
         assert_eq!(r5.completed_macros, 1);
+    }
+
+    #[test]
+    fn agent_cursor_config_and_path_macro_methods_work_in_sandbox() {
+        let mut sandbox = PhodopusSandbox::new(DEFAULT_HEAP_LIMIT_BYTES, None).unwrap();
+        let script = r##"
+            koma.appearance({
+                agent_cursor = {
+                    enabled = true,
+                    size = 32,
+                    accent_color = "#7ee787",
+                    trail_enabled = true,
+                    fog_enabled = false,
+                    ripple_enabled = true,
+                    idle_timeout_ms = 5000,
+                    idle_wobble = false,
+                },
+            })
+            koma.macro.define({
+                id = "cursor.path_demo",
+                app_id = ".*",
+                run = function(ctx)
+                    ctx:move_path(
+                        { { x = 10, y = 20 }, { x = 120, y = 80 }, { x = 240, y = 40 } },
+                        { spline = "catmull_rom", kinematics = { profile = "bezier", duration_ms = 120 } }
+                    )
+                    ctx:stroke_path({
+                        waypoints = { { grid_225 = "B2" }, { grid_225 = "G8" } },
+                        spline = "bezier",
+                        hold_before_move_ms = 20,
+                        hold_before_release_ms = 10,
+                        kinematics = { profile = "minimum_jerk", duration_ms = 100 },
+                    })
+                    ctx:path({
+                        waypoints = { { x = 50, y = 50 }, { x = 150, y = 150 } },
+                    })
+                    ctx:settle_cursor(true)
+                end,
+            })
+        "##;
+        sandbox.eval_init_lua(script).unwrap();
+
+        let ac = &sandbox.config_snapshot().appearance.agent_cursor;
+        assert!(ac.enabled);
+        assert!((ac.size - 32.0).abs() < 1e-4);
+        assert_eq!(ac.accent_color, "#7ee787");
+        assert!(!ac.fog_enabled);
+        assert_eq!(ac.idle_timeout_ms, 5000);
+        assert!(!ac.idle_wobble);
+
+        let stubs = crate::generate_luals_stubs();
+        assert!(stubs.contains("---@alias KomaPathSplineKind"));
+        assert!(stubs.contains("---@class KomaAgentCursorSpec"));
+        assert!(stubs.contains("---@class KomaPathSpec"));
+        assert!(stubs.contains("---@field agent_cursor? KomaAgentCursorSpec"));
+        assert!(stubs.contains("function MacroContext:move_path(waypoints, opts) end"));
+        assert!(stubs.contains("function MacroContext:stroke_path(spec) end"));
+        assert!(stubs.contains("function MacroContext:path(spec) end"));
+        assert!(stubs.contains("function MacroContext:settle_cursor(immediate) end"));
+
+        let (_exec, mode) = sandbox
+            .start_macro_tx(
+                WorkspaceId::new("ws-1"),
+                Epoch(1),
+                &MacroId::new("cursor.path_demo"),
+                &serde_json::json!({}),
+                0,
+            )
+            .unwrap();
+        assert_eq!(mode, ExecutorMode::HostSuspended);
+
+        struct DummyBridge;
+        impl crate::host_abi::HostBridge for DummyBridge {
+            fn current_epoch(&self, _ws_id: &WorkspaceId) -> Option<Epoch> {
+                Some(Epoch(1))
+            }
+            fn focused_app_id(&self, _ws_id: &WorkspaceId) -> Option<String> {
+                None
+            }
+            fn tap_key_chord(&mut self, _: &WorkspaceId, _: &str) -> Result<(), IpcError> {
+                Ok(())
+            }
+            fn move_pointer(&mut self, _: &WorkspaceId, _: &AnchorPoint) -> Result<u64, IpcError> {
+                Ok(0)
+            }
+            fn inject_text(
+                &mut self,
+                _: &WorkspaceId,
+                _: &str,
+                _: TextInjectStrategy,
+            ) -> Result<(), IpcError> {
+                Ok(())
+            }
+            fn paste_mime(&mut self, _: &WorkspaceId, _: &str, _: &[u8]) -> Result<(), IpcError> {
+                Ok(())
+            }
+        }
+
+        sandbox.drive_ready_coroutines(0, &[], &DummyBridge);
+        let a0 = sandbox.drain_queued_actions();
+        assert!(matches!(
+            &a0[0],
+            QueuedHostAction::MovePointerPath {
+                spline: PathSplineKind::CatmullRom,
+                waypoints,
+                ..
+            } if waypoints.len() == 3
+        ));
+
+        sandbox.drive_ready_coroutines(120, &[], &DummyBridge);
+        let a1 = sandbox.drain_queued_actions();
+        assert!(matches!(a1[0], QueuedHostAction::MovePointer { .. }));
+        assert!(matches!(
+            &a1[1],
+            QueuedHostAction::PointerButton {
+                button,
+                pressed: true,
+                ..
+            } if button == "left"
+        ));
+
+        sandbox.drive_ready_coroutines(140, &[], &DummyBridge);
+        let a2 = sandbox.drain_queued_actions();
+        assert!(matches!(
+            &a2[0],
+            QueuedHostAction::MovePointerPath {
+                spline: PathSplineKind::Bezier,
+                waypoints,
+                ..
+            } if waypoints.len() == 2
+        ));
+
+        sandbox.drive_ready_coroutines(240, &[], &DummyBridge);
+        sandbox.drive_ready_coroutines(250, &[], &DummyBridge);
+        let a3 = sandbox.drain_queued_actions();
+        assert!(matches!(
+            a3[0],
+            QueuedHostAction::PointerButton { pressed: false, .. }
+        ));
+        assert!(matches!(a3[1], QueuedHostAction::MovePointerPath { .. }));
+
+        let r_end = sandbox.drive_ready_coroutines(450, &[], &DummyBridge);
+        assert_eq!(r_end.completed_macros, 1);
+        let a4 = sandbox.drain_queued_actions();
+        assert!(matches!(
+            a4[0],
+            QueuedHostAction::SettleAgentCursor {
+                immediate: true,
+                ..
+            }
+        ));
     }
 }

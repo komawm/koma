@@ -11,7 +11,8 @@ use koma_render::{
     RenderTargetKind,
     frame_composer::{
         DEFAULT_BACKDROP_CLEAR, FrameBlurContext, append_scratchpad_dim_scrim,
-        append_tab_indicator_elements, assemble_workspace_elements, prepend_config_error_banner,
+        append_tab_indicator_elements, assemble_workspace_elements, prepend_agent_cursor_elements,
+        prepend_config_error_banner,
     },
 };
 use smithay::{
@@ -456,6 +457,9 @@ pub fn render_winit_frame(state: &mut KomaState) -> anyhow::Result<()> {
         state.schedule_cursor_animation_redraw(delay_ms);
     }
     winit_state.sync_host_cursor(state.cursor_manager.status());
+    let agent_cursor_snap = (!locked)
+        .then(|| state.step_agent_cursor_for_output(&out_name, &out_ws_id))
+        .flatten();
 
     // 1. Assemble front-to-back render elements & composite damaged regions into Winit framebuffer
     let render_res = {
@@ -576,6 +580,13 @@ pub fn render_winit_frame(state: &mut KomaState) -> anyhow::Result<()> {
             if state.config_error_banner.is_some() {
                 prepend_config_error_banner(viewport, &mut elements);
             }
+            prepend_agent_cursor_elements(
+                winit_state.backend.renderer(),
+                RenderTargetKind::PhysicalOutput,
+                output_scale,
+                agent_cursor_snap.as_ref(),
+                &mut elements,
+            );
             elements.splice(0..0, cursor_elems);
             (elements, DEFAULT_BACKDROP_CLEAR)
         };
@@ -634,6 +645,10 @@ pub(crate) fn toggle_ring0_preempt_takeover(state: &mut KomaState, trigger_label
                 &format!("preempted by human {trigger_label} takeover"),
             );
             state.pointer_animations.retain(|a| a.ws_id != ws_id);
+            if let Some(ac) = state.agent_cursors.get_mut(&ws_id) {
+                ac.visual.on_preempted(now);
+            }
+            state.queue_redraw();
             cancelled_lua = (c1 + c2) > 0;
         }
         info!(

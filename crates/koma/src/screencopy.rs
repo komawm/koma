@@ -13,13 +13,14 @@ use std::{
     time::Duration,
 };
 
-use koma_model::{LayoutMode, LogicalViewport, WorkspaceLeaseState};
+use koma_model::{AgentCursorFrameSnapshot, LayoutMode, LogicalViewport, WorkspaceLeaseState};
 use koma_proto::{OverlayKind, WorkspaceId};
 use koma_render::{
     RenderTargetKind,
     elements::KomaRenderElement,
     frame_composer::{
-        append_tab_indicator_elements, assemble_workspace_elements, prepend_config_error_banner,
+        append_tab_indicator_elements, assemble_workspace_elements, prepend_agent_cursor_elements,
+        prepend_config_error_banner,
     },
     offscreen_fbo::LazyOffscreenSurface,
 };
@@ -701,6 +702,10 @@ fn render_output_rgba8_for_screencopy(
     let result = if let Some(active) = backend.as_mut() {
         let cursor_pos = state.pointer_location - output.current_location().to_f64();
         let mut cursor_manager = std::mem::take(&mut state.cursor_manager);
+        let agent_cursor_snap = spec
+            .overlay_cursor
+            .then(|| state.step_agent_cursor_for_output(&output.name(), &ws_id))
+            .flatten();
         let base_items = state.collect_workspace_scene_items(&ws_id, true);
         let special_overlay =
             if state.focused_output_name().as_deref() == Some(output.name().as_str()) {
@@ -750,6 +755,7 @@ fn render_output_rgba8_for_screencopy(
                     .map(|(l, items)| (l, items.as_slice())),
                 spec.overlay_cursor
                     .then_some((&mut cursor_manager, cursor_pos)),
+                agent_cursor_snap.as_ref(),
                 now_ms,
             );
             let slot_name = format!("__screencopy_{}", output.name());
@@ -803,6 +809,10 @@ fn copy_to_dmabuf(
     let res = if let Some(active) = backend.as_mut() {
         let cursor_pos = state.pointer_location - output.current_location().to_f64();
         let mut cursor_manager = std::mem::take(&mut state.cursor_manager);
+        let agent_cursor_snap = spec
+            .overlay_cursor
+            .then(|| state.step_agent_cursor_for_output(&output.name(), &ws_id))
+            .flatten();
         let base_items = state.collect_workspace_scene_items(&ws_id, true);
         let special_overlay =
             if state.focused_output_name().as_deref() == Some(output.name().as_str()) {
@@ -848,6 +858,7 @@ fn copy_to_dmabuf(
                     .map(|(l, items)| (l, items.as_slice())),
                 spec.overlay_cursor
                     .then_some((&mut cursor_manager, cursor_pos)),
+                agent_cursor_snap.as_ref(),
                 now_ms,
             );
             let shifted: Vec<RelocateRenderElement<KomaRenderElement<GlesRenderer>>> = elements
@@ -904,6 +915,7 @@ fn build_screencopy_elements<'a>(
         &[koma_render::frame_composer::WindowSceneItem<'a>],
     )>,
     cursor: Option<(&mut crate::cursor::CursorManager, Point<f64, Logical>)>,
+    agent_cursor: Option<&AgentCursorFrameSnapshot>,
     now_ms: u64,
 ) -> Vec<KomaRenderElement<GlesRenderer>> {
     use smithay::wayland::shell::wlr_layer::Layer;
@@ -911,11 +923,7 @@ fn build_screencopy_elements<'a>(
     let output_scale = smithay::utils::Scale::from(output.current_scale().fractional_scale());
     let mut elements = Vec::new();
 
-    // Front-to-back order: cursor -> overlay/top layers -> IME popups -> special overlay -> workspace -> bottom/background layers.
-    if let Some((cursor_manager, cursor_pos)) = cursor {
-        elements.extend(cursor_manager.render_elements(renderer, cursor_pos, output_scale, now_ms));
-    }
-
+    // Front-to-back order: human cursor -> agent cursor/trail -> overlay/top layers -> IME popups -> special overlay -> workspace -> bottom/background layers.
     append_layer_tier_elements(
         renderer,
         output,
@@ -972,6 +980,19 @@ fn build_screencopy_elements<'a>(
 
     if state.config_error_banner.is_some() {
         prepend_config_error_banner(viewport, &mut elements);
+    }
+
+    prepend_agent_cursor_elements(
+        renderer,
+        RenderTargetKind::ScreencastPreview,
+        output_scale,
+        agent_cursor,
+        &mut elements,
+    );
+    if let Some((cursor_manager, cursor_pos)) = cursor {
+        let cursor_elems =
+            cursor_manager.render_elements(renderer, cursor_pos, output_scale, now_ms);
+        elements.splice(0..0, cursor_elems);
     }
 
     elements

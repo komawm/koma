@@ -3,6 +3,11 @@ use crate::{
     geometry::LogicalPoint,
 };
 
+pub use crate::cursor_path::{
+    ArcLengthSpline, CentripetalCatmullRom, CubicBezierSegment2D, HeadingArcChooser,
+    PathSplineKind, PointerPathTrack, VelocityVerletSpring1D,
+};
+
 /// Upper safety bound (in ms) for damped Hooke pointer springs without an explicit duration cap.
 pub const MAX_POINTER_SPRING_MS: u64 = 2_500;
 

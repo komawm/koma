@@ -4,8 +4,8 @@
 //! 4-quadrant `smart_split` drop-zone previews, and multi-pass `Dual Kawase Blur` backdrops.
 
 use koma_model::{
-    BlurConfig, BorderConfig, DimConfig, FocusRingConfig, LogicalRect, LogicalViewport,
-    ShadowConfig, WorkspaceLeaseState, parse_hex_color,
+    AgentCursorFrameSnapshot, BlurConfig, BorderConfig, DimConfig, FocusRingConfig, LogicalRect,
+    LogicalViewport, ShadowConfig, WorkspaceLeaseState, parse_hex_color,
 };
 use koma_proto::OverlayKind;
 use smithay::{
@@ -24,9 +24,9 @@ use smithay::{
 use crate::{
     RenderTargetKind,
     elements::{
-        KomaBlurredBackdropElement, KomaClippedSurfaceElement, KomaDropShadowElement,
-        KomaRenderElement, KomaRoundedBorderElement, KomaSolidColorElement,
-        to_smithay_logical_rect,
+        KomaAgentCursorElement, KomaAgentTrailElement, KomaBlurredBackdropElement,
+        KomaClippedSurfaceElement, KomaDropShadowElement, KomaRenderElement,
+        KomaRoundedBorderElement, KomaSolidColorElement, to_smithay_logical_rect,
     },
     shaders::{KomaCompiledShaders, KomaGlesRenderer},
 };
@@ -744,6 +744,60 @@ pub fn append_tab_indicator_elements<R>(
     }
 }
 
+/// Pure view-isolation gate for agent cursor elements: human `PhysicalOutput` and
+/// `ScreencastPreview` render the agent cursor overlay, whereas `RenderTargetKind::AgentCapture`
+/// strictly omits all agent cursor, aura fog, ripple, and motion trail elements.
+#[inline]
+#[must_use]
+pub const fn should_render_agent_cursor(target: RenderTargetKind) -> bool {
+    !matches!(target, RenderTargetKind::AgentCapture)
+}
+
+/// Prepends agent cursor, ripple, fog, and motion-trail elements (cursor front-most before trail)
+/// onto `elements`, obeying `RenderTargetKind::AgentCapture` strict view isolation.
+pub fn prepend_agent_cursor_elements<R>(
+    renderer: &mut R,
+    target: RenderTargetKind,
+    output_scale: Scale<f64>,
+    snapshot: Option<&AgentCursorFrameSnapshot>,
+    elements: &mut Vec<KomaRenderElement<R>>,
+) where
+    R: Renderer + ImportAll + ImportMem + KomaGlesRenderer + crate::elements::KomaRenderTarget,
+    R::TextureId: Clone + 'static,
+{
+    if !should_render_agent_cursor(target) {
+        return;
+    }
+    let Some(snap) = snapshot else {
+        return;
+    };
+    if snap.opacity <= 0.001 {
+        return;
+    }
+
+    let shaders = KomaCompiledShaders::get_or_compile(renderer.as_gles_renderer());
+    let mut overlay: Vec<KomaRenderElement<R>> = Vec::with_capacity(2);
+    if let Some(cursor_prog) = shaders.agent_cursor {
+        overlay.push(KomaRenderElement::from(
+            KomaAgentCursorElement::from_snapshot(snap, output_scale, cursor_prog),
+        ));
+    }
+    if let Some(trail_prog) = shaders.agent_trail
+        && let Some(trail_elem) = KomaAgentTrailElement::from_points(
+            &snap.trail_points,
+            snap.accent_rgba,
+            snap.opacity,
+            output_scale,
+            trail_prog,
+        )
+    {
+        overlay.push(KomaRenderElement::from(trail_elem));
+    }
+    if !overlay.is_empty() {
+        elements.splice(0..0, overlay);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -906,5 +960,14 @@ mod tests {
             resolve_focus_ring_rgba(&enabled, false),
             [0.0, 1.0, 0.0, f32::from(0x80_u8) / 255.0]
         );
+    }
+
+    #[test]
+    fn agent_cursor_view_isolation_excludes_agent_capture_targets() {
+        assert!(!should_render_agent_cursor(RenderTargetKind::AgentCapture));
+        assert!(should_render_agent_cursor(RenderTargetKind::PhysicalOutput));
+        assert!(should_render_agent_cursor(
+            RenderTargetKind::ScreencastPreview
+        ));
     }
 }

@@ -47,7 +47,7 @@ use koma_proto::{
 };
 use koma_render::{
     RenderTargetKind,
-    frame_composer::{WindowSceneItem, assemble_workspace_elements},
+    frame_composer::{WindowSceneItem, assemble_workspace_elements, prepend_agent_cursor_elements},
     offscreen_fbo::LazyOffscreenSurface,
 };
 use koma_seat::VirtualSeatLedger;
@@ -795,6 +795,13 @@ fn dispatch_rpc(
                     .ok_or_else(|| IpcError::new(ErrorSymbol::ErrNotFound, "unknown workspace"))?
                     .lease
                     .human_toggle_takeover(60_000, now_ms);
+                if fx.cancel_lua_coroutines {
+                    state.pointer_animations.retain(|a| a.ws_id != params.ws_id);
+                    if let Some(ac) = state.agent_cursors.get_mut(&params.ws_id) {
+                        ac.visual.on_preempted(now_ms);
+                    }
+                    state.queue_redraw();
+                }
                 return Ok((json!({ "epoch": fx.new_epoch }), Vec::new()));
             }
             let epoch = state
@@ -1128,6 +1135,133 @@ fn dispatch_rpc(
                 Some(button),
             )?;
             Ok((json!({ "ok": true, "epoch": active_epoch }), Vec::new()))
+        }
+
+        "vseat.path" | "vseat.stroke" => {
+            let ws_id = parse_ws_id(&req.params)?;
+            let expected_epoch = parse_expected_epoch(&req.params)?;
+            let auto_ttl = req
+                .params
+                .get("auto_acquire")
+                .and_then(Value::as_bool)
+                .unwrap_or(true)
+                .then_some(60_000);
+            let (session_id, grant) = authorize_peer_for_ws(
+                state,
+                &auth_snapshot,
+                &ws_id,
+                PrivilegeLevel::Control,
+                now_ms,
+            )?;
+
+            let raw_waypoints = req
+                .params
+                .get("waypoints")
+                .and_then(Value::as_array)
+                .ok_or_else(|| {
+                    IpcError::new(ErrorSymbol::ErrInvalidParams, "waypoints array is required")
+                })?;
+            if !(2..=128).contains(&raw_waypoints.len()) {
+                return Err(IpcError::new(
+                    ErrorSymbol::ErrInvalidParams,
+                    format!(
+                        "waypoints must contain 2..=128 anchors (got {})",
+                        raw_waypoints.len()
+                    ),
+                ));
+            }
+            let mut waypoints = Vec::with_capacity(raw_waypoints.len());
+            for item in raw_waypoints {
+                waypoints.push(parse_ipc_anchor(item)?);
+            }
+
+            let spline: koma_model::PathSplineKind = match req.params.get("spline") {
+                None | Some(Value::Null) => koma_model::PathSplineKind::default(),
+                Some(v) => serde_json::from_value(v.clone()).map_err(|e| {
+                    IpcError::new(
+                        ErrorSymbol::ErrInvalidParams,
+                        format!("invalid spline: {e}"),
+                    )
+                })?,
+            };
+            let explicit_button = req
+                .params
+                .get("button")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned);
+            let button = if req.method == "vseat.stroke" {
+                Some(explicit_button.unwrap_or_else(|| "left".to_owned()))
+            } else {
+                explicit_button
+            };
+            let hold_start_ms = req
+                .params
+                .get("hold_start_ms")
+                .or_else(|| req.params.get("hold_before_move_ms"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let hold_end_ms = req
+                .params
+                .get("hold_end_ms")
+                .or_else(|| req.params.get("hold_before_release_ms"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let kinematics = parse_ipc_kinematics(&req.params);
+
+            let active_epoch = {
+                let ws = state
+                    .workspaces
+                    .get_mut(&ws_id)
+                    .ok_or_else(|| IpcError::new(ErrorSymbol::ErrNotFound, "unknown workspace"))?;
+                ws.lease.validate_mutation_gate(
+                    &session_id,
+                    grant,
+                    expected_epoch,
+                    auto_ttl,
+                    now_ms,
+                )?
+            };
+
+            let count = crate::macro_runtime::queue_pointer_path_trajectory(
+                state,
+                ws_id,
+                active_epoch,
+                waypoints,
+                crate::macro_runtime::PointerPathLaunchOpts {
+                    spline,
+                    kinematics,
+                    hold_start_ms,
+                    hold_end_ms,
+                    press_button_at_start: button.clone(),
+                    release_button_on_finish: button,
+                },
+            )?;
+            Ok((
+                json!({ "ok": true, "epoch": active_epoch, "waypoints": count }),
+                Vec::new(),
+            ))
+        }
+
+        "vseat.cursor_settle" => {
+            let ws_id = parse_ws_id(&req.params)?;
+            let immediate = req
+                .params
+                .get("immediate")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let _ = authorize_peer_for_ws(
+                state,
+                &auth_snapshot,
+                &ws_id,
+                PrivilegeLevel::Control,
+                now_ms,
+            )?;
+            if !state.workspaces.contains_key(&ws_id) {
+                return Err(IpcError::new(ErrorSymbol::ErrNotFound, "unknown workspace"));
+            }
+            crate::macro_runtime::settle_agent_cursor(state, &ws_id, immediate);
+            Ok((json!({ "ok": true }), Vec::new()))
         }
 
         "vseat.key" => {
@@ -1543,7 +1677,7 @@ fn execute_zero_copy_capture_frame(
             });
 
         active_backend.with_primary_renderer(|renderer| {
-            let elements = assemble_workspace_elements(
+            let mut elements = assemble_workspace_elements(
                 renderer,
                 viewport,
                 Scale::from(viewport.scale),
@@ -1553,6 +1687,13 @@ fn execute_zero_copy_capture_frame(
                 None,
                 None,
                 &scene_items,
+            );
+            prepend_agent_cursor_elements(
+                renderer,
+                RenderTargetKind::AgentCapture,
+                Scale::from(viewport.scale),
+                None,
+                &mut elements,
             );
             offscreen.capture_rgba8_pixels(renderer, &elements)
         })
@@ -1684,13 +1825,63 @@ fn parse_ipc_anchor(val: &Value) -> Result<koma_model::AnchorPoint, IpcError> {
             dy: 0.0,
         });
     }
-    let input: koma_lua::schema::LuaAnchorPointInput = serde_json::from_value(val.clone())
+    if let Some(arr) = val.as_array() {
+        if arr.len() != 2 {
+            return Err(IpcError::new(
+                ErrorSymbol::ErrInvalidParams,
+                format!(
+                    "array anchor waypoint must have [x, y] length 2, got {}",
+                    arr.len()
+                ),
+            ));
+        }
+        let x = arr[0].as_f64().filter(|v| v.is_finite()).ok_or_else(|| {
+            IpcError::new(
+                ErrorSymbol::ErrInvalidParams,
+                "array anchor x must be finite",
+            )
+        })?;
+        let y = arr[1].as_f64().filter(|v| v.is_finite()).ok_or_else(|| {
+            IpcError::new(
+                ErrorSymbol::ErrInvalidParams,
+                "array anchor y must be finite",
+            )
+        })?;
+        return Ok(koma_model::AnchorPoint::AnchorOffset {
+            anchor: koma_model::Anchor9::TopLeft,
+            dx: x,
+            dy: y,
+        });
+    }
+    if !val.is_object() {
+        return Err(IpcError::new(
+            ErrorSymbol::ErrInvalidParams,
+            "invalid anchor: expected object or [x, y] array",
+        ));
+    }
+    let mut input: koma_lua::schema::LuaAnchorPointInput = serde_json::from_value(val.clone())
         .map_err(|e| {
             IpcError::new(
                 ErrorSymbol::ErrInvalidParams,
                 format!("invalid anchor: {e}"),
             )
         })?;
+    if input.x.is_none()
+        && let Some(dx_val) = val.get("dx").filter(|v| !v.is_null())
+    {
+        let dx = dx_val.as_f64().filter(|v| v.is_finite()).ok_or_else(|| {
+            IpcError::new(ErrorSymbol::ErrInvalidParams, "anchor dx must be finite")
+        })?;
+        input.x = Some(dx);
+    }
+    if input.y.is_none()
+        && let Some(dy_val) = val.get("dy").filter(|v| !v.is_null())
+    {
+        let dy = dy_val.as_f64().filter(|v| v.is_finite()).ok_or_else(|| {
+            IpcError::new(ErrorSymbol::ErrInvalidParams, "anchor dy must be finite")
+        })?;
+        input.y = Some(dy);
+    }
     input
         .into_anchor_point()
         .map_err(|e| IpcError::new(ErrorSymbol::ErrInvalidParams, e))
@@ -1745,6 +1936,9 @@ mod tests {
             "macro.run",
             "events.subscribe",
             "vseat.key",
+            "vseat.path",
+            "vseat.stroke",
+            "vseat.cursor_settle",
             "lua.exec_tx",
             "config.reload",
         ] {
@@ -1753,5 +1947,154 @@ mod tests {
             assert_eq!(err.symbol, ErrorSymbol::ErrCapabilityDenied);
             assert_eq!(err.message, "session is locked");
         }
+    }
+
+    #[test]
+    fn vseat_path_stroke_and_cursor_settle_decouple_human_pointer_and_preserve_capture_isolation() {
+        use smithay::utils::Point;
+        use std::os::unix::net::UnixStream;
+
+        let (_event_loop, _display, mut state) = crate::state::tests::make_headless_test_state();
+        let ws_id = state.active_ws_id.clone();
+        let expected_epoch = state
+            .workspaces
+            .get(&ws_id)
+            .expect("active ws")
+            .lease
+            .epoch()
+            .get();
+
+        // Human physical pointer must never be clobbered by vseat.* calls.
+        let human_pos = Point::from((777.0, 555.0));
+        state.pointer_location = human_pos;
+
+        let (client_stream, _peer) = UnixStream::pair().expect("unix stream pair");
+        let conn_id = 42_u64;
+        state.ipc_clients.insert(
+            conn_id,
+            IpcClientConn {
+                conn_id,
+                stream: client_stream,
+                channel: SocketChannel::Admin,
+                auth: PeerAuthState::AdminVerified {
+                    uid: 1000,
+                    gid: 1000,
+                    session_id: SessionId("test-admin".to_owned()),
+                },
+                reg_token: None,
+                inbox: FrameInbox::default(),
+                outbox: FrameOutbox::default(),
+                event_ring: EventRingBuffer::default(),
+                subscribed_workspaces: BTreeSet::new(),
+                subscribed_topics: HashSet::new(),
+                armed_writable: false,
+            },
+        );
+
+        // 1. Validate error when fewer than 2 waypoints provided
+        let bad_req = IpcRequest {
+            id: 1,
+            method: "vseat.path".to_owned(),
+            params: json!({
+                "ws_id": ws_id.as_str(),
+                "expected_epoch": expected_epoch,
+                "waypoints": [[100, 100]]
+            }),
+        };
+        let err = dispatch_rpc(&mut state, conn_id, bad_req, Vec::new())
+            .expect_err("1 waypoint must fail validation");
+        assert_eq!(err.symbol, ErrorSymbol::ErrInvalidParams);
+
+        // 2. Execute multi-waypoint vseat.path mixing [x,y], {anchor,dx,dy}, and {grid_225}
+        let path_req = IpcRequest {
+            id: 2,
+            method: "vseat.path".to_owned(),
+            params: json!({
+                "ws_id": ws_id.as_str(),
+                "expected_epoch": expected_epoch,
+                "spline": "catmull_rom",
+                "duration_ms": 180,
+                "waypoints": [
+                    [100.0, 120.0],
+                    { "anchor": "center", "dx": 15.0, "dy": -10.0 },
+                    { "grid_225": "M11" }
+                ]
+            }),
+        };
+        let (path_res, _) =
+            dispatch_rpc(&mut state, conn_id, path_req, Vec::new()).expect("vseat.path succeeds");
+        assert_eq!(path_res["ok"], json!(true));
+        assert_eq!(path_res["waypoints"], json!(3));
+        assert_eq!(state.pointer_location, human_pos);
+        assert_eq!(state.pointer_animations.len(), 1);
+        assert!(state.step_agent_cursor_for_workspace(&ws_id).is_some());
+        let active_epoch = path_res["epoch"].as_u64().expect("active epoch");
+
+        // 3. Execute instant vseat.stroke and confirm button press/release left clean ledger & human pointer intact
+        let stroke_req = IpcRequest {
+            id: 3,
+            method: "vseat.stroke".to_owned(),
+            params: json!({
+                "ws_id": ws_id.as_str(),
+                "expected_epoch": active_epoch,
+                "spline": "bezier",
+                "kinematics": { "profile": "instant" },
+                "waypoints": [
+                    { "x": 200.0, "y": 240.0 },
+                    { "x": 360.0, "y": 320.0 }
+                ]
+            }),
+        };
+        let (stroke_res, _) = dispatch_rpc(&mut state, conn_id, stroke_req, Vec::new())
+            .expect("vseat.stroke succeeds");
+        assert_eq!(stroke_res["ok"], json!(true));
+        assert_eq!(stroke_res["waypoints"], json!(2));
+        assert_eq!(state.pointer_location, human_pos);
+        let ac = state
+            .agent_cursors
+            .get(&ws_id)
+            .expect("agent cursor tracked");
+        assert!((ac.ws_local_pos.x - 360.0).abs() < 1e-3);
+        assert!((ac.ws_local_pos.y - 320.0).abs() < 1e-3);
+
+        // 4. capture.frame excludes agent cursor rendering (`AgentCapture` isolation)
+        assert!(!koma_render::frame_composer::should_render_agent_cursor(
+            RenderTargetKind::AgentCapture
+        ));
+        assert!(koma_render::frame_composer::should_render_agent_cursor(
+            RenderTargetKind::PhysicalOutput
+        ));
+        assert!(koma_render::frame_composer::should_render_agent_cursor(
+            RenderTargetKind::ScreencastPreview
+        ));
+        let capture_req = IpcRequest {
+            id: 4,
+            method: "capture.frame".to_owned(),
+            params: json!({
+                "ws_id": ws_id.as_str(),
+                "overlay_kind": "none",
+                "max_edge": 1280,
+                "format": "raw_rgba8",
+                "transport": "inline_base64"
+            }),
+        };
+        let (cap_res, _) = dispatch_rpc(&mut state, conn_id, capture_req, Vec::new())
+            .expect("capture.frame succeeds");
+        assert!(cap_res["width"].as_u64().is_some());
+        assert_eq!(state.pointer_location, human_pos);
+
+        // 5. vseat.cursor_settle immediate hides visual cursor cleanly
+        let settle_req = IpcRequest {
+            id: 5,
+            method: "vseat.cursor_settle".to_owned(),
+            params: json!({
+                "ws_id": ws_id.as_str(),
+                "immediate": true
+            }),
+        };
+        let (settle_res, _) = dispatch_rpc(&mut state, conn_id, settle_req, Vec::new())
+            .expect("vseat.cursor_settle succeeds");
+        assert_eq!(settle_res["ok"], json!(true));
+        assert!(state.step_agent_cursor_for_workspace(&ws_id).is_none());
     }
 }

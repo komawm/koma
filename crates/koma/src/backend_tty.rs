@@ -31,7 +31,8 @@ use koma_render::{
     elements::KomaRenderElement,
     frame_composer::{
         DEFAULT_BACKDROP_CLEAR, FrameBlurContext, append_scratchpad_dim_scrim,
-        append_tab_indicator_elements, assemble_workspace_elements, prepend_config_error_banner,
+        append_tab_indicator_elements, assemble_workspace_elements, prepend_agent_cursor_elements,
+        prepend_config_error_banner,
     },
 };
 use libc::dev_t;
@@ -1959,6 +1960,11 @@ fn on_session_event_callback(state: &mut KomaState, event: SessionEvent) {
                 SERIAL_COUNTER.next_serial(),
                 smithay::backend::input::InputTime::now(),
             );
+            state.pointer_animations.clear();
+            let now_ms = state.elapsed_ms();
+            for ac in state.agent_cursors.values_mut() {
+                ac.visual.on_preempted(now_ms);
+            }
             state.keybinds.reset_scroll_trackers();
             state.gestures.reset_active_sessions();
             tty.libinput.suspend();
@@ -2161,6 +2167,9 @@ fn render_single_drm_surface(
     {
         state.schedule_cursor_animation_redraw(delay_ms);
     }
+    let agent_cursor_snap = (!locked)
+        .then(|| state.step_agent_cursor_for_output(&out_name, &out_ws_id))
+        .flatten();
 
     let (elements, clear_color): (Vec<KomaRenderElement<TtyRenderer<'_>>>, Color32F) = if locked {
         (
@@ -2285,6 +2294,13 @@ fn render_single_drm_surface(
             &mut elements,
         );
 
+        prepend_agent_cursor_elements(
+            &mut renderer,
+            RenderTargetKind::PhysicalOutput,
+            output_scale,
+            agent_cursor_snap.as_ref(),
+            &mut elements,
+        );
         elements.splice(0..0, cursor_elems);
         (elements, DEFAULT_BACKDROP_CLEAR)
     };
