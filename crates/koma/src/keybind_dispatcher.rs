@@ -929,6 +929,7 @@ pub fn process_pointer_button_event(
     is_bare_metal_tty: bool,
 ) {
     state.reconcile_session_lock();
+    state.notify_user_activity();
     let serial = SERIAL_COUNTER.next_serial();
     let Some(pointer) = state.seat.get_pointer() else {
         return;
@@ -1119,6 +1120,7 @@ pub fn process_keyboard_key_event(
     is_bare_metal_tty: bool,
 ) {
     state.reconcile_session_lock();
+    state.notify_user_activity();
     if state.virtual_keyboard_keymap_active {
         state.force_reapply_configured_xkb_config();
     }
@@ -1411,6 +1413,7 @@ pub fn process_pointer_axis_event<B: InputBackend>(
     is_bare_metal_tty: bool,
 ) {
     state.reconcile_session_lock();
+    state.notify_user_activity();
     let source = event.source();
     let time = event.time();
 
@@ -1729,6 +1732,9 @@ fn fire_scroll_bind_ticks(
 /// Ensures Smithay's `PointerHandle` hover target matches the current Z-order hit-tested surface
 /// (LockSurface > Overlay > Top > windows > Bottom > Background) before forwarding pointer events.
 pub(crate) fn refresh_pointer_hover_focus(state: &mut KomaState, time: InputTime) {
+    if state.has_active_locked_pointer_constraint() {
+        return;
+    }
     let Some(pointer) = state.seat.get_pointer() else {
         return;
     };
@@ -2198,16 +2204,21 @@ pub fn execute_action_descriptor(
         }
 
         ActionDescriptor::WorkspaceFocus(target) | ActionDescriptor::WorkspacePeek(target) => {
+            state.break_active_pointer_constraints();
             if target.starts_with(SPECIAL_WORKSPACE_PREFIX) {
                 let sp_id = state.ensure_special_workspace(Some(&target));
                 state.active_special_ws_id = Some(sp_id);
                 state.focus_active_deck_window();
+                state.reconcile_idle_inhibitors();
+                state.sync_foreign_toplevels();
                 state.queue_redraw();
             } else {
                 let ws_id = state.ensure_workspace_by_name_or_id(&target);
                 state.active_special_ws_id = None;
                 state.active_ws_id = ws_id;
                 state.focus_active_deck_window();
+                state.reconcile_idle_inhibitors();
+                state.sync_foreign_toplevels();
                 state.queue_redraw();
             }
         }
@@ -2413,9 +2424,12 @@ fn cycle_workspace_focus(state: &mut KomaState, forward: bool) {
     } else {
         (cur_pos + ids.len() - 1) % ids.len()
     };
+    state.break_active_pointer_constraints();
     state.active_special_ws_id = None;
     state.active_ws_id = ids[next_pos].clone();
     state.focus_active_deck_window();
+    state.reconcile_idle_inhibitors();
+    state.sync_foreign_toplevels();
     state.queue_redraw();
 }
 

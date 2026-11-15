@@ -71,3 +71,7 @@ features = [
     "renderer_gl",
     "wayland_frontend",
 ]
+
+[dev-dependencies]
+wayland-client.workspace = true
+wayland-protocols-wlr.workspace = true

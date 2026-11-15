@@ -73,6 +73,12 @@ mod config_watcher;
 #[cfg(feature = "smithay-winit")]
 mod cursor;
 #[cfg(feature = "smithay-winit")]
+mod desktop_protocols;
+#[cfg(feature = "smithay-winit")]
+mod foreign_toplevel;
+#[cfg(feature = "smithay-winit")]
+mod gamma_control;
+#[cfg(feature = "smithay-winit")]
 mod gesture_dispatcher;
 #[cfg(feature = "smithay-winit")]
 mod handlers;
@@ -83,7 +89,13 @@ mod keybind_dispatcher;
 #[cfg(feature = "smithay-winit")]
 mod macro_runtime;
 #[cfg(feature = "smithay-winit")]
+mod output_power;
+#[cfg(feature = "smithay-winit")]
 mod pointer_grabs;
+#[cfg(all(test, feature = "smithay-winit"))]
+mod protocol_tests;
+#[cfg(feature = "smithay-winit")]
+mod screencopy;
 #[cfg(feature = "smithay-winit")]
 mod security_context;
 #[cfg(feature = "smithay-winit")]
@@ -291,11 +303,11 @@ fn run_nested_winit(
     let mut state = KomaState::new(
         display_handle,
         event_loop.get_signal(),
+        event_loop.handle(),
         socket_name.clone(),
         "seat0",
         initial_viewport,
     );
-    state.loop_handle = Some(event_loop.handle());
     crate::config_watcher::setup_config_watcher(
         &mut state,
         crate::config_watcher::KomaConfigPath::resolve(config_override),
@@ -328,6 +340,7 @@ fn run_nested_winit(
 
     event_loop
         .run(Some(Duration::from_millis(16)), &mut state, |state| {
+            crate::screencopy::flush_pending_screencopy_frames(state);
             state.popups.cleanup();
             state.cleanup_ime_popups();
             let _ = state.display_handle.flush_clients();
@@ -374,11 +387,11 @@ fn run_bare_metal_tty(
     let mut state = KomaState::new(
         display_handle,
         event_loop.get_signal(),
+        event_loop.handle(),
         socket_name.clone(),
         &seat_name,
         LogicalViewport::new(1920, 1080, 1.0),
     );
-    state.loop_handle = Some(event_loop.handle());
 
     // Load initial `~/.config/koma/init.lua` + start watcher BEFORE KMS connector mode selection!
     crate::config_watcher::setup_config_watcher(
@@ -423,6 +436,7 @@ fn run_bare_metal_tty(
             if state.redraw_queued {
                 render_pending_tty_outputs(state);
             }
+            crate::screencopy::flush_pending_screencopy_frames(state);
             state.popups.cleanup();
             state.cleanup_ime_popups();
             let _ = state.display_handle.flush_clients();

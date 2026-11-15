@@ -485,6 +485,7 @@ pub fn process_gesture_swipe_begin<B: InputBackend>(
     event: &B::GestureSwipeBeginEvent,
 ) {
     state.reconcile_session_lock();
+    state.notify_user_activity();
     state.keybinds.pending_releases.clear();
     let fingers = event.fingers().clamp(1, 8) as u8;
     let is_locked = state.is_locked_or_abandoned();
@@ -531,6 +532,7 @@ pub fn process_gesture_swipe_update<B: InputBackend + 'static>(
 ) where
     B::Device: 'static,
 {
+    state.notify_user_activity();
     // Extract unaccelerated `libinput` deltas and device natural-scroll state on bare-metal TTY
     // (`niri/src/input/mod.rs` lines 3886-3893).
     #[cfg(feature = "smithay-tty")]
@@ -717,6 +719,7 @@ pub fn process_gesture_swipe_end<B: InputBackend>(
     event: &B::GestureSwipeEndEvent,
 ) {
     state.reconcile_session_lock();
+    state.notify_user_activity();
     let prev = state.gestures.active_swipe.take();
     match prev {
         Some(ActiveSwipeSession::Compositor {
@@ -774,6 +777,7 @@ pub fn process_gesture_pinch_begin<B: InputBackend>(
     event: &B::GesturePinchBeginEvent,
 ) {
     state.reconcile_session_lock();
+    state.notify_user_activity();
     state.keybinds.pending_releases.clear();
     let fingers = event.fingers().clamp(1, 8) as u8;
     let is_locked = state.is_locked_or_abandoned();
@@ -813,6 +817,7 @@ pub fn process_gesture_pinch_update<B: InputBackend>(
     is_bare_metal_tty: bool,
 ) {
     state.reconcile_session_lock();
+    state.notify_user_activity();
     let is_locked = state.is_locked_or_abandoned();
     match &mut state.gestures.active_pinch {
         Some(ActivePinchSession::Compositor { fingers, committed }) => {
@@ -870,6 +875,7 @@ pub fn process_gesture_pinch_end<B: InputBackend>(
     state: &mut KomaState,
     event: &B::GesturePinchEndEvent,
 ) {
+    state.notify_user_activity();
     let prev = state.gestures.active_pinch.take();
     if matches!(prev, Some(ActivePinchSession::ClientForwarded)) {
         let time = event.time();
@@ -892,6 +898,7 @@ pub fn process_gesture_hold_begin<B: InputBackend>(
     state: &mut KomaState,
     event: &B::GestureHoldBeginEvent,
 ) {
+    state.notify_user_activity();
     state.keybinds.pending_releases.clear();
     let time = event.time();
     refresh_pointer_hover_focus(state, time);
@@ -912,6 +919,7 @@ pub fn process_gesture_hold_end<B: InputBackend>(
     state: &mut KomaState,
     event: &B::GestureHoldEndEvent,
 ) {
+    state.notify_user_activity();
     let time = event.time();
     refresh_pointer_hover_focus(state, time);
     if let Some(pointer) = state.seat.get_pointer() {

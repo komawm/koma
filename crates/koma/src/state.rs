@@ -5,7 +5,7 @@
 
 use std::{
     cell::RefCell,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     ffi::OsString,
     sync::Arc,
     time::{Duration, Instant},
@@ -41,7 +41,10 @@ use smithay::{
     reexports::{
         wayland_protocols::{
             ext::session_lock::v1::server::ext_session_lock_v1::ExtSessionLockV1,
-            xdg::shell::server::xdg_toplevel,
+            xdg::{
+                decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode,
+                shell::server::xdg_toplevel,
+            },
         },
         wayland_server::{
             DisplayHandle, Resource as _,
@@ -51,12 +54,17 @@ use smithay::{
     },
     utils::{IsAlive as _, Logical, Point, SERIAL_COUNTER, Size},
     wayland::{
-        compositor::{CompositorClientState, CompositorState, with_states},
+        compositor::{CompositorClientState, CompositorState, get_parent, with_states},
         cursor_shape::CursorShapeManagerState,
         dmabuf::DmabufState,
+        foreign_toplevel_list::ForeignToplevelListState,
         fractional_scale::FractionalScaleManagerState,
+        idle_inhibit::IdleInhibitManagerState,
+        idle_notify::IdleNotifierState,
         output::OutputManagerState,
+        pointer_constraints::PointerConstraintsState,
         pointer_gestures::PointerGesturesState,
+        relative_pointer::RelativePointerManagerState,
         security_context::{SecurityContext, SecurityContextState},
         selection::{
             data_device::DataDeviceState,
@@ -67,11 +75,16 @@ use smithay::{
         session_lock::{LockSurface, SessionLockManagerState},
         shell::{
             wlr_layer::{KeyboardInteractivity, Layer, WlrLayerShellState},
-            xdg::{SurfaceCachedState, ToplevelSurface, XdgShellState, XdgToplevelSurfaceData},
+            xdg::{
+                SurfaceCachedState, ToplevelSurface, XdgShellState, XdgToplevelSurfaceData,
+                decoration::XdgDecorationState,
+            },
         },
         shm::ShmState,
         viewporter::ViewporterState,
         virtual_keyboard::VirtualKeyboardManagerState,
+        xdg_activation::XdgActivationState,
+        xdg_toplevel_icon::XdgToplevelIconManager,
     },
 };
 use tracing::{debug, info, warn};
@@ -89,10 +102,15 @@ use crate::{
     backend_winit::WinitBackendState,
     config_watcher::{ConfigWatcherHandle, KomaConfigPath},
     cursor::CursorManager,
+    desktop_protocols::{DeferredXdgActivation, StoredToplevelIcon},
+    foreign_toplevel::WlrForeignToplevelState,
+    gamma_control::{GammaControlState, GammaLut},
     gesture_dispatcher::GestureTable,
     ipc_server::IpcClientConn,
     keybind_dispatcher::KeybindTable,
     macro_runtime::{ActivePointerAnimation, WorkspaceDamageTracker},
+    output_power::{OutputPowerMode, OutputPowerState},
+    screencopy::ScreencopyState,
     security_context::{
         JailedWaylandSocket, NewClient, PeerSocketCredentials, client_can_view_primary_selection,
         client_is_unrestricted, is_surface_from_restricted_client, query_peer_credentials,
@@ -485,6 +503,8 @@ pub struct UnmappedToplevel {
     pub win_id: WindowId,
     pub window: Window,
     pub initial_configure_sent: bool,
+    pub decoration_mode: DecorationMode,
+    pub icon: Option<StoredToplevelIcon>,
 }
 
 /// Active mapped Wayland window participating in `DwindleTree`, `ScrollingStrip`, `DeckStashStack`,
@@ -496,9 +516,13 @@ pub struct MappedWindow {
     pub app_id: String,
     pub title: String,
     pub is_floating: bool,
+    pub is_maximized: bool,
+    pub is_minimized: bool,
     pub is_sandboxed: bool,
     pub preferred_size: (u32, u32),
     pub rect: LogicalRect,
+    pub decoration_mode: DecorationMode,
+    pub icon: Option<StoredToplevelIcon>,
 }
 
 pub struct KomaState {
@@ -551,6 +575,25 @@ pub struct KomaState {
     pub text_input_state: TextInputManagerState,
     #[allow(dead_code)]
     pub input_method_state: InputMethodManagerState,
+    #[allow(dead_code)]
+    pub xdg_decoration_state: XdgDecorationState,
+    #[allow(dead_code)]
+    pub xdg_toplevel_icon_manager: XdgToplevelIconManager,
+    pub xdg_activation_state: XdgActivationState,
+    pub deferred_xdg_activations: Vec<DeferredXdgActivation>,
+    pub foreign_toplevel_list_state: ForeignToplevelListState,
+    pub wlr_foreign_toplevel_state: WlrForeignToplevelState,
+    pub idle_notifier_state: IdleNotifierState<Self>,
+    #[allow(dead_code)]
+    pub idle_inhibit_state: IdleInhibitManagerState,
+    pub idle_inhibitors: HashSet<WlSurface>,
+    #[allow(dead_code)]
+    pub pointer_constraints_state: PointerConstraintsState,
+    #[allow(dead_code)]
+    pub relative_pointer_manager_state: RelativePointerManagerState,
+    pub screencopy_state: ScreencopyState,
+    pub output_power_state: OutputPowerState,
+    pub gamma_control_state: GammaControlState,
     pub popups: PopupManager,
     pub ime_popups: Vec<ImePopupSurface>,
     pub applied_keyboard_xkb: Option<KeyboardXkbSignature>,
@@ -604,6 +647,8 @@ pub struct KomaState {
 
     // Unified display & input backend (`Winit` nested or `Tty` bare-metal KMS/DRM)
     pub backend: Option<ActiveBackend>,
+    #[cfg(test)]
+    pub test_outputs: Vec<Output>,
     pub redraw_queued: bool,
 }
 
@@ -611,6 +656,7 @@ impl KomaState {
     pub fn new(
         display_handle: DisplayHandle,
         loop_signal: LoopSignal,
+        loop_handle: LoopHandle<'static, Self>,
         socket_name: OsString,
         seat_name: &str,
         initial_viewport: LogicalViewport,
@@ -655,6 +701,23 @@ impl KomaState {
         let dmabuf_state = DmabufState::new();
         let viewporter_state = ViewporterState::new::<Self>(&display_handle);
         let fractional_scale_state = FractionalScaleManagerState::new::<Self>(&display_handle);
+        let xdg_decoration_state = XdgDecorationState::new::<Self>(&display_handle);
+        let mut xdg_toplevel_icon_manager = XdgToplevelIconManager::new::<Self>(&display_handle);
+        xdg_toplevel_icon_manager.replace_icon_sizes([16, 24, 32, 48, 64]);
+        let xdg_activation_state = XdgActivationState::new::<Self>(&display_handle);
+        let foreign_toplevel_list_state = ForeignToplevelListState::new_with_filter::<Self>(
+            &display_handle,
+            client_is_unrestricted,
+        );
+        let wlr_foreign_toplevel_state = WlrForeignToplevelState::new(&display_handle);
+        let idle_notifier_state = IdleNotifierState::new(&display_handle, loop_handle.clone());
+        let idle_inhibit_state = IdleInhibitManagerState::new::<Self>(&display_handle);
+        let pointer_constraints_state = PointerConstraintsState::new::<Self>(&display_handle);
+        let relative_pointer_manager_state =
+            RelativePointerManagerState::new::<Self>(&display_handle);
+        let screencopy_state = ScreencopyState::new(&display_handle);
+        let output_power_state = OutputPowerState::new(&display_handle);
+        let gamma_control_state = GammaControlState::new(&display_handle);
 
         let mut seat = seat_state.new_wl_seat(&display_handle, seat_name);
         seat.add_keyboard(
@@ -691,7 +754,7 @@ impl KomaState {
             start_time: Instant::now(),
             display_handle,
             loop_signal,
-            loop_handle: None,
+            loop_handle: Some(loop_handle),
             trampoline_timer_token: None,
             socket_name,
             instance_signature: None,
@@ -721,6 +784,20 @@ impl KomaState {
             fractional_scale_state,
             text_input_state,
             input_method_state,
+            xdg_decoration_state,
+            xdg_toplevel_icon_manager,
+            xdg_activation_state,
+            deferred_xdg_activations: Vec::new(),
+            foreign_toplevel_list_state,
+            wlr_foreign_toplevel_state,
+            idle_notifier_state,
+            idle_inhibit_state,
+            idle_inhibitors: HashSet::new(),
+            pointer_constraints_state,
+            relative_pointer_manager_state,
+            screencopy_state,
+            output_power_state,
+            gamma_control_state,
             popups: PopupManager::default(),
             ime_popups: Vec::new(),
             applied_keyboard_xkb: Some(KeyboardXkbSignature::default()),
@@ -769,6 +846,8 @@ impl KomaState {
             unmapped_windows: HashMap::new(),
             mapped_windows: Vec::new(),
             backend: None,
+            #[cfg(test)]
+            test_outputs: Vec::new(),
             redraw_queued: false,
         }
     }
@@ -977,6 +1056,10 @@ impl KomaState {
 
     #[must_use]
     pub fn primary_output(&self) -> Option<Output> {
+        #[cfg(test)]
+        if self.backend.is_none() && !self.test_outputs.is_empty() {
+            return self.test_outputs.first().cloned();
+        }
         self.backend
             .as_ref()
             .and_then(ActiveBackend::primary_output)
@@ -984,6 +1067,10 @@ impl KomaState {
 
     #[must_use]
     pub fn all_outputs(&self) -> Vec<Output> {
+        #[cfg(test)]
+        if self.backend.is_none() && !self.test_outputs.is_empty() {
+            return self.test_outputs.clone();
+        }
         self.backend
             .as_ref()
             .map(ActiveBackend::all_outputs)
@@ -1024,6 +1111,7 @@ impl KomaState {
         self.gestures.reset_active_sessions();
 
         let now_input = smithay::backend::input::InputTime::now();
+        self.break_active_pointer_constraints();
         let _ = crate::pointer_grabs::cancel_active_pointer_grab(
             self,
             SERIAL_COUNTER.next_serial(),
@@ -1185,6 +1273,7 @@ impl KomaState {
             return;
         };
         let is_offscreen = matches!(ws.presentation, PresentationTarget::Offscreen { .. });
+        let fullscreen_win = ws.fullscreen_window;
         let visible = ws.compute_animation_target_geometries();
         let now_ms = self.elapsed_ms();
         let appearance = self.lua_sandbox.config_snapshot().appearance;
@@ -1212,19 +1301,40 @@ impl KomaState {
                         bypass,
                     );
                 }
-                if size_changed || float_changed {
+                let is_fs = fullscreen_win == Some(win_id);
+                let is_max = mapped.is_maximized;
+                let dec_mode = mapped.decoration_mode;
+                let state_needs_configure = mapped.window.toplevel().is_some_and(|t| {
+                    t.with_pending_state(|st| {
+                        st.states.contains(xdg_toplevel::State::Fullscreen) != is_fs
+                            || st.states.contains(xdg_toplevel::State::Maximized) != is_max
+                            || st.decoration_mode != Some(dec_mode)
+                    })
+                });
+                if size_changed || float_changed || state_needs_configure {
                     let inner_w = target_rect.w.saturating_sub(border_inset).max(48) as i32;
                     let inner_h = target_rect.h.saturating_sub(border_inset).max(48) as i32;
                     if let Some(toplevel) = mapped.window.toplevel() {
                         toplevel.with_pending_state(|st| {
                             st.size = Some(Size::from((inner_w, inner_h)));
                             for tiled_state in TILED_TOPLEVEL_STATES {
-                                if is_float {
+                                if is_float || is_fs || is_max {
                                     st.states.unset(tiled_state);
                                 } else {
                                     st.states.set(tiled_state);
                                 }
                             }
+                            if is_max {
+                                st.states.set(xdg_toplevel::State::Maximized);
+                            } else {
+                                st.states.unset(xdg_toplevel::State::Maximized);
+                            }
+                            if is_fs {
+                                st.states.set(xdg_toplevel::State::Fullscreen);
+                            } else {
+                                st.states.unset(xdg_toplevel::State::Fullscreen);
+                            }
+                            st.decoration_mode = Some(dec_mode);
                         });
                         toplevel.send_pending_configure();
                     }
@@ -1365,9 +1475,13 @@ impl KomaState {
             app_id: app_id.clone(),
             title: title.clone(),
             is_floating,
+            is_maximized: false,
+            is_minimized: false,
             is_sandboxed,
             preferred_size,
             rect: wa,
+            decoration_mode: unmapped.decoration_mode,
+            icon: unmapped.icon,
         };
         info!(
             win_id = %mapped.win_id,
@@ -1636,12 +1750,17 @@ impl KomaState {
         let active_id = self
             .workspaces
             .get(&target_ws_id)
-            .and_then(WorkspaceState::active_window);
+            .and_then(WorkspaceState::active_window)
+            .filter(|id| {
+                self.mapped_windows
+                    .iter()
+                    .any(|m| m.win_id == *id && !m.is_minimized)
+            });
         for mapped in &self.mapped_windows {
             if mapped.ws_id == target_ws_id
                 && let Some(toplevel) = mapped.window.toplevel()
             {
-                let is_active = Some(mapped.win_id) == active_id;
+                let is_active = Some(mapped.win_id) == active_id && !mapped.is_minimized;
                 toplevel.with_pending_state(|st| {
                     if is_active {
                         st.states.set(xdg_toplevel::State::Activated);
@@ -1653,6 +1772,7 @@ impl KomaState {
             }
         }
         self.reconcile_keyboard_focus();
+        self.sync_foreign_toplevels();
     }
 
     #[must_use]
@@ -1792,6 +1912,9 @@ impl KomaState {
                 let Some(mapped) = self.mapped_windows.iter().find(|m| m.win_id == win_id) else {
                     continue;
                 };
+                if mapped.is_minimized {
+                    continue;
+                }
                 let origin = Point::from((f64::from(rect.x) + b_off, f64::from(rect.y) + b_off));
                 let local_pos = global_pos - origin;
                 if let Some((surf, surf_offset)) = mapped
@@ -2019,6 +2142,9 @@ impl KomaState {
         let mut items = Vec::with_capacity(candidates_bottom_to_top.len());
         for (win_id, target_rect, is_floating) in candidates_bottom_to_top.into_iter().rev() {
             if let Some(mapped) = self.mapped_windows.iter().find(|m| m.win_id == win_id) {
+                if mapped.is_minimized {
+                    continue;
+                }
                 let is_focused = Some(win_id) == focused_id;
                 let dyn_rules = self.rules.resolve_dynamic(&WindowMatchContext {
                     app_id: &mapped.app_id,
@@ -2115,7 +2241,10 @@ impl KomaState {
         {
             if let Some(ws) = self.workspaces.get(ws_id) {
                 for (win_id, _, _) in ws.compute_visible_geometries() {
-                    if let Some(m) = self.mapped_windows.iter().find(|m| m.win_id == win_id)
+                    if let Some(m) = self
+                        .mapped_windows
+                        .iter()
+                        .find(|m| m.win_id == win_id && !m.is_minimized)
                         && let Some(t) = m.window.toplevel()
                     {
                         surfaces.push(t.wl_surface().clone());
@@ -2158,6 +2287,7 @@ impl KomaState {
     }
 
     pub fn queue_redraw(&mut self) {
+        self.screencopy_state.mark_damage();
         self.redraw_queued = true;
         if let Some(backend) = &mut self.backend {
             backend.request_redraw();
@@ -2491,6 +2621,7 @@ impl KomaState {
         B::Device: smithay::backend::input::Device,
     {
         self.reconcile_session_lock();
+        self.notify_user_activity();
         let Some(pos) = self.resolve_touch_position::<B, _>(&event) else {
             return;
         };
@@ -2518,6 +2649,7 @@ impl KomaState {
     where
         B::Device: smithay::backend::input::Device,
     {
+        self.notify_user_activity();
         let Some(pos) = self.resolve_touch_position::<B, _>(&event) else {
             return;
         };
@@ -2537,6 +2669,7 @@ impl KomaState {
     }
 
     pub fn handle_touch_up<B: InputBackend>(&mut self, event: B::TouchUpEvent) {
+        self.notify_user_activity();
         let Some(touch) = self.seat.get_touch() else {
             return;
         };
@@ -2561,6 +2694,175 @@ impl KomaState {
         if let Some(touch) = self.seat.get_touch() {
             touch.cancel(self);
         }
+    }
+
+    pub fn apply_output_power_mode(
+        &mut self,
+        output: &Output,
+        mode: OutputPowerMode,
+    ) -> Result<(), String> {
+        let _ = output;
+        match &mut self.backend {
+            #[cfg(feature = "smithay-tty")]
+            Some(ActiveBackend::Tty(tty)) => tty.set_output_dpms(output, mode),
+            _ => {
+                let _ = mode;
+                Ok(())
+            }
+        }
+    }
+
+    #[must_use]
+    pub fn query_output_gamma_info(&self, output: &Output) -> Option<(u32, Option<GammaLut>)> {
+        match &self.backend {
+            #[cfg(feature = "smithay-tty")]
+            Some(ActiveBackend::Tty(tty)) => tty.query_output_gamma_info(output),
+            _ => {
+                let _ = output;
+                None
+            }
+        }
+    }
+
+    pub fn apply_output_gamma(&self, output: &Output, lut: &GammaLut) -> Result<(), String> {
+        match &self.backend {
+            #[cfg(feature = "smithay-tty")]
+            Some(ActiveBackend::Tty(tty)) => tty.apply_output_gamma(output, lut),
+            _ => {
+                let _ = (output, lut);
+                Err("hardware gamma LUTs require bare-metal TTY DRM backend".to_owned())
+            }
+        }
+    }
+
+    pub fn sync_foreign_toplevels(&mut self) {
+        crate::foreign_toplevel::sync_all_foreign_toplevels(self);
+    }
+
+    pub fn activate_window_by_id(&mut self, win_id: WindowId) -> bool {
+        let Some((ws_id, was_minimized)) = self
+            .mapped_windows
+            .iter()
+            .find(|m| m.win_id == win_id)
+            .map(|m| (m.ws_id.clone(), m.is_minimized))
+        else {
+            return false;
+        };
+
+        if was_minimized
+            && let Some(m) = self.mapped_windows.iter_mut().find(|m| m.win_id == win_id)
+        {
+            m.is_minimized = false;
+        }
+
+        if let Some(ws) = self.workspaces.get(&ws_id) {
+            if ws.is_special {
+                self.active_special_ws_id = Some(ws_id.clone());
+            } else if matches!(ws.presentation, PresentationTarget::Physical(_))
+                && self.active_ws_id != ws_id
+            {
+                self.active_special_ws_id = None;
+                self.active_ws_id = ws_id.clone();
+            } else if self.active_special_ws_id.is_some()
+                && self.active_special_ws_id.as_ref() != Some(&ws_id)
+            {
+                self.active_special_ws_id = None;
+            }
+        }
+
+        let now_ms = self.elapsed_ms();
+        if let Some(ws) = self.workspaces.get_mut(&ws_id) {
+            ws.activate_window(win_id, now_ms);
+        }
+        self.focused_ondemand_layer = None;
+        self.break_active_pointer_constraints();
+        self.sync_workspace_geometries(&ws_id);
+        self.focus_active_deck_window();
+        self.reconcile_idle_inhibitors();
+        self.queue_redraw();
+        true
+    }
+
+    pub fn activate_window_by_surface(&mut self, surface: &WlSurface) -> bool {
+        let mut root = surface.clone();
+        while let Some(parent) = get_parent(&root) {
+            root = parent;
+        }
+        let win_id = self
+            .mapped_windows
+            .iter()
+            .find(|m| m.window.toplevel().is_some_and(|t| *t.wl_surface() == root))
+            .map(|m| m.win_id);
+        if let Some(win_id) = win_id {
+            return self.activate_window_by_id(win_id);
+        }
+        false
+    }
+
+    pub fn set_window_maximized(&mut self, win_id: WindowId, maximized: bool) {
+        let Some(mapped) = self.mapped_windows.iter_mut().find(|m| m.win_id == win_id) else {
+            return;
+        };
+        if mapped.is_maximized == maximized {
+            if let Some(toplevel) = mapped.window.toplevel() {
+                toplevel.send_pending_configure();
+            }
+            return;
+        }
+        mapped.is_maximized = maximized;
+        let ws_id = mapped.ws_id.clone();
+        self.sync_workspace_geometries(&ws_id);
+        self.sync_foreign_toplevels();
+        self.queue_redraw();
+    }
+
+    pub fn set_window_minimized(&mut self, win_id: WindowId, minimized: bool) {
+        let Some(mapped) = self.mapped_windows.iter_mut().find(|m| m.win_id == win_id) else {
+            return;
+        };
+        if mapped.is_minimized == minimized {
+            return;
+        }
+        mapped.is_minimized = minimized;
+        let ws_id = mapped.ws_id.clone();
+        if minimized {
+            self.break_active_pointer_constraints();
+        } else {
+            let now_ms = self.elapsed_ms();
+            if let Some(ws) = self.workspaces.get_mut(&ws_id) {
+                ws.activate_window(win_id, now_ms);
+            }
+        }
+        self.focus_active_deck_window();
+        self.reconcile_idle_inhibitors();
+        self.sync_foreign_toplevels();
+        self.queue_redraw();
+    }
+
+    pub fn set_window_fullscreen(
+        &mut self,
+        win_id: WindowId,
+        fullscreen: bool,
+        _target_output: Option<Output>,
+    ) {
+        let Some(ws_id) = self
+            .mapped_windows
+            .iter()
+            .find(|m| m.win_id == win_id)
+            .map(|m| m.ws_id.clone())
+        else {
+            return;
+        };
+        if let Some(ws) = self.workspaces.get_mut(&ws_id) {
+            let is_fs = ws.fullscreen_window == Some(win_id);
+            if is_fs != fullscreen {
+                ws.toggle_fullscreen(win_id);
+            }
+        }
+        self.sync_workspace_geometries(&ws_id);
+        self.focus_active_deck_window();
+        self.sync_foreign_toplevels();
+        self.queue_redraw();
     }
 }
 
@@ -2602,11 +2904,11 @@ pub fn read_toplevel_min_max_size(wl_surface: &WlSurface) -> ((u32, u32), (u32, 
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use smithay::output::{Mode, PhysicalProperties, Scale, Subpixel};
 
-    fn test_output(name: &str) -> Output {
+    pub(crate) fn test_output(name: &str) -> Output {
         let out = Output::new(
             name.to_owned(),
             PhysicalProperties {
@@ -2776,7 +3078,7 @@ mod tests {
         );
     }
 
-    fn make_headless_test_state() -> (
+    pub(crate) fn make_headless_test_state() -> (
         calloop::EventLoop<'static, KomaState>,
         smithay::reexports::wayland_server::Display<KomaState>,
         KomaState,
@@ -2788,6 +3090,7 @@ mod tests {
         let state = KomaState::new(
             display.handle(),
             event_loop.get_signal(),
+            event_loop.handle(),
             OsString::from("wayland-koma-unit-test"),
             "seat0",
             LogicalViewport::new(1920, 1080, 1.0),

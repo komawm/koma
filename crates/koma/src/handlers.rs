@@ -14,7 +14,10 @@ use smithay::{
     input::{Seat, SeatHandler, SeatState, pointer::CursorImageStatus, tablet::TabletSeatHandler},
     output::Output,
     reexports::{
-        wayland_protocols::xdg::shell::server::xdg_toplevel,
+        wayland_protocols::xdg::{
+            decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode,
+            shell::server::xdg_toplevel,
+        },
         wayland_server::{
             Client, Resource as _,
             protocol::{
@@ -32,7 +35,6 @@ use smithay::{
         dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier},
         fractional_scale::{FractionalScaleHandler, with_fractional_scale},
         output::OutputHandler,
-        pointer_constraints::PointerConstraintsHandler,
         selection::{
             SelectionHandler, SelectionTarget,
             data_device::{
@@ -156,6 +158,8 @@ impl CompositorHandler for KomaState {
                 }
             }
             self.reconcile_keyboard_focus();
+            self.reconcile_idle_inhibitors();
+            self.maybe_activate_pointer_constraint();
             self.queue_redraw();
             return;
         }
@@ -182,6 +186,8 @@ impl CompositorHandler for KomaState {
                 self.sync_output_workarea(&output);
             }
             self.reconcile_keyboard_focus();
+            self.reconcile_idle_inhibitors();
+            self.maybe_activate_pointer_constraint();
             self.queue_redraw();
             return;
         }
@@ -192,7 +198,11 @@ impl CompositorHandler for KomaState {
         {
             if is_surface_mapped(&root_surface) {
                 unmapped.window.on_commit();
+                self.refresh_toplevel_icon(&root_surface);
                 self.promote_unmapped_to_mapped(unmapped);
+                self.reconcile_idle_inhibitors();
+                self.maybe_activate_pointer_constraint();
+                self.sync_foreign_toplevels();
                 return;
             }
 
@@ -214,6 +224,7 @@ impl CompositorHandler for KomaState {
         }) {
             if surface == &root_surface && !is_surface_mapped(&root_surface) {
                 let removed = self.mapped_windows.remove(idx);
+                crate::foreign_toplevel::close_foreign_toplevel(self, removed.win_id);
                 self.window_animations
                     .borrow_mut()
                     .remove_immediately(removed.win_id);
@@ -228,8 +239,13 @@ impl CompositorHandler for KomaState {
                         win_id: removed.win_id,
                         window: removed.window,
                         initial_configure_sent: false,
+                        decoration_mode: removed.decoration_mode,
+                        icon: removed.icon,
                     },
                 );
+                self.break_active_pointer_constraints();
+                self.reconcile_idle_inhibitors();
+                self.sync_foreign_toplevels();
                 if removed.ws_id == self.active_ws_id
                     || Some(&removed.ws_id) == self.active_special_ws_id.as_ref()
                 {
@@ -240,6 +256,7 @@ impl CompositorHandler for KomaState {
             }
 
             self.mapped_windows[idx].window.on_commit();
+            self.refresh_toplevel_icon(&root_surface);
             let (app_id, title) = read_toplevel_metadata(&root_surface);
             self.mapped_windows[idx].app_id = app_id;
             self.mapped_windows[idx].title = title;
@@ -249,6 +266,9 @@ impl CompositorHandler for KomaState {
                 ws.frame_clock.record_activity(now);
             }
             notify_workspace_surface_damage(self, &ws_id);
+            self.reconcile_idle_inhibitors();
+            self.maybe_activate_pointer_constraint();
+            self.sync_foreign_toplevels();
             if ws_id == self.active_ws_id || Some(&ws_id) == self.active_special_ws_id.as_ref() {
                 self.queue_redraw();
             }
@@ -256,6 +276,7 @@ impl CompositorHandler for KomaState {
     }
 
     fn destroyed(&mut self, surface: &WlSurface) {
+        self.idle_inhibitors.remove(surface);
         if matches!(
             self.cursor_manager.status(),
             CursorImageStatus::Surface(active) if active == surface
@@ -271,6 +292,7 @@ impl CompositorHandler for KomaState {
             self.focused_ondemand_layer = None;
             self.reconcile_keyboard_focus();
         }
+        self.reconcile_idle_inhibitors();
     }
 }
 
@@ -314,6 +336,8 @@ impl XdgShellHandler for KomaState {
                 win_id,
                 window,
                 initial_configure_sent: false,
+                decoration_mode: DecorationMode::ServerSide,
+                icon: None,
             },
         );
     }
@@ -410,6 +434,65 @@ impl XdgShellHandler for KomaState {
         self.queue_redraw();
     }
 
+    fn maximize_request(&mut self, surface: ToplevelSurface) {
+        let wl_surface = surface.wl_surface();
+        if let Some(win_id) = find_mapped_window_id(self, wl_surface) {
+            self.set_window_maximized(win_id, true);
+        } else {
+            surface.with_pending_state(|s| s.states.set(xdg_toplevel::State::Maximized));
+            surface.send_configure();
+        }
+    }
+
+    fn unmaximize_request(&mut self, surface: ToplevelSurface) {
+        let wl_surface = surface.wl_surface();
+        if let Some(win_id) = find_mapped_window_id(self, wl_surface) {
+            self.set_window_maximized(win_id, false);
+        } else {
+            surface.with_pending_state(|s| s.states.unset(xdg_toplevel::State::Maximized));
+            surface.send_configure();
+        }
+    }
+
+    fn fullscreen_request(&mut self, surface: ToplevelSurface, output: Option<WlOutput>) {
+        let wl_surface = surface.wl_surface();
+        let target_output = output.and_then(|o| Output::from_resource(&o));
+        if let Some(win_id) = find_mapped_window_id(self, wl_surface) {
+            self.set_window_fullscreen(win_id, true, target_output);
+        } else {
+            surface.with_pending_state(|s| s.states.set(xdg_toplevel::State::Fullscreen));
+            surface.send_configure();
+        }
+    }
+
+    fn unfullscreen_request(&mut self, surface: ToplevelSurface) {
+        let wl_surface = surface.wl_surface();
+        if let Some(win_id) = find_mapped_window_id(self, wl_surface) {
+            self.set_window_fullscreen(win_id, false, None);
+        } else {
+            surface.with_pending_state(|s| s.states.unset(xdg_toplevel::State::Fullscreen));
+            surface.send_configure();
+        }
+    }
+
+    fn minimize_request(&mut self, surface: ToplevelSurface) {
+        if let Some(win_id) = find_mapped_window_id(self, surface.wl_surface()) {
+            self.set_window_minimized(win_id, true);
+        }
+    }
+
+    fn app_id_changed(&mut self, surface: ToplevelSurface) {
+        sync_toplevel_metadata_change(self, surface.wl_surface());
+    }
+
+    fn title_changed(&mut self, surface: ToplevelSurface) {
+        sync_toplevel_metadata_change(self, surface.wl_surface());
+    }
+
+    fn parent_changed(&mut self, _surface: ToplevelSurface) {
+        self.sync_foreign_toplevels();
+    }
+
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
         let wl_surface = surface.wl_surface();
         self.unmapped_windows.remove(wl_surface);
@@ -420,6 +503,7 @@ impl XdgShellHandler for KomaState {
                 .is_some_and(|t| t.wl_surface() == wl_surface)
         }) {
             let removed = self.mapped_windows.remove(pos);
+            crate::foreign_toplevel::close_foreign_toplevel(self, removed.win_id);
             self.window_animations
                 .borrow_mut()
                 .remove_immediately(removed.win_id);
@@ -428,6 +512,9 @@ impl XdgShellHandler for KomaState {
                 ws.remove_window(removed.win_id, now_ms);
             }
             self.sync_workspace_geometries(&removed.ws_id);
+            self.break_active_pointer_constraints();
+            self.reconcile_idle_inhibitors();
+            self.sync_foreign_toplevels();
             if removed.ws_id == self.active_ws_id
                 || Some(&removed.ws_id) == self.active_special_ws_id.as_ref()
             {
@@ -435,6 +522,34 @@ impl XdgShellHandler for KomaState {
                 self.queue_redraw();
             }
         }
+    }
+}
+
+fn find_mapped_window_id(
+    state: &KomaState,
+    wl_surface: &WlSurface,
+) -> Option<koma_proto::WindowId> {
+    state
+        .mapped_windows
+        .iter()
+        .find(|m| {
+            m.window
+                .toplevel()
+                .is_some_and(|t| t.wl_surface() == wl_surface)
+        })
+        .map(|m| m.win_id)
+}
+
+fn sync_toplevel_metadata_change(state: &mut KomaState, wl_surface: &WlSurface) {
+    let (app_id, title) = read_toplevel_metadata(wl_surface);
+    if let Some(mapped) = state.mapped_windows.iter_mut().find(|m| {
+        m.window
+            .toplevel()
+            .is_some_and(|t| t.wl_surface() == wl_surface)
+    }) {
+        mapped.app_id = app_id;
+        mapped.title = title;
+        state.sync_foreign_toplevels();
     }
 }
 
@@ -483,6 +598,26 @@ impl SeatHandler for KomaState {
             }
             self.queue_redraw();
         }
+
+        if let Some(pointer) = seat.get_pointer()
+            && let Some(ptr_surf) = pointer.current_focus()
+        {
+            let mut ptr_root = ptr_surf;
+            while let Some(p) = get_parent(&ptr_root) {
+                ptr_root = p;
+            }
+            let same_root = focused.is_some_and(|f| {
+                let mut kb_root = f.clone();
+                while let Some(p) = get_parent(&kb_root) {
+                    kb_root = p;
+                }
+                kb_root == ptr_root
+            });
+            if !same_root {
+                self.break_active_pointer_constraints();
+            }
+        }
+        self.sync_foreign_toplevels();
     }
 
     fn led_state_changed(
@@ -558,6 +693,8 @@ impl SessionLockHandler for KomaState {
             confirmation.lock();
             info!("host Wayland session locked via ext-session-lock-v1");
             self.reconcile_keyboard_focus();
+            self.reconcile_idle_inhibitors();
+            self.sync_foreign_toplevels();
             self.queue_redraw();
         } else {
             warn!("rejected concurrent ext-session-lock-v1 acquire while lock active");
@@ -569,6 +706,9 @@ impl SessionLockHandler for KomaState {
             self.focused_ondemand_layer = None;
             info!("host Wayland session unlocked");
             self.reconcile_keyboard_focus();
+            self.flush_deferred_xdg_activations();
+            self.reconcile_idle_inhibitors();
+            self.sync_foreign_toplevels();
             crate::keybind_dispatcher::refresh_pointer_hover_focus(
                 self,
                 smithay::backend::input::InputTime::now(),
@@ -746,6 +886,7 @@ impl WlrLayerShellHandler for KomaState {
             map.arrange();
         }
         self.sync_output_workarea(&output);
+        self.reconcile_idle_inhibitors();
         self.reconcile_keyboard_focus();
         self.queue_redraw();
     }
@@ -772,12 +913,11 @@ impl WlrLayerShellHandler for KomaState {
         if let Some(output) = removed_output {
             self.sync_output_workarea(&output);
         }
+        self.reconcile_idle_inhibitors();
         self.reconcile_keyboard_focus();
         self.queue_redraw();
     }
 }
-
-impl PointerConstraintsHandler for KomaState {}
 
 impl TabletSeatHandler for KomaState {
     type ToolFocus = WlSurface;
