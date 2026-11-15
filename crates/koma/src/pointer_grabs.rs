@@ -90,6 +90,7 @@ pub fn start_compositor_move_grab(state: &mut KomaState, button_code: u32, seria
     if state.is_locked_or_abandoned() {
         return false;
     }
+    state.break_active_pointer_constraints();
     let Some(pointer) = state.seat.get_pointer() else {
         return false;
     };
@@ -137,6 +138,7 @@ pub fn start_compositor_resize_grab(
     if state.is_locked_or_abandoned() {
         return false;
     }
+    state.break_active_pointer_constraints();
     let Some(pointer) = state.seat.get_pointer() else {
         return false;
     };
@@ -185,6 +187,7 @@ pub fn start_csd_move_grab(
     if state.is_locked_or_abandoned() {
         return false;
     }
+    state.break_active_pointer_constraints();
     let Some(pointer) = state.seat.get_pointer() else {
         return false;
     };
@@ -228,6 +231,7 @@ pub fn start_csd_resize_grab(
     if state.is_locked_or_abandoned() {
         return false;
     }
+    state.break_active_pointer_constraints();
     let Some(explicit_corner) = resize_corner_from_xdg_edge(edges) else {
         return false;
     };

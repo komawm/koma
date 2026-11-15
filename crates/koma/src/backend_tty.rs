@@ -64,10 +64,10 @@ use smithay::{
         },
         udev::{self, UdevBackend, UdevEvent},
     },
-    input::{keyboard::KeyboardSource, pointer::MotionEvent},
+    input::keyboard::KeyboardSource,
     output::{Mode, Output, OutputModeSource, PhysicalProperties, Scale},
     reexports::{
-        drm::control::{self, ModeFlags, ModeTypeFlags, connector, crtc},
+        drm::control::{self, Device as _, ModeFlags, ModeTypeFlags, connector, crtc},
         gbm::Modifier,
         input::Libinput,
         rustix::{fs::OFlags, io::Errno},
@@ -130,8 +130,7 @@ pub enum SurfaceRedrawState {
 
 /// Active KMS CRTC scanout surface managed by `DrmCompositor`.
 pub struct DrmOutputSurface {
-    // Physical connector handle retained for DRM hotplug/output lifecycle tracking.
-    #[allow(dead_code)]
+    // Physical connector handle retained for DRM hotplug, DPMS, and output lifecycle tracking.
     pub connector: connector::Handle,
     pub connector_name: String,
     pub output: Output,
@@ -701,6 +700,11 @@ impl TtyBackendState {
             return;
         };
         for (_, surf) in device.surfaces.drain() {
+            let output_name = surf.output.name();
+            state.output_power_state.notify_output_removed(&output_name);
+            state
+                .gamma_control_state
+                .notify_output_removed(&output_name);
             if let Some(global) = surf.wl_global {
                 state.display_handle.remove_global::<KomaState>(global);
             }
@@ -931,6 +935,11 @@ impl TtyBackendState {
             return;
         };
         if let Some(removed) = device.surfaces.remove(&crtc) {
+            let output_name = removed.output.name();
+            state.output_power_state.notify_output_removed(&output_name);
+            state
+                .gamma_control_state
+                .notify_output_removed(&output_name);
             if let Some(global) = removed.wl_global {
                 state.display_handle.remove_global::<KomaState>(global);
             }
@@ -939,6 +948,128 @@ impl TtyBackendState {
                 "disconnected KMS connector & removed wl_output global"
             );
         }
+    }
+
+    pub fn set_output_dpms(
+        &mut self,
+        output: &Output,
+        mode: crate::output_power::OutputPowerMode,
+    ) -> Result<(), String> {
+        let mut target = None;
+        for (node, dev) in &self.devices {
+            for (crtc, surf) in &dev.surfaces {
+                if surf.output == *output {
+                    target = Some((*node, *crtc, surf.connector));
+                    break;
+                }
+            }
+            if target.is_some() {
+                break;
+            }
+        }
+        let Some((node, _crtc, connector)) = target else {
+            return Err(format!(
+                "output {} is not bound to any active DRM connector",
+                output.name()
+            ));
+        };
+        let device = self
+            .devices
+            .get(&node)
+            .ok_or_else(|| format!("missing DRM device for {}", output.name()))?;
+        let props = device
+            .drm
+            .get_properties(connector)
+            .map_err(|err| format!("failed to query connector properties: {err}"))?;
+        for &prop_handle in props.as_props_and_values().0 {
+            let Ok(info) = device.drm.get_property(prop_handle) else {
+                continue;
+            };
+            if info.name().to_bytes() != b"DPMS" {
+                continue;
+            }
+            let target_val = match info.value_type() {
+                control::property::ValueType::Enum(enum_vals) => {
+                    let wanted: &[u8] = match mode {
+                        crate::output_power::OutputPowerMode::On => b"On",
+                        crate::output_power::OutputPowerMode::Off => b"Off",
+                    };
+                    enum_vals
+                        .values()
+                        .1
+                        .iter()
+                        .find(|ev| ev.name().to_bytes().eq_ignore_ascii_case(wanted))
+                        .map(|ev| ev.value())
+                        .unwrap_or(match mode {
+                            crate::output_power::OutputPowerMode::On => 0,
+                            crate::output_power::OutputPowerMode::Off => 3,
+                        })
+                }
+                _ => match mode {
+                    crate::output_power::OutputPowerMode::On => 0,
+                    crate::output_power::OutputPowerMode::Off => 3,
+                },
+            };
+            device
+                .drm
+                .set_property(connector, prop_handle, target_val)
+                .map_err(|err| format!("failed setting DRM DPMS property: {err}"))?;
+            return Ok(());
+        }
+        Err(format!(
+            "connector {} does not expose a DRM DPMS property",
+            output.name()
+        ))
+    }
+
+    #[must_use]
+    pub fn query_output_gamma_info(
+        &self,
+        output: &Output,
+    ) -> Option<(u32, Option<crate::gamma_control::GammaLut>)> {
+        for dev in self.devices.values() {
+            for (crtc, surf) in &dev.surfaces {
+                if surf.output == *output {
+                    let crtc_info = dev.drm.get_crtc(*crtc).ok()?;
+                    let gamma_len = crtc_info.gamma_length();
+                    if gamma_len == 0 {
+                        return Some((0, None));
+                    }
+                    let len = gamma_len as usize;
+                    let mut red = vec![0_u16; len];
+                    let mut green = vec![0_u16; len];
+                    let mut blue = vec![0_u16; len];
+                    let original_lut = dev
+                        .drm
+                        .get_gamma(*crtc, &mut red, &mut green, &mut blue)
+                        .ok()
+                        .map(|()| crate::gamma_control::GammaLut { red, green, blue });
+                    return Some((gamma_len, original_lut));
+                }
+            }
+        }
+        None
+    }
+
+    pub fn apply_output_gamma(
+        &self,
+        output: &Output,
+        lut: &crate::gamma_control::GammaLut,
+    ) -> Result<(), String> {
+        for dev in self.devices.values() {
+            for (crtc, surf) in &dev.surfaces {
+                if surf.output == *output {
+                    return dev
+                        .drm
+                        .set_gamma(*crtc, &lut.red, &lut.green, &lut.blue)
+                        .map_err(|err| format!("DRM set_gamma failed: {err}"));
+                }
+            }
+        }
+        Err(format!(
+            "output {} is not bound to an active DRM CRTC",
+            output.name()
+        ))
     }
 }
 
@@ -1366,6 +1497,13 @@ fn render_single_drm_surface(
     }
     let target_render_node = device.render_node.unwrap_or(tty.primary_render_node);
     let surface = device.surfaces.get_mut(&crtc)?;
+    if state
+        .output_power_state
+        .is_output_off(&surface.output.name())
+    {
+        surface.redraw_state = SurfaceRedrawState::Idle;
+        return None;
+    }
     let output_scale = MathScale::from(surface.output.current_scale().fractional_scale());
 
     let mut renderer: TtyRenderer<'_> = match tty.gpu_manager.renderer(
@@ -1605,34 +1743,11 @@ where
 
         // Physical mouse & touchpad relative motion (`PointerMotionEvent::delta`)
         InputEvent::PointerMotion { event } => {
-            let (max_w, max_h) = state
-                .workspaces
-                .get(&state.active_ws_id)
-                .map(|ws| (f64::from(ws.viewport.width), f64::from(ws.viewport.height)))
-                .unwrap_or((1920.0, 1080.0));
-
-            let delta = event.delta();
-            let next_x = (state.pointer_location.x + delta.x).clamp(0.0, (max_w - 1.0).max(0.0));
-            let next_y = (state.pointer_location.y + delta.y).clamp(0.0, (max_h - 1.0).max(0.0));
-            let pos = Point::from((next_x, next_y));
-            state.pointer_location = pos;
-            state.reconcile_session_lock();
-
-            let under = state.surface_under(pos);
-            if let Some(pointer) = state.seat.get_pointer() {
-                let serial = SERIAL_COUNTER.next_serial();
-                pointer.motion(
-                    state,
-                    under,
-                    &MotionEvent {
-                        location: pos,
-                        serial,
-                        time: event.time(),
-                    },
-                );
-                pointer.frame(state);
-            }
-            state.queue_redraw();
+            state.handle_pointer_relative_motion(
+                event.delta(),
+                event.delta_unaccel(),
+                event.time(),
+            );
         }
 
         // Drawing tablets (e.g. Wacom CTL-472 / OpenTabletDriver) & touchscreens
@@ -1643,24 +1758,7 @@ where
                 .map(|ws| (ws.viewport.width as i32, ws.viewport.height as i32))
                 .unwrap_or((1920, 1080));
             let pos: Point<f64, _> = event.position_transformed(out_geo_size.into());
-            state.pointer_location = pos;
-            state.reconcile_session_lock();
-
-            let under = state.surface_under(pos);
-            if let Some(pointer) = state.seat.get_pointer() {
-                let serial = SERIAL_COUNTER.next_serial();
-                pointer.motion(
-                    state,
-                    under,
-                    &MotionEvent {
-                        location: pos,
-                        serial,
-                        time: event.time(),
-                    },
-                );
-                pointer.frame(state);
-            }
-            state.queue_redraw();
+            state.handle_pointer_absolute_motion(pos, event.time());
         }
 
         InputEvent::PointerButton { event } => {
@@ -1729,6 +1827,13 @@ where
 
         InputEvent::TouchCancel { .. } => {
             state.handle_touch_cancel();
+        }
+
+        InputEvent::TabletToolAxis { .. }
+        | InputEvent::TabletToolProximity { .. }
+        | InputEvent::TabletToolTip { .. }
+        | InputEvent::TabletToolButton { .. } => {
+            state.notify_user_activity();
         }
 
         _ => {}

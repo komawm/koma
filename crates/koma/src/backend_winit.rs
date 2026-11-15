@@ -28,7 +28,7 @@ use smithay::{
     desktop::{layer_map_for_output, utils::send_frames_surface_tree},
     input::{
         keyboard::KeyboardSource,
-        pointer::{CursorIcon, CursorImageStatus, MotionEvent},
+        pointer::{CursorIcon, CursorImageStatus},
     },
     output::{Mode, Output, PhysicalProperties, Scale, Subpixel},
     reexports::winit::{
@@ -629,24 +629,7 @@ where
                 .map(|ws| (ws.viewport.width as i32, ws.viewport.height as i32))
                 .unwrap_or((1280, 800));
             let pos: Point<f64, _> = event.position_transformed(out_geo_size.into());
-            state.pointer_location = pos;
-            state.reconcile_session_lock();
-
-            let under = state.surface_under(pos);
-            if let Some(pointer) = state.seat.get_pointer() {
-                let serial = SERIAL_COUNTER.next_serial();
-                pointer.motion(
-                    state,
-                    under,
-                    &MotionEvent {
-                        location: pos,
-                        serial,
-                        time: event.time(),
-                    },
-                );
-                pointer.frame(state);
-            }
-            state.queue_redraw();
+            state.handle_pointer_absolute_motion(pos, event.time());
         }
         InputEvent::PointerButton { event } => {
             crate::keybind_dispatcher::process_pointer_button_event(

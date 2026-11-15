@@ -665,6 +665,8 @@ dependencies = [
  "smithay-drm-extras",
  "tracing",
  "tracing-subscriber",
+ "wayland-client",
+ "wayland-protocols-wlr",
  "wayland-server",
  "xcursor",
 ]

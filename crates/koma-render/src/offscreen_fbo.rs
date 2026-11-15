@@ -44,6 +44,11 @@ impl LazyOffscreenSurface {
 
     /// Renders `elements` on demand (`Render-on-Read`), allocating the backing `GlesTexture`
     /// only on the first capture or after a `FrozenZeroHz` reclamation.
+    #[must_use]
+    pub const fn size(&self) -> Size<i32, Physical> {
+        self.size
+    }
+
     pub fn render_on_read(
         &mut self,
         renderer: &mut GlesRenderer,
