@@ -250,6 +250,8 @@ pub struct KomaRoundedBorderElement {
     outer_radius: [f32; 4],
     border_width: f32,
     border_color: [f32; 4],
+    border_color_end: [f32; 4],
+    gradient_angle_rad: f32,
     opacity: f32,
     scale: f32,
     carrier_tex: GlesTexture,
@@ -275,6 +277,8 @@ impl KomaRoundedBorderElement {
             outer_radius,
             border_width,
             border_color,
+            border_color_end: border_color,
+            gradient_angle_rad: 0.0,
             opacity: opacity.clamp(0.0, 1.0),
             scale: scale.x as f32,
             carrier_tex,
@@ -282,7 +286,14 @@ impl KomaRoundedBorderElement {
         }
     }
 
-    fn uniforms(&self) -> [Uniform<'static>; 5] {
+    #[must_use]
+    pub fn with_gradient(mut self, border_color_end: [f32; 4], gradient_angle_rad: f32) -> Self {
+        self.border_color_end = border_color_end;
+        self.gradient_angle_rad = gradient_angle_rad;
+        self
+    }
+
+    fn uniforms(&self) -> [Uniform<'static>; 7] {
         [
             Uniform::new("koma_scale", self.scale),
             Uniform::new(
@@ -292,6 +303,8 @@ impl KomaRoundedBorderElement {
             Uniform::new("outer_radius", self.outer_radius),
             Uniform::new("border_width", self.border_width),
             Uniform::new("border_color", self.border_color),
+            Uniform::new("border_color_end", self.border_color_end),
+            Uniform::new("gradient_angle_rad", self.gradient_angle_rad),
         ]
     }
 }

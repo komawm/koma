@@ -88,6 +88,11 @@ pub struct InitialWindowRules {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DynamicWindowRules {
     pub opacity: Option<f32>,
+    pub inactive_opacity: Option<f32>,
+    pub animation: Option<String>,
+    pub no_blur: Option<bool>,
+    pub no_shadow: Option<bool>,
+    pub border_color: Option<String>,
     pub corner_radius: Option<u16>,
     pub clip_to_geometry: Option<bool>,
     pub focusable: Option<bool>,
@@ -191,6 +196,21 @@ impl WindowRuleEngine {
             }
             if let Some(v) = rule.dynamic.opacity {
                 out.opacity = Some(v);
+            }
+            if let Some(v) = rule.dynamic.inactive_opacity {
+                out.inactive_opacity = Some(v);
+            }
+            if let Some(v) = rule.dynamic.animation.as_ref() {
+                out.animation = Some(v.clone());
+            }
+            if let Some(v) = rule.dynamic.no_blur {
+                out.no_blur = Some(v);
+            }
+            if let Some(v) = rule.dynamic.no_shadow {
+                out.no_shadow = Some(v);
+            }
+            if let Some(v) = rule.dynamic.border_color.as_ref() {
+                out.border_color = Some(v.clone());
             }
             if let Some(v) = rule.dynamic.corner_radius {
                 out.corner_radius = Some(v);

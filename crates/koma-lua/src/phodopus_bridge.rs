@@ -18,7 +18,10 @@ use std::{
 };
 
 use gc_arena::Rootable;
-use koma_model::{AnchorPoint, DwindleConfig, LayoutMode, ScrollingConfig};
+use koma_model::{
+    AnchorPoint, CubicBezier, CurveSpec, DwindleConfig, HookeSpringParams, LayoutMode,
+    ScrollingConfig,
+};
 use koma_proto::{Epoch, ErrorSymbol, IpcError, MacroId, TextInjectStrategy, WorkspaceId};
 use phodopus::{
     Callback, CallbackReturn, Closure, Context, Error as LuaError, Executor, ExecutorMode, Fuel,
@@ -35,12 +38,13 @@ use crate::{
         PendingHostOp, TrampolineScheduler,
     },
     schema::{
-        ActionDescriptor, AppearanceSpec, BindHandleId, BindOptions, BindSpec, DeviceOverrideSpec,
-        GestureSpec, InputConfigSpec, KomaConfigRegistry, KomaHandleRef, LuaAnchorPointInput,
-        LuaClickOptsInput, LuaDragSpecInput, LuaKeyOptsInput, LuaKinematicsInput, LuaLayerRuleSpec,
-        LuaScrollSpecInput, LuaSettleOptsInput, LuaTextOptsInput, LuaWindowRuleSpec,
-        MacroDefinition, MacroHandleId, MacroLimitsSpec, MacroParamSpec, MonitorSpec, RuleHandleId,
-        TriggerEdge, WorkspaceSpec, XwaylandConfigSpec, validate_gesture_spec,
+        ActionDescriptor, AppearanceSpec, BindHandleId, BindOptions, BindSpec,
+        DesktopQuerySnapshot, DeviceOverrideSpec, GestureSpec, InputConfigSpec, KomaConfigRegistry,
+        KomaHandleRef, LuaAnchorPointInput, LuaClickOptsInput, LuaDragSpecInput, LuaKeyOptsInput,
+        LuaKinematicsInput, LuaLayerRuleSpec, LuaScrollSpecInput, LuaSettleOptsInput,
+        LuaTextOptsInput, LuaWindowRuleSpec, MacroDefinition, MacroHandleId, MacroLimitsSpec,
+        MacroParamSpec, MonitorSpec, RuleHandleId, TriggerEdge, WorkspaceSpec, XwaylandConfigSpec,
+        validate_gesture_spec,
     },
 };
 
@@ -107,6 +111,11 @@ pub enum QueuedHostAction {
     SpawnProcess {
         argv: Vec<String>,
     },
+    DispatchAction {
+        ws_id: WorkspaceId,
+        expected_epoch: Epoch,
+        action: ActionDescriptor,
+    },
 }
 
 /// Shared interior state accessible to `Phodopus` callbacks on the single-threaded `calloop` thread.
@@ -115,6 +124,8 @@ struct SandboxInner {
     next_id: u64,
     now_ms: u64,
     in_declarative_load: bool,
+    event_dispatch_depth: u8,
+    pub desktop_snapshot: DesktopQuerySnapshot,
     pub config: KomaConfigRegistry,
     pub bind_callbacks: BTreeMap<BindHandleId, StashedFunction>,
     pub mode_enter_hooks: BTreeMap<String, StashedFunction>,
@@ -249,6 +260,113 @@ impl PhodopusSandbox {
     pub fn set_clock_ms(&self, now_ms: u64) {
         self.clock_ms.set(now_ms);
         self.state.borrow_mut().now_ms = now_ms;
+    }
+
+    /// Updates the read-only desktop snapshot exposed to `ctx:windows()`, `ctx:focused_window()`,
+    /// `ctx:outputs()`, and `ctx:workspaces()`.
+    pub fn set_desktop_snapshot(&self, snap: DesktopQuerySnapshot) {
+        self.state.borrow_mut().desktop_snapshot = snap;
+    }
+
+    /// Returns `true` when at least one `koma.on(event_name, ...)` handler is registered.
+    #[must_use]
+    pub fn has_event_hooks(&self, event_name: &str) -> bool {
+        self.state
+            .borrow()
+            .event_hooks
+            .get(event_name)
+            .is_some_and(|hooks| !hooks.is_empty())
+    }
+
+    /// Invokes all `koma.on(event_name, fn(ctx, ev))` listeners with recursion depth capped at `4`.
+    pub fn emit_event_hooks(
+        &mut self,
+        event_name: &str,
+        payload: &serde_json::Value,
+        ws_id: WorkspaceId,
+        expected_epoch: Epoch,
+        now_ms: u64,
+    ) -> Result<usize, String> {
+        const MAX_EVENT_DEPTH: u8 = 4;
+        let hooks = {
+            let mut inner = self.state.borrow_mut();
+            if inner.event_dispatch_depth >= MAX_EVENT_DEPTH {
+                return Err(format!(
+                    "event hook recursion limit ({MAX_EVENT_DEPTH}) exceeded on `{event_name}`"
+                ));
+            }
+            let list = inner
+                .event_hooks
+                .get(event_name)
+                .cloned()
+                .unwrap_or_default();
+            if list.is_empty() {
+                return Ok(0);
+            }
+            inner.event_dispatch_depth += 1;
+            list
+        };
+
+        self.set_clock_ms(now_ms);
+        let mut launched = 0_usize;
+        let mut last_err: Option<String> = None;
+
+        for (idx, stashed_fn) in hooks.into_iter().enumerate() {
+            let scope_ws_id = ws_id.clone();
+            let macro_id = MacroId::new(format!("event_{event_name}_{idx}"));
+            let scope = MacroExecScope {
+                ws_id: scope_ws_id.clone(),
+                expected_epoch,
+                macro_id: macro_id.clone(),
+                state: self.state.clone(),
+            };
+
+            let step_res = self.lua.try_enter(|ctx| {
+                let cb_fn = ctx.fetch(&stashed_fn);
+                let ctx_ud = create_macro_context_userdata(ctx, scope)?;
+                let ev_val = to_value(ctx, payload).map_err(RuntimeError::new)?;
+                let exec = Executor::start(ctx, cb_fn, (ctx_ud, ev_val));
+                let mut fuel = Fuel::with(MACRO_SLICE_FUEL_BUDGET as i32);
+                let _ = exec.step(ctx, &mut fuel).map_err(RuntimeError::new)?;
+                Ok(ctx.stash(exec))
+            });
+
+            match step_res {
+                Ok(stashed_exec) => {
+                    launched += 1;
+                    let (mode, pending_raw) = self.lua.enter(|ctx| {
+                        let ex = ctx.fetch(&stashed_exec);
+                        (ex.mode(), ex.pending_host_op(ctx).map(HostOpHandle::raw))
+                    });
+                    if mode == ExecutorMode::HostSuspended
+                        && let Some(raw_handle) = pending_raw
+                    {
+                        let tx_id = self.next_tx_id;
+                        self.next_tx_id += 1;
+                        self.handle_to_tx.insert(raw_handle, tx_id);
+                        self.active_txs.insert(
+                            tx_id,
+                            ActiveMacroInstance {
+                                ws_id: scope_ws_id,
+                                expected_epoch,
+                                macro_id,
+                                stashed_exec,
+                                parked_raw_handle: raw_handle,
+                            },
+                        );
+                    }
+                }
+                Err(err) => {
+                    last_err = Some(format!("Lua event `{event_name}` hook error: {err}"));
+                }
+            }
+        }
+
+        self.state.borrow_mut().event_dispatch_depth -= 1;
+        if let Some(err) = last_err {
+            return Err(err);
+        }
+        Ok(launched)
     }
 
     /// Evaluates `~/.config/koma/init.lua` synchronously within `CONFIG_FUEL_BUDGET` (`200,000` fuel).
@@ -954,8 +1072,135 @@ fn install_koma_globals<'gc>(ctx: Context<'gc>, state: SharedState) -> Result<()
             "appearance",
             Callback::from_fn(&ctx, move |ctx, _, mut stack| {
                 let val: Value = stack.consume(ctx)?;
-                let spec: AppearanceSpec = from_value(val).map_err(RuntimeError::new)?;
-                st.borrow_mut().config.appearance = spec;
+                let mut spec: AppearanceSpec = from_value(val).map_err(RuntimeError::new)?;
+                let mut inner = st.borrow_mut();
+                let mut merged_curves =
+                    std::mem::take(&mut inner.config.appearance.animations.curves);
+                merged_curves.extend(spec.animations.curves);
+                spec.animations.curves = merged_curves;
+                inner.config.appearance = spec;
+                Ok(CallbackReturn::Return)
+            }),
+        );
+    }
+    {
+        let st = state.clone();
+        koma.set_field(
+            ctx,
+            "bezier",
+            Callback::from_fn(&ctx, move |ctx, _, mut stack| {
+                let (name, arg2, y1_opt, x2_opt, y2_opt, dur_opt): (
+                    std::string::String,
+                    Value,
+                    Option<f64>,
+                    Option<f64>,
+                    Option<f64>,
+                    Option<u32>,
+                ) = stack.consume(ctx)?;
+                let (bezier, duration_ms) = match arg2 {
+                    Value::Table(tbl) => {
+                        let mut pts: Option<[f64; 4]> = tbl.get(ctx, "points").ok();
+                        if pts.is_none() {
+                            let p1: Result<f64, _> = tbl.get(ctx, 1);
+                            let p2: Result<f64, _> = tbl.get(ctx, 2);
+                            let p3: Result<f64, _> = tbl.get(ctx, 3);
+                            let p4: Result<f64, _> = tbl.get(ctx, 4);
+                            if let (Ok(a), Ok(b), Ok(c), Ok(d)) = (p1, p2, p3, p4) {
+                                pts = Some([a, b, c, d]);
+                            }
+                        }
+                        let [x1, y1, x2, y2] = if let Some(p) = pts {
+                            p
+                        } else {
+                            let x1: f64 = tbl
+                                .get(ctx, "x1")
+                                .map_err(|_| runtime_err("koma.bezier table requires `points` or `x1,y1,x2,y2`"))?;
+                            let y1: f64 = tbl.get(ctx, "y1").map_err(RuntimeError::new)?;
+                            let x2: f64 = tbl.get(ctx, "x2").map_err(RuntimeError::new)?;
+                            let y2: f64 = tbl.get(ctx, "y2").map_err(RuntimeError::new)?;
+                            [x1, y1, x2, y2]
+                        };
+                        let dur: Option<u32> = tbl.get(ctx, "duration_ms").ok();
+                        (CubicBezier::new(x1, y1, x2, y2), dur.unwrap_or(250).clamp(1, 5000))
+                    }
+                    Value::Number(x1) => {
+                        let y1 = y1_opt.ok_or_else(|| runtime_err("koma.bezier requires y1"))?;
+                        let x2 = x2_opt.ok_or_else(|| runtime_err("koma.bezier requires x2"))?;
+                        let y2 = y2_opt.ok_or_else(|| runtime_err("koma.bezier requires y2"))?;
+                        (
+                            CubicBezier::new(x1, y1, x2, y2),
+                            dur_opt.unwrap_or(250).clamp(1, 5000),
+                        )
+                    }
+                    Value::Integer(x1) => {
+                        let y1 = y1_opt.ok_or_else(|| runtime_err("koma.bezier requires y1"))?;
+                        let x2 = x2_opt.ok_or_else(|| runtime_err("koma.bezier requires x2"))?;
+                        let y2 = y2_opt.ok_or_else(|| runtime_err("koma.bezier requires y2"))?;
+                        (
+                            CubicBezier::new(x1 as f64, y1, x2, y2),
+                            dur_opt.unwrap_or(250).clamp(1, 5000),
+                        )
+                    }
+                    _ => {
+                        return Err(runtime_err(
+                            "koma.bezier(name, x1, y1, x2, y2, duration_ms?) or koma.bezier(name, { points = {...}, duration_ms = ... })",
+                        ));
+                    }
+                };
+                st.borrow_mut().config.appearance.animations.curves.insert(
+                    name,
+                    CurveSpec::Bezier {
+                        bezier,
+                        duration_ms,
+                    },
+                );
+                Ok(CallbackReturn::Return)
+            }),
+        );
+    }
+    {
+        let st = state.clone();
+        koma.set_field(
+            ctx,
+            "spring",
+            Callback::from_fn(&ctx, move |ctx, _, mut stack| {
+                let (name, tbl): (std::string::String, Table) = stack.consume(ctx)?;
+                let mass: f64 = tbl
+                    .get::<_, Option<f64>>(ctx, "mass")
+                    .ok()
+                    .flatten()
+                    .unwrap_or(1.0);
+                let stiffness: f64 = tbl
+                    .get::<_, Option<f64>>(ctx, "stiffness")
+                    .ok()
+                    .flatten()
+                    .unwrap_or(800.0);
+                let epsilon: f64 = tbl
+                    .get::<_, Option<f64>>(ctx, "epsilon")
+                    .ok()
+                    .flatten()
+                    .unwrap_or(0.0005);
+                let damping: Option<f64> = tbl.get::<_, Option<f64>>(ctx, "damping").ok().flatten();
+                let damping_ratio: Option<f64> = tbl
+                    .get::<_, Option<f64>>(ctx, "damping_ratio")
+                    .ok()
+                    .flatten();
+                let params = if let Some(c) = damping {
+                    HookeSpringParams::from_physical(mass, c, stiffness, epsilon)
+                } else {
+                    HookeSpringParams::from_ratio(
+                        damping_ratio.unwrap_or(1.0),
+                        stiffness,
+                        mass,
+                        epsilon,
+                    )
+                };
+                st.borrow_mut()
+                    .config
+                    .appearance
+                    .animations
+                    .curves
+                    .insert(name, CurveSpec::Spring(params));
                 Ok(CallbackReturn::Return)
             }),
         );
@@ -1518,6 +1763,18 @@ fn build_act_namespace<'gc>(ctx: Context<'gc>) -> Result<Table<'gc>, LuaError<'g
     );
     win.set_field(
         ctx,
+        "focus",
+        Callback::from_fn(&ctx, |ctx, _, mut stack| {
+            let win_id: u64 = stack.consume(ctx)?;
+            stack.replace(
+                ctx,
+                UserData::new_static(&ctx, ActionDescriptor::WindowFocus(win_id)),
+            );
+            Ok(CallbackReturn::Return)
+        }),
+    );
+    win.set_field(
+        ctx,
         "move_to_monitor",
         Callback::from_fn(&ctx, |ctx, _, mut stack| {
             let mon: std::string::String = stack.consume(ctx)?;
@@ -1732,6 +1989,22 @@ fn build_act_namespace<'gc>(ctx: Context<'gc>) -> Result<Table<'gc>, LuaError<'g
             stack.replace(
                 ctx,
                 UserData::new_static(&ctx, ActionDescriptor::WorkspacePeek(ws)),
+            );
+            Ok(CallbackReturn::Return)
+        }),
+    );
+    ws_ns.set_field(
+        ctx,
+        "set_layout",
+        Callback::from_fn(&ctx, |ctx, _, mut stack| {
+            let (mode_val, workspace): (Value, Option<std::string::String>) = stack.consume(ctx)?;
+            let layout: LayoutMode = from_value(mode_val).map_err(RuntimeError::new)?;
+            stack.replace(
+                ctx,
+                UserData::new_static(
+                    &ctx,
+                    ActionDescriptor::WorkspaceSetLayout { workspace, layout },
+                ),
             );
             Ok(CallbackReturn::Return)
         }),
@@ -2367,6 +2640,95 @@ fn create_macro_context_userdata<'gc>(
         }),
     )?;
 
+    methods.try_set_field(
+        ctx,
+        "focused_window",
+        Callback::from_fn(&ctx, |ctx, _, mut stack| {
+            let ud: UserData = stack.consume(ctx)?;
+            let sc = ud
+                .downcast_static::<MacroExecScope>()
+                .map_err(RuntimeError::new)?;
+            let focused = sc.state.borrow().desktop_snapshot.focused_window.clone();
+            let val = match focused {
+                Some(ref info) => to_value(ctx, info).map_err(RuntimeError::new)?,
+                None => Value::Nil,
+            };
+            stack.replace(ctx, val);
+            Ok(CallbackReturn::Return)
+        }),
+    )?;
+
+    methods.try_set_field(
+        ctx,
+        "windows",
+        Callback::from_fn(&ctx, |ctx, _, mut stack| {
+            let ud: UserData = stack.consume(ctx)?;
+            let sc = ud
+                .downcast_static::<MacroExecScope>()
+                .map_err(RuntimeError::new)?;
+            let windows = sc.state.borrow().desktop_snapshot.windows.clone();
+            let val = to_value(ctx, &windows).map_err(RuntimeError::new)?;
+            stack.replace(ctx, val);
+            Ok(CallbackReturn::Return)
+        }),
+    )?;
+
+    methods.try_set_field(
+        ctx,
+        "outputs",
+        Callback::from_fn(&ctx, |ctx, _, mut stack| {
+            let ud: UserData = stack.consume(ctx)?;
+            let sc = ud
+                .downcast_static::<MacroExecScope>()
+                .map_err(RuntimeError::new)?;
+            let outputs = sc.state.borrow().desktop_snapshot.outputs.clone();
+            let val = to_value(ctx, &outputs).map_err(RuntimeError::new)?;
+            stack.replace(ctx, val);
+            Ok(CallbackReturn::Return)
+        }),
+    )?;
+
+    methods.try_set_field(
+        ctx,
+        "workspaces",
+        Callback::from_fn(&ctx, |ctx, _, mut stack| {
+            let ud: UserData = stack.consume(ctx)?;
+            let sc = ud
+                .downcast_static::<MacroExecScope>()
+                .map_err(RuntimeError::new)?;
+            let workspaces = sc.state.borrow().desktop_snapshot.workspaces.clone();
+            let val = to_value(ctx, &workspaces).map_err(RuntimeError::new)?;
+            stack.replace(ctx, val);
+            Ok(CallbackReturn::Return)
+        }),
+    )?;
+
+    methods.try_set_field(
+        ctx,
+        "dispatch",
+        Callback::from_fn(&ctx, |ctx, _, mut stack| {
+            let (ud, action_val): (UserData, Value) = stack.consume(ctx)?;
+            let sc = ud
+                .downcast_static::<MacroExecScope>()
+                .map_err(RuntimeError::new)?;
+            let action = extract_action_descriptor(action_val)?;
+            if matches!(action, ActionDescriptor::LuaCallback(_)) {
+                return Err(runtime_err(
+                    "ctx:dispatch cannot invoke nested LuaCallback actions",
+                ));
+            }
+            sc.state
+                .borrow_mut()
+                .host_actions
+                .push_back(QueuedHostAction::DispatchAction {
+                    ws_id: sc.ws_id.clone(),
+                    expected_epoch: sc.expected_epoch,
+                    action,
+                });
+            Ok(CallbackReturn::Return)
+        }),
+    )?;
+
     mt.set(ctx, MetaMethod::Index, methods)?;
     let ud = UserData::new_static(&ctx, scope);
     ud.set_metatable(&ctx, Some(mt));
@@ -2670,5 +3032,243 @@ mod tests {
             cfg.binds[3].action,
             ActionDescriptor::WindowMoveToMonitor("eDP-1".to_owned())
         );
+    }
+
+    #[test]
+    fn evaluates_dotfiles_showcase_and_preserves_registered_curves() {
+        let mut sandbox = PhodopusSandbox::new(DEFAULT_HEAP_LIMIT_BYTES, None).unwrap();
+        let cfg = sandbox
+            .eval_init_lua(include_str!("../../../examples/dotfiles_showcase.lua"))
+            .expect("examples/dotfiles_showcase.lua should evaluate cleanly");
+
+        let anims = &cfg.appearance.animations;
+        assert!(anims.curves.contains_key("overshoot_pop"));
+        assert!(anims.curves.contains_key("silk_glide"));
+        assert!(anims.curves.contains_key("bouncy_spring"));
+        assert_eq!(anims.windows_open.curve.as_deref(), Some("overshoot_pop"));
+        assert_eq!(anims.windows_open.style.as_deref(), Some("popin"));
+
+        let border = &cfg.appearance.border;
+        assert_eq!(border.active_color_end.as_deref(), Some("#bb9af7"));
+        assert_eq!(border.inactive_color_end.as_deref(), Some("#1f2335"));
+        assert!((border.gradient_angle - 45.0).abs() < 1e-4);
+        assert!((border.gradient_rotate_rpm - 12.0).abs() < 1e-4);
+
+        assert_eq!(cfg.window_rules[0].inactive_opacity, Some(0.82));
+        assert_eq!(cfg.window_rules[0].animation.as_deref(), Some("popin"));
+        assert_eq!(cfg.window_rules[0].border_color.as_deref(), Some("#7dcfff"));
+        assert_eq!(cfg.window_rules[1].no_blur, Some(true));
+        assert_eq!(cfg.window_rules[1].no_shadow, Some(true));
+
+        assert!(sandbox.has_event_hooks("output.changed"));
+        assert!(!sandbox.has_event_hooks("window.closed"));
+
+        // Partial `koma.appearance(...)` override must preserve already registered curves.
+        let mut partial_sb = PhodopusSandbox::new(DEFAULT_HEAP_LIMIT_BYTES, None).unwrap();
+        let partial_cfg = partial_sb
+            .eval_init_lua(
+                r##"
+                koma.bezier("custom_pop", 0.05, 0.9, 0.1, 1.08, 220)
+                koma.spring("custom_sp", { stiffness = 500, damping = 20, mass = 1.0 })
+                koma.appearance({ corner_radius = 10 })
+                "##,
+            )
+            .expect("partial appearance after curve registration must succeed");
+        assert!(
+            partial_cfg
+                .appearance
+                .animations
+                .curves
+                .contains_key("custom_pop")
+        );
+        assert!(
+            partial_cfg
+                .appearance
+                .animations
+                .curves
+                .contains_key("custom_sp")
+        );
+        assert_eq!(partial_cfg.appearance.corner_radius, Some(10));
+    }
+
+    #[test]
+    fn macro_context_desktop_queries_dispatch_redaction_and_event_hooks() {
+        use crate::{LuaOutputInfo, LuaWindowInfo, LuaWorkspaceInfo};
+
+        let mut sandbox = PhodopusSandbox::new(DEFAULT_HEAP_LIMIT_BYTES, None).unwrap();
+        let cfg = sandbox
+            .eval_init_lua(
+                r##"
+                koma.bind("Mod + Return", function(ctx)
+                    local focused = ctx:focused_window()
+                    assert(focused ~= nil and focused.id == 42)
+                    assert(focused.app_id == "com.mitchellh.ghostty")
+
+                    local wins = ctx:windows()
+                    assert(#wins == 2)
+                    assert(wins[2].app_id == "[protected]")
+                    assert(wins[2].title == "[protected]")
+
+                    local outs = ctx:outputs()
+                    assert(#outs == 1 and outs[1].name == "DP-1" and outs[1].focused == true)
+
+                    local wss = ctx:workspaces()
+                    assert(#wss == 1 and wss[1].name == "1" and wss[1].active == true)
+
+                    ctx:dispatch(koma.act.window.focus(42))
+                    ctx:dispatch(koma.act.workspace.set_layout("scrolling", "2"))
+
+                    local nested_ok = pcall(function()
+                        ctx:dispatch({ LuaCallback = 1 })
+                    end)
+                    assert(not nested_ok)
+                end, { desc = "Run-or-Raise test" })
+
+                koma.on("output.changed", function(ctx, ev)
+                    if ev.width and ev.width >= 3440 then
+                        ctx:dispatch(koma.act.workspace.set_layout("scrolling"))
+                    end
+                end)
+                "##,
+            )
+            .expect("closure + event hook script must parse cleanly");
+
+        let ActionDescriptor::LuaCallback(bind_id) = cfg.binds[0].action else {
+            panic!("expected LuaCallback action for function bind");
+        };
+
+        let focused_win = LuaWindowInfo {
+            id: 42,
+            app_id: "com.mitchellh.ghostty".to_owned(),
+            title: "fish".to_owned(),
+            workspace: "1".to_owned(),
+            floating: false,
+            fullscreen: false,
+            focused: true,
+        };
+        sandbox.set_desktop_snapshot(DesktopQuerySnapshot {
+            focused_window: Some(focused_win.clone()),
+            windows: vec![
+                focused_win,
+                LuaWindowInfo {
+                    id: 99,
+                    app_id: "[protected]".to_owned(),
+                    title: "[protected]".to_owned(),
+                    workspace: "1".to_owned(),
+                    floating: true,
+                    fullscreen: false,
+                    focused: false,
+                },
+            ],
+            outputs: vec![LuaOutputInfo {
+                name: "DP-1".to_owned(),
+                width: 3440,
+                height: 1440,
+                scale: 1.0,
+                refresh_mhz: 165_000,
+                active_workspace: "1".to_owned(),
+                focused: true,
+            }],
+            workspaces: vec![LuaWorkspaceInfo {
+                id: "1".to_owned(),
+                name: "1".to_owned(),
+                layout: "dwindle".to_owned(),
+                presentation: "headed".to_owned(),
+                focused_window_id: Some(42),
+                window_count: 2,
+                active: true,
+            }],
+        });
+
+        let ws_id = WorkspaceId::new("1");
+        sandbox
+            .start_bind_callback_tx(bind_id, ws_id.clone(), Epoch(1), 100)
+            .expect("bind closure must execute cleanly");
+        let actions = sandbox.drain_queued_actions();
+        assert_eq!(actions.len(), 2);
+        assert!(matches!(
+            actions[0],
+            QueuedHostAction::DispatchAction {
+                action: ActionDescriptor::WindowFocus(42),
+                ..
+            }
+        ));
+        assert!(matches!(
+            &actions[1],
+            QueuedHostAction::DispatchAction {
+                action: ActionDescriptor::WorkspaceSetLayout {
+                    workspace: Some(ws),
+                    layout: LayoutMode::Scrolling,
+                },
+                ..
+            } if ws == "2"
+        ));
+
+        sandbox
+            .emit_event_hooks(
+                "output.changed",
+                &serde_json::json!({ "output": "DP-1", "width": 3440, "height": 1440 }),
+                ws_id.clone(),
+                Epoch(1),
+                200,
+            )
+            .expect("event hook must execute cleanly");
+        let hook_actions = sandbox.drain_queued_actions();
+        assert_eq!(hook_actions.len(), 1);
+        assert!(matches!(
+            hook_actions[0],
+            QueuedHostAction::DispatchAction {
+                action: ActionDescriptor::WorkspaceSetLayout {
+                    workspace: None,
+                    layout: LayoutMode::Scrolling,
+                },
+                ..
+            }
+        ));
+
+        // Verify recursion depth cap (`MAX_EVENT_DEPTH = 4`).
+        let mut depth_sb = PhodopusSandbox::new(DEFAULT_HEAP_LIMIT_BYTES, None).unwrap();
+        depth_sb
+            .eval_init_lua(
+                r##"
+                koma.on("workspace.focused", function(ctx, ev)
+                    ctx:dispatch(koma.act.workspace.focus("2"))
+                end)
+                "##,
+            )
+            .unwrap();
+        for _ in 0..4 {
+            assert!(
+                depth_sb
+                    .emit_event_hooks(
+                        "workspace.focused",
+                        &serde_json::json!({}),
+                        ws_id.clone(),
+                        Epoch(1),
+                        300,
+                    )
+                    .is_ok()
+            );
+        }
+        // Reset check isn't stuck on sequential calls: each top-level `emit_event_hooks`
+        // decrements depth back to 0 on exit, so sequential dispatches stay within cap!
+        let depth_err = {
+            depth_sb.state.borrow_mut().event_dispatch_depth = 4;
+            depth_sb.emit_event_hooks(
+                "workspace.focused",
+                &serde_json::json!({}),
+                ws_id,
+                Epoch(1),
+                301,
+            )
+        };
+        assert!(depth_err.is_err());
+
+        // Verify LuaLS stubs include new desktop query/event types.
+        let stubs = crate::generate_luals_stubs();
+        assert!(stubs.contains("---@class KomaWindowInfo"));
+        assert!(stubs.contains("---@class KomaCurveSpec"));
+        assert!(stubs.contains("---@field on fun(event: KomaEventName"));
+        assert!(stubs.contains("function MacroContext:dispatch(action) end"));
     }
 }

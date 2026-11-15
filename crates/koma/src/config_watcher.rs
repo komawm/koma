@@ -610,6 +610,11 @@ fn compile_window_rule_specs(specs: &[LuaWindowRuleSpec]) -> Result<Vec<WindowRu
             },
             dynamic: DynamicWindowRules {
                 opacity: spec.opacity,
+                inactive_opacity: spec.inactive_opacity,
+                animation: spec.animation.clone(),
+                no_blur: spec.no_blur,
+                no_shadow: spec.no_shadow,
+                border_color: spec.border_color.clone(),
                 corner_radius: spec.corner_radius,
                 clip_to_geometry: spec.clip_to_geometry,
                 focusable: spec.focusable,
@@ -706,6 +711,15 @@ pub fn reload_from_lua_source(
 
     state.apply_runtime_input_config(&registry);
     state.queue_redraw();
+    if !deferred_vm_swap {
+        state.emit_lua_event(
+            "config.reloaded",
+            serde_json::json!({
+                "generation": state.config_generation,
+                "init_path": init_path.display().to_string(),
+            }),
+        );
+    }
 
     if had_previous_error && send_desktop_notification {
         spawn_nonblocking_notify(
@@ -749,6 +763,10 @@ pub fn promote_deferred_sandbox_if_idle(state: &mut KomaState) {
         state.lua_sandbox = ready_vm;
         let registry = state.lua_sandbox.config_snapshot();
         state.apply_runtime_input_config(&registry);
+        state.emit_lua_event(
+            "config.reloaded",
+            serde_json::json!({ "generation": state.config_generation }),
+        );
         info!(
             generation = state.config_generation,
             "promoted staged Shadow PhodopusSandbox after in-flight coroutines finished"

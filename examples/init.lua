@@ -106,6 +106,8 @@ koma.input({
     tablet = { map_to_output = "eDP-1" },
 })
 
+koma.bezier("snappy_overshoot", 0.05, 0.9, 0.1, 1.05, 220)
+
 koma.appearance({
     corner_radius = 12,
     border = {
@@ -148,6 +150,7 @@ koma.appearance({
         damping_ratio = 1.0,
         stiffness = 800.0,
         open_scale_from = 0.88,
+        windows_open = { curve = "snappy_overshoot", style = "popin" },
     },
 })
 
@@ -222,6 +225,7 @@ koma.rule.window({
     name = "frosted-glass-terminals",
     matches = { { app_id = "^(com\\.mitchellh\\.ghostty|org\\.wezfurlong\\.wezterm|foot)$" } },
     opacity = 0.90,
+    inactive_opacity = 0.85,
     corner_radius = 12,
 })
 

@@ -187,6 +187,8 @@ uniform vec2 geo_size;
 uniform vec4 outer_radius;
 uniform float border_width;
 uniform vec4 border_color;
+uniform vec4 border_color_end;
+uniform float gradient_angle_rad;
 
 float koma_rounding_alpha(vec2 coords, vec2 size, vec4 corner_radius, float scale);
 
@@ -194,8 +196,12 @@ void main() {
     vec4 dummy_sample = texture2D(tex, v_coords);
     vec2 coords = v_coords * geo_size;
 
+    vec2 grad_dir = vec2(cos(gradient_angle_rad), sin(gradient_angle_rad));
+    float grad_t = clamp(dot(v_coords - vec2(0.5), grad_dir) + 0.5, 0.0, 1.0);
+    vec4 grad_rgba = mix(border_color, border_color_end, grad_t);
+
     // Premultiply RGB by alpha
-    vec4 color = vec4(border_color.rgb * border_color.a, border_color.a) * (dummy_sample.a * 0.0 + 1.0);
+    vec4 color = vec4(grad_rgba.rgb * grad_rgba.a, grad_rgba.a) * (dummy_sample.a * 0.0 + 1.0);
     color *= koma_rounding_alpha(coords, geo_size, outer_radius, koma_scale);
 
     if (border_width > 0.0) {
@@ -451,6 +457,8 @@ impl KomaCompiledShaders {
                     UniformName::new("outer_radius", UniformType::_4f),
                     UniformName::new("border_width", UniformType::_1f),
                     UniformName::new("border_color", UniformType::_4f),
+                    UniformName::new("border_color_end", UniformType::_4f),
+                    UniformName::new("gradient_angle_rad", UniformType::_1f),
                 ],
             )
             .map_err(|e| warn!("failed compiling rounded_border GLSL shader: {e:?}"))

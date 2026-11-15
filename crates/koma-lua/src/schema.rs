@@ -81,6 +81,11 @@ pub enum ActionDescriptor {
     WorkspaceFocusNext,
     WorkspaceFocusPrev,
     WorkspacePeek(String),
+    WorkspaceSetLayout {
+        workspace: Option<String>,
+        layout: LayoutMode,
+    },
+    WindowFocus(u64),
     MonitorFocus(String),
     MonitorFocusDirection(String),
     WindowMoveToMonitor(String),
@@ -981,12 +986,62 @@ pub struct LuaWindowRuleSpec {
     pub excludes: Vec<LuaWindowMatchInput>,
     pub initial: LuaInitialWindowRuleInput,
     pub opacity: Option<f32>,
+    pub inactive_opacity: Option<f32>,
+    pub animation: Option<String>,
+    pub no_blur: Option<bool>,
+    pub no_shadow: Option<bool>,
+    pub border_color: Option<String>,
     pub corner_radius: Option<u16>,
     pub clip_to_geometry: Option<bool>,
     pub focusable: Option<bool>,
     pub pin_on_output: Option<bool>,
     pub suppress_events: Vec<String>,
     pub block_out_from: Option<BlockOutPolicy>,
+}
+
+/// Read-only window snapshot exposed to Lua via `ctx:windows()` / `ctx:focused_window()`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LuaWindowInfo {
+    pub id: u64,
+    pub app_id: String,
+    pub title: String,
+    pub workspace: String,
+    pub floating: bool,
+    pub fullscreen: bool,
+    pub focused: bool,
+}
+
+/// Read-only output snapshot exposed to Lua via `ctx:outputs()`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct LuaOutputInfo {
+    pub name: String,
+    pub width: u32,
+    pub height: u32,
+    pub scale: f64,
+    pub refresh_mhz: u32,
+    pub active_workspace: String,
+    pub focused: bool,
+}
+
+/// Read-only workspace snapshot exposed to Lua via `ctx:workspaces()`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LuaWorkspaceInfo {
+    pub id: String,
+    pub name: String,
+    pub layout: String,
+    pub presentation: String,
+    pub focused_window_id: Option<u64>,
+    pub window_count: usize,
+    pub active: bool,
+}
+
+/// Consolidated read-only compositor snapshot synchronized into `PhodopusSandbox` before Lua slices.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct DesktopQuerySnapshot {
+    pub focused_window: Option<LuaWindowInfo>,
+    pub windows: Vec<LuaWindowInfo>,
+    pub outputs: Vec<LuaOutputInfo>,
+    pub workspaces: Vec<LuaWorkspaceInfo>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

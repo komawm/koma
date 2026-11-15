@@ -12,11 +12,15 @@ use std::{
 };
 
 use calloop::{LoopHandle, LoopSignal, RegistrationToken};
-use koma_lua::{ActionDescriptor, TrampolineScheduler, phodopus_bridge::PhodopusSandbox};
+use koma_lua::{
+    ActionDescriptor, DesktopQuerySnapshot, LuaOutputInfo, LuaWindowInfo, LuaWorkspaceInfo,
+    TrampolineScheduler, phodopus_bridge::PhodopusSandbox,
+};
 use koma_model::{
     LayoutMode, LogicalPoint, LogicalRect, LogicalViewport, OpenMode, OutputLayout,
     OutputTransform, PresentationTarget, SafeAreaInsets, SavedOutputConfig, WindowAnimationTable,
     WindowMatchContext, WindowRuleEngine, WorkspaceLeaseState, WorkspaceState,
+    WorkspaceTransitionTable,
 };
 use koma_proto::{
     CapabilityToken, Epoch, EventTopic, OutputId, SeatId, TokenClaims, WindowId, WorkspaceEvent,
@@ -671,6 +675,8 @@ pub struct KomaState {
     pub damage_trackers: HashMap<WorkspaceId, WorkspaceDamageTracker>,
     pub pointer_animations: Vec<ActivePointerAnimation>,
     pub window_animations: RefCell<WindowAnimationTable>,
+    pub workspace_transitions: RefCell<WorkspaceTransitionTable>,
+    pub last_notified_focus_win_id: Option<WindowId>,
     /// Live 4-quadrant `smart_split` / `Scrolling` column drop zone `(ws_id, preview_rect)` during drag.
     pub active_drop_preview: Option<(WorkspaceId, LogicalRect)>,
     /// Active `MoveWindowGrab` cursor state `(ws_id, cursor_x)` driving continuous VBlank edge auto-scroll.
@@ -883,6 +889,8 @@ impl KomaState {
             damage_trackers: HashMap::new(),
             pointer_animations: Vec::new(),
             window_animations: RefCell::new(WindowAnimationTable::default()),
+            workspace_transitions: RefCell::new(WorkspaceTransitionTable::default()),
+            last_notified_focus_win_id: None,
             active_drop_preview: None,
             active_drag_edge_scroll: None,
             edge_scroll_keep_alive: false,
@@ -1532,6 +1540,16 @@ impl KomaState {
         self.sync_foreign_toplevels();
         crate::output_management::sync_output_manager(self);
         self.queue_redraw();
+        self.emit_lua_event(
+            "output.changed",
+            serde_json::json!({
+                "name": out_name,
+                "event": if was_registered { "updated" } else { "added" },
+                "width": logical_w,
+                "height": logical_h,
+                "scale": scale,
+            }),
+        );
     }
 
     #[cfg(any(feature = "smithay-tty", test))]
@@ -1583,6 +1601,16 @@ impl KomaState {
         self.sync_foreign_toplevels();
         crate::output_management::sync_output_manager(self);
         self.queue_redraw();
+        self.emit_lua_event(
+            "output.changed",
+            serde_json::json!({
+                "name": out_name,
+                "event": "removed",
+                "width": 0_u32,
+                "height": 0_u32,
+                "scale": 1.0_f64,
+            }),
+        );
     }
 
     pub fn clamp_and_update_pointer_bounds(&mut self) {
@@ -1956,7 +1984,7 @@ impl KomaState {
                         win_id,
                         target_rect,
                         now_ms,
-                        anim_cfg,
+                        &anim_cfg,
                         bypass,
                     );
                 }
@@ -2153,6 +2181,37 @@ impl KomaState {
             "promoted Wayland toplevel into workspace Space"
         );
         let win_id_created = mapped.win_id;
+        let mapped_is_protected = self
+            .rules
+            .resolve_dynamic(&WindowMatchContext {
+                app_id: &app_id,
+                title: &title,
+                is_floating,
+                is_focused: true,
+                is_xwayland: false,
+                is_modal_dialog: false,
+                is_screencast_target: false,
+                is_agent_workspace: is_agent_ws,
+            })
+            .block_out_from
+            .is_some_and(|p| p.blocks_agent_capture());
+        let anim_style_override = self
+            .rules
+            .resolve_dynamic(&WindowMatchContext {
+                app_id: &app_id,
+                title: &title,
+                is_floating,
+                is_focused: true,
+                is_xwayland: false,
+                is_modal_dialog: false,
+                is_screencast_target: false,
+                is_agent_workspace: is_agent_ws,
+            })
+            .animation;
+        let ws_viewport = self
+            .workspaces
+            .get(&ws_id)
+            .map_or(LogicalViewport::new(1920, 1080, 1.0), |w| w.viewport);
         self.mapped_windows.push(mapped);
         self.sync_workspace_geometries(&ws_id);
         self.sync_window_output_membership(&ws_id);
@@ -2166,8 +2225,10 @@ impl KomaState {
             self.window_animations.borrow_mut().on_window_opened(
                 win_id_created,
                 final_rect,
+                ws_viewport,
                 now_ms,
-                anim_cfg,
+                &anim_cfg,
+                anim_style_override.as_deref(),
                 is_agent_ws,
             );
         }
@@ -2180,6 +2241,23 @@ impl KomaState {
             self.queue_redraw();
         } else if visible_anywhere {
             self.queue_redraw();
+        }
+        if !is_agent_ws {
+            let title_redacted = if mapped_is_protected {
+                "[protected]"
+            } else {
+                title.as_str()
+            };
+            self.emit_lua_event(
+                "window.mapped",
+                serde_json::json!({
+                    "id": win_id_created.slot,
+                    "app_id": app_id,
+                    "title_redacted": title_redacted,
+                    "workspace": ws_id.to_string(),
+                    "floating": is_floating,
+                }),
+            );
         }
     }
 
@@ -2489,6 +2567,42 @@ impl KomaState {
         }
         self.reconcile_keyboard_focus();
         self.sync_foreign_toplevels();
+
+        let now_ms = self.elapsed_ms();
+        let anim_cfg = self.lua_sandbox.config_snapshot().appearance.animations;
+        let is_offscreen = self
+            .workspaces
+            .get(&target_ws_id)
+            .is_some_and(|w| matches!(w.presentation, PresentationTarget::Offscreen { .. }));
+        {
+            let mut tbl = self.window_animations.borrow_mut();
+            for mapped in &self.mapped_windows {
+                if mapped.ws_id == target_ws_id && !mapped.is_minimized {
+                    tbl.retarget_focus(
+                        mapped.win_id,
+                        Some(mapped.win_id) == active_id,
+                        now_ms,
+                        &anim_cfg,
+                        is_offscreen,
+                    );
+                }
+            }
+        }
+
+        if self.last_notified_focus_win_id != active_id {
+            self.last_notified_focus_win_id = active_id;
+            if !is_offscreen
+                && let Some(focused_id) = active_id
+                && let Some(m) = self.mapped_windows.iter().find(|m| m.win_id == focused_id)
+            {
+                let payload = serde_json::json!({
+                    "id": focused_id.slot,
+                    "app_id": m.app_id,
+                    "workspace": m.ws_id.to_string(),
+                });
+                self.emit_lua_event("window.focused", payload);
+            }
+        }
     }
 
     #[must_use]
@@ -2882,9 +2996,19 @@ impl KomaState {
     #[must_use]
     pub fn has_active_animations(&self) -> bool {
         let now_ms = self.elapsed_ms();
+        let rotating_border = {
+            let appearance = &self.lua_sandbox.config_snapshot().appearance;
+            appearance.border.is_gradient_rotating()
+                && self.mapped_windows.iter().any(|m| !m.is_minimized)
+        };
         self.edge_scroll_keep_alive
+            || rotating_border
             || self
                 .window_animations
+                .borrow_mut()
+                .has_active_animations(now_ms)
+            || self
+                .workspace_transitions
                 .borrow_mut()
                 .has_active_animations(now_ms)
             || self
@@ -2914,6 +3038,17 @@ impl KomaState {
             }
         } else {
             0
+        };
+        let ws_transform = if is_screencast_or_agent_capture || is_agent_ws {
+            koma_model::SampledWorkspaceTransform::default()
+        } else {
+            let hosting_out = match &ws.presentation {
+                PresentationTarget::Physical(out_id) => Some(out_id.0.as_str()),
+                PresentationTarget::Offscreen { .. } => None,
+            };
+            hosting_out.map_or_else(Default::default, |out| {
+                self.workspace_transitions.borrow_mut().sample(out, now_ms)
+            })
         };
         let candidates_bottom_to_top = ws.compute_animation_target_geometries();
         let appearance = &self.lua_sandbox.config_snapshot().appearance;
@@ -2945,7 +3080,14 @@ impl KomaState {
                     .block_out_from
                     .is_some_and(|p| p.blocks_agent_capture());
 
-                let base_opacity = dyn_rules.opacity.unwrap_or(1.0);
+                let base_opacity = if is_focused {
+                    dyn_rules.opacity.unwrap_or(1.0)
+                } else {
+                    dyn_rules
+                        .inactive_opacity
+                        .or(dyn_rules.opacity)
+                        .unwrap_or(1.0)
+                };
                 let is_fs = fullscreen_id == Some(win_id);
                 let corner_radius = if is_fs {
                     0.0
@@ -2953,9 +3095,13 @@ impl KomaState {
                     f32::from(dyn_rules.corner_radius.unwrap_or(default_radius))
                 };
 
-                let (mut render_rect, eff_opacity) =
+                let (mut render_rect, eff_opacity, focus_factor) =
                     if is_screencast_or_agent_capture || is_agent_ws {
-                        (target_rect, base_opacity)
+                        (
+                            target_rect,
+                            base_opacity,
+                            if is_focused { 1.0 } else { 0.0 },
+                        )
                     } else {
                         let sampled = self.window_animations.borrow_mut().sample_visual(
                             win_id,
@@ -2964,9 +3110,16 @@ impl KomaState {
                         );
                         (
                             sampled.rect,
-                            (base_opacity * sampled.opacity_multiplier).clamp(0.0, 1.0),
+                            (base_opacity
+                                * sampled.opacity_multiplier
+                                * ws_transform.opacity_multiplier)
+                                .clamp(0.0, 1.0),
+                            sampled.focus_factor,
                         )
                     };
+
+                render_rect.x += ws_transform.offset_x;
+                render_rect.y += ws_transform.offset_y;
 
                 if is_scrolling_strip && !is_floating {
                     render_rect.x -= camera_shift_px;
@@ -2982,10 +3135,18 @@ impl KomaState {
                     rect: render_rect,
                     is_floating,
                     is_focused,
+                    focus_factor,
                     is_protected_surface: is_protected,
                     opacity: eff_opacity,
                     corner_radius,
-                    wants_blur: blur_enabled && !is_fs,
+                    wants_blur: blur_enabled && !is_fs && !dyn_rules.no_blur.unwrap_or(false),
+                    no_shadow: dyn_rules.no_shadow.unwrap_or(false),
+                    border_color_override: dyn_rules.border_color,
+                    gradient_time_ms: if is_screencast_or_agent_capture || is_agent_ws {
+                        0
+                    } else {
+                        now_ms
+                    },
                     border: border_cfg.clone(),
                     focus_ring: focus_ring_cfg.clone(),
                     shadow: shadow_cfg.clone(),
@@ -3536,6 +3697,249 @@ impl KomaState {
 
     pub fn sync_foreign_toplevels(&mut self) {
         crate::foreign_toplevel::sync_all_foreign_toplevels(self);
+    }
+
+    /// Captures a read-only desktop snapshot for `Phodopus` Lua `ctx:windows()`,
+    /// `ctx:focused_window()`, `ctx:outputs()`, and `ctx:workspaces()`, redacting protected
+    /// surface titles and scoping offscreen agent workspaces safely.
+    #[must_use]
+    pub fn capture_lua_desktop_snapshot(
+        &self,
+        scope_ws_id: Option<&WorkspaceId>,
+    ) -> DesktopQuerySnapshot {
+        let active_ws_id = self.effective_interactive_ws_id();
+        let active_focused_id = self
+            .workspaces
+            .get(&active_ws_id)
+            .and_then(WorkspaceState::active_window);
+
+        let mut windows = Vec::new();
+        let mut focused_window = None;
+        for mapped in &self.mapped_windows {
+            if mapped.is_minimized {
+                continue;
+            }
+            let Some(ws) = self.workspaces.get(&mapped.ws_id) else {
+                continue;
+            };
+            let is_offscreen = matches!(ws.presentation, PresentationTarget::Offscreen { .. });
+            if is_offscreen && scope_ws_id != Some(&mapped.ws_id) {
+                continue;
+            }
+            let is_focused =
+                mapped.ws_id == active_ws_id && Some(mapped.win_id) == active_focused_id;
+            let is_protected = self
+                .rules
+                .resolve_dynamic(&WindowMatchContext {
+                    app_id: &mapped.app_id,
+                    title: &mapped.title,
+                    is_floating: mapped.is_floating,
+                    is_focused,
+                    is_xwayland: false,
+                    is_modal_dialog: false,
+                    is_screencast_target: false,
+                    is_agent_workspace: is_offscreen,
+                })
+                .block_out_from
+                .is_some_and(|p| p.blocks_agent_capture());
+            let info = LuaWindowInfo {
+                id: mapped.win_id.slot,
+                app_id: mapped.app_id.clone(),
+                title: if is_protected {
+                    "[protected]".to_owned()
+                } else {
+                    mapped.title.clone()
+                },
+                workspace: ws.name.clone(),
+                floating: mapped.is_floating,
+                fullscreen: ws.fullscreen_window == Some(mapped.win_id),
+                focused: is_focused,
+            };
+            if is_focused {
+                focused_window = Some(info.clone());
+            }
+            windows.push(info);
+        }
+
+        let focused_out_name = self.focused_output_name();
+        let outputs = self
+            .all_outputs()
+            .into_iter()
+            .map(|out| {
+                let name = out.name();
+                let (width, height, scale) = output_logical_viewport(&out);
+                let refresh_mhz = out
+                    .current_mode()
+                    .map_or(60_000, |m| m.refresh.max(0) as u32);
+                let active_ws = self.active_workspace_for_output(&name);
+                let ws_name = self
+                    .workspaces
+                    .get(&active_ws)
+                    .map_or_else(|| active_ws.to_string(), |w| w.name.clone());
+                LuaOutputInfo {
+                    focused: focused_out_name.as_deref() == Some(name.as_str()),
+                    name,
+                    width,
+                    height,
+                    scale,
+                    refresh_mhz,
+                    active_workspace: ws_name,
+                }
+            })
+            .collect();
+
+        let workspaces = self
+            .workspaces
+            .values()
+            .map(|ws| {
+                let count = self
+                    .mapped_windows
+                    .iter()
+                    .filter(|m| m.ws_id == ws.id && !m.is_minimized)
+                    .count();
+                let layout = match ws.layout_mode {
+                    LayoutMode::Dwindle => "dwindle",
+                    LayoutMode::Scrolling => "scrolling",
+                    LayoutMode::Deck => "deck",
+                }
+                .to_owned();
+                let presentation = match ws.presentation {
+                    PresentationTarget::Physical(_) => "headed",
+                    PresentationTarget::Offscreen { .. } => "headless",
+                }
+                .to_owned();
+                LuaWorkspaceInfo {
+                    id: ws.id.to_string(),
+                    name: ws.name.clone(),
+                    layout,
+                    presentation,
+                    focused_window_id: ws.active_window().map(|id| id.slot),
+                    window_count: count,
+                    active: ws.id == active_ws_id,
+                }
+            })
+            .collect();
+
+        DesktopQuerySnapshot {
+            focused_window,
+            windows,
+            outputs,
+            workspaces,
+        }
+    }
+
+    /// Emits a `koma.on(event_name, fn(ctx, ev))` hook slice with fast no-op path when unsubscribed.
+    pub fn emit_lua_event(&mut self, event_name: &str, payload: serde_json::Value) {
+        if !self.lua_sandbox.has_event_hooks(event_name) {
+            return;
+        }
+        let ws_id = self.active_ws_id.clone();
+        let epoch = self
+            .workspaces
+            .get(&ws_id)
+            .map(|w| w.lease.epoch())
+            .unwrap_or_default();
+        let now_ms = self.elapsed_ms();
+        let snap = self.capture_lua_desktop_snapshot(None);
+        self.lua_sandbox.set_desktop_snapshot(snap);
+        if let Err(err) = self
+            .lua_sandbox
+            .emit_event_hooks(event_name, &payload, ws_id, epoch, now_ms)
+        {
+            warn!(event = %event_name, "{err}");
+            return;
+        }
+        crate::macro_runtime::execute_queued_host_actions(self);
+        crate::macro_runtime::rearm_trampoline_timer(self);
+    }
+
+    /// Triggers a per-output headed workspace slide/fade transition and emits `"workspace.focused"`.
+    pub fn trigger_workspace_transition(
+        &mut self,
+        output_name: &str,
+        old_ws: &WorkspaceId,
+        new_ws: &WorkspaceId,
+        direction_hint: i32,
+    ) {
+        if old_ws == new_ws {
+            return;
+        }
+        let Some(ws) = self.workspaces.get(new_ws) else {
+            return;
+        };
+        let is_offscreen = matches!(ws.presentation, PresentationTarget::Offscreen { .. });
+        let viewport = ws.viewport;
+        let ws_name = ws.name.clone();
+        let layout_str = match ws.layout_mode {
+            LayoutMode::Dwindle => "dwindle",
+            LayoutMode::Scrolling => "scrolling",
+            LayoutMode::Deck => "deck",
+        };
+        let dir = if direction_hint != 0 {
+            direction_hint
+        } else {
+            let old_num = self
+                .workspaces
+                .get(old_ws)
+                .and_then(|w| w.name.parse::<i32>().ok());
+            let new_num = ws_name.parse::<i32>().ok();
+            match (old_num, new_num) {
+                (Some(a), Some(b)) if b != a => (b - a).signum(),
+                _ => 1,
+            }
+        };
+        let now_ms = self.elapsed_ms();
+        let anim_cfg = self.lua_sandbox.config_snapshot().appearance.animations;
+        self.workspace_transitions.borrow_mut().trigger_switch(
+            output_name,
+            dir,
+            viewport,
+            now_ms,
+            &anim_cfg,
+            is_offscreen,
+        );
+        if !is_offscreen {
+            self.emit_lua_event(
+                "workspace.focused",
+                serde_json::json!({
+                    "id": new_ws.to_string(),
+                    "name": ws_name,
+                    "output": output_name,
+                    "layout": layout_str,
+                }),
+            );
+        }
+    }
+
+    /// Focuses a mapped window matching raw numeric `slot` (`LuaWindowInfo.id`).
+    pub fn activate_window_by_slot(&mut self, slot: u64) -> bool {
+        let Some(win_id) = self
+            .mapped_windows
+            .iter()
+            .find(|m| m.win_id.slot == slot)
+            .map(|m| m.win_id)
+        else {
+            return false;
+        };
+        self.activate_window_by_id(win_id)
+    }
+
+    /// Changes a workspace's tiling layout (`dwindle` | `scrolling` | `deck` | `bsp`) and smoothly
+    /// retargets window geometries via the configured Hooke/Bezier curves.
+    pub fn set_workspace_layout(&mut self, target_ws: Option<&str>, layout: LayoutMode) -> bool {
+        let ws_id = match target_ws {
+            Some(q) => self.ensure_workspace_by_name_or_id(q),
+            None => self.effective_interactive_ws_id(),
+        };
+        let now_ms = self.elapsed_ms();
+        let Some(ws) = self.workspaces.get_mut(&ws_id) else {
+            return false;
+        };
+        ws.layout_mode = layout;
+        ws.recalculate(now_ms);
+        self.sync_workspace_geometries(&ws_id);
+        self.queue_redraw();
+        true
     }
 
     pub fn activate_window_by_id(&mut self, win_id: WindowId) -> bool {
@@ -4156,5 +4560,75 @@ pub(crate) mod tests {
         );
         assert!((right_replugged.current_scale().fractional_scale() - 1.5).abs() < 1e-4);
         assert_eq!(right_replugged.current_transform(), Transform::_90);
+    }
+
+    #[test]
+    fn output_changed_hook_and_workspace_transition_dispatch_end_to_end() {
+        use koma_lua::ActionDescriptor;
+        use smithay::output::{Mode, PhysicalProperties, Subpixel};
+
+        let (_el, _disp, mut state) = make_headless_test_state();
+        state
+            .lua_sandbox
+            .eval_init_lua(
+                r##"
+                koma.on("output.changed", function(ctx, ev)
+                    if ev.width and ev.width >= 3440 then
+                        ctx:dispatch(koma.act.workspace.set_layout("scrolling"))
+                    end
+                end)
+                koma.on("workspace.focused", function(ctx, ev)
+                    if ev.name == "2" then
+                        ctx:dispatch(koma.act.workspace.set_layout("deck", "2"))
+                    end
+                end)
+                "##,
+            )
+            .expect("Lua event hooks must evaluate");
+
+        let ultrawide = Output::new(
+            "DP-1".to_owned(),
+            PhysicalProperties {
+                size: (800, 340).into(),
+                subpixel: Subpixel::Unknown,
+                make: "Test".to_owned(),
+                model: "Ultrawide".to_owned(),
+                serial_number: "uw-1".to_owned(),
+            },
+        );
+        ultrawide.change_current_state(
+            Some(Mode {
+                size: (3440, 1440).into(),
+                refresh: 165_000,
+            }),
+            None,
+            Some(Scale::Integer(1)),
+            None,
+        );
+        state.test_outputs = vec![ultrawide.clone()];
+        state.register_or_update_output(&ultrawide, Some((0, 0)), SafeAreaInsets::default(), true);
+
+        let ws1 = state.active_workspace_for_output("DP-1");
+        assert_eq!(
+            state.workspaces.get(&ws1).unwrap().layout_mode,
+            LayoutMode::Scrolling,
+            "output.changed Lua hook should auto-switch ultrawide workspace to scrolling"
+        );
+
+        crate::keybind_dispatcher::execute_action_descriptor(
+            &mut state,
+            ActionDescriptor::WorkspaceFocus("2".to_owned()),
+            false,
+        );
+        let ws2 = state.active_workspace_for_output("DP-1");
+        assert_eq!(
+            state.workspaces.get(&ws2).unwrap().layout_mode,
+            LayoutMode::Deck,
+            "workspace.focused Lua hook should switch workspace 2 to deck"
+        );
+        assert!(
+            state.has_active_animations(),
+            "switching workspace should start a WorkspaceTransitionTable slide animation"
+        );
     }
 }
