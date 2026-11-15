@@ -38,6 +38,7 @@ use smithay::{
 use tracing::debug;
 
 use crate::state::{ClientState, KomaState};
+use koma_proto::WorkspaceId;
 
 pub const XDG_ACTIVATION_TOKEN_TTL: Duration = Duration::from_secs(10);
 pub const MAX_DEFERRED_ACTIVATIONS: usize = 16;
@@ -58,6 +59,14 @@ pub struct StoredToplevelIcon {
 #[derive(Debug, Clone)]
 pub struct DeferredXdgActivation {
     pub surface: WlSurface,
+    pub created_at: Instant,
+}
+
+/// Creator sandbox/jail policy snapshotted when an `xdg_activation_token_v1` is created.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivationTokenPolicy {
+    pub restricted: bool,
+    pub jailed_workspace: Option<WorkspaceId>,
     pub created_at: Instant,
 }
 
@@ -157,9 +166,11 @@ impl XdgActivationHandler for KomaState {
         &mut self.xdg_activation_state
     }
 
-    fn token_created(&mut self, _token: XdgActivationToken, data: XdgActivationTokenData) -> bool {
+    fn token_created(&mut self, token: XdgActivationToken, data: XdgActivationTokenData) -> bool {
         self.xdg_activation_state
             .retain_tokens(|_, info| info.timestamp.elapsed() < XDG_ACTIVATION_TOKEN_TTL);
+        self.xdg_activation_tokens
+            .retain(|_, policy| policy.created_at.elapsed() < XDG_ACTIVATION_TOKEN_TTL);
 
         // If a serial + seat was supplied, ensure it matches the compositor's seat.
         if let Some((_, ref wl_seat)) = data.serial
@@ -172,6 +183,29 @@ impl XdgActivationHandler for KomaState {
         {
             return false;
         }
+
+        let Some(ref client_id) = data.client_id else {
+            return false;
+        };
+        let Ok(client_data) = self
+            .display_handle
+            .backend_handle()
+            .get_client_data(client_id.clone())
+        else {
+            return false;
+        };
+        let Some(requester_state) = client_data.downcast_ref::<ClientState>() else {
+            return false;
+        };
+
+        self.xdg_activation_tokens.insert(
+            token,
+            ActivationTokenPolicy {
+                restricted: requester_state.restricted,
+                jailed_workspace: requester_state.jailed_workspace.clone(),
+                created_at: data.timestamp,
+            },
+        );
         true
     }
 
@@ -183,33 +217,41 @@ impl XdgActivationHandler for KomaState {
     ) {
         let expired = token_data.timestamp.elapsed() >= XDG_ACTIVATION_TOKEN_TTL;
         let _ = self.xdg_activation_state.remove_token(&token);
+        let policy = self.xdg_activation_tokens.remove(&token);
+        self.xdg_activation_state
+            .retain_tokens(|_, info| info.timestamp.elapsed() < XDG_ACTIVATION_TOKEN_TTL);
+        self.xdg_activation_tokens
+            .retain(|_, p| p.created_at.elapsed() < XDG_ACTIVATION_TOKEN_TTL);
         if expired || !surface.alive() {
             return;
         }
 
-        // Prevent cross-sandbox / cross-jail activation across isolated clients.
-        if let (Some(token_client_id), Some(target_client)) =
-            (token_data.client_id.as_ref(), surface.client())
+        // Fail closed when creator policy could not be snapshotted at token creation.
+        let Some(requester_policy) = policy else {
+            debug!("blocked xdg_activation request missing snapshotted creator policy");
+            return;
+        };
+
+        // Prevent cross-sandbox / cross-jail activation across isolated clients even if the
+        // requester disconnected before submitting `activate`.
+        let target_client = surface.client();
+        let target_state = target_client
+            .as_ref()
+            .and_then(|c| c.get_data::<ClientState>());
+        if (requester_policy.restricted || requester_policy.jailed_workspace.is_some())
+            && target_state.is_none()
         {
-            let target_state = target_client.get_data::<ClientState>();
-            let requester_data = self
-                .display_handle
-                .backend_handle()
-                .get_client_data(token_client_id.clone())
-                .ok();
-            let requester_state = requester_data
-                .as_ref()
-                .and_then(|d| d.downcast_ref::<ClientState>());
-            let target_jail = target_state.and_then(|d| d.jailed_workspace.as_ref());
-            let requester_jail = requester_state.and_then(|d| d.jailed_workspace.as_ref());
-            let requester_restricted = requester_state.is_some_and(|d| d.restricted);
-            let target_restricted = target_state.is_some_and(|d| d.restricted);
-            if (requester_jail.is_some() && requester_jail != target_jail)
-                || (requester_restricted && !target_restricted)
-            {
-                debug!("blocked cross-jail/cross-sandbox xdg_activation request");
-                return;
-            }
+            debug!("blocked xdg_activation request from restricted creator with unresolved target");
+            return;
+        }
+        let target_jail = target_state.and_then(|d| d.jailed_workspace.as_ref());
+        let target_restricted = target_state.is_some_and(|d| d.restricted);
+        if (requester_policy.jailed_workspace.is_some()
+            && requester_policy.jailed_workspace.as_ref() != target_jail)
+            || (requester_policy.restricted && !target_restricted)
+        {
+            debug!("blocked cross-jail/cross-sandbox xdg_activation request");
+            return;
         }
 
         self.reconcile_session_lock();
@@ -661,7 +703,8 @@ impl KomaState {
         }
     }
 
-    /// Centralized relative pointer motion supporting locked, confined, and free pointer constraints.
+    /// Centralized relative pointer motion supporting locked, confined, and free pointer constraints
+    /// across 2D multi-output layouts (including non-contiguous gap crossing).
     #[cfg_attr(not(feature = "smithay-tty"), allow(dead_code))]
     pub fn handle_pointer_relative_motion(
         &mut self,
@@ -669,7 +712,7 @@ impl KomaState {
         delta_unaccel: Point<f64, Logical>,
         time: smithay::backend::input::InputTime,
     ) {
-        let candidate = self.pointer_location + delta;
+        let candidate = self.step_pointer_across_outputs(delta);
         self.dispatch_constrained_pointer_motion(candidate, delta, delta_unaccel, time);
     }
 
@@ -762,6 +805,13 @@ impl KomaState {
 
         let clamped = self.clamp_pointer_to_outputs(candidate_pos);
         self.pointer_location = clamped;
+        if let Some(new_out) = self.output_at_point_strict(clamped) {
+            let new_name = new_out.name();
+            if self.focused_output_name.as_deref() != Some(new_name.as_str()) {
+                self.focused_output_name = Some(new_name.clone());
+                self.active_ws_id = self.active_workspace_for_output(&new_name);
+            }
+        }
         let under = self.surface_under(clamped);
         pointer.motion(
             self,
@@ -779,7 +829,31 @@ impl KomaState {
     }
 
     #[must_use]
+    pub fn step_pointer_across_outputs(&self, delta: Point<f64, Logical>) -> Point<f64, Logical> {
+        if self.output_layout.enabled_entries().next().is_some() {
+            let next = self.output_layout.step_pointer(
+                koma_model::LogicalPoint {
+                    x: self.pointer_location.x,
+                    y: self.pointer_location.y,
+                },
+                koma_model::LogicalPoint {
+                    x: delta.x,
+                    y: delta.y,
+                },
+            );
+            return Point::from((next.x, next.y));
+        }
+        self.clamp_pointer_to_outputs(self.pointer_location + delta)
+    }
+
+    #[must_use]
     pub fn clamp_pointer_to_outputs(&self, pos: Point<f64, Logical>) -> Point<f64, Logical> {
+        if self.output_layout.enabled_entries().next().is_some() {
+            let clamped = self
+                .output_layout
+                .clamp_pointer(koma_model::LogicalPoint { x: pos.x, y: pos.y });
+            return Point::from((clamped.x, clamped.y));
+        }
         let (max_w, max_h) = self
             .workspaces
             .get(&self.active_ws_id)
@@ -797,7 +871,8 @@ impl KomaState {
         if let Some(m) = self.mapped_windows.iter().find(|m| {
             !m.is_minimized && m.window.toplevel().is_some_and(|t| *t.wl_surface() == root)
         }) {
-            return Some(Point::from((f64::from(m.rect.x), f64::from(m.rect.y))));
+            let ws_origin = self.workspace_output_origin(&m.ws_id);
+            return Some(ws_origin + Point::from((f64::from(m.rect.x), f64::from(m.rect.y))));
         }
         for out in self.all_outputs() {
             let map = layer_map_for_output(&out);

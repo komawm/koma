@@ -844,7 +844,18 @@ fn install_koma_globals<'gc>(ctx: Context<'gc>, state: SharedState) -> Result<()
             "monitor",
             Callback::from_fn(&ctx, move |ctx, _, mut stack| {
                 let val: Value = stack.consume(ctx)?;
-                let spec: MonitorSpec = from_value(val).map_err(RuntimeError::new)?;
+                let has_explicit_transform =
+                    matches!(val, Value::Table(t) if !t.get_value(ctx, "transform").is_nil());
+                let mut spec: MonitorSpec = from_value(val).map_err(RuntimeError::new)?;
+                spec.has_explicit_transform = has_explicit_transform;
+                spec.parsed_transform().map_err(runtime_err)?;
+                if let crate::schema::MonitorScaleSpec::Fixed(s) = spec.scale
+                    && (!s.is_finite() || !(0.5..=4.0).contains(&s))
+                {
+                    return Err(runtime_err(format!(
+                        "invalid monitor scale `{s}` (expected \"auto\" or 0.5..=4.0)"
+                    )));
+                }
                 st.borrow_mut().config.monitors.push(spec);
                 Ok(CallbackReturn::Return)
             }),
@@ -1505,7 +1516,86 @@ fn build_act_namespace<'gc>(ctx: Context<'gc>) -> Result<Table<'gc>, LuaError<'g
             Ok(CallbackReturn::Return)
         }),
     );
+    win.set_field(
+        ctx,
+        "move_to_monitor",
+        Callback::from_fn(&ctx, |ctx, _, mut stack| {
+            let mon: std::string::String = stack.consume(ctx)?;
+            stack.replace(
+                ctx,
+                UserData::new_static(&ctx, ActionDescriptor::WindowMoveToMonitor(mon)),
+            );
+            Ok(CallbackReturn::Return)
+        }),
+    );
+    win.set_field(
+        ctx,
+        "move_to_monitor_direction",
+        Callback::from_fn(&ctx, |ctx, _, mut stack| {
+            let dir: std::string::String = stack.consume(ctx)?;
+            stack.replace(
+                ctx,
+                UserData::new_static(&ctx, ActionDescriptor::WindowMoveToMonitorDirection(dir)),
+            );
+            Ok(CallbackReturn::Return)
+        }),
+    );
+    for (field, dir) in [
+        ("move_to_monitor_left", "left"),
+        ("move_to_monitor_right", "right"),
+        ("move_to_monitor_up", "up"),
+        ("move_to_monitor_down", "down"),
+    ] {
+        win.set_field(
+            ctx,
+            field,
+            unit_act(
+                ctx,
+                ActionDescriptor::WindowMoveToMonitorDirection(dir.to_owned()),
+            ),
+        );
+    }
     act.set_field(ctx, "window", win);
+
+    // koma.act.monitor.*
+    let mon_ns = Table::new(&ctx);
+    mon_ns.set_field(
+        ctx,
+        "focus",
+        Callback::from_fn(&ctx, |ctx, _, mut stack| {
+            let mon: std::string::String = stack.consume(ctx)?;
+            stack.replace(
+                ctx,
+                UserData::new_static(&ctx, ActionDescriptor::MonitorFocus(mon)),
+            );
+            Ok(CallbackReturn::Return)
+        }),
+    );
+    mon_ns.set_field(
+        ctx,
+        "focus_direction",
+        Callback::from_fn(&ctx, |ctx, _, mut stack| {
+            let dir: std::string::String = stack.consume(ctx)?;
+            stack.replace(
+                ctx,
+                UserData::new_static(&ctx, ActionDescriptor::MonitorFocusDirection(dir)),
+            );
+            Ok(CallbackReturn::Return)
+        }),
+    );
+    for (field, dir) in [
+        ("focus_left", "left"),
+        ("focus_right", "right"),
+        ("focus_up", "up"),
+        ("focus_down", "down"),
+    ] {
+        mon_ns.set_field(
+            ctx,
+            field,
+            unit_act(ctx, ActionDescriptor::MonitorFocusDirection(dir.to_owned())),
+        );
+    }
+    act.set_field(ctx, "monitor", mon_ns);
 
     // koma.act.focus.*
     let focus = Table::new(&ctx);
@@ -2518,5 +2608,67 @@ mod tests {
         assert!(example_cfg.input.inherit_default_binds);
         assert!(example_cfg.appearance.border.enabled);
         assert!(example_cfg.appearance.shadow.enabled);
+    }
+
+    #[test]
+    fn evaluates_monitor_macbook_fields_transforms_and_monitor_actions() {
+        let mut sandbox = PhodopusSandbox::new(DEFAULT_HEAP_LIMIT_BYTES, None).unwrap();
+        let lua = r##"
+            koma.monitor({
+                output = "eDP-1",
+                mode = "3024x1964@120",
+                scale = "auto",
+                position = { x = 0, y = 0 },
+                safe_area = { top = 38 },
+            })
+            koma.monitor({
+                output = "DP-1",
+                mode = "3840x2160@60",
+                scale = 1.5,
+                transform = "normal",
+                position = { 1512, 0 },
+                allow_non_desktop = false,
+            })
+            koma.monitor({
+                output = "DP-2",
+                non_desktop = true,
+                transform = "flipped-270",
+            })
+            koma.bind("Mod + Left", koma.act.monitor.focus_left())
+            koma.bind("Mod + Shift + Right", koma.act.window.move_to_monitor_right())
+            koma.bind("Mod + 0", koma.act.monitor.focus("DP-1"))
+            koma.bind("Mod + Shift + 0", koma.act.window.move_to_monitor("eDP-1"))
+        "##;
+        let cfg = sandbox
+            .eval_init_lua(lua)
+            .expect("multi-monitor init.lua must evaluate cleanly");
+        assert_eq!(cfg.monitors.len(), 3);
+        assert!(!cfg.monitors[0].has_explicit_transform);
+        assert!(cfg.monitors[1].has_explicit_transform);
+        assert_eq!(cfg.monitors[1].resolved_position(), Some((1512, 0)));
+        assert!(cfg.monitors[2].allow_non_desktop);
+        assert_eq!(
+            cfg.monitors[2].parsed_transform().unwrap(),
+            koma_model::OutputTransform::Flipped270
+        );
+        assert_eq!(cfg.monitors[0].safe_area.top, 38);
+        assert_eq!(cfg.monitors[0].scale, crate::MonitorScaleSpec::Auto);
+        assert_eq!(cfg.binds.len(), 4);
+        assert_eq!(
+            cfg.binds[0].action,
+            ActionDescriptor::MonitorFocusDirection("left".to_owned())
+        );
+        assert_eq!(
+            cfg.binds[1].action,
+            ActionDescriptor::WindowMoveToMonitorDirection("right".to_owned())
+        );
+        assert_eq!(
+            cfg.binds[2].action,
+            ActionDescriptor::MonitorFocus("DP-1".to_owned())
+        );
+        assert_eq!(
+            cfg.binds[3].action,
+            ActionDescriptor::WindowMoveToMonitor("eDP-1".to_owned())
+        );
     }
 }

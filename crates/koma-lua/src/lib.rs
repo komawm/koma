@@ -23,13 +23,13 @@ pub use crate::{
         DeviceOverrideSpec, EffectiveLibinputSettings, GestureSpec, InputConfigSpec,
         KeyboardInputSpec, KomaConfigRegistry, KomaHandleRef, LibinputDeviceProbe,
         LuaLayerRuleSpec, LuaWindowRuleSpec, MacroDefinition, MacroHandleId, MacroLimitsSpec,
-        MacroParamSpec, MonitorSpec, PointerInputSpec, RuleHandleId, ScrollMethodSpec,
-        TabletInputSpec, TouchpadInputSpec, WorkspaceSpec, XwaylandConfigSpec,
-        resolve_effective_libinput_settings, validate_gesture_spec,
+        MacroParamSpec, MonitorPositionSpec, MonitorScaleSpec, MonitorSpec, PointerInputSpec,
+        RuleHandleId, ScrollMethodSpec, TabletInputSpec, TouchpadInputSpec, WorkspaceSpec,
+        XwaylandConfigSpec, resolve_effective_libinput_settings, validate_gesture_spec,
     },
     typegen::generate_luals_stubs,
 };
 pub use koma_model::{
     AnimationConfig, BlurConfig, BorderConfig, DimConfig, DwindleConfig, FocusRingConfig,
-    ScrollingConfig, ShadowConfig,
+    OutputTransform, SafeAreaInsets, ScrollingConfig, ShadowConfig,
 };

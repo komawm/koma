@@ -675,16 +675,23 @@ pub fn reload_from_lua_source(
     //    mapped windows, Deck stacks, or active Agent `WorkspaceLease` `Epoch`s!)
     reconcile_declarative_workspaces(state, &registry, now_ms);
 
-    // 3. Reconcile live KMS monitor scales (`koma.monitor`) without dropping Wayland surfaces
+    // 3. Reconcile live KMS monitor scales, transforms, 2D positions & notch safe areas
     #[cfg(feature = "smithay-tty")]
     {
-        let resized = if let Some(ActiveBackend::Tty(tty)) = state.backend.as_mut() {
+        let updated = if let Some(ActiveBackend::Tty(tty)) = state.backend.as_mut() {
             tty.apply_hot_reloaded_monitors(&registry)
         } else {
             Vec::new()
         };
-        for (out, lw, lh, scale) in resized {
-            state.handle_output_resized(&out, lw, lh, scale);
+        for upd in updated {
+            state.set_output_safe_area(upd.output.name(), upd.safe_area);
+            if upd.explicit_pos.is_some() {
+                state
+                    .output_layout
+                    .set_explicit_position(&upd.output.name(), upd.explicit_pos);
+                state.apply_output_layout_positions();
+            }
+            state.handle_output_resized(&upd.output, upd.logical_w, upd.logical_h, upd.scale);
         }
     }
 

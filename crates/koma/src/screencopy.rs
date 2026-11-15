@@ -508,6 +508,13 @@ pub fn flush_pending_screencopy_frames(state: &mut KomaState) {
             mark_frame_failed(&frame);
             continue;
         }
+        if !state
+            .screencopy_state
+            .manager_has_unseen_damage(item.spec.manager_id)
+        {
+            state.screencopy_state.pending_damage_copies.push(item);
+            continue;
+        }
         execute_screencopy_copy(state, &frame, &item.buffer, &item.spec, true);
     }
 }
@@ -695,18 +702,23 @@ fn render_output_rgba8_for_screencopy(
         let cursor_pos = state.pointer_location - output.current_location().to_f64();
         let mut cursor_manager = std::mem::take(&mut state.cursor_manager);
         let base_items = state.collect_workspace_scene_items(&ws_id, true);
-        let special_overlay = state
-            .active_special_ws_id
-            .as_ref()
-            .filter(|sp_id| state.workspaces.contains_key(*sp_id))
-            .map(|sp_id| {
-                let sp_lease = state
-                    .workspaces
-                    .get(sp_id)
-                    .map(|ws| ws.lease.state().clone())
-                    .unwrap_or(WorkspaceLeaseState::Unheld);
-                (sp_lease, state.collect_workspace_scene_items(sp_id, true))
-            });
+        let special_overlay =
+            if state.focused_output_name().as_deref() == Some(output.name().as_str()) {
+                state
+                    .active_special_ws_id
+                    .as_ref()
+                    .filter(|sp_id| state.workspaces.contains_key(*sp_id))
+                    .map(|sp_id| {
+                        let sp_lease = state
+                            .workspaces
+                            .get(sp_id)
+                            .map(|ws| ws.lease.state().clone())
+                            .unwrap_or(WorkspaceLeaseState::Unheld);
+                        (sp_lease, state.collect_workspace_scene_items(sp_id, true))
+                    })
+            } else {
+                None
+            };
         let base_lease = state
             .workspaces
             .get(&ws_id)
@@ -749,7 +761,9 @@ fn render_output_rgba8_for_screencopy(
                     spec.scale,
                 )
             });
-            if offscreen.size() != spec.output_phys_size {
+            if offscreen.size() != spec.output_phys_size
+                || offscreen.scale() != smithay::utils::Scale::from(spec.scale)
+            {
                 *offscreen = LazyOffscreenSurface::new(
                     spec.output_phys_size.w,
                     spec.output_phys_size.h,
@@ -790,14 +804,19 @@ fn copy_to_dmabuf(
         let cursor_pos = state.pointer_location - output.current_location().to_f64();
         let mut cursor_manager = std::mem::take(&mut state.cursor_manager);
         let base_items = state.collect_workspace_scene_items(&ws_id, true);
-        let special_overlay = state.active_special_ws_id.as_ref().map(|sp_id| {
-            let sp_lease = state
-                .workspaces
-                .get(sp_id)
-                .map(|ws| ws.lease.state().clone())
-                .unwrap_or(WorkspaceLeaseState::Unheld);
-            (sp_lease, state.collect_workspace_scene_items(sp_id, true))
-        });
+        let special_overlay =
+            if state.focused_output_name().as_deref() == Some(output.name().as_str()) {
+                state.active_special_ws_id.as_ref().map(|sp_id| {
+                    let sp_lease = state
+                        .workspaces
+                        .get(sp_id)
+                        .map(|ws| ws.lease.state().clone())
+                        .unwrap_or(WorkspaceLeaseState::Unheld);
+                    (sp_lease, state.collect_workspace_scene_items(sp_id, true))
+                })
+            } else {
+                None
+            };
         let base_lease = state
             .workspaces
             .get(&ws_id)
@@ -867,8 +886,8 @@ fn copy_to_dmabuf(
     res
 }
 
-fn output_workspace_id(state: &KomaState, _output: &Output) -> WorkspaceId {
-    state.active_ws_id.clone()
+fn output_workspace_id(state: &KomaState, output: &Output) -> WorkspaceId {
+    state.active_workspace_for_output(&output.name())
 }
 
 #[allow(clippy::too_many_arguments)]

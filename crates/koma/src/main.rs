@@ -89,6 +89,8 @@ mod keybind_dispatcher;
 #[cfg(feature = "smithay-winit")]
 mod macro_runtime;
 #[cfg(feature = "smithay-winit")]
+mod output_management;
+#[cfg(feature = "smithay-winit")]
 mod output_power;
 #[cfg(feature = "smithay-winit")]
 mod pointer_grabs;
@@ -106,6 +108,8 @@ mod state;
 mod xwayland_satellite;
 
 mod cli;
+#[cfg(any(feature = "smithay-tty", test))]
+mod edid;
 
 use std::env;
 

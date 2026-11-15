@@ -14,9 +14,9 @@ use std::{
 use calloop::{LoopHandle, LoopSignal, RegistrationToken};
 use koma_lua::{ActionDescriptor, TrampolineScheduler, phodopus_bridge::PhodopusSandbox};
 use koma_model::{
-    LayoutMode, LogicalPoint, LogicalRect, LogicalViewport, OpenMode, PresentationTarget,
-    WindowAnimationTable, WindowMatchContext, WindowRuleEngine, WorkspaceLeaseState,
-    WorkspaceState,
+    LayoutMode, LogicalPoint, LogicalRect, LogicalViewport, OpenMode, OutputLayout,
+    OutputTransform, PresentationTarget, SafeAreaInsets, SavedOutputConfig, WindowAnimationTable,
+    WindowMatchContext, WindowRuleEngine, WorkspaceLeaseState, WorkspaceState,
 };
 use koma_proto::{
     CapabilityToken, Epoch, EventTopic, OutputId, SeatId, TokenClaims, WindowId, WorkspaceEvent,
@@ -37,7 +37,7 @@ use smithay::{
         utils::under_from_surface_tree,
     },
     input::{Seat, SeatState, keyboard::XkbConfig, pointer::CursorImageStatus},
-    output::Output,
+    output::{Output, Scale},
     reexports::{
         wayland_protocols::{
             ext::session_lock::v1::server::ext_session_lock_v1::ExtSessionLockV1,
@@ -52,13 +52,16 @@ use smithay::{
             protocol::wl_surface::WlSurface,
         },
     },
-    utils::{IsAlive as _, Logical, Point, SERIAL_COUNTER, Size},
+    utils::{IsAlive as _, Logical, Point, SERIAL_COUNTER, Size, Transform},
     wayland::{
-        compositor::{CompositorClientState, CompositorState, get_parent, with_states},
+        compositor::{
+            CompositorClientState, CompositorState, TraversalAction, get_parent, with_states,
+            with_surface_tree_downward,
+        },
         cursor_shape::CursorShapeManagerState,
         dmabuf::DmabufState,
         foreign_toplevel_list::ForeignToplevelListState,
-        fractional_scale::FractionalScaleManagerState,
+        fractional_scale::{FractionalScaleManagerState, with_fractional_scale},
         idle_inhibit::IdleInhibitManagerState,
         idle_notify::IdleNotifierState,
         output::OutputManagerState,
@@ -83,7 +86,7 @@ use smithay::{
         shm::ShmState,
         viewporter::ViewporterState,
         virtual_keyboard::VirtualKeyboardManagerState,
-        xdg_activation::XdgActivationState,
+        xdg_activation::{XdgActivationState, XdgActivationToken},
         xdg_toplevel_icon::XdgToplevelIconManager,
     },
 };
@@ -102,13 +105,14 @@ use crate::{
     backend_winit::WinitBackendState,
     config_watcher::{ConfigWatcherHandle, KomaConfigPath},
     cursor::CursorManager,
-    desktop_protocols::{DeferredXdgActivation, StoredToplevelIcon},
+    desktop_protocols::{ActivationTokenPolicy, DeferredXdgActivation, StoredToplevelIcon},
     foreign_toplevel::WlrForeignToplevelState,
     gamma_control::{GammaControlState, GammaLut},
     gesture_dispatcher::GestureTable,
     ipc_server::IpcClientConn,
     keybind_dispatcher::KeybindTable,
     macro_runtime::{ActivePointerAnimation, WorkspaceDamageTracker},
+    output_management::WlrOutputManagerState,
     output_power::{OutputPowerMode, OutputPowerState},
     screencopy::ScreencopyState,
     security_context::{
@@ -392,16 +396,49 @@ pub const fn resolve_keyboard_focus_source(
     }
 }
 
+/// Converts Koma's pure domain `OutputTransform` into Smithay's `Transform`.
+#[must_use]
+pub const fn koma_transform_to_smithay(t: OutputTransform) -> Transform {
+    match t {
+        OutputTransform::Normal => Transform::Normal,
+        OutputTransform::Rotate90 => Transform::_90,
+        OutputTransform::Rotate180 => Transform::_180,
+        OutputTransform::Rotate270 => Transform::_270,
+        OutputTransform::Flipped => Transform::Flipped,
+        OutputTransform::Flipped90 => Transform::Flipped90,
+        OutputTransform::Flipped180 => Transform::Flipped180,
+        OutputTransform::Flipped270 => Transform::Flipped270,
+    }
+}
+
+/// Converts Smithay's `Transform` into Koma's pure domain `OutputTransform`.
+#[must_use]
+pub const fn smithay_transform_to_koma(t: Transform) -> OutputTransform {
+    match t {
+        Transform::Normal => OutputTransform::Normal,
+        Transform::_90 => OutputTransform::Rotate90,
+        Transform::_180 => OutputTransform::Rotate180,
+        Transform::_270 => OutputTransform::Rotate270,
+        Transform::Flipped => OutputTransform::Flipped,
+        Transform::Flipped90 => OutputTransform::Flipped90,
+        Transform::Flipped180 => OutputTransform::Flipped180,
+        Transform::Flipped270 => OutputTransform::Flipped270,
+    }
+}
+
 /// Computes logical output width, height, and scale from a Smithay `Output`.
 #[must_use]
 pub fn output_logical_viewport(output: &Output) -> (u32, u32, f64) {
-    let scale = output.current_scale().fractional_scale();
+    let scale = output.current_scale().fractional_scale().max(0.01);
     let (w, h) = output
         .current_mode()
         .map(|mode| {
-            let logical_size = mode.size.to_f64().to_logical(scale).to_i32_round::<i32>();
-            let transformed = output.current_transform().transform_size(logical_size);
-            (transformed.w.max(64) as u32, transformed.h.max(64) as u32)
+            let phys_transformed = output.current_transform().transform_size(mode.size);
+            let logical = phys_transformed
+                .to_f64()
+                .to_logical(scale)
+                .to_i32_round::<i32>();
+            (logical.w.max(64) as u32, logical.h.max(64) as u32)
         })
         .unwrap_or((1920, 1080));
     (w, h, scale)
@@ -580,6 +617,7 @@ pub struct KomaState {
     #[allow(dead_code)]
     pub xdg_toplevel_icon_manager: XdgToplevelIconManager,
     pub xdg_activation_state: XdgActivationState,
+    pub xdg_activation_tokens: HashMap<XdgActivationToken, ActivationTokenPolicy>,
     pub deferred_xdg_activations: Vec<DeferredXdgActivation>,
     pub foreign_toplevel_list_state: ForeignToplevelListState,
     pub wlr_foreign_toplevel_state: WlrForeignToplevelState,
@@ -593,6 +631,7 @@ pub struct KomaState {
     pub relative_pointer_manager_state: RelativePointerManagerState,
     pub screencopy_state: ScreencopyState,
     pub output_power_state: OutputPowerState,
+    pub wlr_output_manager_state: WlrOutputManagerState,
     pub gamma_control_state: GammaControlState,
     pub popups: PopupManager,
     pub ime_popups: Vec<ImePopupSurface>,
@@ -608,6 +647,10 @@ pub struct KomaState {
     pub cursor_anim_timer_token: Option<RegistrationToken>,
 
     // Koma pure domain model (`koma-model` + `koma-lua` + `koma-seat`)
+    pub output_layout: OutputLayout,
+    pub output_workspaces: HashMap<String, WorkspaceId>,
+    pub focused_output_name: Option<String>,
+    pub output_safe_areas: HashMap<String, SafeAreaInsets>,
     pub active_ws_id: WorkspaceId,
     /// Optional `special:<name>` Scratchpad overlay workspace currently visible above `active_ws_id`!
     pub active_special_ws_id: Option<WorkspaceId>,
@@ -717,6 +760,7 @@ impl KomaState {
             RelativePointerManagerState::new::<Self>(&display_handle);
         let screencopy_state = ScreencopyState::new(&display_handle);
         let output_power_state = OutputPowerState::new(&display_handle);
+        let wlr_output_manager_state = WlrOutputManagerState::new(&display_handle);
         let gamma_control_state = GammaControlState::new(&display_handle);
 
         let mut seat = seat_state.new_wl_seat(&display_handle, seat_name);
@@ -787,6 +831,7 @@ impl KomaState {
             xdg_decoration_state,
             xdg_toplevel_icon_manager,
             xdg_activation_state,
+            xdg_activation_tokens: HashMap::new(),
             deferred_xdg_activations: Vec::new(),
             foreign_toplevel_list_state,
             wlr_foreign_toplevel_state,
@@ -797,6 +842,7 @@ impl KomaState {
             relative_pointer_manager_state,
             screencopy_state,
             output_power_state,
+            wlr_output_manager_state,
             gamma_control_state,
             popups: PopupManager::default(),
             ime_popups: Vec::new(),
@@ -814,6 +860,10 @@ impl KomaState {
             )),
             cursor_manager: CursorManager::new(),
             cursor_anim_timer_token: None,
+            output_layout: OutputLayout::new(),
+            output_workspaces: HashMap::new(),
+            focused_output_name: None,
+            output_safe_areas: HashMap::new(),
             active_ws_id,
             active_special_ws_id: None,
             workspaces,
@@ -1075,6 +1125,615 @@ impl KomaState {
             .as_ref()
             .map(ActiveBackend::all_outputs)
             .unwrap_or_default()
+    }
+
+    /// Returns the currently focused physical `Output`, falling back to primary or first output.
+    #[must_use]
+    pub fn focused_output(&self) -> Option<Output> {
+        let outputs = self.all_outputs();
+        if let Some(ref focused_name) = self.focused_output_name
+            && let Some(out) = outputs.iter().find(|o| o.name() == *focused_name)
+        {
+            return Some(out.clone());
+        }
+        self.primary_output().or_else(|| outputs.into_iter().next())
+    }
+
+    #[must_use]
+    pub fn focused_output_name(&self) -> Option<String> {
+        self.focused_output().map(|o| o.name())
+    }
+
+    #[must_use]
+    pub fn output_safe_area(&self, output_name: &str) -> SafeAreaInsets {
+        self.output_safe_areas
+            .get(output_name)
+            .copied()
+            .unwrap_or_default()
+            .clamped_non_negative()
+    }
+
+    pub fn set_output_safe_area(
+        &mut self,
+        output_name: impl Into<String>,
+        safe_area: SafeAreaInsets,
+    ) {
+        self.output_safe_areas
+            .insert(output_name.into(), safe_area.clamped_non_negative());
+    }
+
+    #[must_use]
+    pub fn active_workspace_for_output(&self, output_name: &str) -> WorkspaceId {
+        self.output_workspaces
+            .get(output_name)
+            .cloned()
+            .unwrap_or_else(|| self.active_ws_id.clone())
+    }
+
+    #[must_use]
+    pub fn output_for_workspace(&self, ws_id: &WorkspaceId) -> Option<Output> {
+        let outputs = self.all_outputs();
+        if let Some((out_name, _)) = self
+            .output_workspaces
+            .iter()
+            .find(|(_, assigned)| *assigned == ws_id)
+            && let Some(out) = outputs.iter().find(|o| o.name() == *out_name)
+        {
+            return Some(out.clone());
+        }
+        if let Some(ws) = self.workspaces.get(ws_id) {
+            if ws.is_special {
+                return self.focused_output();
+            }
+            if let PresentationTarget::Physical(ref out_id) = ws.presentation {
+                if out_id.as_str() == "primary" {
+                    return self.primary_output().or_else(|| outputs.into_iter().next());
+                }
+                if let Some(out) = outputs.iter().find(|o| o.name() == out_id.as_str()) {
+                    return Some(out.clone());
+                }
+            }
+        }
+        if *ws_id == self.active_ws_id {
+            self.focused_output()
+        } else {
+            None
+        }
+    }
+
+    #[must_use]
+    pub fn workspace_output_origin(&self, ws_id: &WorkspaceId) -> Point<f64, Logical> {
+        self.output_for_workspace(ws_id)
+            .map(|o| o.current_location().to_f64())
+            .unwrap_or_default()
+    }
+
+    #[must_use]
+    pub fn viewport_for_output(&self, output: &Output) -> LogicalViewport {
+        let (logical_w, logical_h, scale) = output_logical_viewport(output);
+        let non_exclusive = {
+            let mut map = layer_map_for_output(output);
+            map.arrange();
+            map.non_exclusive_zone()
+        };
+        let safe_area = self.output_safe_area(&output.name());
+        LogicalViewport::new(logical_w, logical_h, scale).with_work_area_zone_and_safe_area(
+            non_exclusive.loc.x,
+            non_exclusive.loc.y,
+            non_exclusive.size.w,
+            non_exclusive.size.h,
+            safe_area,
+        )
+    }
+
+    #[must_use]
+    pub fn preferred_scale_for_surface(&self, surface: &WlSurface) -> f64 {
+        let mut root = surface.clone();
+        while let Some(parent) = get_parent(&root) {
+            root = parent;
+        }
+        if let Some(mapped) = self
+            .mapped_windows
+            .iter()
+            .find(|m| m.window.toplevel().is_some_and(|t| *t.wl_surface() == root))
+            && let Some(out) = self.output_for_workspace(&mapped.ws_id)
+        {
+            return out.current_scale().fractional_scale().max(0.01);
+        }
+        for out in self.all_outputs() {
+            let map = layer_map_for_output(&out);
+            if map.layers().any(|l| l.wl_surface() == &root) {
+                return out.current_scale().fractional_scale().max(0.01);
+            }
+        }
+        self.focused_output()
+            .map(|o| o.current_scale().fractional_scale().max(0.01))
+            .unwrap_or(1.0)
+    }
+
+    /// Updates `wl_surface.enter/leave` and `wp_fractional_scale_v1` preferred scale across a surface tree
+    /// without nesting `with_states` locks.
+    pub fn sync_surface_tree_output_and_scale(
+        &self,
+        root_surface: &WlSurface,
+        target_output: Option<&Output>,
+        scale: f64,
+    ) {
+        let clamped_scale = scale.max(0.01);
+        let mut tree_surfaces: Vec<WlSurface> = Vec::new();
+        with_surface_tree_downward(
+            root_surface,
+            (),
+            |_, _, ()| TraversalAction::DoChildren(()),
+            |surf, states, ()| {
+                with_fractional_scale(states, |fractional| {
+                    fractional.set_preferred_scale(clamped_scale);
+                });
+                tree_surfaces.push(surf.clone());
+            },
+            |_, _, ()| true,
+        );
+        let all_outputs = self.all_outputs();
+        for surf in &tree_surfaces {
+            for out in &all_outputs {
+                if Some(out) == target_output {
+                    out.enter(surf);
+                } else {
+                    out.leave(surf);
+                }
+            }
+        }
+    }
+
+    pub fn sync_window_output_membership(&self, ws_id: &WorkspaceId) {
+        let target_output = self.output_for_workspace(ws_id);
+        let scale = target_output
+            .as_ref()
+            .map(|o| o.current_scale().fractional_scale())
+            .or_else(|| self.workspaces.get(ws_id).map(|ws| ws.viewport.scale))
+            .unwrap_or(1.0);
+        for mapped in &self.mapped_windows {
+            if mapped.ws_id == *ws_id
+                && let Some(toplevel) = mapped.window.toplevel()
+            {
+                self.sync_surface_tree_output_and_scale(
+                    toplevel.wl_surface(),
+                    target_output.as_ref(),
+                    scale,
+                );
+            }
+        }
+    }
+
+    pub fn sync_output_layer_scales(&self, output: &Output) {
+        let scale = output.current_scale().fractional_scale().max(0.01);
+        let surfaces: Vec<WlSurface> = {
+            let map = layer_map_for_output(output);
+            map.layers().map(|l| l.wl_surface().clone()).collect()
+        };
+        for surf in surfaces {
+            with_surface_tree_downward(
+                &surf,
+                (),
+                |_, _, ()| TraversalAction::DoChildren(()),
+                |_, states, ()| {
+                    with_fractional_scale(states, |fractional| {
+                        fractional.set_preferred_scale(scale);
+                    });
+                },
+                |_, _, ()| true,
+            );
+        }
+    }
+
+    pub fn apply_output_layout_positions(&self) {
+        let outputs = self.all_outputs();
+        for entry in self.output_layout.entries() {
+            if let Some(out) = outputs.iter().find(|o| o.name() == entry.name) {
+                let target_loc: Point<i32, Logical> = entry.resolved_pos.into();
+                if out.current_location() != target_loc {
+                    out.change_current_state(None, None, None, Some(target_loc));
+                }
+            }
+        }
+    }
+
+    pub fn ensure_initial_workspace_for_output(&mut self, output: &Output) -> WorkspaceId {
+        let out_name = output.name();
+        if let Some(existing) = self.output_workspaces.get(&out_name).cloned()
+            && self.workspaces.contains_key(&existing)
+        {
+            return existing;
+        }
+
+        // 1. Restore saved workspace from hotplug memory if still present and not displayed elsewhere.
+        if let Some(saved_ws) = self
+            .output_layout
+            .saved_hotplug_state(&out_name)
+            .and_then(|s| s.active_ws_id.clone())
+            && self.workspaces.contains_key(&saved_ws)
+            && !self
+                .output_workspaces
+                .iter()
+                .any(|(other_out, ws)| other_out != &out_name && ws == &saved_ws)
+        {
+            self.output_workspaces
+                .insert(out_name.clone(), saved_ws.clone());
+            if let Some(ws) = self.workspaces.get_mut(&saved_ws)
+                && !ws.is_special
+            {
+                ws.presentation = PresentationTarget::Physical(OutputId::new(&out_name));
+            }
+            return saved_ws;
+        }
+
+        // 2. Claim an existing unassigned physical workspace with matching `preferred_output`.
+        let matching_unassigned = self
+            .workspaces
+            .iter()
+            .find(|(id, ws)| {
+                !ws.is_special
+                    && matches!(
+                        &ws.presentation,
+                        PresentationTarget::Physical(out_id) if out_id.as_str() == out_name
+                    )
+                    && !self
+                        .output_workspaces
+                        .values()
+                        .any(|assigned| assigned == *id)
+            })
+            .map(|(id, _)| id.clone());
+        if let Some(ws_id) = matching_unassigned {
+            self.output_workspaces.insert(out_name, ws_id.clone());
+            return ws_id;
+        }
+
+        // 3. First connected monitor inherits the startup `active_ws_id` (`ws_01`) if unclaimed.
+        if !self
+            .output_workspaces
+            .values()
+            .any(|assigned| assigned == &self.active_ws_id)
+            && self.workspaces.contains_key(&self.active_ws_id)
+        {
+            let ws_id = self.active_ws_id.clone();
+            if let Some(ws) = self.workspaces.get_mut(&ws_id) {
+                ws.presentation = PresentationTarget::Physical(OutputId::new(&out_name));
+            }
+            self.output_workspaces.insert(out_name, ws_id.clone());
+            return ws_id;
+        }
+
+        // 4. Create a fresh numbered physical workspace (`2`, `3`, ...) bound to this monitor.
+        let mut num = 1usize;
+        let query = loop {
+            let candidate = num.to_string();
+            let used = self
+                .workspaces
+                .values()
+                .any(|ws| !ws.is_special && ws.name == candidate);
+            if !used {
+                break candidate;
+            }
+            num += 1;
+        };
+        let ws_id = self.ensure_workspace_by_name_or_id(&query);
+        if let Some(ws) = self.workspaces.get_mut(&ws_id) {
+            ws.presentation = PresentationTarget::Physical(OutputId::new(&out_name));
+        }
+        self.output_workspaces.insert(out_name, ws_id.clone());
+        ws_id
+    }
+
+    #[cfg_attr(not(feature = "smithay-tty"), allow(dead_code))]
+    #[must_use]
+    pub fn is_output_enabled(&self, output_name: &str) -> bool {
+        self.output_layout
+            .entry(output_name)
+            .is_none_or(|entry| entry.enabled)
+    }
+
+    pub fn register_or_update_output(
+        &mut self,
+        output: &Output,
+        explicit_pos: Option<(i32, i32)>,
+        safe_area: SafeAreaInsets,
+        enabled: bool,
+    ) {
+        let out_name = output.name();
+        let was_registered = self.output_layout.entry(&out_name).is_some();
+        if !was_registered
+            && let Some(saved) = self.output_layout.saved_hotplug_state(&out_name).cloned()
+        {
+            let saved_mode = saved.mode.and_then(|(w, h, refresh)| {
+                output.modes().into_iter().find(|m| {
+                    m.size.w == w
+                        && m.size.h == h
+                        && (refresh == 0 || m.refresh.max(0) as u32 == refresh)
+                })
+            });
+            let saved_transform = saved.transform.map(koma_transform_to_smithay);
+            let saved_scale = saved.scale.map(Scale::Fractional);
+            if saved_mode.is_some() || saved_transform.is_some() || saved_scale.is_some() {
+                output.change_current_state(saved_mode, saved_transform, saved_scale, None);
+            }
+        }
+
+        self.set_output_safe_area(&out_name, safe_area);
+        let (logical_w, logical_h, scale) = output_logical_viewport(output);
+        let transform = smithay_transform_to_koma(output.current_transform());
+        let saved_pos = self
+            .output_layout
+            .saved_hotplug_state(&out_name)
+            .and_then(|s| s.position);
+        let pos_to_use = explicit_pos.or(saved_pos);
+
+        self.output_layout.upsert_output(
+            out_name.clone(),
+            koma_model::OutputLayoutSpec {
+                logical_w,
+                logical_h,
+                scale,
+                transform,
+                explicit_pos: pos_to_use,
+                enabled,
+            },
+        );
+        self.apply_output_layout_positions();
+
+        let assigned_ws = if enabled {
+            Some(self.ensure_initial_workspace_for_output(output))
+        } else {
+            self.output_workspaces.remove(&out_name);
+            if self.focused_output_name.as_deref() == Some(out_name.as_str()) {
+                self.focused_output_name = self
+                    .output_layout
+                    .enabled_entries()
+                    .next()
+                    .map(|e| e.name.clone());
+                if let Some(ref next_name) = self.focused_output_name {
+                    self.active_ws_id = self.active_workspace_for_output(next_name);
+                }
+            }
+            None
+        };
+        if let Some(ref ws_id) = assigned_ws {
+            if self.focused_output_name.is_none() {
+                self.focused_output_name = Some(out_name.clone());
+                self.active_ws_id = ws_id.clone();
+            }
+            let resolved_pos = self
+                .output_layout
+                .entry(&out_name)
+                .map(|e| e.explicit_pos.or(Some(e.resolved_pos)))
+                .unwrap_or(pos_to_use);
+            let cur_mode = output
+                .current_mode()
+                .map(|m| (m.size.w, m.size.h, m.refresh.max(0) as u32));
+            self.output_layout.record_hotplug_state(
+                &out_name,
+                SavedOutputConfig {
+                    active_ws_id: Some(ws_id.clone()),
+                    position: resolved_pos,
+                    scale: Some(scale),
+                    transform: Some(transform),
+                    mode: cur_mode,
+                    enabled,
+                },
+            );
+        }
+
+        self.sync_output_workarea(output);
+        if let Some(ref ws_id) = assigned_ws {
+            self.sync_window_output_membership(ws_id);
+        }
+        self.sync_output_layer_scales(output);
+        self.clamp_and_update_pointer_bounds();
+        self.reconcile_keyboard_focus();
+        self.sync_foreign_toplevels();
+        crate::output_management::sync_output_manager(self);
+        self.queue_redraw();
+    }
+
+    #[cfg(any(feature = "smithay-tty", test))]
+    pub fn unregister_output(&mut self, output: &Output) {
+        let out_name = output.name();
+        let cur_ws = self.output_workspaces.remove(&out_name);
+        let cur_mode = output
+            .current_mode()
+            .map(|m| (m.size.w, m.size.h, m.refresh.max(0) as u32));
+        let cur_scale = output.current_scale().fractional_scale();
+        let cur_transform = smithay_transform_to_koma(output.current_transform());
+        let saved_entry = self.output_layout.entry(&out_name).cloned();
+        self.output_layout.record_hotplug_state(
+            &out_name,
+            SavedOutputConfig {
+                active_ws_id: cur_ws.or_else(|| {
+                    self.output_layout
+                        .saved_hotplug_state(&out_name)
+                        .and_then(|s| s.active_ws_id.clone())
+                }),
+                position: saved_entry.as_ref().and_then(|e| e.explicit_pos),
+                scale: Some(cur_scale),
+                transform: Some(cur_transform),
+                mode: cur_mode,
+                enabled: saved_entry.as_ref().is_none_or(|e| e.enabled),
+            },
+        );
+        self.output_layout.remove_output(&out_name);
+        self.apply_output_layout_positions();
+
+        if self.focused_output_name.as_deref() == Some(out_name.as_str()) {
+            let next_output = self
+                .all_outputs()
+                .into_iter()
+                .find(|o| o.name() != out_name)
+                .map(|o| o.name());
+            self.focused_output_name = next_output.clone();
+            if let Some(ref next_name) = next_output {
+                self.active_ws_id = self.active_workspace_for_output(next_name);
+            }
+        }
+        let ws_ids: Vec<WorkspaceId> = self.workspaces.keys().cloned().collect();
+        for ws_id in ws_ids {
+            self.sync_window_output_membership(&ws_id);
+        }
+        self.clamp_and_update_pointer_bounds();
+        self.focus_active_deck_window();
+        self.reconcile_idle_inhibitors();
+        self.sync_foreign_toplevels();
+        crate::output_management::sync_output_manager(self);
+        self.queue_redraw();
+    }
+
+    pub fn clamp_and_update_pointer_bounds(&mut self) {
+        if self.output_layout.enabled_entries().next().is_some() {
+            let clamped = self.output_layout.clamp_pointer(LogicalPoint {
+                x: self.pointer_location.x,
+                y: self.pointer_location.y,
+            });
+            self.pointer_location = Point::from((clamped.x, clamped.y));
+        }
+    }
+
+    pub fn focus_output(&mut self, target_name: &str) -> bool {
+        let Some(target_out) = self
+            .all_outputs()
+            .into_iter()
+            .find(|o| o.name() == target_name)
+        else {
+            return false;
+        };
+        if self
+            .output_layout
+            .entry(target_name)
+            .is_some_and(|e| !e.enabled)
+        {
+            return false;
+        }
+        self.break_active_pointer_constraints();
+        self.active_special_ws_id = None;
+        self.focused_output_name = Some(target_name.to_owned());
+        let ws_id = self.ensure_initial_workspace_for_output(&target_out);
+        self.active_ws_id = ws_id.clone();
+        self.sync_output_workarea(&target_out);
+
+        let rect = self.output_logical_rect(&target_out);
+        let inside_target = self.pointer_location.x >= f64::from(rect.loc.x)
+            && self.pointer_location.x < f64::from(rect.loc.x + rect.size.w)
+            && self.pointer_location.y >= f64::from(rect.loc.y)
+            && self.pointer_location.y < f64::from(rect.loc.y + rect.size.h);
+        if !inside_target && !self.is_locked_or_abandoned() {
+            let center = Point::from((
+                f64::from(rect.loc.x) + f64::from(rect.size.w) * 0.5,
+                f64::from(rect.loc.y) + f64::from(rect.size.h) * 0.5,
+            ));
+            self.pointer_location = center;
+            if let Some(pointer) = self.seat.get_pointer()
+                && !pointer.is_grabbed()
+            {
+                let under = self.surface_under(center);
+                pointer.motion(
+                    self,
+                    under,
+                    &smithay::input::pointer::MotionEvent {
+                        location: center,
+                        serial: SERIAL_COUNTER.next_serial(),
+                        time: smithay::backend::input::InputTime::now(),
+                    },
+                );
+                pointer.frame(self);
+            }
+        }
+
+        self.focus_active_deck_window();
+        self.reconcile_idle_inhibitors();
+        self.sync_foreign_toplevels();
+        self.queue_redraw();
+        true
+    }
+
+    pub fn move_active_window_between_workspaces(
+        &mut self,
+        src_ws_id: &WorkspaceId,
+        dst_ws_id: &WorkspaceId,
+    ) -> bool {
+        if src_ws_id == dst_ws_id {
+            return false;
+        }
+        let now_ms = self.elapsed_ms();
+        let active_win = self.workspaces.get_mut(src_ws_id).and_then(|src| {
+            let win_id = src.active_window()?;
+            let was_float = src.floating.contains(win_id);
+            let _ = src.remove_window(win_id, now_ms);
+            Some((win_id, was_float))
+        });
+
+        let Some((win_id, was_float)) = active_win else {
+            return false;
+        };
+        let pref = self
+            .mapped_windows
+            .iter()
+            .find(|m| m.win_id == win_id)
+            .map(|m| m.preferred_size);
+        let dst_origin = self.workspace_output_origin(dst_ws_id);
+        let cursor = LogicalPoint {
+            x: self.pointer_location.x - dst_origin.x,
+            y: self.pointer_location.y - dst_origin.y,
+        };
+
+        let now_float = if let Some(dst) = self.workspaces.get_mut(dst_ws_id) {
+            dst.insert_window(
+                win_id,
+                was_float,
+                None,
+                None,
+                pref,
+                Some(cursor),
+                false,
+                true,
+                now_ms,
+            )
+        } else {
+            was_float
+        };
+
+        if let Some(m) = self.mapped_windows.iter_mut().find(|m| m.win_id == win_id) {
+            m.ws_id = dst_ws_id.clone();
+            m.is_floating = now_float;
+        }
+        self.sync_workspace_geometries(src_ws_id);
+        self.sync_workspace_geometries(dst_ws_id);
+        self.sync_window_output_membership(dst_ws_id);
+        self.focus_active_deck_window();
+        self.queue_redraw();
+        true
+    }
+
+    pub fn move_active_window_to_output(&mut self, target_name: &str) -> bool {
+        let Some(target_out) = self
+            .all_outputs()
+            .into_iter()
+            .find(|o| o.name() == target_name)
+        else {
+            return false;
+        };
+        if self
+            .output_layout
+            .entry(target_name)
+            .is_some_and(|e| !e.enabled)
+        {
+            return false;
+        }
+        let src_ws_id = self.effective_interactive_ws_id();
+        let dst_ws_id = self.ensure_initial_workspace_for_output(&target_out);
+        if src_ws_id == dst_ws_id {
+            return false;
+        }
+        if !self.move_active_window_between_workspaces(&src_ws_id, &dst_ws_id) {
+            return false;
+        }
+        self.focus_output(target_name)
     }
 
     #[must_use]
@@ -1441,9 +2100,10 @@ impl KomaState {
                 });
 
         let opt_max_size = (max_sz.0 > 0 || max_sz.1 > 0).then_some(max_sz);
+        let ws_origin = self.workspace_output_origin(&ws_id);
         let cursor_logical = LogicalPoint {
-            x: self.pointer_location.x,
-            y: self.pointer_location.y,
+            x: self.pointer_location.x - ws_origin.x,
+            y: self.pointer_location.y - ws_origin.y,
         };
 
         let now_ms = self.elapsed_ms();
@@ -1495,6 +2155,7 @@ impl KomaState {
         let win_id_created = mapped.win_id;
         self.mapped_windows.push(mapped);
         self.sync_workspace_geometries(&ws_id);
+        self.sync_window_output_membership(&ws_id);
         if let Some(final_rect) = self
             .mapped_windows
             .iter()
@@ -1511,14 +2172,19 @@ impl KomaState {
             );
         }
 
+        let visible_anywhere = ws_id == self.active_ws_id
+            || Some(&ws_id) == self.active_special_ws_id.as_ref()
+            || self.output_workspaces.values().any(|id| id == &ws_id);
         if ws_id == self.active_ws_id || Some(&ws_id) == self.active_special_ws_id.as_ref() {
             self.focus_active_deck_window();
+            self.queue_redraw();
+        } else if visible_anywhere {
             self.queue_redraw();
         }
     }
 
     /// Arranges `wlr-layer-shell` surfaces for `output` and syncs the non-exclusive workarea
-    /// into every matching physical workspace (`Dwindle` / `Scrolling` / `Deck` / `FloatingStack`).
+    /// composed with `SafeAreaInsets` (camera notch) into every matching physical workspace.
     pub fn sync_output_workarea(&mut self, output: &Output) {
         let (logical_w, logical_h, scale) = output_logical_viewport(output);
         let non_exclusive = {
@@ -1526,25 +2192,33 @@ impl KomaState {
             map.arrange();
             map.non_exclusive_zone()
         };
-        let viewport = LogicalViewport::new(logical_w, logical_h, scale).with_work_area_zone(
-            non_exclusive.loc.x,
-            non_exclusive.loc.y,
-            non_exclusive.size.w,
-            non_exclusive.size.h,
-        );
+        let safe_area = self.output_safe_area(&output.name());
+        let viewport = LogicalViewport::new(logical_w, logical_h, scale)
+            .with_work_area_zone_and_safe_area(
+                non_exclusive.loc.x,
+                non_exclusive.loc.y,
+                non_exclusive.size.w,
+                non_exclusive.size.h,
+                safe_area,
+            );
+        let out_name = output.name();
         let single_output = self.all_outputs().len() <= 1;
         let is_primary = self.primary_output().as_ref() == Some(output);
+        let assigned_ws = self.output_workspaces.get(&out_name).cloned();
         let now_ms = self.elapsed_ms();
         let mut affected_ws = Vec::new();
         for (ws_id, ws) in &mut self.workspaces {
-            let matches = match &ws.presentation {
-                PresentationTarget::Physical(out_id) => {
-                    single_output
-                        || out_id.as_str() == output.name()
-                        || (is_primary && out_id.as_str() == "primary")
-                }
-                PresentationTarget::Offscreen { .. } => false,
-            };
+            let matches = assigned_ws.as_ref() == Some(ws_id)
+                || match &ws.presentation {
+                    PresentationTarget::Physical(out_id) => {
+                        out_id.as_str() == out_name
+                            || (single_output
+                                && !ws.is_special
+                                && self.output_workspaces.is_empty())
+                            || (is_primary && out_id.as_str() == "primary")
+                    }
+                    PresentationTarget::Offscreen { .. } => false,
+                };
             if matches && ws.viewport != viewport {
                 ws.viewport = viewport;
                 ws.recalculate(now_ms);
@@ -1564,17 +2238,39 @@ impl KomaState {
         logical_h: u32,
         scale: f64,
     ) {
+        let out_name = output.name();
+        let transform = smithay_transform_to_koma(output.current_transform());
+        if self.output_layout.entry(&out_name).is_some() {
+            let existing = self.output_layout.entry(&out_name).cloned();
+            self.output_layout.upsert_output(
+                out_name.clone(),
+                koma_model::OutputLayoutSpec {
+                    logical_w: logical_w.max(64),
+                    logical_h: logical_h.max(64),
+                    scale,
+                    transform,
+                    explicit_pos: existing.as_ref().and_then(|e| e.explicit_pos),
+                    enabled: existing.as_ref().is_none_or(|e| e.enabled),
+                },
+            );
+            self.apply_output_layout_positions();
+        } else {
+            self.register_or_update_output(output, None, self.output_safe_area(&out_name), true);
+        }
+
         let non_exclusive = {
             let mut map = layer_map_for_output(output);
             map.arrange();
             map.non_exclusive_zone()
         };
+        let safe_area = self.output_safe_area(&out_name);
         let viewport = LogicalViewport::new(logical_w.max(64), logical_h.max(64), scale)
-            .with_work_area_zone(
+            .with_work_area_zone_and_safe_area(
                 non_exclusive.loc.x,
                 non_exclusive.loc.y,
                 non_exclusive.size.w,
                 non_exclusive.size.h,
+                safe_area,
             );
         if let Some(lock_surface) = self.session_lock.active_lock_surface_for_output(output) {
             let needs_configure = lock_surface.with_pending_state(|st| {
@@ -1593,31 +2289,39 @@ impl KomaState {
 
         let single_output = self.all_outputs().len() <= 1;
         let is_primary = self.primary_output().as_ref() == Some(output);
+        let assigned_ws = self.output_workspaces.get(&out_name).cloned();
         let now_ms = self.elapsed_ms();
         let mut affected_ws: Vec<WorkspaceId> = Vec::new();
         for (ws_id, ws) in &mut self.workspaces {
-            let matches = match &ws.presentation {
-                PresentationTarget::Physical(out_id) => {
-                    single_output
-                        || out_id.as_str() == output.name()
-                        || (is_primary && out_id.as_str() == "primary")
-                }
-                PresentationTarget::Offscreen { .. } => false,
-            };
+            let matches = assigned_ws.as_ref() == Some(ws_id)
+                || match &ws.presentation {
+                    PresentationTarget::Physical(out_id) => {
+                        out_id.as_str() == out_name
+                            || (single_output
+                                && !ws.is_special
+                                && self.output_workspaces.is_empty())
+                            || (is_primary && out_id.as_str() == "primary")
+                    }
+                    PresentationTarget::Offscreen { .. } => false,
+                };
             if matches {
                 ws.viewport = viewport;
-                if single_output || is_primary {
-                    ws.presentation = PresentationTarget::Physical(OutputId::new(output.name()));
+                if !ws.is_special && (single_output || assigned_ws.as_ref() == Some(ws_id)) {
+                    ws.presentation = PresentationTarget::Physical(OutputId::new(&out_name));
                 }
                 ws.recalculate(now_ms);
                 affected_ws.push(ws_id.clone());
             }
         }
 
-        for ws_id in affected_ws {
-            self.sync_workspace_geometries(&ws_id);
+        for ws_id in &affected_ws {
+            self.sync_workspace_geometries(ws_id);
+            self.sync_window_output_membership(ws_id);
         }
+        self.sync_output_layer_scales(output);
+        self.clamp_and_update_pointer_bounds();
         self.reconcile_keyboard_focus();
+        crate::output_management::sync_output_manager(self);
         self.queue_redraw();
     }
 
@@ -1630,23 +2334,28 @@ impl KomaState {
             .and_then(WorkspaceState::active_window)?;
         self.mapped_windows
             .iter()
-            .find(|m| m.win_id == active_id)
+            .find(|m| m.win_id == active_id && !m.is_minimized)
             .and_then(|m| m.window.toplevel().map(|t| t.wl_surface().clone()))
     }
 
     #[must_use]
-    pub fn output_at_point(&self, global_pos: Point<f64, Logical>) -> Option<Output> {
-        let outputs = self.all_outputs();
-        for output in &outputs {
+    pub fn output_at_point_strict(&self, global_pos: Point<f64, Logical>) -> Option<Output> {
+        for output in self.all_outputs() {
             let origin = output.current_location().to_f64();
-            let (w, h, _) = output_logical_viewport(output);
+            let (w, h, _) = output_logical_viewport(&output);
             let local = global_pos - origin;
             if local.x >= 0.0 && local.y >= 0.0 && local.x < f64::from(w) && local.y < f64::from(h)
             {
-                return Some(output.clone());
+                return Some(output);
             }
         }
-        self.primary_output().or_else(|| outputs.into_iter().next())
+        None
+    }
+
+    #[must_use]
+    pub fn output_at_point(&self, global_pos: Point<f64, Logical>) -> Option<Output> {
+        self.output_at_point_strict(global_pos)
+            .or_else(|| self.focused_output())
     }
 
     #[must_use]
@@ -1757,18 +2466,25 @@ impl KomaState {
                     .any(|m| m.win_id == *id && !m.is_minimized)
             });
         for mapped in &self.mapped_windows {
-            if mapped.ws_id == target_ws_id
-                && let Some(toplevel) = mapped.window.toplevel()
-            {
-                let is_active = Some(mapped.win_id) == active_id && !mapped.is_minimized;
-                toplevel.with_pending_state(|st| {
+            if let Some(toplevel) = mapped.window.toplevel() {
+                let is_active = mapped.ws_id == target_ws_id
+                    && Some(mapped.win_id) == active_id
+                    && !mapped.is_minimized;
+                let changed = toplevel.with_pending_state(|st| {
+                    let was = st.states.contains(xdg_toplevel::State::Activated);
+                    if was == is_active {
+                        return false;
+                    }
                     if is_active {
                         st.states.set(xdg_toplevel::State::Activated);
                     } else {
                         st.states.unset(xdg_toplevel::State::Activated);
                     }
+                    true
                 });
-                toplevel.send_pending_configure();
+                if changed {
+                    toplevel.send_pending_configure();
+                }
             }
         }
         self.reconcile_keyboard_focus();
@@ -1882,8 +2598,8 @@ impl KomaState {
         })
     }
 
-    /// Hit-tests `global_pos` across any open `special:<name>` Scratchpad first, then `active_ws_id`,
-    /// strictly in **front-to-back** Z-order (`FloatingStack` topmost -> bottom -> Tiled panes).
+    /// Hit-tests `global_pos` across any open `special:<name>` Scratchpad first, then the output's
+    /// active workspace, strictly in **front-to-back** Z-order (`FloatingStack` topmost -> bottom -> Tiled panes).
     #[must_use]
     pub fn hit_test_visible_surface(
         &self,
@@ -1895,13 +2611,36 @@ impl KomaState {
         } else {
             0.0
         };
-        let candidate_workspaces = self
-            .active_special_ws_id
-            .iter()
-            .chain(std::iter::once(&self.active_ws_id));
+        let has_outputs = !self.all_outputs().is_empty();
+        let target_output = self.output_at_point_strict(global_pos);
+        if has_outputs && target_output.is_none() {
+            return None;
+        }
+        let (out_origin, output_local, candidate_workspaces): (
+            Point<f64, Logical>,
+            Point<f64, Logical>,
+            Vec<WorkspaceId>,
+        ) = if let Some(ref out) = target_output {
+            let origin = out.current_location().to_f64();
+            let out_name = out.name();
+            let include_special = self.focused_output_name().as_deref() == Some(out_name.as_str());
+            let mut list = Vec::with_capacity(2);
+            if include_special && let Some(sp) = &self.active_special_ws_id {
+                list.push(sp.clone());
+            }
+            list.push(self.active_workspace_for_output(&out_name));
+            (origin, global_pos - origin, list)
+        } else {
+            let mut list = Vec::with_capacity(2);
+            if let Some(sp) = &self.active_special_ws_id {
+                list.push(sp.clone());
+            }
+            list.push(self.active_ws_id.clone());
+            (Point::default(), global_pos, list)
+        };
 
         for ws_id in candidate_workspaces {
-            let Some(ws) = self.workspaces.get(ws_id) else {
+            let Some(ws) = self.workspaces.get(&ws_id) else {
                 continue;
             };
             for (win_id, rect, _) in ws
@@ -1915,20 +2654,22 @@ impl KomaState {
                 if mapped.is_minimized {
                     continue;
                 }
-                let origin = Point::from((f64::from(rect.x) + b_off, f64::from(rect.y) + b_off));
-                let local_pos = global_pos - origin;
+                let local_origin =
+                    Point::from((f64::from(rect.x) + b_off, f64::from(rect.y) + b_off));
+                let local_pos = output_local - local_origin;
+                let global_origin = local_origin + out_origin;
                 if let Some((surf, surf_offset)) = mapped
                     .window
                     .surface_under(local_pos, WindowSurfaceType::ALL)
                 {
-                    return Some((win_id, ws_id.clone(), surf, surf_offset.to_f64() + origin));
+                    return Some((win_id, ws_id, surf, surf_offset.to_f64() + global_origin));
                 }
-                let in_frame = global_pos.x >= f64::from(rect.x)
-                    && global_pos.x <= f64::from(rect.x + rect.w as i32)
-                    && global_pos.y >= f64::from(rect.y)
-                    && global_pos.y <= f64::from(rect.y + rect.h as i32);
+                let in_frame = output_local.x >= f64::from(rect.x)
+                    && output_local.x <= f64::from(rect.x + rect.w as i32)
+                    && output_local.y >= f64::from(rect.y)
+                    && output_local.y <= f64::from(rect.y + rect.h as i32);
                 if in_frame && let Some(toplevel) = mapped.window.toplevel() {
-                    return Some((win_id, ws_id.clone(), toplevel.wl_surface().clone(), origin));
+                    return Some((win_id, ws_id, toplevel.wl_surface().clone(), global_origin));
                 }
             }
         }
@@ -1940,14 +2681,30 @@ impl KomaState {
         &self,
         global_pos: Point<f64, Logical>,
     ) -> Option<(WorkspaceId, WindowId)> {
-        let target_ws_id = self.effective_interactive_ws_id();
+        let (target_ws_id, output_local) =
+            if let Some(out) = self.output_at_point_strict(global_pos) {
+                let origin = out.current_location().to_f64();
+                let out_name = out.name();
+                let ws_id = if self.focused_output_name().as_deref() == Some(out_name.as_str())
+                    && let Some(sp) = &self.active_special_ws_id
+                {
+                    sp.clone()
+                } else {
+                    self.active_workspace_for_output(&out_name)
+                };
+                (ws_id, global_pos - origin)
+            } else if self.all_outputs().is_empty() {
+                (self.effective_interactive_ws_id(), global_pos)
+            } else {
+                return None;
+            };
         let now_ms = self.elapsed_ms();
         let tab_win_id = self.workspaces.get(&target_ws_id).and_then(|ws| {
             if ws.layout_mode == LayoutMode::Scrolling && ws.fullscreen_window.is_none() {
                 ws.scrolling.hit_test_tab_indicator(
                     LogicalPoint {
-                        x: global_pos.x,
-                        y: global_pos.y,
+                        x: output_local.x,
+                        y: output_local.y,
                     },
                     ws.viewport,
                     now_ms,
@@ -2029,6 +2786,16 @@ impl KomaState {
         if let Some((target_ws_id, tab_win_id)) = self.tab_indicator_window_at(global_pos) {
             let now_ms = self.elapsed_ms();
             self.focused_ondemand_layer = None;
+            if let Some(hit_out) = self.output_at_point_strict(global_pos) {
+                self.focused_output_name = Some(hit_out.name());
+                if !self
+                    .workspaces
+                    .get(&target_ws_id)
+                    .is_some_and(|w| w.is_special)
+                {
+                    self.active_ws_id = target_ws_id.clone();
+                }
+            }
             if let Some(ws) = self.workspaces.get_mut(&target_ws_id) {
                 ws.activate_window(tab_win_id, now_ms);
             }
@@ -2045,6 +2812,19 @@ impl KomaState {
             {
                 self.active_special_ws_id = None;
             }
+            if let Some(hit_out) = self.output_at_point_strict(global_pos) {
+                let hit_out_name = hit_out.name();
+                self.focused_output_name = Some(hit_out_name.clone());
+                if !self
+                    .workspaces
+                    .get(&hit_ws_id)
+                    .is_some_and(|w| w.is_special)
+                {
+                    self.output_workspaces
+                        .insert(hit_out_name, hit_ws_id.clone());
+                    self.active_ws_id = hit_ws_id.clone();
+                }
+            }
             let now_ms = self.elapsed_ms();
             if let Some(ws) = self.workspaces.get_mut(&hit_ws_id) {
                 ws.activate_window(win_id, now_ms);
@@ -2054,6 +2834,11 @@ impl KomaState {
             self.queue_redraw();
         } else {
             self.focused_ondemand_layer = None;
+            if let Some(hit_out) = self.output_at_point_strict(global_pos) {
+                let hit_out_name = hit_out.name();
+                self.focused_output_name = Some(hit_out_name.clone());
+                self.active_ws_id = self.active_workspace_for_output(&hit_out_name);
+            }
             self.focus_active_deck_window();
         }
     }
@@ -2211,34 +2996,46 @@ impl KomaState {
         items
     }
 
-    /// Collects **front-to-back** scene lists for physical output rendering:
+    /// Collects **front-to-back** scene lists for a specific physical output (`output_name`):
     /// `(base_ws_items, Option<(special_lease_state, special_ws_items)>)`.
     #[must_use]
-    pub fn collect_physical_scene_items(
+    pub fn collect_output_scene_items(
         &self,
+        output_name: &str,
     ) -> (
         Vec<WindowSceneItem<'_>>,
         Option<(WorkspaceLeaseState, Vec<WindowSceneItem<'_>>)>,
     ) {
-        let base_items = self.collect_workspace_scene_items(&self.active_ws_id, false);
-        let special_overlay = self.active_special_ws_id.as_ref().and_then(|sp_id| {
-            let sp_ws = self.workspaces.get(sp_id)?;
-            let sp_items = self.collect_workspace_scene_items(sp_id, false);
-            Some((sp_ws.lease.state().clone(), sp_items))
-        });
+        let base_ws_id = self.active_workspace_for_output(output_name);
+        let base_items = self.collect_workspace_scene_items(&base_ws_id, false);
+        let is_focused = self.focused_output_name().as_deref() == Some(output_name);
+        let special_overlay = if is_focused {
+            self.active_special_ws_id.as_ref().and_then(|sp_id| {
+                let sp_ws = self.workspaces.get(sp_id)?;
+                let sp_items = self.collect_workspace_scene_items(sp_id, false);
+                Some((sp_ws.lease.state().clone(), sp_items))
+            })
+        } else {
+            None
+        };
         (base_items, special_overlay)
     }
 
-    /// Returns all `WlSurface` roots currently visible on the physical output so `wl_surface.frame`
-    /// callbacks advance smoothly across every tiled/floating/Scratchpad window!
+    /// Returns visible toplevel `WlSurface` roots displayed on `output_name`.
     #[must_use]
-    pub fn visible_physical_toplevel_surfaces(&self) -> Vec<WlSurface> {
+    pub fn visible_physical_toplevel_surfaces_for_output(
+        &self,
+        output_name: &str,
+    ) -> Vec<WlSurface> {
         let mut surfaces = Vec::new();
-        for ws_id in self
-            .active_special_ws_id
-            .iter()
-            .chain(std::iter::once(&self.active_ws_id))
-        {
+        let base_ws_id = self.active_workspace_for_output(output_name);
+        let is_focused = self.focused_output_name().as_deref() == Some(output_name);
+        let special_iter = if is_focused {
+            self.active_special_ws_id.as_ref()
+        } else {
+            None
+        };
+        for ws_id in special_iter.into_iter().chain(std::iter::once(&base_ws_id)) {
             if let Some(ws) = self.workspaces.get(ws_id) {
                 for (win_id, _, _) in ws.compute_visible_geometries() {
                     if let Some(m) = self
@@ -2386,8 +3183,12 @@ impl KomaState {
 
         if let Some(m) = win_match {
             let win_geo_loc = m.window.geometry().loc;
+            let ws_origin = self.workspace_output_origin(&m.ws_id).to_i32_round::<i32>();
             return Rectangle::new(
-                Point::from((m.rect.x - win_geo_loc.x, m.rect.y - win_geo_loc.y)),
+                Point::from((
+                    ws_origin.x + m.rect.x - win_geo_loc.x,
+                    ws_origin.y + m.rect.y - win_geo_loc.y,
+                )),
                 Size::from((m.rect.w.max(1) as i32, m.rect.h.max(1) as i32)),
             );
         }
@@ -3221,5 +4022,141 @@ pub(crate) mod tests {
             InputTime::from_millis(2),
             false,
         );
+    }
+
+    #[test]
+    fn notch_safe_area_and_per_output_workspaces_update_cleanly() {
+        use smithay::output::{Mode, PhysicalProperties, Subpixel};
+
+        let (_el, _disp, mut state) = make_headless_test_state();
+        let retina = Output::new(
+            "eDP-1".to_owned(),
+            PhysicalProperties {
+                size: (302, 196).into(),
+                subpixel: Subpixel::HorizontalRgb,
+                make: "APP".into(),
+                model: "Color LCD".into(),
+                serial_number: "RETINA1".into(),
+            },
+        );
+        retina.change_current_state(
+            Some(Mode {
+                size: (3024, 1964).into(),
+                refresh: 120_000,
+            }),
+            None,
+            Some(Scale::Fractional(2.0)),
+            Some((0, 0).into()),
+        );
+        state.test_outputs.push(retina.clone());
+
+        let notch = SafeAreaInsets {
+            top: 38,
+            bottom: 0,
+            left: 0,
+            right: 0,
+        };
+        state.register_or_update_output(&retina, Some((0, 0)), notch, true);
+
+        let ws_id = state.active_workspace_for_output("eDP-1");
+        let ws = state.workspaces.get(&ws_id).expect("eDP-1 workspace");
+        assert_eq!(ws.viewport.width, 1512);
+        assert_eq!(ws.viewport.height, 982);
+        assert_eq!(
+            ws.viewport.work_area,
+            Some(LogicalRect::new(0, 38, 1512, 944))
+        );
+
+        // Second output receives its own independent workspace & 2D placement.
+        let external = test_output("HDMI-A-1");
+        state.test_outputs.push(external.clone());
+        state.register_or_update_output(&external, None, SafeAreaInsets::default(), true);
+        let ws_ext = state.active_workspace_for_output("HDMI-A-1");
+        assert_ne!(ws_id, ws_ext);
+        assert_eq!(external.current_location(), Point::from((1512, 0)));
+    }
+
+    #[test]
+    fn multi_monitor_2d_pointer_crossing_focus_and_hotplug_persistence() {
+        use koma_lua::ActionDescriptor;
+        use smithay::backend::input::InputTime;
+
+        let (_el, _disp, mut state) = make_headless_test_state();
+        let left = test_output("eDP-1");
+        let right = test_output("HDMI-A-1");
+        state.test_outputs = vec![left.clone(), right.clone()];
+
+        state.register_or_update_output(&left, Some((0, 0)), SafeAreaInsets::default(), true);
+        state.register_or_update_output(
+            &right,
+            Some((2000, -120)),
+            SafeAreaInsets::default(),
+            true,
+        );
+
+        // Pointer crossing an 80px gap from left output into right output switches focus to HDMI-A-1.
+        state.pointer_location = Point::from((1918.0, 200.0));
+        state.handle_pointer_relative_motion(
+            (6.0, 0.0).into(),
+            (6.0, 0.0).into(),
+            InputTime::from_millis(10),
+        );
+        assert_eq!(state.focused_output_name().as_deref(), Some("HDMI-A-1"));
+        assert!(state.pointer_location.x >= 2000.0);
+
+        // Directional & named monitor focus actions update focused output & active_ws_id.
+        crate::keybind_dispatcher::execute_action_descriptor(
+            &mut state,
+            ActionDescriptor::MonitorFocusDirection("left".to_owned()),
+            false,
+        );
+        assert_eq!(state.focused_output_name().as_deref(), Some("eDP-1"));
+
+        crate::keybind_dispatcher::execute_action_descriptor(
+            &mut state,
+            ActionDescriptor::MonitorFocus("HDMI-A-1".to_owned()),
+            false,
+        );
+        assert_eq!(state.focused_output_name().as_deref(), Some("HDMI-A-1"));
+
+        // Assign workspace 4 + scale 1.5 + Transform::_90 to HDMI-A-1 before unplugging.
+        crate::keybind_dispatcher::execute_action_descriptor(
+            &mut state,
+            ActionDescriptor::WorkspaceFocus("4".to_owned()),
+            false,
+        );
+        let ws4 = state.active_workspace_for_output("HDMI-A-1");
+        right.change_current_state(
+            None,
+            Some(Transform::_90),
+            Some(Scale::Fractional(1.5)),
+            None,
+        );
+        state.register_or_update_output(
+            &right,
+            Some((2000, -120)),
+            SafeAreaInsets::default(),
+            true,
+        );
+        assert_eq!(state.active_workspace_for_output("HDMI-A-1"), ws4);
+
+        // Hot-unplug HDMI-A-1: focus returns cleanly to eDP-1.
+        state.test_outputs.retain(|o| o.name() != "HDMI-A-1");
+        state.unregister_output(&right);
+        assert_eq!(state.focused_output_name().as_deref(), Some("eDP-1"));
+
+        // Reconnect a brand-new Output instance for HDMI-A-1 (default scale 1.0, Transform::Normal):
+        // hotplug persistence restores workspace 4, explicit pos (2000, -120), scale 1.5, and Transform::_90.
+        let right_replugged = test_output("HDMI-A-1");
+        state.test_outputs.push(right_replugged.clone());
+        state.register_or_update_output(&right_replugged, None, SafeAreaInsets::default(), true);
+
+        assert_eq!(state.active_workspace_for_output("HDMI-A-1"), ws4);
+        assert_eq!(
+            right_replugged.current_location(),
+            Point::from((2000, -120))
+        );
+        assert!((right_replugged.current_scale().fractional_scale() - 1.5).abs() < 1e-4);
+        assert_eq!(right_replugged.current_transform(), Transform::_90);
     }
 }

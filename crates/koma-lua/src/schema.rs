@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use koma_model::{
     Anchor9, AnchorPoint, AnimationConfig, BlockOutPolicy, BlurConfig, BorderConfig, DimConfig,
     DwindleConfig, FocusRingConfig, FrameClockConfig, LayoutMode, LogicalViewport, OpenMode,
-    ScrollingConfig, ShadowConfig,
+    OutputTransform, SafeAreaInsets, ScrollingConfig, ShadowConfig,
 };
 use koma_proto::{KinematicProfileKind, MacroId, OutputId, TextInjectStrategy};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -81,6 +81,10 @@ pub enum ActionDescriptor {
     WorkspaceFocusNext,
     WorkspaceFocusPrev,
     WorkspacePeek(String),
+    MonitorFocus(String),
+    MonitorFocusDirection(String),
+    WindowMoveToMonitor(String),
+    WindowMoveToMonitorDirection(String),
     ModeEnter(String),
     ModeExit,
     ReloadConfig,
@@ -149,6 +153,145 @@ pub struct EdidMatchSpec {
     pub serial: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub enum MonitorScaleSpec {
+    Auto,
+    Fixed(f64),
+}
+
+impl Default for MonitorScaleSpec {
+    fn default() -> Self {
+        Self::Fixed(1.0)
+    }
+}
+
+impl MonitorScaleSpec {
+    /// Resolves effective logical scale from explicit numeric scale or physical DPI heuristics.
+    #[must_use]
+    pub fn resolve(self, phys_w_px: u32, phys_h_px: u32, phys_w_mm: i32, phys_h_mm: i32) -> f64 {
+        match self {
+            Self::Auto => {
+                koma_model::compute_auto_scale(phys_w_px, phys_h_px, phys_w_mm, phys_h_mm)
+            }
+            Self::Fixed(s) => {
+                if s.is_finite() && (0.5..=4.0).contains(&s) {
+                    s
+                } else {
+                    1.0
+                }
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for MonitorScaleSpec {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct ScaleVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for ScaleVisitor {
+            type Value = MonitorScaleSpec;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "a numeric monitor scale or \"auto\"")
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                if v.trim().eq_ignore_ascii_case("auto") {
+                    Ok(MonitorScaleSpec::Auto)
+                } else if let Ok(num) = v.trim().parse::<f64>() {
+                    Ok(MonitorScaleSpec::Fixed(num))
+                } else {
+                    Err(E::custom(format!(
+                        "invalid monitor scale string `{v}` (expected \"auto\" or a number)"
+                    )))
+                }
+            }
+
+            fn visit_f64<E>(self, v: f64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(MonitorScaleSpec::Fixed(v))
+            }
+
+            fn visit_i64<E>(self, v: i64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(MonitorScaleSpec::Fixed(v as f64))
+            }
+
+            fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(MonitorScaleSpec::Fixed(v as f64))
+            }
+        }
+
+        deserializer.deserialize_any(ScaleVisitor)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+pub struct MonitorPositionSpec {
+    pub x: i32,
+    pub y: i32,
+}
+
+impl<'de> Deserialize<'de> for MonitorPositionSpec {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct PosVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for PosVisitor {
+            type Value = MonitorPositionSpec;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "`{{ x = int, y = int }}` or `[x, y]`")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let x = seq.next_element::<i32>()?.unwrap_or(0);
+                let y = seq.next_element::<i32>()?.unwrap_or(0);
+                while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+                Ok(MonitorPositionSpec { x, y })
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut x = 0_i32;
+                let mut y = 0_i32;
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "x" | "1" => x = map.next_value::<i32>()?,
+                        "y" | "2" => y = map.next_value::<i32>()?,
+                        _ => {
+                            let _: serde::de::IgnoredAny = map.next_value()?;
+                        }
+                    }
+                }
+                Ok(MonitorPositionSpec { x, y })
+            }
+        }
+
+        deserializer.deserialize_any(PosVisitor)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MonitorSpec {
@@ -156,8 +299,16 @@ pub struct MonitorSpec {
     #[serde(rename = "match")]
     pub edid_match: Option<EdidMatchSpec>,
     pub mode: String,
-    pub scale: f64,
+    pub scale: MonitorScaleSpec,
     pub transform: String,
+    #[serde(skip)]
+    pub has_explicit_transform: bool,
+    pub position: Option<MonitorPositionSpec>,
+    pub x: Option<i32>,
+    pub y: Option<i32>,
+    #[serde(alias = "non_desktop")]
+    pub allow_non_desktop: bool,
+    pub safe_area: SafeAreaInsets,
     pub vrr: serde_json::Value,
     pub max_bpc: Option<u8>,
     pub drm_lease: bool,
@@ -166,14 +317,38 @@ pub struct MonitorSpec {
     pub backdrop_color: Option<String>,
 }
 
+impl MonitorSpec {
+    /// Returns explicit `(x, y)` output placement if specified via `position` or `x`/`y`.
+    #[must_use]
+    pub fn resolved_position(&self) -> Option<(i32, i32)> {
+        if let Some(pos) = self.position {
+            return Some((pos.x, pos.y));
+        }
+        if self.x.is_some() || self.y.is_some() {
+            return Some((self.x.unwrap_or(0), self.y.unwrap_or(0)));
+        }
+        None
+    }
+
+    pub fn parsed_transform(&self) -> Result<OutputTransform, String> {
+        OutputTransform::parse_str(&self.transform)
+    }
+}
+
 impl Default for MonitorSpec {
     fn default() -> Self {
         Self {
             output: None,
             edid_match: None,
             mode: "preferred".to_owned(),
-            scale: 1.0,
+            scale: MonitorScaleSpec::default(),
             transform: "normal".to_owned(),
+            has_explicit_transform: false,
+            position: None,
+            x: None,
+            y: None,
+            allow_non_desktop: false,
+            safe_area: SafeAreaInsets::default(),
             vrr: serde_json::Value::Bool(false),
             max_bpc: None,
             drm_lease: false,
@@ -1096,6 +1271,48 @@ impl KomaConfigRegistry {
         })
     }
 
+    /// Finds the declarative `koma.monitor(...)` rule matching `connector_name` or EDID metadata.
+    #[must_use]
+    pub fn find_monitor_for_output(
+        &self,
+        connector_name: &str,
+        make: Option<&str>,
+        model: Option<&str>,
+        serial: Option<&str>,
+    ) -> Option<&MonitorSpec> {
+        if let Some(exact) = self.find_monitor(connector_name) {
+            return Some(exact);
+        }
+        self.monitors.iter().find(|m| {
+            if m.output.is_some() {
+                return false;
+            }
+            let Some(em) = &m.edid_match else {
+                return false;
+            };
+            let matches_make = em
+                .make
+                .as_ref()
+                .is_none_or(|want| make.is_some_and(|got| got.eq_ignore_ascii_case(want.trim())));
+            let matches_model = em.model.as_ref().is_none_or(|want| {
+                model.is_some_and(|got| {
+                    got.eq_ignore_ascii_case(want.trim())
+                        || got
+                            .to_ascii_lowercase()
+                            .contains(&want.trim().to_ascii_lowercase())
+                })
+            });
+            let matches_serial = em
+                .serial
+                .as_ref()
+                .is_none_or(|want| serial.is_some_and(|got| got.eq_ignore_ascii_case(want.trim())));
+            (em.make.is_some() || em.model.is_some() || em.serial.is_some())
+                && matches_make
+                && matches_model
+                && matches_serial
+        })
+    }
+
     pub fn apply_handle_enabled(&mut self, handle: KomaHandleRef, enabled: bool) -> bool {
         match handle {
             KomaHandleRef::Bind(id) => {
@@ -1378,5 +1595,47 @@ mod tests {
         assert_eq!(res_mouse.accel_speed, Some(0.4));
         assert_eq!(res_mouse.click_method, None);
         assert_eq!(res_mouse.dwt, None);
+    }
+
+    #[test]
+    fn monitor_spec_parses_auto_scale_position_safe_area_and_non_desktop_aliases() {
+        let json = serde_json::json!({
+            "output": "eDP-1",
+            "mode": "3024x1964@120",
+            "scale": "auto",
+            "transform": "flipped-90",
+            "position": [1920, 0],
+            "non_desktop": true,
+            "safe_area": { "top": 38 }
+        });
+        let spec: MonitorSpec = serde_json::from_value(json).expect("valid MonitorSpec");
+        assert_eq!(spec.scale, MonitorScaleSpec::Auto);
+        assert_eq!(spec.scale.resolve(3024, 1964, 302, 196), 2.0);
+        assert_eq!(spec.scale.resolve(1920, 1080, 0, 0), 1.0);
+        assert_eq!(spec.parsed_transform().unwrap(), OutputTransform::Flipped90);
+        assert_eq!(spec.resolved_position(), Some((1920, 0)));
+        assert!(spec.allow_non_desktop);
+        assert_eq!(
+            spec.safe_area,
+            SafeAreaInsets {
+                top: 38,
+                bottom: 0,
+                left: 0,
+                right: 0,
+            }
+        );
+
+        let fixed_json = serde_json::json!({
+            "output": "DP-1",
+            "scale": 1.5,
+            "position": { "x": -1920, "y": 120 },
+            "allow_non_desktop": false
+        });
+        let fixed_spec: MonitorSpec =
+            serde_json::from_value(fixed_json).expect("valid fixed MonitorSpec");
+        assert_eq!(fixed_spec.scale, MonitorScaleSpec::Fixed(1.5));
+        assert_eq!(fixed_spec.scale.resolve(1920, 1080, 0, 0), 1.5);
+        assert_eq!(fixed_spec.resolved_position(), Some((-1920, 120)));
+        assert!(!fixed_spec.allow_non_desktop);
     }
 }

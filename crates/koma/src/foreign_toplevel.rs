@@ -409,13 +409,31 @@ fn build_snapshots(
                 .toplevel()
                 .and_then(|t| t.parent())
                 .and_then(|p| parent_map.get(&p.id()).copied());
-            let visible_outputs = if m.ws_id == state.active_ws_id
-                || state.active_special_ws_id.as_ref() == Some(&m.ws_id)
-            {
-                output_names.clone()
-            } else {
-                Vec::new()
-            };
+            let visible_outputs: Vec<String> =
+                if outputs.is_empty() || state.output_workspaces.is_empty() {
+                    if m.ws_id == state.active_ws_id
+                        || state.active_special_ws_id.as_ref() == Some(&m.ws_id)
+                    {
+                        output_names.clone()
+                    } else {
+                        Vec::new()
+                    }
+                } else if state.active_special_ws_id.as_ref() == Some(&m.ws_id) {
+                    state
+                        .focused_output_name()
+                        .into_iter()
+                        .filter(|n| output_names.contains(n))
+                        .collect()
+                } else {
+                    state
+                        .output_workspaces
+                        .iter()
+                        .filter(|(out_name, ws_id)| {
+                            *ws_id == &m.ws_id && output_names.contains(out_name)
+                        })
+                        .map(|(out_name, _)| out_name.clone())
+                        .collect()
+                };
             (
                 m.win_id,
                 ToplevelSnapshot {

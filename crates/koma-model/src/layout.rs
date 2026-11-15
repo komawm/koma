@@ -152,12 +152,12 @@ impl FloatingStack {
         let max_w = if max_size.0 > 0 {
             (max_size.0 as i32).max(min_w)
         } else {
-            wa.w.max(96) as i32
+            (wa.w.max(96) as i32).max(min_w)
         };
         let max_h = if max_size.1 > 0 {
             (max_size.1 as i32).max(min_h)
         } else {
-            wa.h.max(72) as i32
+            (wa.h.max(72) as i32).max(min_h)
         };
 
         let right_edge = initial.x + initial.w as i32;
@@ -373,5 +373,39 @@ impl DeckStashStack {
     pub fn active_geometry(&self, viewport: LogicalViewport) -> Option<(WindowId, LogicalRect)> {
         self.active_deck
             .map(|win_id| (win_id, viewport.work_area_rect()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compute_corner_resize_rect_never_panics_when_work_area_smaller_than_min_size() {
+        let tiny_vp = LogicalViewport::new(64, 48, 1.0).with_work_area_zone(0, 0, 64, 48);
+        let initial = LogicalRect::new(0, 0, 200, 150);
+        let resized = FloatingStack::compute_corner_resize_rect(
+            initial,
+            ResizeCorner::BottomRight,
+            -32.0,
+            -24.0,
+            (200, 150),
+            (0, 0),
+            tiny_vp,
+        );
+        assert_eq!(resized.w, 200);
+        assert_eq!(resized.h, 150);
+
+        let grown = FloatingStack::compute_corner_resize_rect(
+            initial,
+            ResizeCorner::TopLeft,
+            -40.0,
+            -30.0,
+            (240, 180),
+            (0, 0),
+            tiny_vp,
+        );
+        assert!(grown.w >= 240);
+        assert!(grown.h >= 180);
     }
 }
