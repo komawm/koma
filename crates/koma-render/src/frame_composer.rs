@@ -753,8 +753,8 @@ pub const fn should_render_agent_cursor(target: RenderTargetKind) -> bool {
     !matches!(target, RenderTargetKind::AgentCapture)
 }
 
-/// Prepends agent cursor, ripple, fog, and motion-trail elements (cursor front-most before trail)
-/// onto `elements`, obeying `RenderTargetKind::AgentCapture` strict view isolation.
+/// Prepends agent cursor, label pill, ripple, fog, motion-trail, and optional caret-box elements
+/// (cursor front-most) onto `elements`, obeying `RenderTargetKind::AgentCapture` strict view isolation.
 pub fn prepend_agent_cursor_elements<R>(
     renderer: &mut R,
     target: RenderTargetKind,
@@ -763,7 +763,7 @@ pub fn prepend_agent_cursor_elements<R>(
     elements: &mut Vec<KomaRenderElement<R>>,
 ) where
     R: Renderer + ImportAll + ImportMem + KomaGlesRenderer + crate::elements::KomaRenderTarget,
-    R::TextureId: Clone + 'static,
+    R::TextureId: Send + Clone + 'static,
 {
     if !should_render_agent_cursor(target) {
         return;
@@ -776,11 +776,22 @@ pub fn prepend_agent_cursor_elements<R>(
     }
 
     let shaders = KomaCompiledShaders::get_or_compile(renderer.as_gles_renderer());
-    let mut overlay: Vec<KomaRenderElement<R>> = Vec::with_capacity(2);
+    let mut overlay: Vec<KomaRenderElement<R>> = Vec::with_capacity(8);
     if let Some(cursor_prog) = shaders.agent_cursor {
         overlay.push(KomaRenderElement::from(
             KomaAgentCursorElement::from_snapshot(snap, output_scale, cursor_prog),
         ));
+    }
+    if let Some(pill) = &snap.label_pill
+        && let Some(pill_elem) = crate::elements::build_label_pill_element(
+            renderer,
+            pill,
+            snap.accent_rgba,
+            snap.opacity,
+            output_scale,
+        )
+    {
+        overlay.push(pill_elem);
     }
     if let Some(trail_prog) = shaders.agent_trail
         && let Some(trail_elem) = KomaAgentTrailElement::from_points(
@@ -792,6 +803,64 @@ pub fn prepend_agent_cursor_elements<R>(
         )
     {
         overlay.push(KomaRenderElement::from(trail_elem));
+    }
+    if let Some(caret) = snap.caret_rect
+        && caret.w > 0
+        && caret.h > 0
+    {
+        let caret_f64 = to_smithay_logical_rect(caret);
+        let [r, g, b, _] = snap.accent_rgba;
+        let alpha = snap.opacity.clamp(0.0, 1.0);
+        if let (Some(border_prog), Some(white_tex)) = (
+            shaders.rounded_border.as_ref(),
+            shaders.white_1x1_tex.as_ref(),
+        ) {
+            overlay.push(KomaRenderElement::RoundedBorder(
+                KomaRoundedBorderElement::new(
+                    caret_f64,
+                    [4.0; 4],
+                    1.5,
+                    [r, g, b, 0.85 * alpha],
+                    alpha,
+                    output_scale,
+                    white_tex.clone(),
+                    border_prog.clone(),
+                ),
+            ));
+        } else {
+            let stroke = 1.5_f64;
+            let outline_rgba = [r, g, b, 0.85 * alpha];
+            let x = caret_f64.loc.x;
+            let y = caret_f64.loc.y;
+            let w = caret_f64.size.w;
+            let h = caret_f64.size.h;
+            overlay.push(KomaRenderElement::from(KomaSolidColorElement::oneshot(
+                Rectangle::new(Point::from((x, y)), Size::from((w, stroke))),
+                outline_rgba,
+            )));
+            overlay.push(KomaRenderElement::from(KomaSolidColorElement::oneshot(
+                Rectangle::new(
+                    Point::from((x, (y + h - stroke).max(y))),
+                    Size::from((w, stroke)),
+                ),
+                outline_rgba,
+            )));
+            overlay.push(KomaRenderElement::from(KomaSolidColorElement::oneshot(
+                Rectangle::new(Point::from((x, y)), Size::from((stroke, h))),
+                outline_rgba,
+            )));
+            overlay.push(KomaRenderElement::from(KomaSolidColorElement::oneshot(
+                Rectangle::new(
+                    Point::from(((x + w - stroke).max(x), y)),
+                    Size::from((stroke, h)),
+                ),
+                outline_rgba,
+            )));
+        }
+        overlay.push(KomaRenderElement::from(KomaSolidColorElement::oneshot(
+            caret_f64,
+            [r, g, b, 0.14 * alpha],
+        )));
     }
     if !overlay.is_empty() {
         elements.splice(0..0, overlay);

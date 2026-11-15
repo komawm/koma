@@ -34,8 +34,9 @@ pub use crate::{
         AgentCursorConfig, AgentCursorFrameSnapshot, AgentCursorVisualDynamics, ArcLengthSpline,
         CURSOR_CLICK_PULSE_MS, CURSOR_CLICK_RIPPLE_MS, CURSOR_MAX_RIPPLES, CURSOR_SETTLE_FADE_MS,
         CURSOR_TRAIL_LIFETIME_MS, CURSOR_TRAIL_MAX_SAMPLES, CURSOR_TRAIL_RENDER_POINTS,
-        CentripetalCatmullRom, CubicBezierSegment2D, HeadingArcChooser, PathSplineKind,
-        PointerPathTrack, VelocityVerletSpring1D, wrap_pi,
+        CentripetalCatmullRom, CubicBezierSegment2D, HandPathModulation, HeadingArcChooser,
+        LABEL_PILL_HEIGHT, LABEL_PILL_MAX_CHARS, LABEL_PILL_MAX_WORDS, LabelPillSnapshot,
+        PathSplineKind, PointerPathTrack, VelocityVerletSpring1D, place_label_pill, wrap_pi,
     },
     dwindle::{
         CardinalDir, DropZonePreview, DwindleConfig, DwindleInsertOutcome, DwindleTree,

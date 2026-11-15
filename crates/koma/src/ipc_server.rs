@@ -30,15 +30,17 @@ use calloop::{
     TokenFactory, generic::Generic,
 };
 use koma_model::{
-    LayoutMode, LogicalViewport, PresentationTarget, WindowMatchContext, WorkspaceState,
+    LayoutMode, LogicalViewport, PresentationTarget, WindowMatchContext, WorkspaceLeaseState,
+    WorkspaceState,
 };
 use koma_proto::{
-    ADMIN_SOCKET_NAME, AGENT_SOCKET_NAME, AncillaryFdRef, CapabilityToken, Epoch, ErrorSymbol,
-    EventRingBuffer, EventTopic, IpcError, IpcRequest, IpcResponse, OverlayKind, PrivilegeLevel,
-    SeatId, SessionId, TokenAuthorizer as _, TokenClaims, TransportKind, WorkspaceEvent,
-    WorkspaceId,
+    ADMIN_SOCKET_NAME, AGENT_SOCKET_NAME, AncillaryFdRef, CapabilityToken, DeliverySemantics,
+    Epoch, ErrorSymbol, EventRingBuffer, EventTopic, IpcError, IpcRequest, IpcResponse,
+    OverlayKind, PrivilegeLevel, SeatId, SessionId, TokenAuthorizer as _, TokenClaims,
+    TransportKind, WorkspaceEvent, WorkspaceId,
     rpc::{
-        CaptureFrameParams, CaptureFrameResult, LuaExecTxParams, WorkspaceModeSpec,
+        CaptureFrameParams, CaptureFrameResult, CursorLabelParams, HitTestParams, HitTestResult,
+        LuaExecTxParams, RelativeMoveParams, WheelScrollParams, WorkspaceModeSpec,
         WorkspaceSetModeParams,
     },
     scm_unix::{
@@ -319,7 +321,7 @@ fn accept_ipc_peer(
                     readiness.writable,
                 );
                 if disconnect {
-                    state.ipc_clients.remove(&conn_id);
+                    cleanup_disconnected_ipc_peer(state, conn_id);
                     return Ok(PostAction::Remove);
                 }
                 // Toggle EPOLLOUT (`Interest::BOTH`) ONLY when outbox has pending bytes so idle
@@ -481,7 +483,8 @@ pub(crate) fn check_ipc_lock_gate(
 }
 
 /// Authorizes and executes a parsed `IpcRequest` against `KomaState`.
-fn dispatch_rpc(
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn dispatch_rpc(
     state: &mut KomaState,
     conn_id: u64,
     req: IpcRequest,
@@ -752,14 +755,15 @@ fn dispatch_rpc(
                 PrivilegeLevel::Control,
                 now_ms,
             )?;
-            let ws = state
-                .workspaces
-                .get_mut(&ws_id)
-                .ok_or_else(|| IpcError::new(ErrorSymbol::ErrNotFound, "unknown workspace"))?;
-            let new_epoch = ws.lease.release(&session_id, expected_epoch)?;
-            if let Some(vseat) = state.vseats.get_mut(&ws.vseat_id) {
-                let _ = vseat.flush_all_held();
-            }
+            let new_epoch = {
+                let ws = state
+                    .workspaces
+                    .get_mut(&ws_id)
+                    .ok_or_else(|| IpcError::new(ErrorSymbol::ErrNotFound, "unknown workspace"))?;
+                ws.lease.release(&session_id, expected_epoch)?
+            };
+            crate::macro_runtime::release_all_vseat_held_inputs(state, &ws_id);
+            state.pointer_animations.retain(|a| a.ws_id != ws_id);
             state.broadcast_workspace_event(
                 EventTopic::WorkspaceLease,
                 &ws_id,
@@ -795,6 +799,9 @@ fn dispatch_rpc(
                     .ok_or_else(|| IpcError::new(ErrorSymbol::ErrNotFound, "unknown workspace"))?
                     .lease
                     .human_toggle_takeover(60_000, now_ms);
+                if fx.flush_virtual_seat {
+                    crate::macro_runtime::release_all_vseat_held_inputs(state, &params.ws_id);
+                }
                 if fx.cancel_lua_coroutines {
                     state.pointer_animations.retain(|a| a.ws_id != params.ws_id);
                     if let Some(ac) = state.agent_cursors.get_mut(&params.ws_id) {
@@ -971,38 +978,94 @@ fn dispatch_rpc(
                 .and_then(Value::as_bool)
                 .unwrap_or(true)
                 .then_some(60_000);
-            let (session_id, grant) = authorize_peer_for_ws(
+            let target = parse_ipc_anchor(req.params.get("target").unwrap_or(&req.params))?;
+            let kinematics = parse_ipc_kinematics(&req.params);
+            let active_epoch = validate_vseat_mutation_gate(
                 state,
                 &auth_snapshot,
                 &ws_id,
-                PrivilegeLevel::Control,
+                expected_epoch,
+                auto_ttl,
                 now_ms,
             )?;
-            let active_epoch = {
-                let ws = state
-                    .workspaces
-                    .get_mut(&ws_id)
-                    .ok_or_else(|| IpcError::new(ErrorSymbol::ErrNotFound, "unknown workspace"))?;
-                ws.lease.validate_mutation_gate(
-                    &session_id,
-                    grant,
-                    expected_epoch,
-                    auto_ttl,
-                    now_ms,
-                )?
-            };
-
-            let target = parse_ipc_anchor(req.params.get("target").unwrap_or(&req.params))?;
-            let kinematics = parse_ipc_kinematics(&req.params);
             crate::macro_runtime::queue_pointer_trajectory(
                 state,
-                ws_id,
+                ws_id.clone(),
                 active_epoch,
                 target,
                 &kinematics,
                 None,
             )?;
-            Ok((json!({ "ok": true, "epoch": active_epoch }), Vec::new()))
+            let disposition = vseat_response_disposition(state, &ws_id);
+            Ok((
+                json!({ "ok": true, "epoch": active_epoch, "disposition": disposition }),
+                Vec::new(),
+            ))
+        }
+
+        "vseat.relative_move" => {
+            let params: RelativeMoveParams = serde_json::from_value(req.params)
+                .map_err(|e| IpcError::new(ErrorSymbol::ErrInvalidParams, e.to_string()))?;
+            let active_epoch = validate_vseat_mutation_gate(
+                state,
+                &auth_snapshot,
+                &params.ws_id,
+                params.expected_epoch,
+                Some(60_000),
+                now_ms,
+            )?;
+            let cursor_pos = crate::macro_runtime::apply_vseat_relative_move(
+                state,
+                &params.ws_id,
+                active_epoch,
+                params.dx,
+                params.dy,
+                params.dx_unaccel,
+                params.dy_unaccel,
+                &params.modifiers,
+            )?;
+            Ok((
+                json!({
+                    "ok": true,
+                    "epoch": active_epoch,
+                    "cursor_pos": [cursor_pos.x, cursor_pos.y],
+                    "disposition": DeliverySemantics::delivered_verified(),
+                }),
+                Vec::new(),
+            ))
+        }
+
+        "vseat.wheel" => {
+            let params: WheelScrollParams = serde_json::from_value(req.params)
+                .map_err(|e| IpcError::new(ErrorSymbol::ErrInvalidParams, e.to_string()))?;
+            let target = params.target.as_ref().map(parse_ipc_anchor).transpose()?;
+            let active_epoch = validate_vseat_mutation_gate(
+                state,
+                &auth_snapshot,
+                &params.ws_id,
+                params.expected_epoch,
+                Some(60_000),
+                now_ms,
+            )?;
+            crate::macro_runtime::apply_vseat_wheel(
+                state,
+                &params.ws_id,
+                active_epoch,
+                target,
+                params.dx,
+                params.dy,
+                params.discrete_x,
+                params.discrete_y,
+                &params.modifiers,
+            )?;
+            Ok((
+                json!({
+                    "ok": true,
+                    "epoch": active_epoch,
+                    "disposition": DeliverySemantics::delivered_verified(),
+                }),
+                Vec::new(),
+            ))
         }
 
         "vseat.click" => {
@@ -1014,29 +1077,10 @@ fn dispatch_rpc(
                 .and_then(Value::as_bool)
                 .unwrap_or(true)
                 .then_some(60_000);
-            let (session_id, grant) = authorize_peer_for_ws(
-                state,
-                &auth_snapshot,
-                &ws_id,
-                PrivilegeLevel::Control,
-                now_ms,
-            )?;
-            let active_epoch = {
-                let ws = state
-                    .workspaces
-                    .get_mut(&ws_id)
-                    .ok_or_else(|| IpcError::new(ErrorSymbol::ErrNotFound, "unknown workspace"))?;
-                ws.lease.validate_mutation_gate(
-                    &session_id,
-                    grant,
-                    expected_epoch,
-                    auto_ttl,
-                    now_ms,
-                )?
-            };
-
             let target = if let Some(cell) = req.params.get("grid_225").and_then(Value::as_str) {
                 koma_model::AnchorPoint::Grid225(cell.to_owned())
+            } else if let Some(target_val) = req.params.get("target") {
+                parse_ipc_anchor(target_val)?
             } else {
                 let x = req.params.get("x").and_then(Value::as_f64).unwrap_or(0.0);
                 let y = req.params.get("y").and_then(Value::as_f64).unwrap_or(0.0);
@@ -1057,47 +1101,40 @@ fn dispatch_rpc(
                 .get("clicks")
                 .and_then(Value::as_u64)
                 .unwrap_or(1) as u8;
+            let modifiers = parse_ipc_modifiers(&req.params)?;
+            let label = parse_ipc_label(&req.params)?;
 
-            crate::macro_runtime::dispatch_single_host_action(
+            let active_epoch = validate_vseat_mutation_gate(
                 state,
-                koma_lua::phodopus_bridge::QueuedHostAction::ClickPointer {
-                    ws_id,
-                    expected_epoch: active_epoch,
-                    target,
-                    opts: koma_lua::schema::LuaClickOptsInput {
-                        button,
-                        clicks,
-                        hold_ms: 25,
-                    },
-                },
-            );
-            Ok((json!({ "ok": true, "epoch": active_epoch }), Vec::new()))
+                &auth_snapshot,
+                &ws_id,
+                expected_epoch,
+                auto_ttl,
+                now_ms,
+            )?;
+            crate::macro_runtime::apply_vseat_click_with_modifiers(
+                state,
+                &ws_id,
+                active_epoch,
+                target,
+                &button,
+                clicks,
+                &modifiers,
+                label,
+            )?;
+            Ok((
+                json!({
+                    "ok": true,
+                    "epoch": active_epoch,
+                    "disposition": DeliverySemantics::delivered_verified(),
+                }),
+                Vec::new(),
+            ))
         }
 
         "vseat.drag" => {
             let ws_id = parse_ws_id(&req.params)?;
             let expected_epoch = parse_expected_epoch(&req.params)?;
-            let (session_id, grant) = authorize_peer_for_ws(
-                state,
-                &auth_snapshot,
-                &ws_id,
-                PrivilegeLevel::Control,
-                now_ms,
-            )?;
-            let active_epoch = {
-                let ws = state
-                    .workspaces
-                    .get_mut(&ws_id)
-                    .ok_or_else(|| IpcError::new(ErrorSymbol::ErrNotFound, "unknown workspace"))?;
-                ws.lease.validate_mutation_gate(
-                    &session_id,
-                    grant,
-                    expected_epoch,
-                    Some(60_000),
-                    now_ms,
-                )?
-            };
-
             let from_pt = parse_ipc_anchor(req.params.get("from").unwrap_or(&Value::Null))?;
             let to_pt = parse_ipc_anchor(req.params.get("to").unwrap_or(&Value::Null))?;
             let button = req
@@ -1106,35 +1143,40 @@ fn dispatch_rpc(
                 .and_then(Value::as_str)
                 .unwrap_or("left")
                 .to_owned();
+            let modifiers = parse_ipc_modifiers(&req.params)?;
+            let label = parse_ipc_label(&req.params)?;
+            let modulation = parse_ipc_modulation(&req.params)?;
             let kinematics = parse_ipc_kinematics(&req.params);
 
-            crate::macro_runtime::dispatch_single_host_action(
+            let active_epoch = validate_vseat_mutation_gate(
                 state,
-                koma_lua::phodopus_bridge::QueuedHostAction::MovePointer {
-                    ws_id: ws_id.clone(),
-                    expected_epoch: active_epoch,
-                    target: from_pt,
-                    kinematics: koma_lua::schema::LuaKinematicsInput::instant(),
-                },
-            );
-            crate::macro_runtime::dispatch_single_host_action(
-                state,
-                koma_lua::phodopus_bridge::QueuedHostAction::PointerButton {
-                    ws_id: ws_id.clone(),
-                    expected_epoch: active_epoch,
-                    button: button.clone(),
-                    pressed: true,
-                },
-            );
-            crate::macro_runtime::queue_pointer_trajectory(
-                state,
-                ws_id,
-                active_epoch,
-                to_pt,
-                &kinematics,
-                Some(button),
+                &auth_snapshot,
+                &ws_id,
+                expected_epoch,
+                Some(60_000),
+                now_ms,
             )?;
-            Ok((json!({ "ok": true, "epoch": active_epoch }), Vec::new()))
+            crate::macro_runtime::queue_pointer_path_trajectory(
+                state,
+                ws_id.clone(),
+                active_epoch,
+                vec![from_pt, to_pt],
+                crate::macro_runtime::PointerPathLaunchOpts {
+                    spline: koma_model::PathSplineKind::Auto,
+                    kinematics,
+                    press_button_at_start: Some(button.clone()),
+                    release_button_on_finish: Some(button),
+                    modifiers,
+                    label,
+                    modulation,
+                    ..Default::default()
+                },
+            )?;
+            let disposition = vseat_response_disposition(state, &ws_id);
+            Ok((
+                json!({ "ok": true, "epoch": active_epoch, "disposition": disposition }),
+                Vec::new(),
+            ))
         }
 
         "vseat.path" | "vseat.stroke" => {
@@ -1146,13 +1188,6 @@ fn dispatch_rpc(
                 .and_then(Value::as_bool)
                 .unwrap_or(true)
                 .then_some(60_000);
-            let (session_id, grant) = authorize_peer_for_ws(
-                state,
-                &auth_snapshot,
-                &ws_id,
-                PrivilegeLevel::Control,
-                now_ms,
-            )?;
 
             let raw_waypoints = req
                 .params
@@ -1207,25 +1242,23 @@ fn dispatch_rpc(
                 .or_else(|| req.params.get("hold_before_release_ms"))
                 .and_then(Value::as_u64)
                 .unwrap_or(0);
+            let modifiers = parse_ipc_modifiers(&req.params)?;
+            let label = parse_ipc_label(&req.params)?;
+            let modulation = parse_ipc_modulation(&req.params)?;
             let kinematics = parse_ipc_kinematics(&req.params);
 
-            let active_epoch = {
-                let ws = state
-                    .workspaces
-                    .get_mut(&ws_id)
-                    .ok_or_else(|| IpcError::new(ErrorSymbol::ErrNotFound, "unknown workspace"))?;
-                ws.lease.validate_mutation_gate(
-                    &session_id,
-                    grant,
-                    expected_epoch,
-                    auto_ttl,
-                    now_ms,
-                )?
-            };
+            let active_epoch = validate_vseat_mutation_gate(
+                state,
+                &auth_snapshot,
+                &ws_id,
+                expected_epoch,
+                auto_ttl,
+                now_ms,
+            )?;
 
             let count = crate::macro_runtime::queue_pointer_path_trajectory(
                 state,
-                ws_id,
+                ws_id.clone(),
                 active_epoch,
                 waypoints,
                 crate::macro_runtime::PointerPathLaunchOpts {
@@ -1235,12 +1268,167 @@ fn dispatch_rpc(
                     hold_end_ms,
                     press_button_at_start: button.clone(),
                     release_button_on_finish: button,
+                    modifiers,
+                    label,
+                    modulation,
                 },
             )?;
+            let disposition = vseat_response_disposition(state, &ws_id);
             Ok((
-                json!({ "ok": true, "epoch": active_epoch, "waypoints": count }),
+                json!({
+                    "ok": true,
+                    "epoch": active_epoch,
+                    "waypoints": count,
+                    "disposition": disposition,
+                }),
                 Vec::new(),
             ))
+        }
+
+        "vseat.hit_test" => {
+            let params: HitTestParams = serde_json::from_value(req.params)
+                .map_err(|e| IpcError::new(ErrorSymbol::ErrInvalidParams, e.to_string()))?;
+            let _ = authorize_peer_for_ws(
+                state,
+                &auth_snapshot,
+                &params.ws_id,
+                PrivilegeLevel::ObserveOnly,
+                now_ms,
+            )?;
+            let ws = state
+                .workspaces
+                .get(&params.ws_id)
+                .ok_or_else(|| IpcError::new(ErrorSymbol::ErrNotFound, "unknown workspace"))?;
+            let target_anchor = parse_ipc_anchor(&params.target)?;
+            let active_win_id = ws.active_window();
+            let ws_full_rect = ws.viewport.full_rect();
+            let target_mapped =
+                active_win_id.and_then(|wid| state.mapped_windows.iter().find(|m| m.win_id == wid));
+            let target_rect = target_mapped.map(|m| m.rect).unwrap_or(ws_full_rect);
+            let target_pt = target_anchor.resolve_in(target_rect).map_err(|e| {
+                IpcError::new(
+                    ErrorSymbol::ErrInvalidParams,
+                    format!("invalid target anchor: {e}"),
+                )
+            })?;
+
+            let margin_x = if target_rect.w >= 3 { 1.0 } else { 0.0 };
+            let margin_y = if target_rect.h >= 3 { 1.0 } else { 0.0 };
+            let min_x = f64::from(target_rect.x) + margin_x;
+            let min_y = f64::from(target_rect.y) + margin_y;
+            let max_x = (f64::from(target_rect.x + target_rect.w as i32) - margin_x).max(min_x);
+            let max_y = (f64::from(target_rect.y + target_rect.h as i32) - margin_y).max(min_y);
+            let (cx, cy) = (target_pt.x, target_pt.y);
+            let sampled_points = vec![
+                [cx, cy],
+                [
+                    (cx - 16.0).clamp(min_x, max_x),
+                    (cy - 16.0).clamp(min_y, max_y),
+                ],
+                [
+                    (cx + 16.0).clamp(min_x, max_x),
+                    (cy - 16.0).clamp(min_y, max_y),
+                ],
+                [
+                    (cx - 16.0).clamp(min_x, max_x),
+                    (cy + 16.0).clamp(min_y, max_y),
+                ],
+                [
+                    (cx + 16.0).clamp(min_x, max_x),
+                    (cy + 16.0).clamp(min_y, max_y),
+                ],
+            ];
+
+            let mut primary_hit_target = false;
+            let mut blocker = None;
+            for (idx, [px, py]) in sampled_points.iter().enumerate() {
+                let hit_wid = state
+                    .surface_under_in_workspace(
+                        &params.ws_id,
+                        smithay::utils::Point::from((*px, *py)),
+                    )
+                    .map(|(wid, _, _)| wid);
+                if idx == 0 {
+                    primary_hit_target = hit_wid.is_some() && hit_wid == active_win_id;
+                }
+                if blocker.is_none()
+                    && let Some(wid) = hit_wid
+                    && Some(wid) != active_win_id
+                {
+                    blocker = Some(wid);
+                }
+            }
+
+            let blocker_mapped =
+                blocker.and_then(|wid| state.mapped_windows.iter().find(|m| m.win_id == wid));
+            let result = HitTestResult {
+                reaches_target: primary_hit_target && blocker.is_none(),
+                target_win_id: target_mapped.map(|m| m.win_id),
+                target_app_id: target_mapped.map(|m| m.app_id.clone()),
+                blocking_win_id: blocker,
+                blocking_app_id: blocker_mapped.map(|m| m.app_id.clone()),
+                blocking_title: blocker_mapped.map(|m| m.title.clone()),
+                blocking_rect: blocker_mapped
+                    .map(|m| [m.rect.x, m.rect.y, m.rect.w as i32, m.rect.h as i32]),
+                geometry_stable: !state.ws_has_active_layout_animation(&params.ws_id),
+                sampled_points,
+                cursor_pos: state
+                    .agent_cursors
+                    .get(&params.ws_id)
+                    .map(|ac| [ac.ws_local_pos.x, ac.ws_local_pos.y]),
+            };
+            let json_res = serde_json::to_value(result).map_err(|e| {
+                IpcError::new(
+                    ErrorSymbol::ErrInvalidParams,
+                    format!("failed serializing hit_test result: {e}"),
+                )
+            })?;
+            Ok((json_res, Vec::new()))
+        }
+
+        "vseat.cursor_label" => {
+            let params: CursorLabelParams = serde_json::from_value(req.params)
+                .map_err(|e| IpcError::new(ErrorSymbol::ErrInvalidParams, e.to_string()))?;
+            let _ = authorize_peer_for_ws(
+                state,
+                &auth_snapshot,
+                &params.ws_id,
+                PrivilegeLevel::Control,
+                now_ms,
+            )?;
+            if !state.workspaces.contains_key(&params.ws_id) {
+                return Err(IpcError::new(ErrorSymbol::ErrNotFound, "unknown workspace"));
+            }
+            let caret_rect = match params.caret_rect {
+                None => None,
+                Some([x, y, w, h]) => {
+                    if !x.is_finite()
+                        || !y.is_finite()
+                        || !w.is_finite()
+                        || !h.is_finite()
+                        || w <= 0.0
+                        || h <= 0.0
+                    {
+                        return Err(IpcError::new(
+                            ErrorSymbol::ErrInvalidParams,
+                            "caret_rect must have finite [x, y, w, h] with w > 0 and h > 0",
+                        ));
+                    }
+                    Some(koma_model::LogicalRect::new(
+                        x.round() as i32,
+                        y.round() as i32,
+                        (w.round() as u32).max(1),
+                        (h.round() as u32).max(1),
+                    ))
+                }
+            };
+            crate::macro_runtime::set_agent_cursor_label(
+                state,
+                &params.ws_id,
+                params.label,
+                caret_rect,
+            );
+            Ok((json!({ "ok": true }), Vec::new()))
         }
 
         "vseat.cursor_settle" => {
@@ -1303,7 +1491,14 @@ fn dispatch_rpc(
                     hold_ms: 18,
                 },
             );
-            Ok((json!({ "ok": true, "epoch": active_epoch }), Vec::new()))
+            Ok((
+                json!({
+                    "ok": true,
+                    "epoch": active_epoch,
+                    "disposition": DeliverySemantics::delivered_verified(),
+                }),
+                Vec::new(),
+            ))
         }
 
         "vseat.inject_text" => {
@@ -1352,7 +1547,14 @@ fn dispatch_rpc(
                     strategy,
                 },
             );
-            Ok((json!({ "ok": true, "epoch": active_epoch }), Vec::new()))
+            Ok((
+                json!({
+                    "ok": true,
+                    "epoch": active_epoch,
+                    "disposition": DeliverySemantics::delivered_verified(),
+                }),
+                Vec::new(),
+            ))
         }
 
         "vseat.paste_mime" => {
@@ -1900,6 +2102,118 @@ fn parse_ipc_kinematics(params: &Value) -> koma_lua::schema::LuaKinematicsInput 
         kin.duration_ms = Some(dur);
     }
     kin
+}
+
+fn validate_vseat_mutation_gate(
+    state: &mut KomaState,
+    auth: &PeerAuthState,
+    ws_id: &WorkspaceId,
+    expected_epoch: Epoch,
+    auto_ttl_ms: Option<u64>,
+    now_ms: u64,
+) -> Result<Epoch, IpcError> {
+    let (session_id, grant) =
+        authorize_peer_for_ws(state, auth, ws_id, PrivilegeLevel::Control, now_ms)?;
+    let ws = state
+        .workspaces
+        .get_mut(ws_id)
+        .ok_or_else(|| IpcError::new(ErrorSymbol::ErrNotFound, "unknown workspace"))?;
+    ws.lease
+        .validate_mutation_gate(&session_id, grant, expected_epoch, auto_ttl_ms, now_ms)
+}
+
+fn parse_ipc_modifiers(params: &Value) -> Result<Vec<String>, IpcError> {
+    match params.get("modifiers") {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(v) => serde_json::from_value::<Vec<String>>(v.clone()).map_err(|e| {
+            IpcError::new(
+                ErrorSymbol::ErrInvalidParams,
+                format!("invalid modifiers array: {e}"),
+            )
+        }),
+    }
+}
+
+fn parse_ipc_label(params: &Value) -> Result<Option<String>, IpcError> {
+    match params.get("label") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.clone())),
+        Some(_) => Err(IpcError::new(
+            ErrorSymbol::ErrInvalidParams,
+            "label must be a string or null",
+        )),
+    }
+}
+
+fn parse_ipc_modulation(params: &Value) -> Result<koma_model::HandPathModulation, IpcError> {
+    let parse_opt_f64 = |key: &str| -> Result<f64, IpcError> {
+        match params.get(key) {
+            None | Some(Value::Null) => Ok(0.0),
+            Some(v) => v.as_f64().filter(|x| x.is_finite()).ok_or_else(|| {
+                IpcError::new(
+                    ErrorSymbol::ErrInvalidParams,
+                    format!("{key} must be a finite number"),
+                )
+            }),
+        }
+    };
+    Ok(koma_model::HandPathModulation {
+        bow: parse_opt_f64("bow")?,
+        overshoot: parse_opt_f64("overshoot")?,
+        tremor: parse_opt_f64("tremor")?,
+    }
+    .sanitized())
+}
+
+fn vseat_response_disposition(state: &KomaState, ws_id: &WorkspaceId) -> DeliverySemantics {
+    if state.pointer_animations.iter().any(|a| &a.ws_id == ws_id) {
+        DeliverySemantics::delivered_unverified_unsafe()
+    } else {
+        DeliverySemantics::delivered_verified()
+    }
+}
+
+pub(crate) fn cleanup_disconnected_ipc_peer(state: &mut KomaState, conn_id: u64) {
+    let Some(removed) = state.ipc_clients.remove(&conn_id) else {
+        return;
+    };
+    let session_id = match &removed.auth {
+        PeerAuthState::AdminVerified { session_id, .. }
+        | PeerAuthState::AgentAuthenticated { session_id, .. } => session_id.clone(),
+        PeerAuthState::AgentUnauthenticated => return,
+    };
+    let now_ms = state.elapsed_ms();
+    let owned_workspaces: Vec<(WorkspaceId, Epoch)> = state
+        .workspaces
+        .iter()
+        .filter_map(|(ws_id, ws)| match ws.lease.state() {
+            WorkspaceLeaseState::AgentExclusive { holder, .. } if holder == &session_id => {
+                Some((ws_id.clone(), ws.lease.epoch()))
+            }
+            _ => None,
+        })
+        .collect();
+    for (ws_id, expected_epoch) in owned_workspaces {
+        let _ = crate::macro_runtime::release_all_vseat_held_inputs(state, &ws_id);
+        state.pointer_animations.retain(|a| a.ws_id != ws_id);
+        if let Some(ac) = state.agent_cursors.get_mut(&ws_id) {
+            ac.visual.begin_settle(now_ms, false);
+        }
+        if let Some(ws) = state.workspaces.get_mut(&ws_id)
+            && let Ok(new_epoch) = ws.lease.release(&session_id, expected_epoch)
+        {
+            state.broadcast_workspace_event(
+                EventTopic::WorkspaceLease,
+                &ws_id,
+                new_epoch,
+                WorkspaceEvent::EpochChanged {
+                    new_epoch,
+                    holder: None,
+                },
+            );
+        }
+        state.queue_redraw();
+    }
 }
 
 fn generate_ephemeral_capability_token() -> Result<CapabilityToken, IpcError> {

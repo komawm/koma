@@ -1951,6 +1951,7 @@ fn on_session_event_callback(state: &mut KomaState, event: SessionEvent) {
             if let Some(keyboard) = state.seat.get_keyboard() {
                 keyboard.release_source(state, KeyboardSource::MAIN);
             }
+            crate::macro_runtime::release_all_vseat_held_inputs_everywhere(state);
             for vseat in state.vseats.values_mut() {
                 let _ = vseat.flush_all_held();
             }

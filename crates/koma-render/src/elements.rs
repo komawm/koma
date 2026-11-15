@@ -4,21 +4,25 @@
 //! 3. `KomaBlurredBackdropElement` — frosted-glass `Dual Kawase Blur` slice clipped to rounded window,
 //! 4. `KomaSolidColorElement` — fractional-scale solid rects (`#000000` Protected blackout, `grid_225`).
 
-use koma_model::{AgentCursorFrameSnapshot, LogicalPoint};
+use koma_model::{AgentCursorFrameSnapshot, LabelPillSnapshot, LogicalPoint};
 use smithay::{
-    backend::renderer::{
-        Color32F, Frame, ImportAll, ImportMem, Renderer, buffer_y_inverted,
-        element::{
-            Element, Id, Kind, RenderElement, UnderlyingStorage,
-            memory::MemoryRenderBufferRenderElement, render_elements,
-            surface::WaylandSurfaceRenderElement,
+    backend::{
+        allocator::Fourcc,
+        renderer::{
+            Color32F, Frame, ImportAll, ImportMem, Renderer, buffer_y_inverted,
+            element::{
+                Element, Id, Kind, RenderElement, UnderlyingStorage,
+                memory::{MemoryRenderBuffer, MemoryRenderBufferRenderElement},
+                render_elements,
+                surface::WaylandSurfaceRenderElement,
+            },
+            gles::{
+                GlesError, GlesFrame, GlesPixelProgram, GlesRenderer, GlesTexProgram, GlesTexture,
+                Uniform, element::PixelShaderElement,
+            },
+            multigpu::{Error as MultiError, MultiRenderer, gbm::GbmGlesBackend},
+            utils::{CommitCounter, DamageSet, OpaqueRegions},
         },
-        gles::{
-            GlesError, GlesFrame, GlesPixelProgram, GlesRenderer, GlesTexProgram, GlesTexture,
-            Uniform, element::PixelShaderElement,
-        },
-        multigpu::{Error as MultiError, MultiRenderer, gbm::GbmGlesBackend},
-        utils::{CommitCounter, DamageSet, OpaqueRegions},
     },
     utils::{
         Buffer, DeviceFd, Logical, Physical, Point, Rectangle, Scale, Size, Transform,
@@ -952,4 +956,307 @@ pub fn to_smithay_logical_rect(rect: koma_model::LogicalRect) -> Rectangle<f64, 
         Point::from((f64::from(rect.x), f64::from(rect.y))),
         Size::from((f64::from(rect.w), f64::from(rect.h))),
     )
+}
+
+#[inline]
+const fn premul_bgra(r: u8, g: u8, b: u8, a: u8) -> [u8; 4] {
+    let af = a as u16;
+    [
+        ((b as u16 * af + 127) / 255) as u8,
+        ((g as u16 * af + 127) / 255) as u8,
+        ((r as u16 * af + 127) / 255) as u8,
+        a,
+    ]
+}
+
+#[inline]
+fn f32_to_u8(v: f32) -> u8 {
+    (v.clamp(0.0, 1.0) * 255.0).round() as u8
+}
+
+/// Compact 5x7 monochrome bitmap font covering printable ASCII `0x20..=0x7E` (7 rows x 5 bits).
+const FONT_5X7_ASCII: [[u8; 7]; 95] = [
+    [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], // ' '
+    [0x04, 0x04, 0x04, 0x04, 0x04, 0x00, 0x04], // '!'
+    [0x0A, 0x0A, 0x0A, 0x00, 0x00, 0x00, 0x00], // '"'
+    [0x0A, 0x0A, 0x1F, 0x0A, 0x1F, 0x0A, 0x0A], // '#'
+    [0x04, 0x0F, 0x14, 0x0E, 0x05, 0x1E, 0x04], // '$'
+    [0x18, 0x19, 0x02, 0x04, 0x08, 0x13, 0x03], // '%'
+    [0x0C, 0x12, 0x14, 0x08, 0x15, 0x12, 0x0D], // '&'
+    [0x06, 0x04, 0x08, 0x00, 0x00, 0x00, 0x00], // '\''
+    [0x02, 0x04, 0x08, 0x08, 0x08, 0x04, 0x02], // '('
+    [0x08, 0x04, 0x02, 0x02, 0x02, 0x04, 0x08], // ')'
+    [0x00, 0x04, 0x15, 0x0E, 0x15, 0x04, 0x00], // '*'
+    [0x00, 0x04, 0x04, 0x1F, 0x04, 0x04, 0x00], // '+'
+    [0x00, 0x00, 0x00, 0x00, 0x06, 0x04, 0x08], // ','
+    [0x00, 0x00, 0x00, 0x1F, 0x00, 0x00, 0x00], // '-'
+    [0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x06], // '.'
+    [0x01, 0x01, 0x02, 0x04, 0x08, 0x10, 0x10], // '/'
+    [0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E], // '0'
+    [0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E], // '1'
+    [0x0E, 0x11, 0x01, 0x06, 0x08, 0x10, 0x1F], // '2'
+    [0x1F, 0x02, 0x04, 0x06, 0x01, 0x11, 0x0E], // '3'
+    [0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02], // '4'
+    [0x1F, 0x10, 0x1E, 0x01, 0x01, 0x11, 0x0E], // '5'
+    [0x06, 0x08, 0x10, 0x1E, 0x11, 0x11, 0x0E], // '6'
+    [0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08], // '7'
+    [0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E], // '8'
+    [0x0E, 0x11, 0x11, 0x0F, 0x01, 0x02, 0x0C], // '9'
+    [0x00, 0x06, 0x06, 0x00, 0x06, 0x06, 0x00], // ':'
+    [0x00, 0x06, 0x06, 0x00, 0x06, 0x04, 0x08], // ';'
+    [0x02, 0x04, 0x08, 0x10, 0x08, 0x04, 0x02], // '<'
+    [0x00, 0x00, 0x1F, 0x00, 0x1F, 0x00, 0x00], // '='
+    [0x08, 0x04, 0x02, 0x01, 0x02, 0x04, 0x08], // '>'
+    [0x0E, 0x11, 0x01, 0x02, 0x04, 0x00, 0x04], // '?'
+    [0x0E, 0x11, 0x17, 0x15, 0x17, 0x10, 0x0E], // '@'
+    [0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11], // 'A'
+    [0x1E, 0x11, 0x11, 0x1E, 0x11, 0x11, 0x1E], // 'B'
+    [0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E], // 'C'
+    [0x1C, 0x12, 0x11, 0x11, 0x11, 0x12, 0x1C], // 'D'
+    [0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F], // 'E'
+    [0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x10], // 'F'
+    [0x0E, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0F], // 'G'
+    [0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11], // 'H'
+    [0x0E, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E], // 'I'
+    [0x07, 0x02, 0x02, 0x02, 0x02, 0x12, 0x0C], // 'J'
+    [0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11], // 'K'
+    [0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F], // 'L'
+    [0x11, 0x1B, 0x15, 0x15, 0x11, 0x11, 0x11], // 'M'
+    [0x11, 0x19, 0x15, 0x13, 0x11, 0x11, 0x11], // 'N'
+    [0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E], // 'O'
+    [0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10], // 'P'
+    [0x0E, 0x11, 0x11, 0x11, 0x15, 0x12, 0x0D], // 'Q'
+    [0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11], // 'R'
+    [0x0F, 0x10, 0x10, 0x0E, 0x01, 0x01, 0x1E], // 'S'
+    [0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04], // 'T'
+    [0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E], // 'U'
+    [0x11, 0x11, 0x11, 0x11, 0x11, 0x0A, 0x04], // 'V'
+    [0x11, 0x11, 0x11, 0x15, 0x15, 0x1B, 0x11], // 'W'
+    [0x11, 0x11, 0x0A, 0x04, 0x0A, 0x11, 0x11], // 'X'
+    [0x11, 0x11, 0x0A, 0x04, 0x04, 0x04, 0x04], // 'Y'
+    [0x1F, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1F], // 'Z'
+    [0x0E, 0x08, 0x08, 0x08, 0x08, 0x08, 0x0E], // '['
+    [0x10, 0x10, 0x08, 0x04, 0x02, 0x01, 0x01], // '\'
+    [0x0E, 0x02, 0x02, 0x02, 0x02, 0x02, 0x0E], // ']'
+    [0x04, 0x0A, 0x11, 0x00, 0x00, 0x00, 0x00], // '^'
+    [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1F], // '_'
+    [0x08, 0x04, 0x02, 0x00, 0x00, 0x00, 0x00], // '`'
+    [0x00, 0x00, 0x0E, 0x01, 0x0F, 0x11, 0x0F], // 'a'
+    [0x10, 0x10, 0x16, 0x19, 0x11, 0x11, 0x1E], // 'b'
+    [0x00, 0x00, 0x0E, 0x10, 0x10, 0x11, 0x0E], // 'c'
+    [0x01, 0x01, 0x0D, 0x13, 0x11, 0x11, 0x0F], // 'd'
+    [0x00, 0x00, 0x0E, 0x11, 0x1F, 0x10, 0x0E], // 'e'
+    [0x06, 0x08, 0x08, 0x1E, 0x08, 0x08, 0x08], // 'f'
+    [0x00, 0x0F, 0x11, 0x11, 0x0F, 0x01, 0x0E], // 'g'
+    [0x10, 0x10, 0x16, 0x19, 0x11, 0x11, 0x11], // 'h'
+    [0x04, 0x00, 0x0C, 0x04, 0x04, 0x04, 0x0E], // 'i'
+    [0x02, 0x00, 0x06, 0x02, 0x02, 0x12, 0x0C], // 'j'
+    [0x10, 0x10, 0x12, 0x14, 0x18, 0x14, 0x12], // 'k'
+    [0x0C, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E], // 'l'
+    [0x00, 0x00, 0x1A, 0x15, 0x15, 0x11, 0x11], // 'm'
+    [0x00, 0x00, 0x16, 0x19, 0x11, 0x11, 0x11], // 'n'
+    [0x00, 0x00, 0x0E, 0x11, 0x11, 0x11, 0x0E], // 'o'
+    [0x00, 0x00, 0x1E, 0x11, 0x1E, 0x10, 0x10], // 'p'
+    [0x00, 0x00, 0x0D, 0x13, 0x0F, 0x01, 0x01], // 'q'
+    [0x00, 0x00, 0x16, 0x19, 0x10, 0x10, 0x10], // 'r'
+    [0x00, 0x00, 0x0E, 0x10, 0x0E, 0x01, 0x1E], // 's'
+    [0x08, 0x08, 0x1E, 0x08, 0x08, 0x09, 0x06], // 't'
+    [0x00, 0x00, 0x11, 0x11, 0x11, 0x13, 0x0D], // 'u'
+    [0x00, 0x00, 0x11, 0x11, 0x11, 0x0A, 0x04], // 'v'
+    [0x00, 0x00, 0x11, 0x11, 0x15, 0x15, 0x0A], // 'w'
+    [0x00, 0x00, 0x11, 0x0A, 0x04, 0x0A, 0x11], // 'x'
+    [0x00, 0x00, 0x11, 0x11, 0x0F, 0x01, 0x0E], // 'y'
+    [0x00, 0x00, 0x1F, 0x02, 0x04, 0x08, 0x1F], // 'z'
+    [0x02, 0x04, 0x04, 0x08, 0x04, 0x04, 0x02], // '{'
+    [0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04], // '|'
+    [0x08, 0x04, 0x04, 0x02, 0x04, 0x04, 0x08], // '}'
+    [0x00, 0x00, 0x08, 0x15, 0x02, 0x00, 0x00], // '~'
+];
+
+#[inline]
+const fn glyph_5x7(ch: char) -> [u8; 7] {
+    let code = ch as u32;
+    if code >= 0x20 && code <= 0x7E {
+        FONT_5X7_ASCII[(code - 0x20) as usize]
+    } else {
+        [0x1F, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1F]
+    }
+}
+
+/// Rasterizes a `LabelPillSnapshot` into a premultiplied `Fourcc::Argb8888` (`[B, G, R, A]`) pixel
+/// buffer at integer `scale` (`1..=4`), drawing a rounded dark backdrop, subtle accent border,
+/// left accent bar, and built-in crisp 5x7 ASCII glyphs.
+///
+/// Complexity: $O(W \cdot H)$ in pixel area (`W <= 600 * scale`, `H = 26 * scale`).
+#[must_use]
+pub fn rasterize_label_pill_argb8888(
+    pill: &LabelPillSnapshot,
+    accent_rgba: [f32; 4],
+    scale: i32,
+) -> (Vec<u8>, u32, u32) {
+    let s = scale.clamp(1, 4) as u32;
+    let w = pill.rect.w.max(1) * s;
+    let h = pill.rect.h.max(1) * s;
+    let mut pixels = vec![0_u8; (w * h * 4) as usize];
+
+    let ar = f32_to_u8(accent_rgba[0]);
+    let ag = f32_to_u8(accent_rgba[1]);
+    let ab = f32_to_u8(accent_rgba[2]);
+    let half_w = w as f32 * 0.5;
+    let half_h = h as f32 * 0.5;
+    let radius = (6.0 * s as f32).min(half_w.min(half_h));
+    let inner_rx = (half_w - radius).max(0.0);
+    let inner_ry = (half_h - radius).max(0.0);
+
+    let bar_x0 = 5 * s;
+    let bar_x1 = 8 * s;
+    let bar_y0 = 5 * s;
+    let bar_y1 = h.saturating_sub(5 * s);
+
+    for py in 0..h {
+        let qy = (py as f32 + 0.5 - half_h).abs() - inner_ry;
+        for px in 0..w {
+            let qx = (px as f32 + 0.5 - half_w).abs() - inner_rx;
+            let dist = qx.max(0.0).hypot(qy.max(0.0)) + qx.max(qy).min(0.0) - radius;
+            let cov = (0.5 - dist).clamp(0.0, 1.0);
+            if cov <= 0.001 {
+                continue;
+            }
+            let in_border = dist > -(1.2 * s as f32);
+            let in_bar = px >= bar_x0 && px < bar_x1 && py >= bar_y0 && py < bar_y1;
+            let rgba = if in_bar {
+                premul_bgra(ar, ag, ab, (255.0 * cov).round() as u8)
+            } else if in_border {
+                let r = (13.0 * 0.55 + f32::from(ar) * 0.45).round() as u8;
+                let g = (17.0 * 0.55 + f32::from(ag) * 0.45).round() as u8;
+                let b = (23.0 * 0.55 + f32::from(ab) * 0.45).round() as u8;
+                premul_bgra(r, g, b, (238.0 * cov).round() as u8)
+            } else {
+                premul_bgra(13, 17, 23, (230.0 * cov).round() as u8)
+            };
+            let idx = ((py * w + px) * 4) as usize;
+            pixels[idx..idx + 4].copy_from_slice(&rgba);
+        }
+    }
+
+    let glyph_scale = 2 * s;
+    let advance = 12 * s;
+    let text_x0 = 14 * s;
+    let text_y0 = h.saturating_sub(7 * glyph_scale) / 2;
+    let text_bgra = premul_bgra(240, 246, 252, 255);
+    let max_text_x = w.saturating_sub(4 * s);
+
+    for (char_idx, ch) in pill.text.chars().enumerate() {
+        let base_x = text_x0 + (char_idx as u32) * advance;
+        if base_x + 5 * glyph_scale > max_text_x {
+            break;
+        }
+        let rows = glyph_5x7(ch);
+        for (ry, bits) in rows.into_iter().enumerate() {
+            for rx in 0..5_u32 {
+                if ((bits >> (4 - rx)) & 1) == 0 {
+                    continue;
+                }
+                for dy in 0..glyph_scale {
+                    let py = text_y0 + (ry as u32) * glyph_scale + dy;
+                    if py >= h {
+                        continue;
+                    }
+                    for dx in 0..glyph_scale {
+                        let px = base_x + rx * glyph_scale + dx;
+                        if px >= w {
+                            continue;
+                        }
+                        let idx = ((py * w + px) * 4) as usize;
+                        pixels[idx..idx + 4].copy_from_slice(&text_bgra);
+                    }
+                }
+            }
+        }
+    }
+
+    (pixels, w, h)
+}
+
+/// Builds a Smithay `CursorBuffer` render element displaying a rasterized [`LabelPillSnapshot`].
+#[must_use]
+pub fn build_label_pill_element<R>(
+    renderer: &mut R,
+    pill: &LabelPillSnapshot,
+    accent_rgba: [f32; 4],
+    opacity: f32,
+    output_scale: Scale<f64>,
+) -> Option<KomaRenderElement<R>>
+where
+    R: KomaRenderTarget,
+    R::TextureId: Send + Clone + 'static,
+{
+    if opacity <= 0.001 || pill.rect.w == 0 || pill.rect.h == 0 {
+        return None;
+    }
+    let int_scale = output_scale.x.ceil().clamp(1.0, 4.0) as i32;
+    let (pixels, px_w, px_h) = rasterize_label_pill_argb8888(pill, accent_rgba, int_scale);
+    let buffer = MemoryRenderBuffer::from_slice(
+        &pixels,
+        Fourcc::Argb8888,
+        (px_w as i32, px_h as i32),
+        int_scale,
+        Transform::Normal,
+        None,
+    );
+    let loc_phys: Point<i32, Physical> =
+        Point::from((f64::from(pill.rect.x), f64::from(pill.rect.y)))
+            .to_physical_precise_round(output_scale);
+    MemoryRenderBufferRenderElement::from_buffer(
+        renderer,
+        loc_phys.to_f64(),
+        &buffer,
+        Some(opacity.clamp(0.0, 1.0)),
+        None,
+        None,
+        Kind::Unspecified,
+    )
+    .ok()
+    .map(KomaRenderElement::CursorBuffer)
+}
+
+#[cfg(test)]
+mod tests {
+    use koma_model::{LogicalRect, place_label_pill};
+
+    use super::*;
+
+    #[test]
+    fn label_pill_rasterizer_draws_backdrop_accent_bar_and_visible_glyphs() {
+        let pill = place_label_pill(
+            LogicalPoint { x: 100.0, y: 100.0 },
+            "CLICK BLU",
+            LogicalRect::new(0, 0, 1920, 1080),
+        )
+        .expect("label pill");
+        let (pixels, w, h) = rasterize_label_pill_argb8888(&pill, [0.49, 0.85, 0.53, 1.0], 1);
+        assert_eq!(w, pill.rect.w);
+        assert_eq!(h, pill.rect.h);
+        assert_eq!(pixels.len(), (w * h * 4) as usize);
+
+        // Corner pixel (0, 0) outside rounded pill corner should be transparent.
+        assert_eq!(&pixels[0..4], &[0, 0, 0, 0]);
+
+        // Left accent stripe at (6, h/2) should reflect accent tint and full alpha.
+        let bar_idx = (((h / 2) * w + 6) * 4) as usize;
+        assert_eq!(pixels[bar_idx + 3], 255);
+        assert!(pixels[bar_idx + 1] > pixels[bar_idx]); // higher G than B
+
+        // Text region contains bright white foreground glyph pixels (#f0f6fc).
+        let white_pixels = pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|px| px[0] == 252 && px[1] == 246 && px[2] == 240 && px[3] == 255)
+            .count();
+        assert!(
+            white_pixels > 40,
+            "expected readable bitmap glyphs, found {white_pixels} white pixels"
+        );
+    }
 }

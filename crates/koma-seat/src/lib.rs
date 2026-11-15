@@ -41,6 +41,16 @@ impl VirtualSeatLedger {
         self.held_buttons.remove(&button_code);
     }
 
+    #[must_use]
+    pub fn is_key_held(&self, key: &str) -> bool {
+        self.held_keysyms.contains(key)
+    }
+
+    #[must_use]
+    pub fn is_button_held(&self, button_code: u32) -> bool {
+        self.held_buttons.contains(&button_code)
+    }
+
     /// Atomically drains all held virtual keys and buttons for immediate release synthesis.
     pub fn flush_all_held(&mut self) -> (Vec<String>, Vec<u32>) {
         let keys = self.held_keysyms.iter().cloned().collect();

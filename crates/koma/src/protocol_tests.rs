@@ -2408,8 +2408,11 @@ mod kom_0024_compat_tests {
         inhibitor_active: usize,
         inhibitor_inactive: usize,
         keyboard_keys: Vec<u32>,
+        keyboard_key_events: Vec<(u32, wl_keyboard::KeyState)>,
         pointer_motions: usize,
         pointer_buttons: Vec<(u32, wl_pointer::ButtonState)>,
+        pointer_axes: Vec<(wl_pointer::Axis, f64)>,
+        pointer_axis_v120: Vec<(wl_pointer::Axis, i32)>,
     }
 
     impl CompatHarness {
@@ -2841,8 +2844,16 @@ mod kom_0024_compat_tests {
             _: &Connection,
             _: &wayland_client::QueueHandle<Self>,
         ) {
-            if let wl_keyboard::Event::Key { key, .. } = event {
+            if let wl_keyboard::Event::Key {
+                key,
+                state: key_state,
+                ..
+            } = event
+            {
                 state.keyboard_keys.push(key);
+                if let WEnum::Value(ks) = key_state {
+                    state.keyboard_key_events.push((key, ks));
+                }
             }
         }
     }
@@ -2863,6 +2874,15 @@ mod kom_0024_compat_tests {
                     state: WEnum::Value(btn_state),
                     ..
                 } => state.pointer_buttons.push((button, btn_state)),
+                wl_pointer::Event::Axis {
+                    axis: WEnum::Value(axis),
+                    value,
+                    ..
+                } => state.pointer_axes.push((axis, value)),
+                wl_pointer::Event::AxisValue120 {
+                    axis: WEnum::Value(axis),
+                    value120,
+                } => state.pointer_axis_v120.push((axis, value120)),
                 _ => {}
             }
         }
@@ -3163,6 +3183,7 @@ mod kom_0024_compat_tests {
                 hold_end_ms: 0,
                 press_button_at_start: Some("left".to_owned()),
                 release_button_on_finish: Some("left".to_owned()),
+                ..Default::default()
             },
         )
         .expect("queue drag path");
@@ -3393,5 +3414,612 @@ mod kom_0024_compat_tests {
         );
         assert!(android_item.clip_to_geometry);
         assert!(android_item.border.enabled);
+    }
+
+    fn insert_test_admin_ipc_client(state: &mut KomaState, conn_id: u64) -> koma_proto::SessionId {
+        use std::collections::{BTreeSet, HashSet};
+        let (stream, _peer) = UnixStream::pair().expect("unix stream pair");
+        let session_id = koma_proto::SessionId::new(format!("test-admin-{conn_id}"));
+        state.ipc_clients.insert(
+            conn_id,
+            crate::ipc_server::IpcClientConn {
+                conn_id,
+                stream,
+                channel: crate::ipc_server::SocketChannel::Admin,
+                auth: crate::ipc_server::PeerAuthState::AdminVerified {
+                    uid: 1000,
+                    gid: 1000,
+                    session_id: session_id.clone(),
+                },
+                reg_token: None,
+                inbox: koma_proto::scm_unix::FrameInbox::default(),
+                outbox: koma_proto::scm_unix::FrameOutbox::default(),
+                event_ring: koma_proto::EventRingBuffer::default(),
+                subscribed_workspaces: BTreeSet::new(),
+                subscribed_topics: HashSet::new(),
+                armed_writable: false,
+            },
+        );
+        session_id
+    }
+
+    #[test]
+    fn vseat_relative_move_honors_locked_pointer_constraint_and_delivers_unaccel_deltas() {
+        let mut env = ClientEnv::new();
+        let qh = env.queue.handle();
+        let constraints = env
+            .client
+            .bind::<zwp_pointer_constraints_v1::ZwpPointerConstraintsV1>(
+                &env.registry,
+                &qh,
+                "zwp_pointer_constraints_v1",
+            );
+        let rel_mgr = env
+            .client
+            .bind::<zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1>(
+                &env.registry,
+                &qh,
+                "zwp_relative_pointer_manager_v1",
+            );
+        let (surface, _xs, _tl) = env.spawn_window("FPSGame", "org.koma.fps");
+        let pointer = env.client.pointers[0].clone();
+        let _rel_ptr = rel_mgr.get_relative_pointer(&pointer, &qh, ());
+        env.pump();
+
+        let ws_id = env.state.active_ws_id.clone();
+        let conn_id = 701_u64;
+        let _sess = insert_test_admin_ipc_client(&mut env.state, conn_id);
+        let mut epoch = env.state.workspaces[&ws_id].lease.epoch().get();
+        let human_pos = Point::from((812.0, 415.0));
+        env.state.pointer_location = human_pos;
+
+        // Place virtual cursor inside the 64x64 surface and focus it.
+        let (mv_res, _) = crate::ipc_server::dispatch_rpc(
+            &mut env.state,
+            conn_id,
+            koma_proto::IpcRequest {
+                id: 1,
+                method: "vseat.pointer_move".to_owned(),
+                params: serde_json::json!({
+                    "ws_id": ws_id.as_str(),
+                    "expected_epoch": epoch,
+                    "target": [24.0, 24.0],
+                    "kinematics": { "profile": "instant" },
+                }),
+            },
+            Vec::new(),
+        )
+        .expect("vseat.pointer_move succeeds");
+        epoch = mv_res["epoch"].as_u64().expect("epoch");
+        env.pump();
+
+        let locked = constraints.lock_pointer(
+            &surface,
+            &pointer,
+            None,
+            zwp_pointer_constraints_v1::Lifetime::Persistent,
+            &qh,
+            (),
+        );
+        env.pump();
+
+        // Trigger constraint activation at virtual cursor location via a tiny relative move.
+        let _ = crate::ipc_server::dispatch_rpc(
+            &mut env.state,
+            conn_id,
+            koma_proto::IpcRequest {
+                id: 2,
+                method: "vseat.relative_move".to_owned(),
+                params: serde_json::json!({
+                    "ws_id": ws_id.as_str(),
+                    "expected_epoch": epoch,
+                    "dx": 2.0,
+                    "dy": 2.0,
+                }),
+            },
+            Vec::new(),
+        )
+        .expect("relative_move activates lock");
+        env.pump();
+        assert!(
+            env.client.locked_events.contains(&"locked"),
+            "pointer lock must activate under vseat cursor"
+        );
+
+        let locked_ws_pos = env.state.agent_cursors[&ws_id].ws_local_pos;
+        env.client.relative_motions.clear();
+
+        let (rel_res, _) = crate::ipc_server::dispatch_rpc(
+            &mut env.state,
+            conn_id,
+            koma_proto::IpcRequest {
+                id: 3,
+                method: "vseat.relative_move".to_owned(),
+                params: serde_json::json!({
+                    "ws_id": ws_id.as_str(),
+                    "expected_epoch": epoch,
+                    "dx": 24.5,
+                    "dy": -13.25,
+                    "dx_unaccel": 20.0,
+                    "dy_unaccel": -10.0,
+                }),
+            },
+            Vec::new(),
+        )
+        .expect("locked relative_move succeeds");
+        env.pump();
+
+        assert_eq!(
+            env.state.agent_cursors[&ws_id].ws_local_pos, locked_ws_pos,
+            "Locked pointer constraint must pin virtual cursor position"
+        );
+        assert_eq!(
+            rel_res["disposition"],
+            serde_json::to_value(koma_proto::DeliverySemantics::delivered_verified()).unwrap()
+        );
+        assert!(
+            env.client.relative_motions.iter().any(|&(dx, dy, ux, uy)| {
+                (dx - 24.5).abs() < 1e-3
+                    && (dy + 13.25).abs() < 1e-3
+                    && (ux - 20.0).abs() < 1e-3
+                    && (uy + 10.0).abs() < 1e-3
+            }),
+            "relative_motions must record raw and unaccelerated deltas, got {:?}",
+            env.client.relative_motions
+        );
+        assert_eq!(env.state.pointer_location, human_pos);
+
+        // Unlock and verify subsequent relative_move advances cursor freely.
+        locked.destroy();
+        env.pump();
+        let _ = crate::ipc_server::dispatch_rpc(
+            &mut env.state,
+            conn_id,
+            koma_proto::IpcRequest {
+                id: 4,
+                method: "vseat.relative_move".to_owned(),
+                params: serde_json::json!({
+                    "ws_id": ws_id.as_str(),
+                    "expected_epoch": epoch,
+                    "dx": 10.0,
+                    "dy": 5.0,
+                }),
+            },
+            Vec::new(),
+        )
+        .expect("unlocked relative_move succeeds");
+        let unlocked_ws_pos = env.state.agent_cursors[&ws_id].ws_local_pos;
+        assert!((unlocked_ws_pos.x - (locked_ws_pos.x + 10.0)).abs() < 1e-3);
+        assert!((unlocked_ws_pos.y - (locked_ws_pos.y + 5.0)).abs() < 1e-3);
+    }
+
+    #[test]
+    fn vseat_wheel_chord_scoping_and_disconnect_cleanup_release_keys_and_buttons() {
+        let mut env = CompatEnv::new(false);
+        let (_surf, _xs, _tl, _win_id) = env.spawn_window("Canvas", "org.koma.canvas", false);
+        let ws_id = env.state.active_ws_id.clone();
+        let conn_id = 702_u64;
+        let _sess = insert_test_admin_ipc_client(&mut env.state, conn_id);
+        let mut epoch = env.state.workspaces[&ws_id].lease.epoch().get();
+
+        // 1. Wheel scroll with temporary modifier chord ["Ctrl", "Shift"]
+        let (wheel_res, _) = crate::ipc_server::dispatch_rpc(
+            &mut env.state,
+            conn_id,
+            koma_proto::IpcRequest {
+                id: 1,
+                method: "vseat.wheel".to_owned(),
+                params: serde_json::json!({
+                    "ws_id": ws_id.as_str(),
+                    "expected_epoch": epoch,
+                    "target": [24.0, 24.0],
+                    "dy": 30.0,
+                    "discrete_y": 2,
+                    "modifiers": ["Ctrl", "Shift"],
+                }),
+            },
+            Vec::new(),
+        )
+        .expect("vseat.wheel succeeds");
+        epoch = wheel_res["epoch"].as_u64().expect("epoch");
+        assert_eq!(
+            wheel_res["disposition"],
+            serde_json::to_value(koma_proto::DeliverySemantics::delivered_verified()).unwrap()
+        );
+        env.pump();
+
+        assert!(
+            env.client
+                .pointer_axes
+                .iter()
+                .any(|&(axis, val)| axis == wl_pointer::Axis::VerticalScroll
+                    && (val - 30.0).abs() < 1e-3),
+            "expected vertical wheel axis event, got {:?}",
+            env.client.pointer_axes
+        );
+        assert!(
+            env.client
+                .pointer_axis_v120
+                .iter()
+                .any(|&(axis, v)| axis == wl_pointer::Axis::VerticalScroll && v == 240),
+            "expected vertical v120=240 wheel event, got {:?}",
+            env.client.pointer_axis_v120
+        );
+        // Ctrl (29) + Shift (42) must both press and release cleanly.
+        assert_eq!(
+            env.client.keyboard_key_events,
+            vec![
+                (29, wl_keyboard::KeyState::Pressed),
+                (42, wl_keyboard::KeyState::Pressed),
+                (42, wl_keyboard::KeyState::Released),
+                (29, wl_keyboard::KeyState::Released),
+            ]
+        );
+        {
+            let vseat_id = &env.state.workspaces[&ws_id].vseat_id;
+            let ledger = &env.state.vseats[vseat_id];
+            assert!(!ledger.is_key_held("ctrl"));
+            assert!(!ledger.is_key_held("shift"));
+        }
+
+        // 2. Click with modifier ["Alt"] + label, verify LabelPill + AgentCapture isolation.
+        env.client.keyboard_key_events.clear();
+        env.client.pointer_buttons.clear();
+        let (click_res, _) = crate::ipc_server::dispatch_rpc(
+            &mut env.state,
+            conn_id,
+            koma_proto::IpcRequest {
+                id: 2,
+                method: "vseat.click".to_owned(),
+                params: serde_json::json!({
+                    "ws_id": ws_id.as_str(),
+                    "expected_epoch": epoch,
+                    "x": 20.0,
+                    "y": 20.0,
+                    "modifiers": ["Alt"],
+                    "label": "CLICK LAYER",
+                }),
+            },
+            Vec::new(),
+        )
+        .expect("vseat.click with modifiers succeeds");
+        assert_eq!(
+            click_res["disposition"],
+            serde_json::to_value(koma_proto::DeliverySemantics::delivered_verified()).unwrap()
+        );
+        env.pump();
+        assert_eq!(
+            env.client.keyboard_key_events,
+            vec![
+                (56, wl_keyboard::KeyState::Pressed),
+                (56, wl_keyboard::KeyState::Released),
+            ]
+        );
+        assert_eq!(
+            env.client.pointer_buttons,
+            vec![
+                (0x110, wl_pointer::ButtonState::Pressed),
+                (0x110, wl_pointer::ButtonState::Released),
+            ]
+        );
+        let snap = env
+            .state
+            .step_agent_cursor_for_workspace(&ws_id)
+            .expect("agent cursor visible with label");
+        assert_eq!(
+            snap.label_pill.as_ref().map(|p| p.text.as_str()),
+            Some("CLICK LAYER")
+        );
+        assert!(!koma_render::frame_composer::should_render_agent_cursor(
+            koma_render::RenderTargetKind::AgentCapture
+        ));
+
+        // 3. Disconnect mid-drag with held Ctrl + left button must release both and release lease.
+        env.client.keyboard_key_events.clear();
+        env.client.pointer_buttons.clear();
+        let (drag_res, _) = crate::ipc_server::dispatch_rpc(
+            &mut env.state,
+            conn_id,
+            koma_proto::IpcRequest {
+                id: 3,
+                method: "vseat.drag".to_owned(),
+                params: serde_json::json!({
+                    "ws_id": ws_id.as_str(),
+                    "expected_epoch": epoch,
+                    "from": [12.0, 12.0],
+                    "to": [48.0, 48.0],
+                    "duration_ms": 200,
+                    "modifiers": ["Ctrl"],
+                }),
+            },
+            Vec::new(),
+        )
+        .expect("in-flight drag succeeds");
+        assert_eq!(
+            drag_res["disposition"],
+            serde_json::to_value(koma_proto::DeliverySemantics::delivered_unverified_unsafe())
+                .unwrap()
+        );
+        env.pump();
+        assert_eq!(
+            env.client.pointer_buttons,
+            vec![(0x110, wl_pointer::ButtonState::Pressed)]
+        );
+        assert_eq!(
+            env.client.keyboard_key_events,
+            vec![(29, wl_keyboard::KeyState::Pressed)]
+        );
+
+        crate::ipc_server::cleanup_disconnected_ipc_peer(&mut env.state, conn_id);
+        env.pump();
+
+        assert_eq!(
+            env.client.pointer_buttons,
+            vec![
+                (0x110, wl_pointer::ButtonState::Pressed),
+                (0x110, wl_pointer::ButtonState::Released),
+            ],
+            "disconnect cleanup must release held mouse button"
+        );
+        assert_eq!(
+            env.client.keyboard_key_events,
+            vec![
+                (29, wl_keyboard::KeyState::Pressed),
+                (29, wl_keyboard::KeyState::Released),
+            ],
+            "disconnect cleanup must release held modifier key"
+        );
+        assert!(env.state.pointer_animations.is_empty());
+        assert!(matches!(
+            env.state.workspaces[&ws_id].lease.state(),
+            koma_model::WorkspaceLeaseState::Unheld
+        ));
+    }
+
+    #[test]
+    fn vseat_hit_test_occlusion_stability_cursor_label_and_takeover_semantics() {
+        let mut env = CompatEnv::new(false);
+        let (_s1, _xs1, _tl1, win_base) = env.spawn_window("Editor", "org.koma.editor", false);
+        let ws_id = env.state.active_ws_id.clone();
+        let conn_id = 703_u64;
+        let _sess = insert_test_admin_ipc_client(&mut env.state, conn_id);
+        let epoch = env.state.workspaces[&ws_id].lease.epoch().get();
+
+        // 1. Stale epoch must return DeliverySemantics::not_delivered_safe().
+        let stale_err = crate::ipc_server::dispatch_rpc(
+            &mut env.state,
+            conn_id,
+            koma_proto::IpcRequest {
+                id: 1,
+                method: "vseat.click".to_owned(),
+                params: serde_json::json!({
+                    "ws_id": ws_id.as_str(),
+                    "expected_epoch": epoch.saturating_add(99),
+                    "x": 10.0,
+                    "y": 10.0,
+                }),
+            },
+            Vec::new(),
+        )
+        .expect_err("stale epoch rejected");
+        assert_eq!(stale_err.symbol, koma_proto::ErrorSymbol::ErrStaleEpoch);
+        assert_eq!(
+            stale_err.disposition,
+            Some(koma_proto::DeliverySemantics::not_delivered_safe())
+        );
+
+        // 2. Unobstructed hit_test reaches target; once open animation settles, geometry_stable is true.
+        *env.state.window_animations.borrow_mut() = koma_model::WindowAnimationTable::default();
+        let (ht1_val, _) = crate::ipc_server::dispatch_rpc(
+            &mut env.state,
+            conn_id,
+            koma_proto::IpcRequest {
+                id: 2,
+                method: "vseat.hit_test".to_owned(),
+                params: serde_json::json!({
+                    "ws_id": ws_id.as_str(),
+                    "target": { "anchor": "top-left", "dx": 32.0, "dy": 32.0 },
+                }),
+            },
+            Vec::new(),
+        )
+        .expect("hit_test succeeds");
+        let ht1: koma_proto::rpc::HitTestResult =
+            serde_json::from_value(ht1_val).expect("HitTestResult deserializes");
+        assert!(ht1.reaches_target);
+        assert_eq!(ht1.target_win_id, Some(win_base));
+        assert_eq!(ht1.blocking_win_id, None);
+        assert!(ht1.geometry_stable);
+        assert_eq!(ht1.sampled_points.len(), 5);
+
+        // 3. Spawn a floating blocker covering win_base's active surface while win_base keeps focus.
+        let (_s2, _xs2, _tl2, win_blocker) =
+            env.spawn_window("AuthPrompt", "org.koma.blocker", false);
+        let base_rect = env
+            .state
+            .mapped_windows
+            .iter()
+            .find(|m| m.win_id == win_base)
+            .expect("win_base mapped")
+            .rect;
+        {
+            let ws = env.state.workspaces.get_mut(&ws_id).expect("ws");
+            ws.remove_window(win_blocker, 0);
+            let blocker_rect = koma_model::LogicalRect::new(base_rect.x, base_rect.y, 80, 80);
+            ws.floating.push_top(win_blocker, blocker_rect);
+            ws.focused_window = Some(win_base);
+        }
+        env.state.sync_workspace_geometries(&ws_id);
+
+        let (ht2_val, _) = crate::ipc_server::dispatch_rpc(
+            &mut env.state,
+            conn_id,
+            koma_proto::IpcRequest {
+                id: 3,
+                method: "vseat.hit_test".to_owned(),
+                params: serde_json::json!({
+                    "ws_id": ws_id.as_str(),
+                    "target": { "anchor": "top-left", "dx": 32.0, "dy": 32.0 },
+                }),
+            },
+            Vec::new(),
+        )
+        .expect("occluded hit_test succeeds");
+        let ht2: koma_proto::rpc::HitTestResult =
+            serde_json::from_value(ht2_val).expect("HitTestResult deserializes");
+        assert!(!ht2.reaches_target);
+        assert_eq!(ht2.target_win_id, Some(win_base));
+        assert_eq!(ht2.blocking_win_id, Some(win_blocker));
+        assert_eq!(ht2.blocking_app_id.as_deref(), Some("org.koma.blocker"));
+        assert_eq!(ht2.blocking_title.as_deref(), Some("AuthPrompt"));
+        assert!(ht2.blocking_rect.is_some());
+
+        // 4. Active window animation flips geometry_stable to false.
+        let anim_cfg = env.state.lua_sandbox.animations_snapshot();
+        let now_ms = env.state.elapsed_ms();
+        env.state.window_animations.borrow_mut().retarget_geometry(
+            win_base,
+            koma_model::LogicalRect::new(base_rect.x + 20, base_rect.y, base_rect.w, base_rect.h),
+            now_ms,
+            &anim_cfg,
+            false,
+        );
+        let (ht3_val, _) = crate::ipc_server::dispatch_rpc(
+            &mut env.state,
+            conn_id,
+            koma_proto::IpcRequest {
+                id: 4,
+                method: "vseat.hit_test".to_owned(),
+                params: serde_json::json!({
+                    "ws_id": ws_id.as_str(),
+                    "target": { "anchor": "center" },
+                }),
+            },
+            Vec::new(),
+        )
+        .expect("animated hit_test succeeds");
+        let ht3: koma_proto::rpc::HitTestResult = serde_json::from_value(ht3_val).unwrap();
+        assert!(!ht3.geometry_stable);
+
+        // 5. vseat.cursor_label sets & clears label_pill + caret_rect.
+        let _ = crate::ipc_server::dispatch_rpc(
+            &mut env.state,
+            conn_id,
+            koma_proto::IpcRequest {
+                id: 5,
+                method: "vseat.cursor_label".to_owned(),
+                params: serde_json::json!({
+                    "ws_id": ws_id.as_str(),
+                    "label": "TYPE QUERY",
+                    "caret_rect": [100.0, 200.0, 14.0, 22.0],
+                }),
+            },
+            Vec::new(),
+        )
+        .expect("cursor_label set succeeds");
+        let labeled_snap = env
+            .state
+            .step_agent_cursor_for_workspace(&ws_id)
+            .expect("labeled snapshot");
+        assert_eq!(
+            labeled_snap.label_pill.as_ref().map(|p| p.text.as_str()),
+            Some("TYPE QUERY")
+        );
+        assert_eq!(
+            labeled_snap.caret_rect,
+            Some(koma_model::LogicalRect::new(100, 200, 14, 22))
+        );
+
+        let _ = crate::ipc_server::dispatch_rpc(
+            &mut env.state,
+            conn_id,
+            koma_proto::IpcRequest {
+                id: 6,
+                method: "vseat.cursor_label".to_owned(),
+                params: serde_json::json!({
+                    "ws_id": ws_id.as_str(),
+                    "label": serde_json::Value::Null,
+                    "caret_rect": serde_json::Value::Null,
+                }),
+            },
+            Vec::new(),
+        )
+        .expect("cursor_label clear succeeds");
+        if let Some(snap_after_clear) = env.state.step_agent_cursor_for_workspace(&ws_id) {
+            assert!(snap_after_clear.label_pill.is_none());
+            assert!(snap_after_clear.caret_rect.is_none());
+        }
+
+        // 6. Verify Human Takeover via ws.set_mode flushes held inputs and returns ErrHumanPreempted.
+        let (drag2_res, _) = crate::ipc_server::dispatch_rpc(
+            &mut env.state,
+            conn_id,
+            koma_proto::IpcRequest {
+                id: 7,
+                method: "vseat.drag".to_owned(),
+                params: serde_json::json!({
+                    "ws_id": ws_id.as_str(),
+                    "expected_epoch": epoch,
+                    "from": [10.0, 10.0],
+                    "to": [30.0, 30.0],
+                    "duration_ms": 200,
+                    "modifiers": ["Shift"],
+                }),
+            },
+            Vec::new(),
+        )
+        .expect("second drag succeeds");
+        let active_epoch = drag2_res["epoch"].as_u64().expect("epoch");
+        env.pump();
+        env.client.keyboard_key_events.clear();
+        env.client.pointer_buttons.clear();
+
+        let _ = crate::ipc_server::dispatch_rpc(
+            &mut env.state,
+            conn_id,
+            koma_proto::IpcRequest {
+                id: 8,
+                method: "ws.set_mode".to_owned(),
+                params: serde_json::json!({
+                    "ws_id": ws_id.as_str(),
+                    "mode": "takeover",
+                }),
+            },
+            Vec::new(),
+        )
+        .expect("ws.set_mode takeover succeeds");
+        env.pump();
+        assert_eq!(
+            env.client.pointer_buttons,
+            vec![(0x110, wl_pointer::ButtonState::Released)]
+        );
+        assert_eq!(
+            env.client.keyboard_key_events,
+            vec![(42, wl_keyboard::KeyState::Released)]
+        );
+        let preempt_err = crate::ipc_server::dispatch_rpc(
+            &mut env.state,
+            conn_id,
+            koma_proto::IpcRequest {
+                id: 9,
+                method: "vseat.click".to_owned(),
+                params: serde_json::json!({
+                    "ws_id": ws_id.as_str(),
+                    "expected_epoch": active_epoch,
+                    "x": 10.0,
+                    "y": 10.0,
+                }),
+            },
+            Vec::new(),
+        )
+        .expect_err("takeover blocks vseat.click");
+        assert_eq!(
+            preempt_err.symbol,
+            koma_proto::ErrorSymbol::ErrHumanPreempted
+        );
+        assert_eq!(
+            preempt_err.disposition,
+            Some(koma_proto::DeliverySemantics::not_delivered_safe())
+        );
     }
 }

@@ -146,6 +146,16 @@ pub struct PointerPathParams {
     pub hold_end_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kinematics: Option<KinematicsParams>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub modifiers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bow: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overshoot: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tremor: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -153,6 +163,69 @@ pub struct CursorSettleParams {
     pub ws_id: WorkspaceId,
     #[serde(default)]
     pub immediate: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RelativeMoveParams {
+    pub ws_id: WorkspaceId,
+    pub expected_epoch: Epoch,
+    pub dx: f64,
+    pub dy: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dx_unaccel: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dy_unaccel: Option<f64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub modifiers: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WheelScrollParams {
+    pub ws_id: WorkspaceId,
+    pub expected_epoch: Epoch,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<serde_json::Value>,
+    #[serde(default)]
+    pub dx: f64,
+    #[serde(default)]
+    pub dy: f64,
+    #[serde(default)]
+    pub discrete_x: i32,
+    #[serde(default)]
+    pub discrete_y: i32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub modifiers: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HitTestParams {
+    pub ws_id: WorkspaceId,
+    pub target: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HitTestResult {
+    pub reaches_target: bool,
+    pub target_win_id: Option<WindowId>,
+    pub target_app_id: Option<String>,
+    pub blocking_win_id: Option<WindowId>,
+    pub blocking_app_id: Option<String>,
+    pub blocking_title: Option<String>,
+    pub blocking_rect: Option<[i32; 4]>,
+    pub geometry_stable: bool,
+    #[serde(default)]
+    pub sampled_points: Vec<[f64; 2]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor_pos: Option<[f64; 2]>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CursorLabelParams {
+    pub ws_id: WorkspaceId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caret_rect: Option<[f64; 4]>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -244,5 +317,91 @@ mod tests {
         let settle_s = serde_json::to_string(&settle).unwrap();
         let settle_back: CursorSettleParams = serde_json::from_str(&settle_s).unwrap();
         assert_eq!(settle, settle_back);
+    }
+
+    #[test]
+    fn vseat_extended_rpc_params_and_results_roundtrip() {
+        let rel = RelativeMoveParams {
+            ws_id: WorkspaceId::new("ws-1"),
+            expected_epoch: Epoch(3),
+            dx: 12.5,
+            dy: -4.0,
+            dx_unaccel: Some(12.5),
+            dy_unaccel: None,
+            modifiers: vec!["ctrl".to_owned(), "shift".to_owned()],
+        };
+        let rel_back: RelativeMoveParams =
+            serde_json::from_str(&serde_json::to_string(&rel).unwrap()).unwrap();
+        assert_eq!(rel, rel_back);
+
+        let wheel = WheelScrollParams {
+            ws_id: WorkspaceId::new("ws-1"),
+            expected_epoch: Epoch(4),
+            target: Some(serde_json::json!({ "win_id": 7 })),
+            dx: 0.0,
+            dy: 15.0,
+            discrete_x: 0,
+            discrete_y: 120,
+            modifiers: vec!["ctrl".to_owned()],
+        };
+        let wheel_back: WheelScrollParams =
+            serde_json::from_str(&serde_json::to_string(&wheel).unwrap()).unwrap();
+        assert_eq!(wheel, wheel_back);
+
+        let ht_params = HitTestParams {
+            ws_id: WorkspaceId::new("ws-1"),
+            target: serde_json::json!({ "grid_225": "H8" }),
+        };
+        let ht_params_back: HitTestParams =
+            serde_json::from_str(&serde_json::to_string(&ht_params).unwrap()).unwrap();
+        assert_eq!(ht_params, ht_params_back);
+
+        let ht_result = HitTestResult {
+            reaches_target: false,
+            target_win_id: Some(WindowId {
+                slot: 1,
+                generation: 1,
+            }),
+            target_app_id: Some("foot".to_owned()),
+            blocking_win_id: Some(WindowId {
+                slot: 2,
+                generation: 1,
+            }),
+            blocking_app_id: Some("dialog".to_owned()),
+            blocking_title: Some("Confirm".to_owned()),
+            blocking_rect: Some([100, 100, 400, 200]),
+            geometry_stable: true,
+            sampled_points: vec![[300.0, 200.0]],
+            cursor_pos: Some([50.0, 60.0]),
+        };
+        let ht_result_back: HitTestResult =
+            serde_json::from_str(&serde_json::to_string(&ht_result).unwrap()).unwrap();
+        assert_eq!(ht_result, ht_result_back);
+
+        let label = CursorLabelParams {
+            ws_id: WorkspaceId::new("ws-1"),
+            label: Some("CLICK SUBMIT".to_owned()),
+            caret_rect: Some([10.0, 20.0, 80.0, 28.0]),
+        };
+        let label_back: CursorLabelParams =
+            serde_json::from_str(&serde_json::to_string(&label).unwrap()).unwrap();
+        assert_eq!(label, label_back);
+
+        let path_json = serde_json::json!({
+            "ws_id": "ws-1",
+            "expected_epoch": 9,
+            "waypoints": [{"x": 10.0, "y": 10.0}, {"x": 100.0, "y": 80.0}],
+            "modifiers": ["shift"],
+            "label": "DRAG",
+            "bow": 12.0,
+            "overshoot": 6.0,
+            "tremor": 1.5
+        });
+        let parsed_path: PointerPathParams = serde_json::from_value(path_json).unwrap();
+        assert_eq!(parsed_path.modifiers, vec!["shift"]);
+        assert_eq!(parsed_path.label.as_deref(), Some("DRAG"));
+        assert_eq!(parsed_path.bow, Some(12.0));
+        assert_eq!(parsed_path.overshoot, Some(6.0));
+        assert_eq!(parsed_path.tremor, Some(1.5));
     }
 }

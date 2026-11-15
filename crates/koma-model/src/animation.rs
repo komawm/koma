@@ -2033,24 +2033,44 @@ impl WindowAnimationTable {
         }
     }
 
+    fn step_entry_animating(entry: &mut WindowSpringEntry, now_ms: u64) -> bool {
+        let _ = entry.x.sample(now_ms);
+        let _ = entry.y.sample(now_ms);
+        let _ = entry.w.sample(now_ms);
+        let _ = entry.h.sample(now_ms);
+        let _ = entry.scale.sample(now_ms);
+        let _ = entry.opacity.sample(now_ms);
+        let _ = entry.focus_factor.sample(now_ms);
+        !(entry.x.is_settled()
+            && entry.y.is_settled()
+            && entry.w.is_settled()
+            && entry.h.is_settled()
+            && entry.scale.is_settled()
+            && entry.opacity.is_settled()
+            && entry.focus_factor.is_settled())
+    }
+
     /// Returns `true` if any window still has an unsettled animation in flight (requiring next VBlank redraw).
     pub fn has_active_animations(&mut self, now_ms: u64) -> bool {
         let mut active = false;
         for entry in self.entries.values_mut() {
-            let _ = entry.x.sample(now_ms);
-            let _ = entry.y.sample(now_ms);
-            let _ = entry.w.sample(now_ms);
-            let _ = entry.h.sample(now_ms);
-            let _ = entry.scale.sample(now_ms);
-            let _ = entry.opacity.sample(now_ms);
-            let _ = entry.focus_factor.sample(now_ms);
-            if !(entry.x.is_settled()
-                && entry.y.is_settled()
-                && entry.w.is_settled()
-                && entry.h.is_settled()
-                && entry.scale.is_settled()
-                && entry.opacity.is_settled()
-                && entry.focus_factor.is_settled())
+            if Self::step_entry_animating(entry, now_ms) {
+                active = true;
+            }
+        }
+        active
+    }
+
+    /// Returns `true` if any window in `win_ids` currently has an unsettled geometry/opacity animation.
+    pub fn has_active_for_windows<'a>(
+        &mut self,
+        now_ms: u64,
+        win_ids: impl IntoIterator<Item = &'a WindowId>,
+    ) -> bool {
+        let mut active = false;
+        for win_id in win_ids {
+            if let Some(entry) = self.entries.get_mut(win_id)
+                && Self::step_entry_animating(entry, now_ms)
             {
                 active = true;
             }

@@ -379,6 +379,15 @@ fn try_activate_constraint_on_focused(
     surface: &WlSurface,
     pointer: &PointerHandle<KomaState>,
 ) {
+    try_activate_constraint_on_focused_at(state, surface, pointer, state.pointer_location);
+}
+
+fn try_activate_constraint_on_focused_at(
+    state: &KomaState,
+    surface: &WlSurface,
+    pointer: &PointerHandle<KomaState>,
+    global_pos: Point<f64, Logical>,
+) {
     if state.is_locked_or_abandoned() || pointer.is_grabbed() {
         return;
     }
@@ -391,7 +400,7 @@ fn try_activate_constraint_on_focused(
     let Some(origin) = state.surface_global_origin(surface) else {
         return;
     };
-    let local_pos = state.pointer_location - origin;
+    let local_pos = global_pos - origin;
     let local_i32: Point<i32, Logical> =
         (local_pos.x.floor() as i32, local_pos.y.floor() as i32).into();
     if let Some(bounds) = surface_logical_bounds(surface)
@@ -535,7 +544,7 @@ fn clamp_point_to_rect(
     Point::from((pt.x.clamp(min_x, max_x), pt.y.clamp(min_y, max_y)))
 }
 
-fn surface_logical_bounds(surface: &WlSurface) -> Option<Rectangle<i32, Logical>> {
+pub(crate) fn surface_logical_bounds(surface: &WlSurface) -> Option<Rectangle<i32, Logical>> {
     let bbox = smithay::desktop::utils::bbox_from_surface_tree(surface, (0, 0));
     if bbox.size.w > 0 && bbox.size.h > 0 {
         Some(bbox)
@@ -673,11 +682,16 @@ impl KomaState {
 
     /// Activates any dormant pointer constraint whose surface holds focus and contains the cursor.
     pub fn maybe_activate_pointer_constraint(&self) {
+        self.maybe_activate_pointer_constraint_at(self.pointer_location);
+    }
+
+    /// Activates any dormant pointer constraint whose surface holds focus and contains `global_pos`.
+    pub fn maybe_activate_pointer_constraint_at(&self, global_pos: Point<f64, Logical>) {
         let Some(pointer) = self.seat.get_pointer() else {
             return;
         };
         if let Some(focused) = pointer.current_focus() {
-            try_activate_constraint_on_focused(self, &focused, &pointer);
+            try_activate_constraint_on_focused_at(self, &focused, &pointer, global_pos);
         }
     }
 

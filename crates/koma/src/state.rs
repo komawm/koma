@@ -2824,6 +2824,29 @@ impl KomaState {
             .clone()
     }
 
+    /// Returns `true` if `ws_id` currently has an in-flight scrolling camera glide or
+    /// window geometry/closing animation that could make point hit-testing transient.
+    #[must_use]
+    pub fn ws_has_active_layout_animation(&self, ws_id: &WorkspaceId) -> bool {
+        let now_ms = self.elapsed_ms();
+        let camera_animating = self
+            .workspaces
+            .get(ws_id)
+            .is_some_and(|ws| ws.scrolling.is_camera_animating(now_ms));
+        if camera_animating {
+            return true;
+        }
+        let ws_win_ids: Vec<WindowId> = self
+            .mapped_windows
+            .iter()
+            .filter(|m| &m.ws_id == ws_id)
+            .map(|m| m.win_id)
+            .collect();
+        self.window_animations
+            .borrow_mut()
+            .has_active_for_windows(now_ms, ws_win_ids.iter())
+    }
+
     /// Advances the visual cursor spring/trail/ripple state for `ws_id` if visible/enabled.
     #[must_use]
     pub fn step_agent_cursor_for_workspace(
@@ -2835,10 +2858,11 @@ impl KomaState {
         if !cfg.enabled {
             return None;
         }
+        let vp_rect = self.workspaces.get(ws_id).map(|ws| ws.viewport.full_rect());
         self.agent_cursors
             .get_mut(ws_id)?
             .visual
-            .step_frame(now_ms, &cfg)
+            .step_frame_in_viewport(now_ms, &cfg, vp_rect)
     }
 
     /// Advances the visual agent cursor snapshot for output `out_name`, preferring a focused

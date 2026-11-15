@@ -14,7 +14,10 @@ pub mod scm_unix;
 
 pub use crate::{
     capability::{CapabilityToken, PrivilegeLevel, TokenAuthorizer, TokenClaims},
-    error::{ErrorSymbol, IpcError},
+    error::{
+        DeliveryDisposition, DeliverySemantics, ErrorSymbol, IpcError, RetryDisposition,
+        default_disposition_for,
+    },
     event::{EventRingBuffer, EventTopic, IpcEventEnvelope, WorkspaceEvent},
     frame::{
         ADMIN_SOCKET_NAME, AGENT_SOCKET_NAME, AncillaryFdRef, FrameDecodeError, IpcRequest,
@@ -23,7 +26,8 @@ pub use crate::{
     },
     ids::{Epoch, MacroId, OutputId, SeatId, SessionId, WindowId, WorkspaceId},
     rpc::{
-        CursorSettleParams, KinematicProfileKind, OverlayKind, PathSplineKind, PointerPathParams,
-        TextInjectStrategy, TransportKind,
+        CursorLabelParams, CursorSettleParams, HitTestParams, HitTestResult, KinematicProfileKind,
+        OverlayKind, PathSplineKind, PointerPathParams, RelativeMoveParams, TextInjectStrategy,
+        TransportKind, WheelScrollParams,
     },
 };

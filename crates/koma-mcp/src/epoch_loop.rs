@@ -88,6 +88,7 @@ impl EpochObservationTracker {
                 ),
                 current_epoch: last_known_server_epoch.map(Epoch::get),
                 retryable: Some(false),
+                disposition: Some(koma_proto::DeliverySemantics::not_delivered_safe()),
             }),
             ObservationStatus::HumanPreempted { takeover_epoch } => Err(IpcError::human_preempted(
                 takeover_epoch.unwrap_or_default(),

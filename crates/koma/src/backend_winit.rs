@@ -628,15 +628,16 @@ pub(crate) fn toggle_ring0_preempt_takeover(state: &mut KomaState, trigger_label
     let now = state.elapsed_ms();
     let ws_id = state.active_ws_id.clone();
     let mut maybe_broadcast = None;
-    if let Some(ws) = state.workspaces.get_mut(&ws_id) {
-        let fx = ws.lease.human_toggle_takeover(60_000, now);
-        let mut flushed_keys = Vec::new();
-        if fx.flush_virtual_seat
-            && let Some(vseat) = state.vseats.get_mut(&ws.vseat_id)
-        {
-            let (keys, _) = vseat.flush_all_held();
-            flushed_keys = keys;
-        }
+    let fx_opt = state
+        .workspaces
+        .get_mut(&ws_id)
+        .map(|ws| ws.lease.human_toggle_takeover(60_000, now));
+    if let Some(fx) = fx_opt {
+        let flushed_keys = if fx.flush_virtual_seat {
+            crate::macro_runtime::release_all_vseat_held_inputs(state, &ws_id)
+        } else {
+            Vec::new()
+        };
         let mut cancelled_lua = false;
         if fx.cancel_lua_coroutines {
             let c1 = state.lua_scheduler.cancel_workspace_tasks(&ws_id).len();

@@ -3699,6 +3699,7 @@ mod tests {
                     trail_enabled = true,
                     fog_enabled = false,
                     ripple_enabled = true,
+                    label_enabled = false,
                     idle_timeout_ms = 5000,
                     idle_wobble = false,
                 },
@@ -3732,12 +3733,14 @@ mod tests {
         assert!((ac.size - 32.0).abs() < 1e-4);
         assert_eq!(ac.accent_color, "#7ee787");
         assert!(!ac.fog_enabled);
+        assert!(!ac.label_enabled);
         assert_eq!(ac.idle_timeout_ms, 5000);
         assert!(!ac.idle_wobble);
 
         let stubs = crate::generate_luals_stubs();
         assert!(stubs.contains("---@alias KomaPathSplineKind"));
         assert!(stubs.contains("---@class KomaAgentCursorSpec"));
+        assert!(stubs.contains("---@field label_enabled? boolean"));
         assert!(stubs.contains("---@class KomaPathSpec"));
         assert!(stubs.contains("---@field agent_cursor? KomaAgentCursorSpec"));
         assert!(stubs.contains("function MacroContext:move_path(waypoints, opts) end"));

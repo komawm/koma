@@ -15,7 +15,8 @@ use crate::{
 
 const DIST_EPS: f64 = 1e-4;
 const TANGENT_EPS: f64 = 1e-9;
-const SUBDIVISIONS_PER_SEGMENT: usize = 16;
+const MIN_SUBDIVISIONS_PER_SEGMENT: usize = 16;
+const MAX_SUBDIVISIONS_PER_SEGMENT: usize = 64;
 const CHOOSER_SAMPLES: usize = 24;
 const VERLET_DT_MAX: f64 = 1.0 / 240.0;
 const REST_CURSOR_ANGLE_RAD: f64 = -1.92;
@@ -29,6 +30,9 @@ pub const CURSOR_TRAIL_LIFETIME_MS: u64 = 220;
 pub const CURSOR_TRAIL_MAX_SAMPLES: usize = 32;
 pub const CURSOR_TRAIL_RENDER_POINTS: usize = 8;
 pub const CURSOR_MAX_RIPPLES: usize = 2;
+pub const LABEL_PILL_MAX_WORDS: usize = 8;
+pub const LABEL_PILL_MAX_CHARS: usize = 48;
+pub const LABEL_PILL_HEIGHT: u32 = 26;
 
 /// 5-point Gauss-Legendre quadrature nodes on `[-1, 1]`.
 const GL5_NODES: [f64; 5] = [
@@ -652,15 +656,44 @@ impl ArcLengthSpline {
         }
     }
 
+    fn adaptive_subdivisions_for_segment(geometry: &SplineGeometry, seg_idx: usize) -> usize {
+        let (p0, d0) = eval_geometry_raw(geometry, seg_idx, 0.0);
+        let (pm, dm) = eval_geometry_raw(geometry, seg_idx, 0.5);
+        let (p1, d1) = eval_geometry_raw(geometry, seg_idx, 1.0);
+
+        let chord = dist_pt(p0, p1);
+        let poly_len = dist_pt(p0, pm) + dist_pt(pm, p1);
+        let est_len = chord.max(poly_len);
+
+        let a0 = (d0.x.hypot(d0.y) > TANGENT_EPS).then(|| d0.y.atan2(d0.x));
+        let am = (dm.x.hypot(dm.y) > TANGENT_EPS).then(|| dm.y.atan2(dm.x));
+        let a1 = (d1.x.hypot(d1.y) > TANGENT_EPS).then(|| d1.y.atan2(d1.x));
+
+        let turn_rad = match (a0, am, a1) {
+            (Some(t0), Some(tm), Some(t1)) => wrap_pi(tm - t0).abs() + wrap_pi(t1 - tm).abs(),
+            (Some(t0), _, Some(t1)) => wrap_pi(t1 - t0).abs(),
+            _ => 0.0,
+        };
+
+        // Bound circular-arc sagitta error (~L * theta / (8 * m^2)) strictly below 0.25 px
+        // even for steep Bezier loops while keeping segment chord spacing bounded on long strokes.
+        let by_curvature = (est_len * turn_rad / 0.85).sqrt().ceil() as usize;
+        let by_length = (est_len / 24.0).ceil() as usize;
+        by_curvature
+            .max(by_length)
+            .clamp(MIN_SUBDIVISIONS_PER_SEGMENT, MAX_SUBDIVISIONS_PER_SEGMENT)
+    }
+
     fn build_lut(geometry: SplineGeometry, seg_count: usize) -> Self {
-        let mut lut = Vec::with_capacity(1 + seg_count * SUBDIVISIONS_PER_SEGMENT);
+        let mut lut = Vec::with_capacity(1 + seg_count * MIN_SUBDIVISIONS_PER_SEGMENT);
         lut.push((0.0, 0, 0.0));
         let mut cum_len = 0.0;
 
         for seg_idx in 0..seg_count {
-            for sub in 0..SUBDIVISIONS_PER_SEGMENT {
-                let u0 = (sub as f64) / (SUBDIVISIONS_PER_SEGMENT as f64);
-                let u1 = ((sub + 1) as f64) / (SUBDIVISIONS_PER_SEGMENT as f64);
+            let subdivs = Self::adaptive_subdivisions_for_segment(&geometry, seg_idx);
+            for sub in 0..subdivs {
+                let u0 = (sub as f64) / (subdivs as f64);
+                let u1 = ((sub + 1) as f64) / (subdivs as f64);
                 let half = 0.5 * (u1 - u0);
                 let mid = 0.5 * (u0 + u1);
 
@@ -693,6 +726,15 @@ impl ArcLengthSpline {
     #[must_use]
     pub const fn total_length(&self) -> f64 {
         self.total_length
+    }
+
+    /// Number of look-up table entries stored along this spline.
+    ///
+    /// Complexity: $O(1)$ time and $O(1)$ space.
+    #[inline]
+    #[must_use]
+    pub fn lut_sample_count(&self) -> usize {
+        self.lut.len()
     }
 
     /// Number of geometric segments.
@@ -1058,10 +1100,86 @@ enum TemporalDriver {
     },
 }
 
-/// Unified multi-waypoint pointer trajectory track pairing `ArcLengthSpline` spatial geometry
-/// with `MinimumJerk`, `Bezier`, `VelocityVerletSpring1D`, or `Instant` temporal progression.
+/// Optional deterministic hand-motion modulation applied smoothly along [`PointerPathTrack`].
 ///
-/// Build Complexity: $O(N \cdot M)$ time and space ($M = 16$).
+/// All fields default to `0.0` (exact arc-length spline with zero synthetic deviation).
+///
+/// Evaluation Complexity: $O(1)$ time and $O(1)$ space.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HandPathModulation {
+    /// Peak lateral normal bow offset in logical pixels at mid-stroke (`sin(pi * frac)`).
+    pub bow: f64,
+    /// Terminal longitudinal overshoot peak in logical pixels before settling cleanly on target.
+    pub overshoot: f64,
+    /// Deterministic sinusoidal micro-tremor amplitude in logical pixels along normal direction.
+    pub tremor: f64,
+}
+
+impl HandPathModulation {
+    /// Returns `true` when all modulation components are negligibly small (`<= 1e-9`).
+    ///
+    /// Complexity: $O(1)$ time and $O(1)$ space.
+    #[must_use]
+    pub fn is_zero(&self) -> bool {
+        self.bow.abs() <= 1e-9 && self.overshoot.abs() <= 1e-9 && self.tremor.abs() <= 1e-9
+    }
+
+    /// Clamps finite modulation parameters to safe ergonomic ranges and zeroes non-finite values.
+    ///
+    /// Complexity: $O(1)$ time and $O(1)$ space.
+    #[must_use]
+    pub fn sanitized(self) -> Self {
+        let clean = |v: f64, min: f64, max: f64| -> f64 {
+            if v.is_finite() {
+                v.clamp(min, max)
+            } else {
+                0.0
+            }
+        };
+        Self {
+            bow: clean(self.bow, -240.0, 240.0),
+            overshoot: clean(self.overshoot, -120.0, 120.0),
+            tremor: clean(self.tremor, 0.0, 32.0),
+        }
+    }
+
+    /// Computes instantaneous 2D displacement offset at normalized progress `frac in [0, 1]`
+    /// and local path tangent `heading_rad`, vanishing strictly at `frac = 0` and `frac = 1`.
+    ///
+    /// Complexity: $O(1)$ time and $O(1)$ space.
+    #[must_use]
+    pub fn offset_at(&self, frac: f64, heading_rad: f64) -> LogicalPoint {
+        if self.is_zero() || !frac.is_finite() || !heading_rad.is_finite() {
+            return pt(0.0, 0.0);
+        }
+        let u = frac.clamp(0.0, 1.0);
+        let env = (PI * u).sin();
+        let (sin_h, cos_h) = heading_rad.sin_cos();
+        let tx = cos_h;
+        let ty = sin_h;
+        let nx = -sin_h;
+        let ny = cos_h;
+
+        let lateral_bow = self.bow * env;
+        let overshoot_env = (u * u * u * u) * (1.0 - u) * 12.207_031_25;
+        let longitudinal_overshoot = self.overshoot * overshoot_env;
+        let tremor_wave =
+            self.tremor * env * (0.65 * (u * 37.0).sin() + 0.35 * (u * 71.0 + 1.1).cos());
+        let lateral = lateral_bow + tremor_wave;
+
+        pt(
+            nx * lateral + tx * longitudinal_overshoot,
+            ny * lateral + ty * longitudinal_overshoot,
+        )
+    }
+}
+
+/// Unified multi-waypoint pointer trajectory track pairing `ArcLengthSpline` spatial geometry
+/// with `MinimumJerk`, `Bezier`, `VelocityVerletSpring1D`, or `Instant` temporal progression
+/// and optional [`HandPathModulation`].
+///
+/// Build Complexity: $O(N \cdot M)$ time and space ($16 \le M \le 64$).
 /// Step Complexity: $O(\log(N \cdot M))$ time and $O(1)$ space per tick.
 #[derive(Debug, Clone)]
 pub struct PointerPathTrack {
@@ -1072,6 +1190,7 @@ pub struct PointerPathTrack {
     last_pos: LogicalPoint,
     last_vel: LogicalPoint,
     last_heading_rad: Option<f64>,
+    modulation: HandPathModulation,
     settled: bool,
 }
 
@@ -1079,7 +1198,7 @@ impl PointerPathTrack {
     /// Launches a trajectory through `waypoints` with the requested `spline`, initial kinematics,
     /// optional viewport containment `bounds`, and temporal `spec`.
     ///
-    /// Complexity: $O(N \cdot M)$ build time and $O(N \cdot M)$ space ($M = 16$).
+    /// Complexity: $O(N \cdot M)$ build time and $O(N \cdot M)$ space ($16 \le M \le 64$).
     #[must_use]
     pub fn launch_waypoints(
         waypoints: &[LogicalPoint],
@@ -1152,6 +1271,7 @@ impl PointerPathTrack {
                     last_pos: start,
                     last_vel: pt(0.0, 0.0),
                     last_heading_rad: Some(start_heading),
+                    modulation: HandPathModulation::default(),
                     settled: false,
                 }
             }
@@ -1176,6 +1296,7 @@ impl PointerPathTrack {
                     last_pos: start,
                     last_vel: pt(0.0, 0.0),
                     last_heading_rad: Some(start_heading),
+                    modulation: HandPathModulation::default(),
                     settled: false,
                 }
             }
@@ -1223,15 +1344,25 @@ impl PointerPathTrack {
                         pt(0.0, 0.0)
                     },
                     last_heading_rad: Some(start_heading),
+                    modulation: HandPathModulation::default(),
                     settled: false,
                 }
             }
         }
     }
 
+    /// Attaches optional deterministic [`HandPathModulation`] (`bow`, `overshoot`, `tremor`).
+    ///
+    /// Complexity: $O(1)$ time and $O(1)$ space.
+    #[must_use]
+    pub fn with_modulation(mut self, modulation: HandPathModulation) -> Self {
+        self.modulation = modulation.sanitized();
+        self
+    }
+
     /// Convenience two-point trajectory constructor supporting all `PointerTrajectorySpec` modes.
     ///
-    /// Complexity: $O(M)$ build time and $O(M)$ space ($M = 16$).
+    /// Complexity: $O(M)$ build time and $O(M)$ space ($16 \le M \le 64$).
     #[must_use]
     pub fn launch_two_point(
         from: LogicalPoint,
@@ -1268,6 +1399,7 @@ impl PointerPathTrack {
             last_pos: pos,
             last_vel: pt(0.0, 0.0),
             last_heading_rad: heading_rad.filter(|a| a.is_finite()),
+            modulation: HandPathModulation::default(),
             settled: true,
         }
     }
@@ -1326,7 +1458,7 @@ impl PointerPathTrack {
             }
         };
 
-        let (pos, heading) = self.spline.sample_at_fraction(frac);
+        let (base_pos, heading) = self.spline.sample_at_fraction(frac);
         self.last_heading_rad = Some(heading);
         if finished_now {
             self.settled = true;
@@ -1335,6 +1467,11 @@ impl PointerPathTrack {
             return self.target;
         }
 
+        let pos = if self.modulation.is_zero() {
+            base_pos
+        } else {
+            add_pt(base_pos, self.modulation.offset_at(frac, heading))
+        };
         let speed_px_s = total_len * ds_dt;
         self.last_pos = pos;
         self.last_vel = pt(heading.cos() * speed_px_s, heading.sin() * speed_px_s);
@@ -1435,6 +1572,7 @@ pub struct AgentCursorConfig {
     pub trail_enabled: bool,
     pub fog_enabled: bool,
     pub ripple_enabled: bool,
+    pub label_enabled: bool,
     pub idle_timeout_ms: u64,
     pub idle_wobble: bool,
 }
@@ -1448,6 +1586,7 @@ impl Default for AgentCursorConfig {
             trail_enabled: true,
             fog_enabled: true,
             ripple_enabled: true,
+            label_enabled: true,
             idle_timeout_ms: 12_000,
             idle_wobble: true,
         }
@@ -1464,7 +1603,93 @@ impl AgentCursorConfig {
     }
 }
 
-/// Render-ready snapshot of the virtual AI cursor, aura fog, ripples, and tapered ribbon trail.
+/// Viewport-clamped floating callout pill geometry and normalized caption text rendered alongside
+/// the virtual agent cursor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LabelPillSnapshot {
+    pub rect: LogicalRect,
+    pub text: String,
+}
+
+fn normalize_label_text(raw: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut char_count = 0usize;
+    for (word_idx, word) in raw
+        .split_whitespace()
+        .take(LABEL_PILL_MAX_WORDS)
+        .enumerate()
+    {
+        let sep = usize::from(word_idx > 0);
+        if char_count + sep >= LABEL_PILL_MAX_CHARS {
+            break;
+        }
+        if word_idx > 0 {
+            out.push(' ');
+            char_count += 1;
+        }
+        for ch in word.chars() {
+            if char_count >= LABEL_PILL_MAX_CHARS {
+                break;
+            }
+            out.push(ch);
+            char_count += 1;
+        }
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// Computes viewport-clamped pill placement near `tip` for `text`, normalizing text to at most
+/// 8 words / 48 chars, offsetting `(+20, +30)` by default, and flipping left/above within an
+/// `8.0 px` margin of the right/bottom viewport edge.
+///
+/// Complexity: $O(L)$ where $L \le 48$ chars (`O(1)` bounded).
+#[must_use]
+pub fn place_label_pill(
+    tip: LogicalPoint,
+    text: &str,
+    viewport: LogicalRect,
+) -> Option<LabelPillSnapshot> {
+    if !is_finite_pt(tip) || viewport.w == 0 || viewport.h == 0 {
+        return None;
+    }
+    let text = normalize_label_text(text)?;
+    let char_len = text.chars().count() as i32;
+    let max_vp_w = viewport.w as i32;
+    let max_vp_h = viewport.h as i32;
+    // Left padding (14 px incl. 3 px accent bar) + 12 px per glyph (5x7 @ 2x + 2 px pitch) + right pad (10 px).
+    let pill_w = (24 + char_len * 12).max(48).min(max_vp_w);
+    let pill_h = (LABEL_PILL_HEIGHT as i32).min(max_vp_h);
+
+    let margin = 8.0_f64;
+    let vp_left = f64::from(viewport.x);
+    let vp_top = f64::from(viewport.y);
+    let vp_right = vp_left + f64::from(viewport.w);
+    let vp_bottom = vp_top + f64::from(viewport.h);
+
+    let mut raw_x = tip.x + 20.0;
+    if raw_x + f64::from(pill_w) + margin > vp_right {
+        raw_x = tip.x - 20.0 - f64::from(pill_w);
+    }
+    let max_x = (vp_right - margin - f64::from(pill_w)).max(vp_left);
+    let min_x = (vp_left + margin).min(max_x);
+    let x = raw_x.clamp(min_x, max_x).round() as i32;
+
+    let mut raw_y = tip.y + 30.0;
+    if raw_y + f64::from(pill_h) + margin > vp_bottom {
+        raw_y = tip.y - 30.0 - f64::from(pill_h);
+    }
+    let max_y = (vp_bottom - margin - f64::from(pill_h)).max(vp_top);
+    let min_y = (vp_top + margin).min(max_y);
+    let y = raw_y.clamp(min_y, max_y).round() as i32;
+
+    Some(LabelPillSnapshot {
+        rect: LogicalRect::new(x, y, pill_w as u32, pill_h as u32),
+        text,
+    })
+}
+
+/// Render-ready snapshot of the virtual AI cursor, aura fog, ripples, tapered ribbon trail, and
+/// optional floating `LabelPill` + caret highlight box.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AgentCursorFrameSnapshot {
     pub tip_pos: LogicalPoint,
@@ -1479,6 +1704,8 @@ pub struct AgentCursorFrameSnapshot {
     pub fog_opacity: f32,
     pub ripples: Vec<(LogicalPoint, f32, f32)>,
     pub trail_points: Vec<(LogicalPoint, f32, f32)>,
+    pub label_pill: Option<LabelPillSnapshot>,
+    pub caret_rect: Option<LogicalRect>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1494,7 +1721,8 @@ struct CursorClickRipple {
 }
 
 /// Dual-layer spring visual state machine for the AI agent cursor (tip spring + heading angle
-/// spring + trailing fog/body displacement + sinusoidal click pulse/ripples + ring-buffer trail).
+/// spring + trailing fog/body displacement + sinusoidal click pulse/ripples + ring-buffer trail +
+/// optional label pill & caret box).
 #[derive(Debug, Clone)]
 pub struct AgentCursorVisualDynamics {
     active: bool,
@@ -1514,6 +1742,8 @@ pub struct AgentCursorVisualDynamics {
     click_pulse_start_ms: Option<u64>,
     ripples: VecDeque<CursorClickRipple>,
     trail: VecDeque<TrailSample>,
+    label_text: Option<String>,
+    caret_rect: Option<LogicalRect>,
 }
 
 impl Default for AgentCursorVisualDynamics {
@@ -1590,6 +1820,8 @@ impl AgentCursorVisualDynamics {
             click_pulse_start_ms: None,
             ripples: VecDeque::with_capacity(CURSOR_MAX_RIPPLES),
             trail: VecDeque::with_capacity(CURSOR_TRAIL_MAX_SAMPLES),
+            label_text: None,
+            caret_rect: None,
         }
     }
 
@@ -1681,6 +1913,24 @@ impl AgentCursorVisualDynamics {
         }
     }
 
+    /// Sets or clears the transient cursor label pill text and optional caret highlight box.
+    ///
+    /// Complexity: $O(L)$ where $L \le 48$ chars (`O(1)` bounded).
+    pub fn set_label(
+        &mut self,
+        label: Option<String>,
+        caret_rect: Option<LogicalRect>,
+        now_ms: u64,
+    ) {
+        self.label_text = label.and_then(|raw| normalize_label_text(&raw));
+        self.caret_rect = caret_rect.filter(|r| r.w > 0 && r.h > 0);
+        if self.label_text.is_some() || self.caret_rect.is_some() {
+            self.active = true;
+            self.last_activity_ms = now_ms;
+            self.settle_fade_start_ms = None;
+        }
+    }
+
     /// Transitions the agent cursor into settle fade-out (`280 ms`), or hides immediately.
     ///
     /// Complexity: $O(1)$ time and $O(1)$ space.
@@ -1691,6 +1941,8 @@ impl AgentCursorVisualDynamics {
             self.click_pulse_start_ms = None;
             self.ripples.clear();
             self.trail.clear();
+            self.label_text = None;
+            self.caret_rect = None;
             return;
         }
         if self.active && self.settle_fade_start_ms.is_none() {
@@ -1767,14 +2019,27 @@ impl AgentCursorVisualDynamics {
     }
 
     /// Advances all visual springs and constructs the render-ready `AgentCursorFrameSnapshot`
-    /// if the cursor is currently visible at `now_ms`.
+    /// using a default `1920x1080` viewport if the cursor is currently visible at `now_ms`.
     ///
     /// Complexity: $O(1)$ time and $O(1)$ space (bounded capacities: 32 trail samples -> 8 output
-    /// points, 2 active ripples).
+    /// points, 2 active ripples, <= 48-char label pill).
     pub fn step_frame(
         &mut self,
         now_ms: u64,
         cfg: &AgentCursorConfig,
+    ) -> Option<AgentCursorFrameSnapshot> {
+        self.step_frame_in_viewport(now_ms, cfg, None)
+    }
+
+    /// Advances all visual springs and constructs the render-ready `AgentCursorFrameSnapshot`
+    /// clamped within `viewport` (or `1920x1080` when `None`) if visible at `now_ms`.
+    ///
+    /// Complexity: $O(1)$ time and $O(1)$ space.
+    pub fn step_frame_in_viewport(
+        &mut self,
+        now_ms: u64,
+        cfg: &AgentCursorConfig,
+        viewport: Option<LogicalRect>,
     ) -> Option<AgentCursorFrameSnapshot> {
         if !cfg.enabled || !self.active {
             return None;
@@ -1951,6 +2216,20 @@ impl AgentCursorVisualDynamics {
             0.0
         };
 
+        let placement_bounds = viewport.unwrap_or_else(|| LogicalRect::new(0, 0, 1920, 1080));
+        let label_pill = if cfg.label_enabled {
+            self.label_text
+                .as_deref()
+                .and_then(|txt| place_label_pill(tip_pos, txt, placement_bounds))
+        } else {
+            None
+        };
+        let caret_rect = if cfg.label_enabled {
+            self.caret_rect
+        } else {
+            None
+        };
+
         self.last_step_ms = now_ms;
         Some(AgentCursorFrameSnapshot {
             tip_pos,
@@ -1965,6 +2244,8 @@ impl AgentCursorVisualDynamics {
             fog_opacity,
             ripples,
             trail_points,
+            label_pill,
+            caret_rect,
         })
     }
 
@@ -2228,5 +2509,155 @@ mod tests {
 
         assert!(dyn_state.step_frame(880, &cfg).is_none());
         assert!(!dyn_state.needs_animation_tick(880, &cfg));
+    }
+
+    #[test]
+    fn adaptive_lut_refines_curved_painting_arcs_below_quarter_pixel_sagitta() {
+        let straight = ArcLengthSpline::from_bezier_segments(vec![CubicBezierSegment2D::new(
+            pt(0.0, 0.0),
+            pt(40.0, 0.0),
+            pt(80.0, 0.0),
+            pt(120.0, 0.0),
+        )]);
+        assert_eq!(straight.lut_sample_count(), 1 + 16);
+
+        let tight_arc = ArcLengthSpline::from_bezier_segments(vec![CubicBezierSegment2D::new(
+            pt(100.0, 400.0),
+            pt(100.0, 50.0),
+            pt(600.0, 50.0),
+            pt(600.0, 400.0),
+        )]);
+        assert!(
+            tight_arc.lut_sample_count() > 1 + 16,
+            "curved arc should trigger adaptive LUT subdivision (> 16), got {}",
+            tight_arc.lut_sample_count()
+        );
+        assert!(tight_arc.lut_sample_count() <= 1 + MAX_SUBDIVISIONS_PER_SEGMENT);
+        let subdivs = tight_arc.lut_sample_count() - 1;
+        // Verify adjacent chord midpoint sagitta vs exact Bezier evaluation stays < 0.25 px.
+        let seg = CubicBezierSegment2D::new(
+            pt(100.0, 400.0),
+            pt(100.0, 50.0),
+            pt(600.0, 50.0),
+            pt(600.0, 400.0),
+        );
+        let mut max_err = 0.0_f64;
+        for i in 0..subdivs {
+            let u0 = i as f64 / subdivs as f64;
+            let u1 = (i + 1) as f64 / subdivs as f64;
+            let (p0, _) = seg.eval(u0);
+            let (p1, _) = seg.eval(u1);
+            let (pm, _) = seg.eval(0.5 * (u0 + u1));
+            let chord_mid = pt(0.5 * (p0.x + p1.x), 0.5 * (p0.y + p1.y));
+            max_err = max_err.max(dist_pt(pm, chord_mid));
+        }
+        assert!(max_err < 0.25, "max chordal error was {max_err}");
+    }
+
+    #[test]
+    fn hand_path_modulation_deflects_midstroke_and_lands_exact() {
+        let base_spec = PointerTrajectorySpec::MinimumJerk {
+            duration_ms: 200,
+            arc_curvature: 0.0,
+        };
+        let plain = PointerPathTrack::launch_two_point(
+            pt(100.0, 200.0),
+            pt(500.0, 200.0),
+            pt(0.0, 0.0),
+            Some(0.0),
+            None,
+            0,
+            base_spec,
+        );
+        let mut mod_track = PointerPathTrack::launch_two_point(
+            pt(100.0, 200.0),
+            pt(500.0, 200.0),
+            pt(0.0, 0.0),
+            Some(0.0),
+            None,
+            0,
+            base_spec,
+        )
+        .with_modulation(HandPathModulation {
+            bow: 24.0,
+            overshoot: 10.0,
+            tremor: 2.0,
+        });
+
+        let mut plain_mut = plain;
+        let mid_plain = plain_mut.step(100);
+        let mid_mod = mod_track.step(100);
+        assert!(
+            (mid_mod.y - mid_plain.y).abs() > 10.0,
+            "bow should deflect midstroke laterally"
+        );
+
+        let end_mod = mod_track.step(200);
+        assert!(mod_track.is_settled());
+        assert_eq!(end_mod, pt(500.0, 200.0));
+    }
+
+    #[test]
+    fn label_pill_placement_truncates_and_flips_inside_viewport() {
+        let vp = LogicalRect::new(0, 0, 1280, 720);
+        assert!(place_label_pill(pt(100.0, 100.0), "   \t  ", vp).is_none());
+
+        let normal = place_label_pill(
+            pt(200.0, 200.0),
+            "one two three four five six seven eight nine ten",
+            vp,
+        )
+        .expect("non-empty label");
+        assert_eq!(normal.text, "one two three four five six seven eight");
+        assert_eq!(normal.rect.x, 220);
+        assert_eq!(normal.rect.y, 230);
+
+        let long_char = "A".repeat(60);
+        let clamped_chars = place_label_pill(pt(100.0, 100.0), &long_char, vp).unwrap();
+        assert_eq!(clamped_chars.text.chars().count(), LABEL_PILL_MAX_CHARS);
+
+        // Near bottom-right edge: must flip left and above tip while keeping >= 8px margin.
+        let edge = place_label_pill(pt(1265.0, 710.0), "CLICK BLU", vp).unwrap();
+        assert!(edge.rect.x + (edge.rect.w as i32) <= 1280 - 8);
+        assert!(edge.rect.y + (edge.rect.h as i32) <= 720 - 8);
+        assert!(edge.rect.x < 1265);
+        assert!(edge.rect.y < 710);
+    }
+
+    #[test]
+    fn visual_dynamics_manages_label_pill_and_caret_lifecycle() {
+        let mut cfg = AgentCursorConfig::default();
+        let mut dyn_state = AgentCursorVisualDynamics::new();
+        dyn_state.set_target(pt(300.0, 300.0), pt(0.0, 0.0), None, 10);
+        dyn_state.set_label(
+            Some("TYPING HELLO".to_owned()),
+            Some(LogicalRect::new(295, 290, 120, 24)),
+            10,
+        );
+
+        let snap = dyn_state
+            .step_frame_in_viewport(20, &cfg, Some(LogicalRect::new(0, 0, 1920, 1080)))
+            .expect("visible");
+        assert_eq!(
+            snap.label_pill.as_ref().map(|p| p.text.as_str()),
+            Some("TYPING HELLO")
+        );
+        assert_eq!(snap.caret_rect, Some(LogicalRect::new(295, 290, 120, 24)));
+
+        cfg.label_enabled = false;
+        let disabled = dyn_state
+            .step_frame_in_viewport(30, &cfg, None)
+            .expect("cursor still visible");
+        assert!(disabled.label_pill.is_none());
+        assert!(disabled.caret_rect.is_none());
+
+        cfg.label_enabled = true;
+        dyn_state.begin_settle(100, false);
+        assert!(dyn_state.step_frame(380, &cfg).is_none());
+        // After settle fade completes, previously set label/caret stay cleared upon reactivation.
+        dyn_state.set_target(pt(400.0, 400.0), pt(0.0, 0.0), None, 400);
+        let after_reactivate = dyn_state.step_frame(410, &cfg).unwrap();
+        assert!(after_reactivate.label_pill.is_none());
+        assert!(after_reactivate.caret_rect.is_none());
     }
 }
