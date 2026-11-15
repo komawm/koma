@@ -8,7 +8,31 @@ desktop, hardware support, or security guarantees.
 
 ## [Unreleased]
 
-## [0.0.1] - 2026-11-14
+## [0.0.1] - 2026-11-16
+
+### Added (agent cursor precision, vSeat trajectories & MCP)
+
+- Multi-waypoint and heading-continuous agent cursor trajectories in `koma-model`
+  (`PathSplineKind::{Auto, CatmullRom, Bezier}`, centripetal `alpha = 0.5`
+  `CentripetalCatmullRom`, 250 Hz adaptive sub-frame resampling, and minimum-jerk
+  kinematics) exposed via `vseat.path`, `vseat.stroke`, and Lua
+  `MacroContext:{move_path, stroke_path, path, settle_cursor}`.
+- Extended `vseat.*` compositor RPCs in `koma` (`vseat.relative_move`,
+  `vseat.wheel`, `vseat.click` with `modifiers` + `label`, `vseat.hit_test`,
+  `vseat.cursor_label`, `vseat.cursor_settle`) alongside Smithay `ClickGrab`
+  drag-motion/button-release forwarding for reliable spline strokes.
+- GLES2 SDF agent cursor indicator and floating `LabelPill` + `caret_rect`
+  companion overlay (`LabelPillSnapshot` rasterization in `koma-render`), with
+  screencopy/capture isolation controls (`koma.capture`).
+- Explicit IPC error delivery metadata (`DeliverySemantics`,
+  `DeliveryDisposition`, `RetryDisposition`) in `koma-proto` so clients can
+  distinguish un-delivered, uncertain, and verified pointer/key actions.
+- Lazy-connect `koma-mcp` stdio server supporting auto-detected `Content-Length`
+  and NDJSON framing across all 17 Koma MCP tools (`koma_ping`,
+  `koma_scene_inventory`, `koma_ws_create`, `koma_capture_frame`, `koma_click`,
+  `koma_drag`, `koma_key`, `koma_inject_text`, `koma_paste_mime`,
+  `koma_win_activate`, `koma_exec_macro`, `koma_path`, `koma_cursor_settle`,
+  `koma_wheel`, `koma_relative_move`, `koma_hit_test`, `koma_cursor_label`).
 
 Initial development prerelease of the imported incubation baseline.
 
@@ -58,13 +82,16 @@ Initial development prerelease of the imported incubation baseline.
 
 ### Known limitations
 
-- No hardware, DRM/KMS, physical input or GPU acceptance has been performed.
-- Nested Wayland and isolated VM validation are still pending; passing CI
-  covers builds, lints and unit/state-machine tests only.
+- No bare-metal hardware, DRM/KMS, physical input or GPU acceptance has been
+  performed.
+- Headless QEMU/KVM and nested `winit` compositor smoke checks have verified
+  virtual seat (`vseat`) agent pointer trajectories, whereas full multi-app
+  daily-driver soak testing remains pending.
 - Koma is not yet a supported daily-driver desktop. Interfaces, configuration
   and IPC may change without notice on the `0.0.x` line.
-- Only `x86_64-unknown-linux-gnu` archives are produced; BSD and other
-  architectures remain planned.
+- Prebuilt archives cover `x86_64-unknown-linux-gnu` and
+  `aarch64-unknown-linux-gnu`; BSD tier builds remain compile-verified while
+  BSD release packaging is planned.
 
 [Unreleased]: https://github.com/komawm/koma/compare/v0.0.1...HEAD
 [0.0.1]: https://github.com/komawm/koma/releases/tag/v0.0.1
