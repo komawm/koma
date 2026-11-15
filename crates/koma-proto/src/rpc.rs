@@ -72,14 +72,32 @@ pub enum PointerDeviceKind {
 pub enum KinematicProfileKind {
     Instant,
     MinimumJerk,
+    #[serde(alias = "hooke", alias = "hooke_spring")]
     Spring,
+    Bezier,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct KinematicsParams {
     pub profile: KinematicProfileKind,
+    #[serde(default)]
     pub arc_curvature: f64,
+    #[serde(default)]
     pub duration_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub curve: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mass: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub damping: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub damping_ratio: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stiffness: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epsilon: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bezier: Option<[f64; 4]>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -135,6 +153,28 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&TransportKind::ShmFd).unwrap(),
             "\"shm_fd\""
+        );
+    }
+
+    #[test]
+    fn kinematic_profile_supports_hooke_aliases_and_bezier() {
+        assert_eq!(
+            serde_json::to_string(&KinematicProfileKind::Spring).unwrap(),
+            "\"spring\""
+        );
+        for wire in ["\"spring\"", "\"hooke\"", "\"hooke_spring\""] {
+            assert_eq!(
+                serde_json::from_str::<KinematicProfileKind>(wire).unwrap(),
+                KinematicProfileKind::Spring
+            );
+        }
+        assert_eq!(
+            serde_json::to_string(&KinematicProfileKind::Bezier).unwrap(),
+            "\"bezier\""
+        );
+        assert_eq!(
+            serde_json::from_str::<KinematicProfileKind>("\"bezier\"").unwrap(),
+            KinematicProfileKind::Bezier
         );
     }
 }

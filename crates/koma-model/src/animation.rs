@@ -875,8 +875,27 @@ impl HookeSpringParams {
     }
 
     #[must_use]
-    fn is_at_rest(&self, x: f64, v: f64, target: f64) -> bool {
+    pub fn is_at_rest(&self, x: f64, v: f64, target: f64) -> bool {
         (x - target).abs() <= self.epsilon * 50.0 && v.abs() <= self.epsilon * 250.0
+    }
+
+    /// Estimates convergence time in milliseconds over `span_px` using symplectic Euler probing
+    /// at `8 ms` steps up to `2500 ms` ($O(1)$ bounded time and $O(1)$ space).
+    #[must_use]
+    pub fn estimated_settle_ms(&self, span_px: f64) -> u64 {
+        let target = if span_px.is_finite() {
+            span_px.abs().max(256.0)
+        } else {
+            512.0
+        };
+        let mut probe = HookeSpringTrack::from_to(0.0, target, 0, *self);
+        for t_ms in (8_u64..=2_500).step_by(8) {
+            let _ = probe.sample(t_ms);
+            if probe.is_settled() {
+                return t_ms;
+            }
+        }
+        2_500
     }
 }
 

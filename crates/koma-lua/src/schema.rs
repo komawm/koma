@@ -1,9 +1,10 @@
 use std::collections::BTreeMap;
 
 use koma_model::{
-    Anchor9, AnchorPoint, AnimationConfig, BlockOutPolicy, BlurConfig, BorderConfig, DimConfig,
-    DwindleConfig, FocusRingConfig, FrameClockConfig, LayoutMode, LogicalViewport, OpenMode,
-    OutputTransform, SafeAreaInsets, ScrollingConfig, ShadowConfig,
+    Anchor9, AnchorPoint, AnimationConfig, BlockOutPolicy, BlurConfig, BorderConfig, CubicBezier,
+    CurveSpec, DimConfig, DwindleConfig, FocusRingConfig, FrameClockConfig, HookeSpringParams,
+    LayoutMode, LogicalViewport, OpenMode, OutputTransform, PointerTrajectorySpec, SafeAreaInsets,
+    ScrollingConfig, ShadowConfig,
 };
 use koma_proto::{KinematicProfileKind, MacroId, OutputId, TextInjectStrategy};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -1148,20 +1149,179 @@ impl LuaAnchorPointInput {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LuaKinematicsInput {
     pub profile: KinematicProfileKind,
-    pub duration_ms: u64,
-    pub arc_curvature: f64,
+    pub duration_ms: Option<u64>,
+    pub arc_curvature: Option<f64>,
+    pub curve: Option<String>,
+    pub mass: Option<f64>,
+    pub damping: Option<f64>,
+    pub damping_ratio: Option<f64>,
+    pub stiffness: Option<f64>,
+    pub epsilon: Option<f64>,
+    pub bezier: Option<[f64; 4]>,
 }
 
 impl Default for LuaKinematicsInput {
     fn default() -> Self {
         Self {
             profile: KinematicProfileKind::MinimumJerk,
-            duration_ms: 110,
-            arc_curvature: 0.08,
+            duration_ms: None,
+            arc_curvature: None,
+            curve: None,
+            mass: None,
+            damping: None,
+            damping_ratio: None,
+            stiffness: None,
+            epsilon: None,
+            bezier: None,
+        }
+    }
+}
+
+impl LuaKinematicsInput {
+    /// Immediate pointer warp (`profile = "instant"`).
+    #[must_use]
+    pub fn instant() -> Self {
+        Self {
+            profile: KinematicProfileKind::Instant,
+            duration_ms: Some(0),
+            arc_curvature: Some(0.0),
+            ..Self::default()
+        }
+    }
+
+    fn resolve_hooke_params(&self, base: Option<HookeSpringParams>) -> HookeSpringParams {
+        let default_eps = base.map_or(0.01, |p| p.epsilon.max(0.01));
+        let eps = self.epsilon.unwrap_or(default_eps);
+
+        if let Some(p) = base
+            && self.mass.is_none()
+            && self.damping.is_none()
+            && self.damping_ratio.is_none()
+            && self.stiffness.is_none()
+        {
+            return HookeSpringParams::from_physical(p.mass, p.damping, p.stiffness, eps);
+        }
+
+        if let Some(p) = base {
+            let m = self.mass.unwrap_or(p.mass);
+            let k = self.stiffness.unwrap_or(p.stiffness);
+            return if let Some(c) = self.damping {
+                HookeSpringParams::from_physical(m, c, k, eps)
+            } else if let Some(zeta) = self.damping_ratio {
+                HookeSpringParams::from_ratio(zeta, k, m, eps)
+            } else {
+                HookeSpringParams::from_physical(m, p.damping, k, eps)
+            };
+        }
+
+        let has_physical = self.mass.is_some()
+            || self.damping.is_some()
+            || self.damping_ratio.is_some()
+            || self.stiffness.is_some();
+        if has_physical {
+            let m = self.mass.unwrap_or(1.0);
+            let k = self.stiffness.unwrap_or(380.0);
+            return if let Some(c) = self.damping {
+                HookeSpringParams::from_physical(m, c, k, eps)
+            } else {
+                HookeSpringParams::from_ratio(self.damping_ratio.unwrap_or(0.92), k, m, eps)
+            };
+        }
+
+        if let Some(dur_ms) = self.duration_ms {
+            let t_sec = (dur_ms.max(16) as f64) / 1000.0;
+            let omega0 = (9.5 / t_sec).clamp(8.0, 120.0);
+            return HookeSpringParams::from_ratio(1.0, omega0 * omega0, 1.0, eps);
+        }
+
+        HookeSpringParams::from_ratio(0.92, 380.0, 1.0, eps)
+    }
+
+    /// Resolves this Lua/IPC table against named curves in `AnimationConfig` into a `PointerTrajectorySpec`.
+    #[must_use]
+    pub fn resolve_spec(&self, animations: &AnimationConfig) -> PointerTrajectorySpec {
+        let arc = self.arc_curvature.unwrap_or(0.0);
+        if self.duration_ms == Some(0) {
+            return PointerTrajectorySpec::Instant;
+        }
+
+        if let Some(name) = self.curve.as_deref()
+            && let Some(curve) =
+                animations.resolve_curve(name, self.duration_ms.map(|d| d.clamp(1, 5_000) as u32))
+        {
+            match curve {
+                CurveSpec::Instant => return PointerTrajectorySpec::Instant,
+                CurveSpec::Bezier {
+                    bezier,
+                    duration_ms,
+                } => {
+                    return PointerTrajectorySpec::Bezier {
+                        bezier,
+                        duration_ms: u64::from(duration_ms),
+                        arc_curvature: arc,
+                    };
+                }
+                CurveSpec::Spring(p) => {
+                    let params = self.resolve_hooke_params(Some(p));
+                    return PointerTrajectorySpec::HookeSpring {
+                        params,
+                        duration_cap_ms: self.duration_ms,
+                        arc_curvature: arc,
+                    };
+                }
+                CurveSpec::AnalyticalSpring(sp) => {
+                    let base = HookeSpringParams::from_physical(
+                        sp.mass,
+                        sp.damping,
+                        sp.stiffness,
+                        sp.epsilon,
+                    );
+                    let params = self.resolve_hooke_params(Some(base));
+                    return PointerTrajectorySpec::HookeSpring {
+                        params,
+                        duration_cap_ms: self.duration_ms,
+                        arc_curvature: arc,
+                    };
+                }
+            }
+        }
+
+        let inferred_spring = self.mass.is_some()
+            || self.damping.is_some()
+            || self.damping_ratio.is_some()
+            || self.stiffness.is_some();
+
+        let effective_profile = match self.profile {
+            KinematicProfileKind::MinimumJerk if self.bezier.is_some() => {
+                KinematicProfileKind::Bezier
+            }
+            KinematicProfileKind::MinimumJerk if inferred_spring => KinematicProfileKind::Spring,
+            other => other,
+        };
+
+        match effective_profile {
+            KinematicProfileKind::Instant => PointerTrajectorySpec::Instant,
+            KinematicProfileKind::MinimumJerk => PointerTrajectorySpec::MinimumJerk {
+                duration_ms: self.duration_ms.unwrap_or(110),
+                arc_curvature: self.arc_curvature.unwrap_or(0.08),
+            },
+            KinematicProfileKind::Bezier => {
+                let [x1, y1, x2, y2] = self.bezier.unwrap_or([0.22, 1.0, 0.36, 1.0]);
+                PointerTrajectorySpec::Bezier {
+                    bezier: CubicBezier::new(x1, y1, x2, y2),
+                    duration_ms: self.duration_ms.unwrap_or(180).clamp(1, 5_000),
+                    arc_curvature: arc,
+                }
+            }
+            KinematicProfileKind::Spring => PointerTrajectorySpec::HookeSpring {
+                params: self.resolve_hooke_params(None),
+                duration_cap_ms: self.duration_ms,
+                arc_curvature: arc,
+            },
         }
     }
 }

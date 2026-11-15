@@ -9,13 +9,10 @@ use calloop::{
 };
 use koma_lua::{HostBridge, phodopus_bridge::QueuedHostAction, schema::LuaKinematicsInput};
 use koma_model::{
-    AnchorPoint, LogicalPoint, LogicalRect, MinimumJerkSolver, SpringSolver, TrajectorySolver as _,
+    AnchorPoint, LogicalPoint, LogicalRect, PointerTrajectorySpec, PointerTrajectoryTrack,
     WindowMatchContext,
 };
-use koma_proto::{
-    Epoch, EventTopic, IpcError, KinematicProfileKind, TextInjectStrategy, WorkspaceEvent,
-    WorkspaceId,
-};
+use koma_proto::{Epoch, EventTopic, IpcError, TextInjectStrategy, WorkspaceEvent, WorkspaceId};
 use regex::Regex;
 use smithay::{
     backend::input::{Axis, AxisSource, ButtonState, InputTime, KeyState, Keycode},
@@ -63,26 +60,28 @@ pub struct WorkspaceDamageTracker {
     pub settle_timer_token: Option<RegistrationToken>,
 }
 
-/// In-flight smooth `vSeat` pointer animation (`minimum_jerk` or `spring`).
+/// In-flight smooth `vSeat` pointer trajectory (`minimum_jerk`, `bezier`, or 2D damped Hooke `spring`).
 #[derive(Debug, Clone)]
 pub struct ActivePointerAnimation {
     pub ws_id: WorkspaceId,
     pub expected_epoch: Epoch,
-    pub from: LogicalPoint,
-    pub to: LogicalPoint,
-    pub start_ms: u64,
-    pub duration_ms: u64,
-    pub kinematics: LuaKinematicsInput,
+    pub track: PointerTrajectoryTrack,
+    pub release_button_on_finish: Option<String>,
 }
 
 /// Read-only `HostBridge` view over `KomaState` passed into `PhodopusSandbox::drive_ready_coroutines`.
 struct StateEpochView<'a> {
     workspaces: &'a std::collections::HashMap<WorkspaceId, koma_model::WorkspaceState>,
+    pointer_animations: &'a [ActivePointerAnimation],
 }
 
 impl HostBridge for StateEpochView<'_> {
     fn current_epoch(&self, ws_id: &WorkspaceId) -> Option<Epoch> {
         self.workspaces.get(ws_id).map(|ws| ws.lease.epoch())
+    }
+
+    fn pointer_trajectory_settled(&self, ws_id: &WorkspaceId) -> Option<bool> {
+        Some(!self.pointer_animations.iter().any(|a| &a.ws_id == ws_id))
     }
 
     fn focused_app_id(&self, _ws_id: &WorkspaceId) -> Option<String> {
@@ -222,6 +221,7 @@ pub fn drive_macro_tick(state: &mut KomaState, explicit_settled: &[WorkspaceId])
     let report = {
         let view = StateEpochView {
             workspaces: &state.workspaces,
+            pointer_animations: &state.pointer_animations,
         };
         state
             .lua_sandbox
@@ -358,30 +358,10 @@ pub(crate) fn dispatch_single_host_action(state: &mut KomaState, action: QueuedH
             if !verify_action_epoch_and_protection(state, &ws_id, expected_epoch) {
                 return;
             }
-            let win_rect = target_window_rect(state, &ws_id);
-            let Ok(dst_pt) = target.resolve_in(win_rect) else {
-                warn!(%ws_id, "invalid grid_225 label in MovePointer");
-                return;
-            };
-
-            if kinematics.profile == KinematicProfileKind::Instant || kinematics.duration_ms == 0 {
-                apply_pointer_motion(state, dst_pt);
-            } else {
-                let from = LogicalPoint {
-                    x: state.pointer_location.x,
-                    y: state.pointer_location.y,
-                };
-                let start_ms = state.elapsed_ms();
-                state.pointer_animations.retain(|a| a.ws_id != ws_id);
-                state.pointer_animations.push(ActivePointerAnimation {
-                    ws_id,
-                    expected_epoch,
-                    from,
-                    to: dst_pt,
-                    start_ms,
-                    duration_ms: kinematics.duration_ms,
-                    kinematics,
-                });
+            if let Err(err) =
+                apply_move_pointer(state, ws_id, expected_epoch, target, &kinematics, None)
+            {
+                warn!("{err}");
             }
         }
 
@@ -612,6 +592,109 @@ fn verify_action_epoch_and_protection(
     true
 }
 
+fn apply_move_pointer(
+    state: &mut KomaState,
+    ws_id: WorkspaceId,
+    expected_epoch: Epoch,
+    target: AnchorPoint,
+    kinematics: &LuaKinematicsInput,
+    release_button_on_finish: Option<String>,
+) -> Result<(), String> {
+    let win_rect = target_window_rect(state, &ws_id);
+    let dst_pt = target
+        .resolve_in(win_rect)
+        .map_err(|e| format!("invalid grid_225 label in MovePointer for {ws_id}: {e}"))?;
+    let anim_cfg = state.lua_sandbox.animations_snapshot();
+    let spec = kinematics.resolve_spec(&anim_cfg);
+    let now_ms = state.elapsed_ms();
+
+    if matches!(spec, PointerTrajectorySpec::Instant) {
+        state.pointer_animations.retain(|a| a.ws_id != ws_id);
+        apply_pointer_motion(state, dst_pt);
+        if let Some(button) = release_button_on_finish {
+            release_pointer_button(state, &ws_id, &button);
+        }
+        return Ok(());
+    }
+
+    if let Some(existing) = state
+        .pointer_animations
+        .iter_mut()
+        .find(|a| a.ws_id == ws_id)
+    {
+        existing.expected_epoch = expected_epoch;
+        existing.track.retarget(dst_pt, now_ms, spec);
+        existing.release_button_on_finish = release_button_on_finish;
+        if existing.track.is_settled() {
+            let release_btn = existing.release_button_on_finish.take();
+            state.pointer_animations.retain(|a| a.ws_id != ws_id);
+            apply_pointer_motion(state, dst_pt);
+            if let Some(button) = release_btn {
+                release_pointer_button(state, &ws_id, &button);
+            }
+        }
+        return Ok(());
+    }
+
+    let from = LogicalPoint {
+        x: state.pointer_location.x,
+        y: state.pointer_location.y,
+    };
+    let track =
+        PointerTrajectoryTrack::launch(from, dst_pt, LogicalPoint { x: 0.0, y: 0.0 }, now_ms, spec);
+    if track.is_settled() {
+        apply_pointer_motion(state, dst_pt);
+        if let Some(button) = release_button_on_finish {
+            release_pointer_button(state, &ws_id, &button);
+        }
+    } else {
+        state.pointer_animations.push(ActivePointerAnimation {
+            ws_id,
+            expected_epoch,
+            track,
+            release_button_on_finish,
+        });
+    }
+    Ok(())
+}
+
+pub(crate) fn queue_pointer_trajectory(
+    state: &mut KomaState,
+    ws_id: WorkspaceId,
+    expected_epoch: Epoch,
+    target: AnchorPoint,
+    kinematics: &LuaKinematicsInput,
+    release_button_on_finish: Option<String>,
+) -> Result<(), IpcError> {
+    if !verify_action_epoch_and_protection(state, &ws_id, expected_epoch) {
+        return Err(IpcError::new(
+            koma_proto::ErrorSymbol::ErrStaleEpoch,
+            "workspace epoch mismatch or protected surface focused",
+        ));
+    }
+    apply_move_pointer(
+        state,
+        ws_id,
+        expected_epoch,
+        target,
+        kinematics,
+        release_button_on_finish,
+    )
+    .map_err(|msg| IpcError::new(koma_proto::ErrorSymbol::ErrInvalidParams, msg))?;
+    rearm_trampoline_timer(state);
+    Ok(())
+}
+
+fn release_pointer_button(state: &mut KomaState, ws_id: &WorkspaceId, button: &str) {
+    let btn_code = linux_button_code(button);
+    if let Some(ws) = state.workspaces.get(ws_id)
+        && let Some(ledger) = state.vseats.get_mut(&ws.vseat_id)
+    {
+        ledger.record_button_up(btn_code);
+    }
+    apply_pointer_button(state, btn_code, ButtonState::Released);
+}
+
 fn step_pointer_animations(state: &mut KomaState, now_ms: u64) {
     state.reconcile_session_lock();
     if state.is_locked_or_abandoned() {
@@ -624,8 +707,9 @@ fn step_pointer_animations(state: &mut KomaState, now_ms: u64) {
 
     let mut remaining = Vec::new();
     let mut latest_pos: Option<LogicalPoint> = None;
+    let mut finished_releases: Vec<(WorkspaceId, String)> = Vec::new();
 
-    for anim in state.pointer_animations.drain(..) {
+    for mut anim in state.pointer_animations.drain(..) {
         let epoch_valid = state.workspaces.get(&anim.ws_id).is_some_and(|ws| {
             !ws.lease.is_human_preempted() && ws.lease.epoch() == anim.expected_epoch
         });
@@ -633,19 +717,14 @@ fn step_pointer_animations(state: &mut KomaState, now_ms: u64) {
             continue;
         }
 
-        let elapsed = now_ms.saturating_sub(anim.start_ms);
-        let t = (elapsed as f64 / anim.duration_ms.max(1) as f64).clamp(0.0, 1.0);
-        let pt = match anim.kinematics.profile {
-            KinematicProfileKind::MinimumJerk => MinimumJerkSolver {
-                arc_curvature: anim.kinematics.arc_curvature,
-            }
-            .sample(anim.from, anim.to, t),
-            KinematicProfileKind::Spring => SpringSolver::default().sample(anim.from, anim.to, t),
-            KinematicProfileKind::Instant => anim.to,
-        };
+        let pt = anim.track.step(now_ms);
         latest_pos = Some(pt);
 
-        if elapsed < anim.duration_ms {
+        if anim.track.is_settled() || now_ms >= anim.track.max_finish_at_ms() {
+            if let Some(btn) = anim.release_button_on_finish.take() {
+                finished_releases.push((anim.ws_id.clone(), btn));
+            }
+        } else {
             remaining.push(anim);
         }
     }
@@ -653,6 +732,9 @@ fn step_pointer_animations(state: &mut KomaState, now_ms: u64) {
     state.pointer_animations = remaining;
     if let Some(pt) = latest_pos {
         apply_pointer_motion(state, pt);
+    }
+    for (ws_id, btn) in finished_releases {
+        release_pointer_button(state, &ws_id, &btn);
     }
 }
 

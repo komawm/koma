@@ -19,8 +19,8 @@ use std::{
 
 use gc_arena::Rootable;
 use koma_model::{
-    AnchorPoint, CubicBezier, CurveSpec, DwindleConfig, HookeSpringParams, LayoutMode,
-    ScrollingConfig,
+    AnchorPoint, AnimationConfig, CubicBezier, CurveSpec, DwindleConfig, HookeSpringParams,
+    LayoutMode, PointerTrajectorySpec, ScrollingConfig,
 };
 use koma_proto::{Epoch, ErrorSymbol, IpcError, MacroId, TextInjectStrategy, WorkspaceId};
 use phodopus::{
@@ -406,6 +406,12 @@ impl PhodopusSandbox {
 
         step_res.map_err(|e| format!("init.lua evaluation error: {e}"))?;
         Ok(self.state.borrow().config.clone())
+    }
+
+    /// Returns a clone of the current declarative animation & curve registry (`AnimationConfig`).
+    #[must_use]
+    pub fn animations_snapshot(&self) -> AnimationConfig {
+        self.state.borrow().config.appearance.animations.clone()
     }
 
     /// Launches a registered `koma.macro.define` coroutine (`lua.exec_tx` or `koma.act.macro.run`)
@@ -2328,14 +2334,15 @@ fn create_macro_context_userdata<'gc>(
             let seq = async_sequence(&ctx, |_, mut seq| async move {
                 let maybe_handle = seq.try_enter(|_, _, _, _| {
                     let mut inner = sc.state.borrow_mut();
-                    let dur = if matches!(
-                        kinematics.profile,
-                        koma_proto::KinematicProfileKind::Instant
-                    ) {
-                        0
-                    } else {
-                        kinematics.duration_ms
-                    };
+                    let spec = kinematics.resolve_spec(&inner.config.appearance.animations);
+                    let dur = spec.estimated_park_ms(512.0);
+                    let settle_driven = matches!(
+                        spec,
+                        PointerTrajectorySpec::HookeSpring {
+                            duration_cap_ms: None,
+                            ..
+                        }
+                    );
                     inner.host_actions.push_back(QueuedHostAction::MovePointer {
                         ws_id: sc.ws_id.clone(),
                         expected_epoch: sc.expected_epoch,
@@ -2343,13 +2350,16 @@ fn create_macro_context_userdata<'gc>(
                         kinematics,
                     });
                     if dur > 0 {
-                        let finish_at_ms = inner.now_ms.saturating_add(dur);
+                        let started_at_ms = inner.now_ms;
+                        let finish_at_ms = started_at_ms.saturating_add(dur);
                         let ws_id = sc.ws_id.clone();
                         Ok::<_, LuaError<'_>>(Some(inner.park_host_op(
                             &sc,
                             PendingHostOp::PointerTrajectory {
                                 ws_id,
+                                started_at_ms,
                                 finish_at_ms,
+                                settle_driven,
                             },
                         )))
                     } else {
@@ -2442,11 +2452,7 @@ fn create_macro_context_userdata<'gc>(
                         ws_id: sc.ws_id.clone(),
                         expected_epoch: sc.expected_epoch,
                         target: from_pt,
-                        kinematics: LuaKinematicsInput {
-                            profile: koma_proto::KinematicProfileKind::Instant,
-                            duration_ms: 0,
-                            arc_curvature: 0.0,
-                        },
+                        kinematics: LuaKinematicsInput::instant(),
                     });
                     inner
                         .host_actions
@@ -2472,20 +2478,32 @@ fn create_macro_context_userdata<'gc>(
                 // Stage 3: Smooth kinematic trajectory to `to`
                 let traj_handle = seq.try_enter(|_, _, _, _| {
                     let mut inner = sc.state.borrow_mut();
+                    let spec = kin.resolve_spec(&inner.config.appearance.animations);
+                    let dur = spec.estimated_park_ms(512.0);
+                    let settle_driven = matches!(
+                        spec,
+                        PointerTrajectorySpec::HookeSpring {
+                            duration_cap_ms: None,
+                            ..
+                        }
+                    );
                     inner.host_actions.push_back(QueuedHostAction::MovePointer {
                         ws_id: sc.ws_id.clone(),
                         expected_epoch: sc.expected_epoch,
                         target: to_pt,
                         kinematics: kin,
                     });
-                    if kin.duration_ms > 0 {
-                        let finish_at_ms = inner.now_ms.saturating_add(kin.duration_ms);
+                    if dur > 0 {
+                        let started_at_ms = inner.now_ms;
+                        let finish_at_ms = started_at_ms.saturating_add(dur);
                         let ws_id = sc.ws_id.clone();
                         Ok::<_, LuaError<'_>>(Some(inner.park_host_op(
                             &sc,
                             PendingHostOp::PointerTrajectory {
                                 ws_id,
+                                started_at_ms,
                                 finish_at_ms,
+                                settle_driven,
                             },
                         )))
                     } else {
@@ -3268,7 +3286,166 @@ mod tests {
         let stubs = crate::generate_luals_stubs();
         assert!(stubs.contains("---@class KomaWindowInfo"));
         assert!(stubs.contains("---@class KomaCurveSpec"));
+        assert!(stubs.contains("---@class KomaKinematicsSpec"));
         assert!(stubs.contains("---@field on fun(event: KomaEventName"));
         assert!(stubs.contains("function MacroContext:dispatch(action) end"));
+    }
+
+    #[test]
+    fn macro_pointer_kinematics_support_hooke_spring_named_curve_and_bezier() {
+        let mut sandbox = PhodopusSandbox::new(DEFAULT_HEAP_LIMIT_BYTES, None).unwrap();
+        sandbox
+            .eval_init_lua(
+                r##"
+                koma.spring("mouse_glide", { mass = 1.0, damping = 22.0, stiffness = 360.0, epsilon = 0.01 })
+
+                koma.macro.define({
+                    id = "pointer.hooke_and_bezier_demo",
+                    app_id = ".*",
+                    description = "Exercises 2D Hooke spring, named spring curve, and cubic Bezier pointer kinematics",
+                    run = function(ctx)
+                        ctx:move_to(
+                            { anchor = "center", x = 80, y = 0 },
+                            { profile = "spring", mass = 1.0, damping = 22.0, stiffness = 360.0 }
+                        )
+                        ctx:drag({
+                            button = "left",
+                            from = { u = 0.25, v = 0.5 },
+                            to = { u = 0.75, v = 0.5 },
+                            hold_before_move_ms = 20,
+                            kinematics = { curve = "mouse_glide" },
+                            hold_before_release_ms = 10,
+                        })
+                        ctx:move_to(
+                            { u = 0.5, v = 0.5 },
+                            { profile = "bezier", bezier = { 0.05, 0.9, 0.1, 1.1 }, duration_ms = 140 }
+                        )
+                    end,
+                })
+                "##,
+            )
+            .expect("hooke and bezier macro script must load cleanly");
+
+        let anim_cfg = sandbox.animations_snapshot();
+        let ws_id = WorkspaceId::from("ws_01");
+        let (_exec, mode) = sandbox
+            .start_macro_tx(
+                ws_id.clone(),
+                Epoch(1),
+                &MacroId::from("pointer.hooke_and_bezier_demo"),
+                &serde_json::json!({}),
+                1_000,
+            )
+            .expect("macro should start cleanly");
+        assert_eq!(mode, ExecutorMode::HostSuspended);
+
+        let a1 = sandbox.drain_queued_actions();
+        assert_eq!(a1.len(), 1);
+        match &a1[0] {
+            QueuedHostAction::MovePointer { kinematics, .. } => {
+                match kinematics.resolve_spec(&anim_cfg) {
+                    PointerTrajectorySpec::HookeSpring {
+                        params,
+                        duration_cap_ms: None,
+                        ..
+                    } => {
+                        assert!((params.mass - 1.0).abs() < 1e-6);
+                        assert!((params.damping - 22.0).abs() < 1e-6);
+                        assert!((params.stiffness - 360.0).abs() < 1e-6);
+                    }
+                    other => panic!("expected HookeSpring, got {other:?}"),
+                }
+            }
+            other => panic!("expected MovePointer, got {other:?}"),
+        }
+
+        struct SettleBridge(Epoch, bool);
+        impl crate::host_abi::HostBridge for SettleBridge {
+            fn current_epoch(&self, _ws_id: &WorkspaceId) -> Option<Epoch> {
+                Some(self.0)
+            }
+            fn pointer_trajectory_settled(&self, _ws_id: &WorkspaceId) -> Option<bool> {
+                Some(self.1)
+            }
+            fn focused_app_id(&self, _ws_id: &WorkspaceId) -> Option<String> {
+                None
+            }
+            fn tap_key_chord(&mut self, _: &WorkspaceId, _: &str) -> Result<(), IpcError> {
+                Ok(())
+            }
+            fn move_pointer(&mut self, _: &WorkspaceId, _: &AnchorPoint) -> Result<u64, IpcError> {
+                Ok(0)
+            }
+            fn inject_text(
+                &mut self,
+                _: &WorkspaceId,
+                _: &str,
+                _: TextInjectStrategy,
+            ) -> Result<(), IpcError> {
+                Ok(())
+            }
+            fn paste_mime(&mut self, _: &WorkspaceId, _: &str, _: &[u8]) -> Result<(), IpcError> {
+                Ok(())
+            }
+        }
+
+        // Still moving at 1_040 ms -> must stay suspended!
+        let r0 = sandbox.drive_ready_coroutines(1_040, &[], &SettleBridge(Epoch(1), false));
+        assert_eq!(r0.resumed_slices, 0);
+
+        // Settle signal at 1_240 ms wakes ctx:move_to before the 2500 ms safety cap and starts drag!
+        let r1 = sandbox.drive_ready_coroutines(1_240, &[], &SettleBridge(Epoch(1), true));
+        assert_eq!(r1.resumed_slices, 1);
+        let a2 = sandbox.drain_queued_actions();
+        assert_eq!(
+            a2.len(),
+            2,
+            "drag Stage 1+2 MovePointer(instant) + Button(down)"
+        );
+
+        // hold_before_move_ms (20 ms) -> Stage 3 drag trajectory using named `mouse_glide` spring!
+        let r2 = sandbox.drive_ready_coroutines(1_260, &[], &SettleBridge(Epoch(1), false));
+        assert_eq!(r2.resumed_slices, 1);
+        let a3 = sandbox.drain_queued_actions();
+        assert_eq!(a3.len(), 1);
+        match &a3[0] {
+            QueuedHostAction::MovePointer { kinematics, .. } => {
+                assert!(matches!(
+                    kinematics.resolve_spec(&anim_cfg),
+                    PointerTrajectorySpec::HookeSpring { .. }
+                ));
+            }
+            other => panic!("expected named-curve HookeSpring MovePointer, got {other:?}"),
+        }
+
+        // Spring settles -> Stage 4 hold (10 ms) -> Stage 5 button up + Bezier move_to
+        let r3 = sandbox.drive_ready_coroutines(1_500, &[], &SettleBridge(Epoch(1), true));
+        assert_eq!(r3.resumed_slices, 1);
+        let r4 = sandbox.drive_ready_coroutines(1_510, &[], &SettleBridge(Epoch(1), true));
+        assert_eq!(r4.resumed_slices, 1);
+        let a4 = sandbox.drain_queued_actions();
+        assert!(matches!(
+            a4[0],
+            QueuedHostAction::PointerButton { pressed: false, .. }
+        ));
+        match &a4[1] {
+            QueuedHostAction::MovePointer { kinematics, .. } => {
+                match kinematics.resolve_spec(&anim_cfg) {
+                    PointerTrajectorySpec::Bezier {
+                        bezier,
+                        duration_ms,
+                        ..
+                    } => {
+                        assert_eq!(duration_ms, 140);
+                        assert!((bezier.y2 - 1.1).abs() < 1e-6);
+                    }
+                    other => panic!("expected Bezier spec, got {other:?}"),
+                }
+            }
+            other => panic!("expected MovePointer(Bezier), got {other:?}"),
+        }
+
+        let r5 = sandbox.drive_ready_coroutines(1_650, &[], &SettleBridge(Epoch(1), false));
+        assert_eq!(r5.completed_macros, 1);
     }
 }

@@ -34,7 +34,10 @@ pub use crate::{
         ResizeCorner,
     },
     geometry::{Anchor9, AnchorPoint, LogicalPoint, LogicalRect, LogicalViewport, SafeAreaInsets},
-    kinematics::{MinimumJerkSolver, SpringSolver, TrajectorySolver},
+    kinematics::{
+        BezierPointerSolver, MAX_POINTER_SPRING_MS, MinimumJerkSolver, PointerSpring2D,
+        PointerTrajectorySpec, PointerTrajectoryTrack, SpringSolver, TrajectorySolver,
+    },
     layout::{DeckStashStack, FloatingEntry, FloatingStack, LayoutMode},
     lease::{PreemptEffects, WorkspaceLease, WorkspaceLeaseState},
     output_layout::{

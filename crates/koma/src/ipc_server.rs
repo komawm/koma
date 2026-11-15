@@ -955,6 +955,49 @@ fn dispatch_rpc(
             ))
         }
 
+        "vseat.pointer_move" => {
+            let ws_id = parse_ws_id(&req.params)?;
+            let expected_epoch = parse_expected_epoch(&req.params)?;
+            let auto_ttl = req
+                .params
+                .get("auto_acquire")
+                .and_then(Value::as_bool)
+                .unwrap_or(true)
+                .then_some(60_000);
+            let (session_id, grant) = authorize_peer_for_ws(
+                state,
+                &auth_snapshot,
+                &ws_id,
+                PrivilegeLevel::Control,
+                now_ms,
+            )?;
+            let active_epoch = {
+                let ws = state
+                    .workspaces
+                    .get_mut(&ws_id)
+                    .ok_or_else(|| IpcError::new(ErrorSymbol::ErrNotFound, "unknown workspace"))?;
+                ws.lease.validate_mutation_gate(
+                    &session_id,
+                    grant,
+                    expected_epoch,
+                    auto_ttl,
+                    now_ms,
+                )?
+            };
+
+            let target = parse_ipc_anchor(req.params.get("target").unwrap_or(&req.params))?;
+            let kinematics = parse_ipc_kinematics(&req.params);
+            crate::macro_runtime::queue_pointer_trajectory(
+                state,
+                ws_id,
+                active_epoch,
+                target,
+                &kinematics,
+                None,
+            )?;
+            Ok((json!({ "ok": true, "epoch": active_epoch }), Vec::new()))
+        }
+
         "vseat.click" => {
             let ws_id = parse_ws_id(&req.params)?;
             let expected_epoch = parse_expected_epoch(&req.params)?;
@@ -1048,38 +1091,15 @@ fn dispatch_rpc(
                 )?
             };
 
-            let parse_pt = |sub: Option<&Value>| -> koma_model::AnchorPoint {
-                if let Some(cell) = sub.and_then(|v| v.get("grid_225")).and_then(Value::as_str) {
-                    koma_model::AnchorPoint::Grid225(cell.to_owned())
-                } else {
-                    let x = sub
-                        .and_then(|v| v.get("x"))
-                        .and_then(Value::as_f64)
-                        .unwrap_or(0.0);
-                    let y = sub
-                        .and_then(|v| v.get("y"))
-                        .and_then(Value::as_f64)
-                        .unwrap_or(0.0);
-                    koma_model::AnchorPoint::AnchorOffset {
-                        anchor: koma_model::Anchor9::TopLeft,
-                        dx: x,
-                        dy: y,
-                    }
-                }
-            };
-            let from_pt = parse_pt(req.params.get("from"));
-            let to_pt = parse_pt(req.params.get("to"));
+            let from_pt = parse_ipc_anchor(req.params.get("from").unwrap_or(&Value::Null))?;
+            let to_pt = parse_ipc_anchor(req.params.get("to").unwrap_or(&Value::Null))?;
             let button = req
                 .params
                 .get("button")
                 .and_then(Value::as_str)
                 .unwrap_or("left")
                 .to_owned();
-            let duration_ms = req
-                .params
-                .get("duration_ms")
-                .and_then(Value::as_u64)
-                .unwrap_or(110);
+            let kinematics = parse_ipc_kinematics(&req.params);
 
             crate::macro_runtime::dispatch_single_host_action(
                 state,
@@ -1087,11 +1107,7 @@ fn dispatch_rpc(
                     ws_id: ws_id.clone(),
                     expected_epoch: active_epoch,
                     target: from_pt,
-                    kinematics: koma_lua::schema::LuaKinematicsInput {
-                        profile: koma_proto::KinematicProfileKind::Instant,
-                        duration_ms: 0,
-                        arc_curvature: 0.0,
-                    },
+                    kinematics: koma_lua::schema::LuaKinematicsInput::instant(),
                 },
             );
             crate::macro_runtime::dispatch_single_host_action(
@@ -1103,28 +1119,14 @@ fn dispatch_rpc(
                     pressed: true,
                 },
             );
-            crate::macro_runtime::dispatch_single_host_action(
+            crate::macro_runtime::queue_pointer_trajectory(
                 state,
-                koma_lua::phodopus_bridge::QueuedHostAction::MovePointer {
-                    ws_id: ws_id.clone(),
-                    expected_epoch: active_epoch,
-                    target: to_pt,
-                    kinematics: koma_lua::schema::LuaKinematicsInput {
-                        profile: koma_proto::KinematicProfileKind::MinimumJerk,
-                        duration_ms,
-                        arc_curvature: 0.08,
-                    },
-                },
-            );
-            crate::macro_runtime::dispatch_single_host_action(
-                state,
-                koma_lua::phodopus_bridge::QueuedHostAction::PointerButton {
-                    ws_id,
-                    expected_epoch: active_epoch,
-                    button,
-                    pressed: false,
-                },
-            );
+                ws_id,
+                active_epoch,
+                to_pt,
+                &kinematics,
+                Some(button),
+            )?;
             Ok((json!({ "ok": true, "epoch": active_epoch }), Vec::new()))
         }
 
@@ -1671,6 +1673,41 @@ fn parse_expected_epoch(params: &Value) -> Result<Epoch, IpcError> {
         .and_then(Value::as_u64)
         .ok_or_else(|| IpcError::new(ErrorSymbol::ErrInvalidParams, "missing expected_epoch"))?;
     Ok(Epoch(n))
+}
+
+fn parse_ipc_anchor(val: &Value) -> Result<koma_model::AnchorPoint, IpcError> {
+    if val.is_null() {
+        return Ok(koma_model::AnchorPoint::AnchorOffset {
+            anchor: koma_model::Anchor9::TopLeft,
+            dx: 0.0,
+            dy: 0.0,
+        });
+    }
+    let input: koma_lua::schema::LuaAnchorPointInput = serde_json::from_value(val.clone())
+        .map_err(|e| {
+            IpcError::new(
+                ErrorSymbol::ErrInvalidParams,
+                format!("invalid anchor: {e}"),
+            )
+        })?;
+    input
+        .into_anchor_point()
+        .map_err(|e| IpcError::new(ErrorSymbol::ErrInvalidParams, e))
+}
+
+fn parse_ipc_kinematics(params: &Value) -> koma_lua::schema::LuaKinematicsInput {
+    let mut kin = params
+        .get("kinematics")
+        .and_then(|v| {
+            serde_json::from_value::<koma_lua::schema::LuaKinematicsInput>(v.clone()).ok()
+        })
+        .unwrap_or_default();
+    if kin.duration_ms.is_none()
+        && let Some(dur) = params.get("duration_ms").and_then(Value::as_u64)
+    {
+        kin.duration_ms = Some(dur);
+    }
+    kin
 }
 
 fn generate_ephemeral_capability_token() -> Result<CapabilityToken, IpcError> {

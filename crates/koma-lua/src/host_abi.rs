@@ -21,13 +21,19 @@ pub enum PendingHostOp {
     },
     PointerTrajectory {
         ws_id: WorkspaceId,
+        started_at_ms: u64,
         finish_at_ms: u64,
+        settle_driven: bool,
     },
 }
 
 /// Host capability interface implemented by Ring 0 (`koma` + `koma-seat`) for `MacroContext`.
 pub trait HostBridge {
     fn current_epoch(&self, ws_id: &WorkspaceId) -> Option<Epoch>;
+    /// Returns `Some(true)` once `ws_id`'s active pointer trajectory (e.g. damped Hooke spring) has converged.
+    fn pointer_trajectory_settled(&self, _ws_id: &WorkspaceId) -> Option<bool> {
+        None
+    }
     fn focused_app_id(&self, ws_id: &WorkspaceId) -> Option<String>;
     fn tap_key_chord(&mut self, ws_id: &WorkspaceId, chord: &str) -> Result<(), IpcError>;
     fn move_pointer(&mut self, ws_id: &WorkspaceId, target: &AnchorPoint) -> Result<u64, IpcError>;
@@ -127,7 +133,17 @@ impl TrampolineScheduler {
         for (&handle, task) in &self.parked {
             let is_ready = match &task.op {
                 PendingHostOp::SleepTimer { deadline_ms } => now_ms >= *deadline_ms,
-                PendingHostOp::PointerTrajectory { finish_at_ms, .. } => now_ms >= *finish_at_ms,
+                PendingHostOp::PointerTrajectory {
+                    ws_id,
+                    started_at_ms,
+                    finish_at_ms,
+                    settle_driven,
+                } => {
+                    now_ms >= *finish_at_ms
+                        || (*settle_driven
+                            && now_ms > *started_at_ms
+                            && bridge.pointer_trajectory_settled(ws_id) == Some(true))
+                }
                 PendingHostOp::WaitDamageSettle {
                     ws_id,
                     timeout_at_ms,
