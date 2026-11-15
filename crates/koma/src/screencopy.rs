@@ -369,13 +369,13 @@ fn init_screencopy_frame(
     let height = phys_size.h as u32;
     let stride = width.saturating_mul(4);
 
+    // wlr-screencopy requires `buffer` and `linux_dmabuf` to be emitted once per frame;
+    // multiple SHM events make v1/v2 clients (such as grim) issue a second `copy`.
     frame.buffer(wl_shm::Format::Argb8888, width, height, stride);
-    frame.buffer(wl_shm::Format::Xrgb8888, width, height, stride);
 
     if frame.version() >= 3 {
         if state.backend.is_some() {
             frame.linux_dmabuf(Fourcc::Argb8888 as u32, width, height);
-            frame.linux_dmabuf(Fourcc::Xrgb8888 as u32, width, height);
         }
         frame.buffer_done();
     }

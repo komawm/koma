@@ -180,7 +180,9 @@ struct ClientHarness {
     decoration_modes: Vec<WEnum<zxdg_toplevel_decoration_v1::Mode>>,
     activation_tokens: Vec<String>,
     screencopy_shm_offers: Vec<ScreencopyBufferOffer>,
+    screencopy_dmabuf_offers: usize,
     screencopy_buffer_done: usize,
+    screencopy_ready: usize,
     screencopy_failed: usize,
     wlr_toplevels: BTreeMap<u32, CapturedWlrToplevel>,
     wlr_toplevel_proxies: Vec<zwlr_foreign_toplevel_handle_v1::ZwlrForeignToplevelHandleV1>,
@@ -547,7 +549,11 @@ impl Dispatch<zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1, ()> for ClientHar
                 height,
                 stride,
             }),
+            zwlr_screencopy_frame_v1::Event::LinuxDmabuf { .. } => {
+                state.screencopy_dmabuf_offers += 1;
+            }
             zwlr_screencopy_frame_v1::Event::BufferDone => state.screencopy_buffer_done += 1,
+            zwlr_screencopy_frame_v1::Event::Ready { .. } => state.screencopy_ready += 1,
             zwlr_screencopy_frame_v1::Event::Failed => state.screencopy_failed += 1,
             _ => {}
         }
@@ -1076,7 +1082,11 @@ fn portals_conf_and_screencopy_lock_fail_closed_behavior() {
     let frame_unlocked = manager.capture_output(0, &wl_out, &qh, ());
     env.pump();
     assert_eq!(env.client.screencopy_buffer_done, 1);
-    assert!(!env.client.screencopy_shm_offers.is_empty());
+    assert_eq!(
+        env.client.screencopy_shm_offers.len(),
+        1,
+        "zwlr_screencopy_frame_v1.buffer must be sent once per frame"
+    );
     assert_eq!(env.client.screencopy_failed, 0);
 
     let offer = env.client.screencopy_shm_offers[0].clone();
@@ -2295,4 +2305,64 @@ fn multi_monitor_window_move_fractional_scale_and_notch_layer_shell_composition(
     bar2_pool.destroy();
     bar_buf.destroy();
     bar_pool.destroy();
+}
+
+#[test]
+fn screencopy_v1_emits_single_buffer_event_and_ready() {
+    let mut env = ClientEnv::new();
+    let qh = env.queue.handle();
+    let (mgr_name, advertised_ver) = env
+        .client
+        .globals
+        .get("zwlr_screencopy_manager_v1")
+        .copied()
+        .expect("missing zwlr_screencopy_manager_v1");
+    assert_eq!(advertised_ver, 3);
+    // Clients such as grim can bind v1 where `buffer_done` does not exist and each
+    // `buffer` event implies format advertisement is complete.
+    let manager_v1 = env
+        .registry
+        .bind::<zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1, (), ClientHarness>(
+            mgr_name,
+            1,
+            &qh,
+            (),
+        );
+    let wl_out = env.client.outputs[0].clone();
+    let frame = manager_v1.capture_output(0, &wl_out, &qh, ());
+    env.pump();
+
+    assert_eq!(env.client.screencopy_shm_offers.len(), 1);
+    assert_eq!(env.client.screencopy_dmabuf_offers, 0);
+    assert_eq!(env.client.screencopy_buffer_done, 0);
+    assert_eq!(env.client.screencopy_failed, 0);
+
+    let offer = env.client.screencopy_shm_offers[0].clone();
+    let shm = env
+        .client
+        .bind::<wl_shm::WlShm>(&env.registry, &qh, "wl_shm");
+    let shm_fd = create_portable_shm_fd((offer.stride * offer.height) as usize, None);
+    let pool = shm.create_pool(
+        shm_fd.as_fd(),
+        (offer.stride * offer.height) as i32,
+        &qh,
+        (),
+    );
+    let buf = pool.create_buffer(
+        0,
+        offer.width as i32,
+        offer.height as i32,
+        offer.stride as i32,
+        offer.format,
+        &qh,
+        (),
+    );
+    frame.copy(&buf);
+    env.pump();
+
+    assert_eq!(env.client.screencopy_ready, 1);
+    assert_eq!(env.client.screencopy_failed, 0);
+
+    buf.destroy();
+    pool.destroy();
 }
