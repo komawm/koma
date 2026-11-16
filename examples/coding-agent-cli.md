@@ -23,12 +23,14 @@ When verifying GUI apps, front-end layouts, or Wayland window state, reach for
     - `komactl config-status` — print what is actually active.
 
 2. **Launch an isolated GUI app in a security-context workspace**
-    - `komactl sandbox run --workspace agent:work -- chromium --app=http://127.0.0.1:5173`
+    - `komactl sandbox run --name agent:work --share-net -- chromium --app=http://127.0.0.1:5173`
+      (`--share-net` is required for the guest to reach a host dev server; sandbox
+      networking is isolated by default)
 
 3. **Delegate multi-step visual verification to Jiku**
-    - `jiku run --workspace agent:work "Click the Settings drawer, toggle Dark Mode, and save a verification report to ~/JikuBox/"`
-    - `jiku status` — check task progress and the current `Epoch`.
-    - `jiku run --workspace agent:work --dry-run "<goal>"` — plan without emitting
+    - `jiku --json run --workspace agent:work "Click the Settings drawer, toggle Dark Mode, and save a verification report to ~/JikuBox/"`
+    - `jiku --json status` — check task progress and the current `Epoch`.
+    - `jiku --json run --workspace agent:work --dry-run "<goal>"` — plan without emitting
       input events.
 
 Both binaries are separate packages: `komactl` ships with Koma, `jiku` with

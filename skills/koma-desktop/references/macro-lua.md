@@ -1,8 +1,10 @@
 # Macro Lua
 
-A macro is a `Phodopus` Lua 5.4 function that runs atomically inside the
-compositor. `koma_exec_macro` launches one by id, with arguments, and returns a
-result — no screenshot loop, no per-step round trip, no model tokens.
+A macro is a `Phodopus` Lua 5.4 function that runs inside the compositor. It can
+suspend at host operations such as `ctx:drag` or `ctx:wait_settle`, so
+`koma_exec_macro` launches it and returns the executor status and epoch — not the
+macro's final result. What you buy is no screenshot loop, no per-step round trip,
+and no model tokens.
 
 ## When a Macro Beats a Tool Loop
 
@@ -72,11 +74,23 @@ most common macro bug.
 koma_exec_macro { ws_id, expected_epoch, macro_id: "wps.drag_indent", args: { delta_px = 32 } }
 ```
 
-- The epoch is checked once, at entry. Inside the macro the workspace is yours.
-- A macro that hits a protected surface or a preempted workspace aborts; it does
-  not retry internally.
-- Results are returned as data. Report the macro id and args, not a narrative of
-  what you believe it did.
+The call returns one of the executor modes plus the epoch it was launched
+against — typically `HostSuspended` when the macro immediately parks on a host
+operation. It never returns the macro's return value.
+
+Completion rules you must plan around:
+
+- A suspended macro resumes when its timer or damage-settle condition fires. The
+  scheduler re-checks the workspace epoch at every resume; a changed epoch
+  cancels the macro with `ERR_STALE_EPOCH`.
+- Human takeover (`Mod+G`) and preemption cancel live macro coroutines for the
+  workspace.
+- Host operations that already ran stay applied. Cancellation is not a rollback.
+- Read completion from the macro's own reported result or from a fresh
+  observation, never from the `koma_exec_macro` response.
+
+The mutation gate checks the epoch at entry. That is not enough on its own: a
+macro that suspends outlives the check, which is why the resume path re-validates.
 
 ## Authoring Rules
 
@@ -85,7 +99,8 @@ koma_exec_macro { ws_id, expected_epoch, macro_id: "wps.drag_indent", args: { de
 2. Validate with `komactl validate` before reloading. It runs in a shadow VM and
    cannot touch the live session.
 3. Keep macros idempotent where possible. A retried macro should not double-type
-   text.
+   text — and because cancellation does not roll back, a partial run is a real
+   outcome.
 4. Never put secrets in macro params. Arguments are visible in configuration and
    in the call record.
 

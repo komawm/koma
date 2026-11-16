@@ -268,7 +268,7 @@ pub fn builtin_mcp_tool_schemas(dynamic_macros: &[MacroDefinition]) -> Vec<Value
         }),
         json!({
             "name": "koma_exec_macro",
-            "description": "Executes a parameterized Phodopus Lua 5.4 macro (`macro_id`) atomically on `ws_id` with zero LLM token overhead.",
+            "description": "Launches a parameterized Phodopus Lua 5.4 macro (`macro_id`) on `ws_id` with zero LLM token overhead. Returns executor status and epoch; a suspended macro completes asynchronously and is cancelled if the workspace epoch changes.",
             "inputSchema": {
                 "type": "object",
                 "required": ["ws_id", "macro_id"],

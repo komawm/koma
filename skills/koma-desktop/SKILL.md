@@ -85,8 +85,9 @@ mutations from both against the same workspace.
   `Control`/`Owner` over one while it is `HumanPreempted`.
 - Free text goes through `koma_inject_text` or `koma_paste_mime`, never through
   synthesized per-character key events.
-- A recorded macro (`koma_exec_macro`) runs atomically and costs no tokens; the
-  reference covers when that beats a tool loop.
+- A recorded macro (`koma_exec_macro`) runs in-compositor and costs no tokens;
+  it returns executor status, not the macro result, so read completion from the
+  macro or a fresh observation. The reference covers when that beats a tool loop.
 
 ## Where the Details Live
 
