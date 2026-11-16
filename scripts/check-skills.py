@@ -7,10 +7,13 @@ Checks, all stdlib only:
   2. the frontmatter block opens and closes with `---` and declares
      `name`, `description`, `license`, and a `metadata` mapping;
   3. `name` matches its directory and uses lowercase kebab-case;
-  4. `description` is non-empty and within the 1024-character limit;
-  5. `license: MIT` is backed by a self-contained MIT `LICENSE` in the skill
-     directory, because the installer copies only that folder;
-  6. every relative Markdown link in the skill resolves on disk.
+  4. `description` is non-empty, not a YAML boolean/null literal, and within the
+     1024-character limit;
+  5. `license` is exactly `MIT`, backed by a self-contained MIT `LICENSE` in the
+     skill directory, because the installer copies only that folder;
+  6. every relative Markdown link resolves on disk, including reference-style
+     definitions, and links inside a skill stay inside that skill directory;
+  7. no stray `skills/SKILL.md`, which the catalog layout cannot discover.
 
 Koma ships one installable skill under `skills/koma-desktop/`; the repository
 root `LICENSE` stays GPL-3.0-or-later, so the MIT text must live inside the
@@ -28,14 +31,25 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 SKILLS = ROOT / "skills"
 NAME_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
-LINK_PATTERN = re.compile(r"\[[^\]]*\]\(([^)\s]+)\)")
-METADATA_KEY = re.compile(r"^([A-Za-z0-9_.-]+):\s*(.*)$")
+LINK_PATTERN = re.compile(r"\[[^\]]*\]\(\s*([^)\s]+)")
+REFERENCE_PATTERN = re.compile(r"^\s{0,3}\[[^\]]+\]:\s*(\S+)", re.M)
+METADATA_KEY = re.compile(r"^(?:-\s+)?([A-Za-z0-9_.-]+):\s*(.*)$")
+NON_STRING_SCALARS = {"true", "false", "null", "~", "yes", "no"}
+MAX_DESCRIPTION = 1024
 
 failures: list[str] = []
 
 
 def fail(message: str) -> None:
     failures.append(message)
+
+
+def normalize_scalar(value: str) -> str:
+    """Strip surrounding quotes so `"MIT"`, `'MIT'`, and `MIT` compare equal."""
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        return value[1:-1].strip()
+    return value
 
 
 def read_frontmatter(path: Path) -> dict[str, object]:
@@ -61,7 +75,7 @@ def read_frontmatter(path: Path) -> dict[str, object]:
             if current == "metadata":
                 match = METADATA_KEY.match(line.strip())
                 if match:
-                    nested[match.group(1)] = match.group(2).strip().strip("\"'")
+                    nested[match.group(1)] = normalize_scalar(match.group(2))
             elif block is not None:
                 block.append(line.strip())
             continue
@@ -97,21 +111,26 @@ def check_skill(skill_dir: Path) -> None:
         if required not in front:
             fail(f"{rel}: frontmatter missing `{required}`")
 
-    declared = str(front.get("name", "")).strip().strip("\"'")
+    declared = normalize_scalar(str(front.get("name", "")))
     if declared != name:
         fail(f"{rel}: frontmatter name `{declared}` does not match directory `{name}`")
     if declared and not NAME_PATTERN.match(declared):
         fail(f"{rel}: name `{declared}` is not lowercase kebab-case")
 
-    description = str(front.get("description", "")).strip()
-    if not description or description in (">", "|"):
+    description = normalize_scalar(str(front.get("description", "")))
+    if not description:
         fail(f"{rel}: description is empty")
-    elif len(description) > 1024:
-        fail(f"{rel}: description exceeds 1024 characters ({len(description)})")
+    elif description.lower() in NON_STRING_SCALARS:
+        fail(f"{rel}: description must be a string, found `{description}`")
+    elif len(description) > MAX_DESCRIPTION:
+        fail(
+            f"{rel}: description exceeds {MAX_DESCRIPTION} characters "
+            f"({len(description)})"
+        )
 
-    license_value = str(front.get("license", "")).strip().strip("\"'")
-    if license_value and license_value.upper() != "MIT":
-        fail(f"{rel}: skill license must be MIT, found `{license_value}`")
+    license_value = normalize_scalar(str(front.get("license", "")))
+    if license_value != "MIT":
+        fail(f"{rel}: skill license must be exactly MIT, found `{license_value}`")
     skill_license = skill_dir / "LICENSE"
     if not skill_license.is_file():
         fail(f"{rel}: missing per-skill LICENSE (the root GPL LICENSE is not copied)")
@@ -125,12 +144,31 @@ def check_skill(skill_dir: Path) -> None:
 
 def check_links(path: Path) -> None:
     text = path.read_text(encoding="utf-8")
-    for target in LINK_PATTERN.findall(text):
+    targets = LINK_PATTERN.findall(text) + REFERENCE_PATTERN.findall(text)
+
+    # A document inside skills/<name>/ must be self-contained: the installer
+    # copies only that directory, so a link above it would break on install.
+    boundary: Path | None = None
+    relative = path.relative_to(SKILLS)
+    if len(relative.parts) > 1:
+        boundary = (SKILLS / relative.parts[0]).resolve()
+
+    for target in targets:
         if target.startswith(("http://", "https://", "mailto:", "#")):
             continue
+        target = target.strip("<>")
         resolved = (path.parent / target.split("#", 1)[0]).resolve()
         if not resolved.exists():
             fail(f"{path.relative_to(ROOT)}: broken relative link `{target}`")
+            continue
+        if boundary is not None:
+            try:
+                resolved.relative_to(boundary)
+            except ValueError:
+                fail(
+                    f"{path.relative_to(ROOT)}: relative link `{target}` escapes "
+                    f"the skill directory, which is the only part installed"
+                )
 
 
 def main() -> int:
@@ -152,7 +190,8 @@ def main() -> int:
         for message in failures:
             print(f"::error::{message}")
         return 1
-    print(f"skills/: {len([p for p in SKILLS.iterdir() if p.is_dir()])} skill(s) valid")
+    count = len([p for p in SKILLS.iterdir() if p.is_dir()])
+    print(f"skills/: {count} skill(s) valid")
     return 0
 
 
