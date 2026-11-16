@@ -4,12 +4,15 @@ set shell := ["bash", "-euo", "pipefail", "-c"]
 default:
     @just --list
 
-check: infra-check fmt-check typecheck clippy test
+check: infra-check skills-check fmt-check typecheck clippy test
 
 infra-check: metadata actionlint scripts-check
 
 metadata:
     python3 scripts/check-infrastructure.py
+
+skills-check:
+    python3 scripts/check-skills.py
 
 # Requires the pinned compiler; infra-check remains usable before it is installed.
 cargo-metadata:

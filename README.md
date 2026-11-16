@@ -4,7 +4,7 @@ Koma is a Wayland tiling compositor designed for keyboard-driven desktops and co
 
 The repository already contains substantial implementation; canonical architecture specifications live in [koma-docs](https://github.com/komawm/docs). It is an early development baseline: source presence and specification targets do not establish build, runtime, security, latency, or platform acceptance. Start with the [current-state inventory](https://github.com/komawm/docs/blob/main/docs/development/current-state.md) and [development guide](https://github.com/komawm/docs/blob/main/docs/development/README.md).
 
-[Jiku](https://github.com/komawm/jiku) is the separate GUI orchestration companion. Its repository defines pure-data contract types, the Three-Driver model routing architecture (`DecisionsDriver`, `TurnModelDriver`, and `LiveSessionDriver`), `DecisionCompiler` primitives, and configurable defaults with zero-error `EmulatedStructuredTextModel` fallback, while remaining a library-only scaffold prior to `v0.1.0`.
+[Jiku](https://github.com/komawm/jiku) is the separate GUI orchestration companion, with its own CLI (`jiku`), daemon (`jikud`), and MCP server. It defines the Three-Driver model routing architecture (`DecisionsDriver`, `TurnModelDriver`, and `LiveSessionDriver`), `DecisionCompiler` primitives, and configurable defaults with zero-error `EmulatedStructuredTextModel` fallback.
 
 ## Configurable defaults and Lua customization
 
@@ -16,19 +16,32 @@ Koma avoids hardcoded behavior in favor of sensible defaults that can be overrid
 
 ## Repository structure
 
-| Crate | Target | Source responsibility |
-| --- | --- | --- |
-| [koma-proto](https://github.com/komawm/koma/tree/main/crates/koma-proto) | Library | IPC schemas and framing, ancillary FD transport, capability tokens, epoch identifiers, event buffers. |
-| [koma-model](https://github.com/komawm/koma/tree/main/crates/koma-model) | Library | Dwindle, scrolling/tabbed columns, deck/stash and floating workspaces, leases, rules, springs, frame clocks. |
-| [koma-lua](https://github.com/komawm/koma/tree/main/crates/koma-lua) | Library | Configuration schema, Phodopus bridge, host operations, coroutine scheduling, macro recording, LuaLS type generation. |
-| [koma-render](https://github.com/komawm/koma/tree/main/crates/koma-render) | Library | Smithay scene composition, shaders, blur, offscreen pools, capture overlays and protected-surface handling. |
-| [koma-seat](https://github.com/komawm/koma/tree/main/crates/koma-seat) | Library | Virtual-seat held-input ledger and text-injection interface. |
-| [koma](https://github.com/komawm/koma/tree/main/crates/koma) | Binary | Winit and TTY backend integration, Wayland handlers, IPC server, input dispatch, config reload and Xwayland integration. |
-| [komactl](https://github.com/komawm/koma/tree/main/crates/komactl) | Binary | Configuration validation and reload, type generation, admin IPC, sandbox launcher. |
-| [koma-mcp](https://github.com/komawm/koma/tree/main/crates/koma-mcp) | Binary | Stdio MCP adapter, agent IPC client, epoch handling and PNG encoding. |
-| [koma-overview](https://github.com/komawm/koma/tree/main/crates/koma-overview) | Binary | Layer-shell companion, thumbnail/overview layout and daemon control. |
+| Crate                                                                          | Target  | Source responsibility                                                                                                    |
+| ------------------------------------------------------------------------------ | ------- | ------------------------------------------------------------------------------------------------------------------------ |
+| [koma-proto](https://github.com/komawm/koma/tree/main/crates/koma-proto)       | Library | IPC schemas and framing, ancillary FD transport, capability tokens, epoch identifiers, event buffers.                    |
+| [koma-model](https://github.com/komawm/koma/tree/main/crates/koma-model)       | Library | Dwindle, scrolling/tabbed columns, deck/stash and floating workspaces, leases, rules, springs, frame clocks.             |
+| [koma-lua](https://github.com/komawm/koma/tree/main/crates/koma-lua)           | Library | Configuration schema, Phodopus bridge, host operations, coroutine scheduling, macro recording, LuaLS type generation.    |
+| [koma-render](https://github.com/komawm/koma/tree/main/crates/koma-render)     | Library | Smithay scene composition, shaders, blur, offscreen pools, capture overlays and protected-surface handling.              |
+| [koma-seat](https://github.com/komawm/koma/tree/main/crates/koma-seat)         | Library | Virtual-seat held-input ledger and text-injection interface.                                                             |
+| [koma](https://github.com/komawm/koma/tree/main/crates/koma)                   | Binary  | Winit and TTY backend integration, Wayland handlers, IPC server, input dispatch, config reload and Xwayland integration. |
+| [komactl](https://github.com/komawm/koma/tree/main/crates/komactl)             | Binary  | Configuration validation and reload, type generation, admin IPC, sandbox launcher.                                       |
+| [koma-mcp](https://github.com/komawm/koma/tree/main/crates/koma-mcp)           | Binary  | Stdio MCP adapter, agent IPC client, epoch handling and PNG encoding.                                                    |
+| [koma-overview](https://github.com/komawm/koma/tree/main/crates/koma-overview) | Binary  | Layer-shell companion, thumbnail/overview layout and daemon control.                                                     |
 
 These nine crates belong to this Git repository. The [organization workspace](https://github.com/komawm/.github) also routes independent checkouts for canonical documentation, Jiku, Lua types and packaging. It uses no Git submodules. Phodopus is the existing shared upstream checkout, with its own identity and history.
+
+## Agent skill
+
+The repository ships an installable agent skill through the
+[Skills CLI](https://github.com/vercel-labs/skills):
+
+```bash
+npx skills add komawm/koma --skill koma-desktop -g
+```
+
+It lives at [`skills/koma-desktop/`](skills/koma-desktop) and is MIT licensed,
+independent of the repository's GPL-3.0-or-later product license. See
+[`skills/README.md`](skills/README.md).
 
 ## Development status and versions
 
@@ -65,4 +78,4 @@ The session installer writes system integration files and can affect login/sessi
 
 ## License
 
-All Koma crates, including [koma-proto](https://github.com/komawm/koma/tree/main/crates/koma-proto), use [GPL-3.0-or-later](https://github.com/komawm/koma/blob/main/LICENSE). Preserve third-party notices and the independent licensing of [Phodopus](https://github.com/Xuepoo/phodopus).
+All Koma crates, including [koma-proto](https://github.com/komawm/koma/tree/main/crates/koma-proto), use [GPL-3.0-or-later](https://github.com/komawm/koma/blob/main/LICENSE). Preserve third-party notices and the independent licensing of [Phodopus](https://github.com/Xuepoo/phodopus). The bundled agent skill under [`skills/`](skills) is MIT licensed; its own `LICENSE` travels with the directory.
