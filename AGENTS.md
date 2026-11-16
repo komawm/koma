@@ -4,7 +4,7 @@
 
 This repository owns Koma's nine Rust crates, Koma configuration examples and session resources. Canonical specifications belong to [koma-docs](https://github.com/komawm/docs), Jiku belongs to [jiku](https://github.com/komawm/jiku), and the LuaLS snapshot belongs to [koma-types](https://github.com/komawm/koma-types). Read the [workspace guidance](https://github.com/komawm/.github/blob/main/workspace/AGENTS.md), [current-state inventory](https://github.com/komawm/docs/blob/main/docs/development/current-state.md), and relevant specifications before editing. The [repository descriptor](https://github.com/komawm/koma/blob/main/repo.toml) owns identity; the [workspace map](https://github.com/komawm/.github/blob/main/workspace/workspace.toml) owns checkout routing.
 
-Keep the nine Koma crates within this Git repository. There are no submodules. Phodopus is an independent upstream repository and a Cargo dependency; do not copy its implementation here or change its ABI incidentally. Jiku currently has non-runnable library scaffolding and templates, with no implemented agent or CLI. Do not describe proposed or unmeasured behavior as shipped, secure, portable, or latency-verified.
+Keep the nine Koma crates within this Git repository. There are no submodules. Phodopus is an independent upstream repository and a Cargo dependency; do not copy its implementation here or change its ABI incidentally. Jiku is an independent repository with its own CLI and daemon; do not duplicate or silently re-implement its orchestration here. Do not describe proposed or unmeasured behavior as shipped, secure, portable, or latency-verified.
 
 ## Work lifecycle
 
@@ -16,7 +16,7 @@ For delegated work, record task dependencies and file scopes; use separate workt
 
 The incubation baseline is `0.0.1` on the `0.0.x` line; the first formal release line will be `0.1.0`. Rust `1.100.0` and Rust 2024 edition are the target baseline. Use the exact toolchain file; an installed older compiler used for structural probes is not target-toolchain validation. Keep dependency upgrades on verified compatible versions, review the lockfile, and record intentional exceptions such as the existing fixed Smithay architecture/API pin until its migration is tested.
 
-All Koma crates, including `koma-proto`, use `GPL-3.0-or-later` and inherit the workspace license metadata. Keep one root `LICENSE` and preserve Phodopus and other third-party licensing and provenance.
+All Koma crates, including `koma-proto`, use `GPL-3.0-or-later` and inherit the workspace license metadata. Keep one root `LICENSE` and preserve Phodopus and other third-party licensing and provenance. The installable agent skill under `skills/` is MIT licensed and carries its own `LICENSE` file, because the skills installer copies only that directory.
 
 Read the [CarryCtx rule catalog](https://github.com/komawm/koma/blob/main/.carryctx/README.md) for local delivery, documentation, security, performance and review policy. Local initialization does not require or authorize remote Issues, PRs, merges, snapshot publication or releases. When remote delivery is explicitly in scope, use labels/milestones and independent CodeRabbit review as described by the [delivery workflow](https://github.com/komawm/koma/blob/main/.carryctx/workflows/issue-to-merge.md).
 
