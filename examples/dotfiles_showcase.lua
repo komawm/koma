@@ -59,7 +59,7 @@ koma.appearance({
 -- 4. Extended per-window rice rules
 koma.rule.window({
     name = "glass-terminal-rice",
-    matches = { { app_id = "^(com\\.mitchellh\\.ghostty|org\\.wezfurlong\\.wezterm|foot)$" } },
+    matches = { { app_id = "^(run\\.bitty\\.Bitty|com\\.mitchellh\\.ghostty|org\\.wezfurlong\\.wezterm|foot)$" } },
     opacity = 0.92,
     inactive_opacity = 0.82,
     corner_radius = 14,
@@ -85,12 +85,12 @@ koma.rule.window({
 -- 5. Dynamic "Run-or-Raise" terminal keybind using read-only desktop queries + Ring 0 dispatch
 koma.bind("Mod + Return", function(ctx)
     for _, win in ipairs(ctx:windows()) do
-        if win.app_id and string.find(win.app_id, "ghostty") then
+        if win.app_id and string.find(win.app_id, "bitty") then
             ctx:dispatch(koma.act.window.focus(win.id))
             return
         end
     end
-    ctx:spawn({ "ghostty" })
+    ctx:spawn({ "bitty" })
 end, { desc = "Run-or-Raise Ghostty terminal" })
 
 -- 6. Ultrawide auto-layout hook: switch focused workspace to Scrolling on > 2560px displays
