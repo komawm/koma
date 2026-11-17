@@ -176,6 +176,8 @@ struct ClientHarness {
     shm: Option<wl_shm::WlShm>,
     xdg_wm_base: Option<xdg_wm_base::XdgWmBase>,
     xdg_surface_configures: usize,
+    /// `xdg_toplevel.configure(w, h)` sizes recorded per toplevel protocol id.
+    toplevel_configures: BTreeMap<u32, Vec<(i32, i32)>>,
     toplevel_close_count: usize,
     decoration_modes: Vec<WEnum<zxdg_toplevel_decoration_v1::Mode>>,
     activation_tokens: Vec<String>,
@@ -469,7 +471,7 @@ impl Dispatch<xdg_surface::XdgSurface, ()> for ClientHarness {
 impl Dispatch<xdg_toplevel::XdgToplevel, ()> for ClientHarness {
     fn event(
         state: &mut Self,
-        _: &xdg_toplevel::XdgToplevel,
+        toplevel: &xdg_toplevel::XdgToplevel,
         event: xdg_toplevel::Event,
         _: &(),
         _: &Connection,
@@ -477,6 +479,13 @@ impl Dispatch<xdg_toplevel::XdgToplevel, ()> for ClientHarness {
     ) {
         if matches!(event, xdg_toplevel::Event::Close) {
             state.toplevel_close_count += 1;
+        }
+        if let xdg_toplevel::Event::Configure { width, height, .. } = event {
+            state
+                .toplevel_configures
+                .entry(toplevel.id().protocol_id())
+                .or_default()
+                .push((width, height));
         }
     }
 }
@@ -4022,4 +4031,88 @@ mod kom_0024_compat_tests {
             Some(koma_proto::DeliverySemantics::not_delivered_safe())
         );
     }
+}
+
+/// `komawm/koma#33`: a split must never configure a client below the `xdg_toplevel.set_min_size`
+/// it advertised. Chromium/Firefox cannot shrink past that minimum, keep committing a cropped,
+/// un-reflowed buffer, and the compositor then masks it to the too-small tile.
+#[test]
+fn split_resize_configures_tiled_clients_above_their_minimum_size() {
+    let mut env = ClientEnv::new();
+    let (_surf_a, _xs_a, toplevel_a) = env.spawn_window("Browser", "org.koma.browser");
+    let browser_id = toplevel_a.id().protocol_id();
+
+    // A CSD browser advertising a 1100 px minimum content width (wider than half of the
+    // 1920 px test workspace), exactly like Chromium's `set_min_size(500, 87)`.
+    toplevel_a.set_min_size(1100, 200);
+    _surf_a.commit();
+    env.pump();
+    let configures_before = env
+        .client
+        .toplevel_configures
+        .get(&browser_id)
+        .map_or(0, Vec::len);
+
+    let (_surf_b, _xs_b, _toplevel_b) = env.spawn_window("Terminal", "org.koma.terminal");
+    env.pump();
+
+    let configures = env
+        .client
+        .toplevel_configures
+        .get(&browser_id)
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        configures.len() > configures_before,
+        "the existing tiled client must be re-configured after the split"
+    );
+
+    let border = env.state.lua_sandbox.config_snapshot().appearance.border;
+    let border_inset = if border.enabled {
+        (border.width.max(0.0) * 2.0).round() as i32
+    } else {
+        0
+    };
+
+    let browser = env
+        .state
+        .mapped_windows
+        .iter()
+        .find(|m| m.app_id == "org.koma.browser")
+        .expect("browser mapped");
+    assert_eq!(
+        browser.rect.w, 1100,
+        "the tiled rect must be clamped up to the client minimum"
+    );
+
+    let (width, height) = *configures.last().expect("configure size");
+    assert_eq!(
+        (width, height),
+        (
+            browser.rect.w as i32 - border_inset,
+            browser.rect.h as i32 - border_inset
+        ),
+        "the configure must carry the clamped, client-honourable size"
+    );
+
+    // An unconstrained client (a terminal) still receives its plain half-width tile.
+    let terminal = env
+        .state
+        .mapped_windows
+        .iter()
+        .find(|m| m.app_id == "org.koma.terminal")
+        .expect("terminal mapped");
+    let terminal_id = _toplevel_b.id().protocol_id();
+    let terminal_configure = *env.client.toplevel_configures[&terminal_id]
+        .last()
+        .expect("terminal configure");
+    assert!(
+        terminal.rect.w < 1100,
+        "the unconstrained terminal keeps the raw half-width box"
+    );
+    assert_eq!(
+        terminal_configure.0,
+        terminal.rect.w as i32 - border_inset,
+        "unconstrained clients are still configured at their tile size"
+    );
 }
