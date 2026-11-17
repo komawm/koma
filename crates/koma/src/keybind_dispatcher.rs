@@ -1784,10 +1784,13 @@ pub fn execute_action_descriptor(
             let mut cmd = Command::new(prog);
             cmd.args(args);
             state.configure_child_env(&mut cmd, Some(&active_ws));
-            if cmd.spawn().is_err() && prog == "ghostty" && args.is_empty() {
+            if crate::child_reaper::spawn_detached(&mut cmd, "keybind.spawn").is_err()
+                && prog == "ghostty"
+                && args.is_empty()
+            {
                 let mut fallback = Command::new("foot");
                 state.configure_child_env(&mut fallback, Some(&active_ws));
-                let _ = fallback.spawn();
+                let _ = crate::child_reaper::spawn_detached(&mut fallback, "keybind.spawn.foot");
             }
         }
 
@@ -2238,7 +2241,7 @@ pub fn execute_action_descriptor(
             let mut cmd = Command::new("koma-overview");
             cmd.arg("toggle");
             state.configure_child_env(&mut cmd, None);
-            let _ = cmd.spawn();
+            let _ = crate::child_reaper::spawn_detached(&mut cmd, "keybind.overview");
         }
 
         ActionDescriptor::WorkspaceFocus(target) | ActionDescriptor::WorkspacePeek(target) => {

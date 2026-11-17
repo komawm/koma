@@ -940,7 +940,7 @@ fn spawn_nonblocking_notify(state: &KomaState, urgency: &str, summary: &str, bod
     let mut cmd = Command::new("notify-send");
     cmd.args(["-a", "koma", "-u", urgency, summary, body]);
     state.configure_child_env(&mut cmd, None);
-    let _ = cmd.spawn();
+    let _ = crate::child_reaper::spawn_detached(&mut cmd, "config-reload.notify");
 }
 
 /// Triggers an immediate synchronous reload from disk (`config.reload` IPC handler).
