@@ -321,7 +321,7 @@ impl KeybindTable {
                 1,
                 "Mod + Return",
                 ActionDescriptor::Spawn {
-                    argv: vec!["ghostty".to_owned()],
+                    argv: vec!["bitty".to_owned()],
                 },
                 None,
             ),
@@ -1784,10 +1784,28 @@ pub fn execute_action_descriptor(
             let mut cmd = Command::new(prog);
             cmd.args(args);
             state.configure_child_env(&mut cmd, Some(&active_ws));
-            if cmd.spawn().is_err() && prog == "ghostty" && args.is_empty() {
-                let mut fallback = Command::new("foot");
-                state.configure_child_env(&mut fallback, Some(&active_ws));
-                let _ = fallback.spawn();
+            if let Err(err) = cmd.spawn() {
+                // The built-in `Mod + Return` terminal is Bitty. Keep a single
+                // conservative fallback so a machine without it still gets a shell,
+                // and log both failures instead of failing silently.
+                if prog == "bitty" && args.is_empty() {
+                    let mut fallback = Command::new("foot");
+                    state.configure_child_env(&mut fallback, Some(&active_ws));
+                    if let Err(fallback_err) = fallback.spawn() {
+                        warn!(
+                            program = %prog,
+                            error = %err,
+                            fallback_error = %fallback_err,
+                            "failed to spawn the default terminal or its `foot` fallback; install Bitty or bind your own terminal"
+                        );
+                    }
+                } else {
+                    warn!(
+                        program = %prog,
+                        error = %err,
+                        "failed to spawn the program bound to this key; check that it is installed and on PATH"
+                    );
+                }
             }
         }
 
@@ -2554,6 +2572,23 @@ mod tests {
         assert_eq!(
             m_right.trigger,
             BindTrigger::MouseButton(MouseButtonTrigger::Right)
+        );
+    }
+
+    #[test]
+    fn builtin_mod_return_spawns_the_promoted_default_terminal() {
+        let defaults = KeybindTable::with_builtin_defaults();
+        let chord = parse_chord_spec("Mod + Return").unwrap();
+        let bind = defaults
+            .binds
+            .iter()
+            .find(|b| b.chord == chord)
+            .expect("Mod + Return must stay bound in the built-in map");
+        assert_eq!(
+            bind.press_action,
+            Some(ActionDescriptor::Spawn {
+                argv: vec!["bitty".to_owned()]
+            })
         );
     }
 
