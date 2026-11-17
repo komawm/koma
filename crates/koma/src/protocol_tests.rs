@@ -2367,6 +2367,166 @@ fn screencopy_v1_emits_single_buffer_event_and_ready() {
     pool.destroy();
 }
 
+#[test]
+fn background_layer_surface_enters_frame_list_below_toplevels() {
+    use crate::backend_winit::{
+        BACKGROUND_LAYER_TIERS, FOREGROUND_LAYER_TIERS, layer_entry_location, layer_tier_entries,
+    };
+    use smithay::{desktop::layer_map_for_output, wayland::shell::wlr_layer::Layer};
+
+    let mut env = ClientEnv::new();
+    let qh = env.queue.handle();
+    let compositor =
+        env.client
+            .bind::<wl_compositor::WlCompositor>(&env.registry, &qh, "wl_compositor");
+    let layer_shell = env.client.bind::<zwlr_layer_shell_v1::ZwlrLayerShellV1>(
+        &env.registry,
+        &qh,
+        "zwlr_layer_shell_v1",
+    );
+    let shm = env
+        .client
+        .bind::<wl_shm::WlShm>(&env.registry, &qh, "wl_shm");
+    env.client.compositor = Some(compositor.clone());
+    env.client.shm = Some(shm.clone());
+
+    // The workspace toplevel the wallpaper must be composited below.
+    let (_win_surface, _xdg_surface, _toplevel) = env.spawn_window("Wall", "org.koma.wall");
+    assert_eq!(
+        env.state.mapped_windows.len(),
+        1,
+        "toplevel must be mapped for the ordering fixture"
+    );
+
+    // Reproduce the awww/swww wallpaper shape: `zwlr_layer_shell_v1` Background tier, anchored to
+    // all four edges, `exclusive_zone == -1`, size `0x0` (the compositor picks the output size).
+    let wl_out = env.client.outputs[0].clone();
+    let wallpaper = compositor.create_surface(&qh, ());
+    let wallpaper_layer = layer_shell.get_layer_surface(
+        &wallpaper,
+        Some(&wl_out),
+        zwlr_layer_shell_v1::Layer::Background,
+        "awww-daemon".to_owned(),
+        &qh,
+        (),
+    );
+    wallpaper_layer.set_anchor(
+        zwlr_layer_surface_v1::Anchor::Top
+            | zwlr_layer_surface_v1::Anchor::Bottom
+            | zwlr_layer_surface_v1::Anchor::Left
+            | zwlr_layer_surface_v1::Anchor::Right,
+    );
+    wallpaper_layer.set_exclusive_zone(-1);
+    wallpaper_layer.set_size(0, 0);
+    wallpaper.commit();
+    env.pump();
+    assert!(
+        env.client.layer_configures >= 1,
+        "compositor must configure the Background surface"
+    );
+
+    // First commit is buffer-less by protocol: the layer is mapped and arranged, but contributes no
+    // pixels yet, so it must not emit a stale element.
+    let map = layer_map_for_output(&env._output);
+    assert_eq!(map.layers_on(Layer::Background).count(), 1);
+    assert!(
+        layer_tier_entries(&map, BACKGROUND_LAYER_TIERS).is_empty(),
+        "a buffer-less Background surface must be skipped instead of emitting a 0x0 element"
+    );
+    drop(map);
+
+    // Attach the wallpaper buffer: from here the Background element must be part of every frame.
+    let wallpaper_fd = create_portable_shm_fd(1920 * 1080 * 4, None);
+    let wallpaper_pool = shm.create_pool(wallpaper_fd.as_fd(), 1920 * 1080 * 4, &qh, ());
+    let wallpaper_buf =
+        wallpaper_pool.create_buffer(0, 1920, 1080, 1920 * 4, wl_shm::Format::Argb8888, &qh, ());
+    wallpaper.attach(Some(&wallpaper_buf), 0, 0);
+    wallpaper.damage_buffer(0, 0, 1920, 1080);
+    wallpaper.commit();
+    env.pump();
+
+    let map = layer_map_for_output(&env._output);
+    let background = layer_tier_entries(&map, BACKGROUND_LAYER_TIERS);
+    assert_eq!(
+        background.len(),
+        1,
+        "the Background wallpaper must enter the frame element list (komawm/koma#31)"
+    );
+    let (bg_layer, bg_location) = &background[0];
+    assert_eq!(bg_layer.namespace(), "awww-daemon");
+    assert_eq!(bg_layer.layer(), Layer::Background);
+    assert_eq!(*bg_location, Point::from((0, 0)));
+    let bg_geometry = map
+        .layer_geometry(bg_layer)
+        .expect("buffer-backed layer must have a usable geometry");
+    assert_eq!(bg_geometry.size, Size::from((1920, 1080)));
+    // A Background surface must never be collected as a foreground layer (no double draw).
+    assert!(
+        layer_tier_entries(&map, FOREGROUND_LAYER_TIERS).is_empty(),
+        "Background tier must not leak into the Overlay/Top list"
+    );
+    drop(map);
+
+    // The Top-tier bar (e.g. waybar) is collected by the other tier list, so the two tiers stay
+    // disjoint and the wallpaper cannot displace it.
+    let bar_surface = compositor.create_surface(&qh, ());
+    let bar_layer = layer_shell.get_layer_surface(
+        &bar_surface,
+        Some(&wl_out),
+        zwlr_layer_shell_v1::Layer::Top,
+        "koma-bar".to_owned(),
+        &qh,
+        (),
+    );
+    bar_layer.set_size(1920, 24);
+    bar_layer.set_anchor(zwlr_layer_surface_v1::Anchor::Top);
+    bar_layer.set_exclusive_zone(24);
+    bar_surface.commit();
+    env.pump();
+    let bar_fd = create_portable_shm_fd(1920 * 24 * 4, None);
+    let bar_pool = shm.create_pool(bar_fd.as_fd(), 1920 * 24 * 4, &qh, ());
+    let bar_buf = bar_pool.create_buffer(0, 1920, 24, 1920 * 4, wl_shm::Format::Argb8888, &qh, ());
+    bar_surface.attach(Some(&bar_buf), 0, 0);
+    bar_surface.damage_buffer(0, 0, 1920, 24);
+    bar_surface.commit();
+    env.pump();
+
+    let map = layer_map_for_output(&env._output);
+    let foreground = layer_tier_entries(&map, FOREGROUND_LAYER_TIERS);
+    assert_eq!(
+        foreground.len(),
+        1,
+        "the Top bar must stay in the foreground list"
+    );
+    assert_eq!(
+        layer_tier_entries(&map, BACKGROUND_LAYER_TIERS).len(),
+        1,
+        "the wallpaper must survive a Top-tier commit"
+    );
+    drop(map);
+
+    // Shared front-to-back tier order: `Bottom` is emitted before `Background`, so it paints above
+    // the wallpaper; both are appended after the workspace toplevels by every backend.
+    assert_eq!(BACKGROUND_LAYER_TIERS, [Layer::Bottom, Layer::Background]);
+    assert_eq!(FOREGROUND_LAYER_TIERS, [Layer::Overlay, Layer::Top]);
+    // A missing cached geometry must not drop a buffer-backed surface: it renders at the origin.
+    assert_eq!(layer_entry_location(None), Point::from((0, 0)));
+    assert_eq!(
+        layer_entry_location(Some(Rectangle::new(
+            Point::from((8, 16)),
+            Size::from((64, 32))
+        ))),
+        Point::from((8, 16))
+    );
+
+    wallpaper_buf.destroy();
+    wallpaper_pool.destroy();
+    bar_buf.destroy();
+    bar_pool.destroy();
+    wallpaper_layer.destroy();
+    bar_layer.destroy();
+}
+
 mod kom_0024_compat_tests {
     use super::*;
     use koma_proto::WindowId;
