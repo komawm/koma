@@ -72,6 +72,7 @@ mod backend_tty;
 mod backend_winit;
 #[cfg(feature = "smithay-winit")]
 mod child_env;
+mod completions;
 #[cfg(feature = "smithay-winit")]
 mod config_watcher;
 #[cfg(feature = "smithay-winit")]
@@ -487,6 +488,12 @@ fn main() {
         }
         CliAction::Version => {
             println!("{}", cli::version());
+            return;
+        }
+        CliAction::Completions(shell) => {
+            if let Some(script) = completions::render(&shell) {
+                print!("{script}");
+            }
             return;
         }
         CliAction::Run(opts) => opts,

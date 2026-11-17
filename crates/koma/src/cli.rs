@@ -41,12 +41,15 @@ pub enum CliAction {
     Run(RunOptions),
     Help,
     Version,
+    /// Print a shell completion script for the named shell.
+    Completions(String),
 }
 
 /// Invalid command line; the binary prints the message plus usage and exits with status 2.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CliError {
     UnknownArgument(String),
+    UnknownShell(String),
     MissingValue(&'static str),
     ConflictingModes(&'static str, &'static str),
 }
@@ -55,6 +58,9 @@ impl fmt::Display for CliError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::UnknownArgument(arg) => write!(f, "unrecognized argument `{arg}`"),
+            Self::UnknownShell(shell) => {
+                write!(f, "unknown shell `{shell}` (expected bash, zsh, or fish)")
+            }
             Self::MissingValue(flag) => write!(f, "option `{flag}` requires a value"),
             Self::ConflictingModes(a, b) => {
                 write!(f, "options `{a}` and `{b}` select different backends")
@@ -88,6 +94,9 @@ Options:
   -c, --config <PATH>     Use PATH instead of $XDG_CONFIG_HOME/koma/init.lua
   -h, --help              Print this help and exit
   -V, --version           Print the version and exit
+
+Subcommands:
+  completions <bash|zsh|fish>   Print a shell completion script and exit
 
 Signals: SIGTERM, SIGINT and SIGHUP stop the compositor gracefully (exit status 0).
 ",
@@ -142,6 +151,13 @@ where
         };
 
         match flag.as_str() {
+            "completions" if inline_value.is_none() => {
+                let shell = args.next().ok_or(CliError::MissingValue("completions"))?;
+                if crate::completions::render(&shell).is_none() {
+                    return Err(CliError::UnknownShell(shell));
+                }
+                return Ok(CliAction::Completions(shell));
+            }
             "-h" | "--help" if inline_value.is_none() => return Ok(CliAction::Help),
             "-V" | "--version" if inline_value.is_none() => return Ok(CliAction::Version),
             "--session" if inline_value.is_none() => opts.is_session = true,

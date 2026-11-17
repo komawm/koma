@@ -3,6 +3,7 @@
 //! `adb`-inspired CLI controller, config validator/reloader & sandbox container launcher for `Koma`.
 
 mod admin_rpc;
+mod completions;
 mod sandbox_runner;
 
 use std::{
@@ -90,6 +91,7 @@ fn usage_text() -> &'static str {
   komactl token mint [label]
   komactl capture [ws_id] [out.rgba]
   komactl sandbox <run|create-jail|revoke-jail> [OPTIONS]
+  komactl completions <bash|zsh|fish>
   komactl -h | --help
   komactl -V | --version
 "
@@ -97,6 +99,27 @@ fn usage_text() -> &'static str {
 
 fn main() -> io::Result<()> {
     let args: Vec<String> = env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("completions") {
+        let Some(name) = args.get(1) else {
+            eprintln!("usage: komactl completions <bash|zsh|fish>");
+            process::exit(2);
+        };
+        let Some(shell) = completions::Shell::parse(name) else {
+            eprintln!(
+                "unknown shell `{name}` (expected {})",
+                [
+                    completions::Shell::Bash.name(),
+                    completions::Shell::Zsh.name(),
+                    completions::Shell::Fish.name()
+                ]
+                .join(", ")
+            );
+            process::exit(2);
+        };
+        print!("{}", completions::render(shell));
+        return Ok(());
+    }
+
     match args.first().map(String::as_str) {
         Some("gen-types") => {
             print!("{}", generate_luals_stubs());
