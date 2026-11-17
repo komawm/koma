@@ -72,6 +72,9 @@ mod backend_tty;
 mod backend_winit;
 #[cfg(feature = "smithay-winit")]
 mod child_env;
+// `smithay-tty` implies `smithay-winit`, so this also covers `--tty`, which spawns `--spawn-cmd`.
+#[cfg(feature = "smithay-winit")]
+mod child_reaper;
 mod completions;
 #[cfg(feature = "smithay-winit")]
 mod config_watcher;
@@ -353,7 +356,7 @@ fn run_nested_winit(
         let active_ws = state.active_ws_id.clone();
         let mut child_cmd = Command::new(&cmd_name);
         state.configure_child_env(&mut child_cmd, Some(&active_ws));
-        let _ = child_cmd.spawn();
+        let _ = crate::child_reaper::spawn_detached(&mut child_cmd, "cli.spawn.winit");
     }
 
     event_loop
@@ -450,7 +453,7 @@ fn run_bare_metal_tty(
         let active_ws = state.active_ws_id.clone();
         let mut child_cmd = Command::new(&cmd_name);
         state.configure_child_env(&mut child_cmd, Some(&active_ws));
-        let _ = child_cmd.spawn();
+        let _ = crate::child_reaper::spawn_detached(&mut child_cmd, "cli.spawn.tty");
     }
 
     event_loop
