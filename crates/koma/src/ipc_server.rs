@@ -821,6 +821,52 @@ pub(crate) fn dispatch_rpc(
             Ok((json!({ "epoch": epoch, "mode": params.mode }), Vec::new()))
         }
 
+        "ws.focus" => {
+            // Workspace navigation for local UI helpers (status bars, scripts).
+            // Same door as `config.reload`: the admin socket, which is already gated
+            // on peer credentials, plus the session lock gate applied above.
+            if channel != SocketChannel::Admin {
+                return Err(IpcError::new(
+                    ErrorSymbol::ErrCapabilityDenied,
+                    "ws.focus is restricted to koma-admin.sock",
+                ));
+            }
+            let query = req
+                .params
+                .get("ws_id")
+                .and_then(Value::as_str)
+                .or_else(|| req.params.get("name").and_then(Value::as_str))
+                .ok_or_else(|| IpcError::new(ErrorSymbol::ErrInvalidParams, "missing ws_id"))?
+                .to_owned();
+
+            // Resolve existing workspaces only: a bar click must not silently create
+            // one. The keybind path keeps its create-on-demand behaviour.
+            let known = state
+                .workspaces
+                .iter()
+                .any(|(id, ws)| id.as_str() == query || ws.name == query);
+            if !known {
+                return Err(IpcError::new(
+                    ErrorSymbol::ErrNotFound,
+                    format!("unknown workspace {query}"),
+                ));
+            }
+
+            crate::keybind_dispatcher::execute_action_descriptor(
+                state,
+                koma_lua::ActionDescriptor::WorkspaceFocus(query.clone()),
+                false,
+            );
+
+            Ok((
+                json!({
+                    "focused": query,
+                    "active_ws_id": state.active_ws_id.as_str(),
+                }),
+                Vec::new(),
+            ))
+        }
+
         "scene.inventory" => {
             let (caller_sess, agent_tok) = resolve_caller_identity(&auth_snapshot)?;
             let mut list = Vec::new();
@@ -2261,6 +2307,71 @@ mod tests {
             assert_eq!(err.symbol, ErrorSymbol::ErrCapabilityDenied);
             assert_eq!(err.message, "session is locked");
         }
+    }
+
+    #[test]
+    fn ws_focus_switches_the_active_workspace_and_rejects_unknown_names() {
+        use std::os::unix::net::UnixStream;
+
+        let (_event_loop, _display, mut state) = crate::state::tests::make_headless_test_state();
+        let start = state.active_ws_id.clone();
+        let target = state.ensure_workspace_by_name_or_id("2");
+        assert_ne!(start, target, "test needs a second workspace");
+
+        let (client_stream, _peer) = UnixStream::pair().expect("unix stream pair");
+        let conn_id = 77_u64;
+        state.ipc_clients.insert(
+            conn_id,
+            IpcClientConn {
+                conn_id,
+                stream: client_stream,
+                channel: SocketChannel::Admin,
+                auth: PeerAuthState::AdminVerified {
+                    uid: 1000,
+                    gid: 1000,
+                    session_id: SessionId("test-admin".to_owned()),
+                },
+                reg_token: None,
+                inbox: FrameInbox::default(),
+                outbox: FrameOutbox::default(),
+                event_ring: EventRingBuffer::default(),
+                subscribed_workspaces: BTreeSet::new(),
+                subscribed_topics: HashSet::new(),
+                armed_writable: false,
+            },
+        );
+
+        let (res, _) = dispatch_rpc(
+            &mut state,
+            conn_id,
+            IpcRequest {
+                id: 1,
+                method: "ws.focus".to_owned(),
+                params: json!({ "ws_id": "2" }),
+            },
+            Vec::new(),
+        )
+        .expect("ws.focus must switch to an existing workspace");
+        assert_eq!(state.active_ws_id, target);
+        assert_eq!(res["focused"], json!("2"));
+        assert_eq!(res["active_ws_id"], json!(target.as_str()));
+
+        // A status-bar click must never create a workspace as a side effect.
+        let before = state.workspaces.len();
+        let err = dispatch_rpc(
+            &mut state,
+            conn_id,
+            IpcRequest {
+                id: 2,
+                method: "ws.focus".to_owned(),
+                params: json!({ "ws_id": "no-such-workspace" }),
+            },
+            Vec::new(),
+        )
+        .expect_err("unknown workspace must be rejected");
+        assert_eq!(err.symbol, ErrorSymbol::ErrNotFound);
+        assert_eq!(state.workspaces.len(), before);
+        assert_eq!(state.active_ws_id, target);
     }
 
     #[test]

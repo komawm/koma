@@ -301,7 +301,7 @@ pub(crate) fn dispatch_single_host_action(state: &mut KomaState, action: QueuedH
                 let mut cmd = Command::new(prog);
                 cmd.args(args);
                 state.configure_child_env(&mut cmd, Some(&active_ws));
-                let _ = cmd.spawn();
+                let _ = crate::child_reaper::spawn_detached(&mut cmd, "macro.spawn");
             }
         }
 
