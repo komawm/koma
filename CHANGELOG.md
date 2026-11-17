@@ -8,6 +8,33 @@ desktop, hardware support, or security guarantees.
 
 ## [Unreleased]
 
+## [0.0.2] - 2026-11-17
+
+### Added
+
+- Installable agent skill at `skills/koma-desktop/` with an MIT `LICENSE` inside
+  the skill directory, a thin `SKILL.md` router, and `references/` for
+  workspaces, input primitives, and macro Lua. It installs with
+  `npx skills add komawm/koma --skill koma-desktop`.
+- `scripts/check-skills.py` (wired into `just check` and CI): validates skill
+  frontmatter, `name`/directory agreement, MIT licensing, metadata, and relative
+  links, and rejects links that escape the skill directory.
+- Shell completions for `koma` and `komactl` in bash, zsh, and fish, exposed as
+  `koma completions <shell>` and `komactl completions <shell>`. `komactl`
+  renders them from a declarative table kept in sync with `usage_text()` by a
+  test; `koma` cross-checks its static scripts against `cli::usage()`.
+
+### Changed
+
+- `examples/SKILL.md` became `examples/coding-agent-cli.md`: a plain CLI-first
+  walkthrough with no frontmatter, so it can no longer be picked up as a second
+  `koma-desktop` skill by a `--full-depth` scan. Its stale "proposed interfaces"
+  warning is gone.
+- `koma_exec_macro`'s MCP description now says it returns executor status and
+  epoch, not a macro result, and that a suspended macro completes
+  asynchronously and is cancelled if the workspace epoch changes.
+- The skill validator rejects YAML booleans/nulls and empty `license` values.
+
 ## [0.0.1] - 2026-11-16
 
 ### Added (agent cursor precision, vSeat trajectories & MCP)
