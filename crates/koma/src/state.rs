@@ -3953,6 +3953,13 @@ impl KomaState {
         if self.applied_keyboard_repeat != (target_delay, target_rate) {
             keyboard.change_repeat_info(target_rate, target_delay);
             self.applied_keyboard_repeat = (target_delay, target_rate);
+            // Logged because "typing repeats too fast" is otherwise unverifiable from a running
+            // compositor (komawm/koma#44).
+            info!(
+                repeat_delay_ms = target_delay,
+                repeat_rate_hz = target_rate,
+                "applied keyboard repeat settings"
+            );
         }
 
         if kb_spec.numlock.is_some() && self.applied_startup_numlock != kb_spec.numlock {

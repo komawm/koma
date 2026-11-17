@@ -42,6 +42,8 @@ const EVDEV_LEFT_SHIFT: u32 = 42;
 const TERMINAL_APP_IDS: &[&str] = &[
     "foot",
     "footclient",
+    "bitty",
+    "run.bitty.Bitty",
     "alacritty",
     "kitty",
     "wezterm",

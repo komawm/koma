@@ -88,6 +88,7 @@ fn usage_text() -> &'static str {
   komactl config-status
   komactl gen-types
   komactl inventory
+  komactl ws focus <ws_id|name>
   komactl token mint [label]
   komactl capture [ws_id] [out.rgba]
   komactl sandbox <run|create-jail|revoke-jail> [OPTIONS]
@@ -150,6 +151,24 @@ fn main() -> io::Result<()> {
             let (val, _) = client.call_raw("scene.inventory", json!({}))?;
             println!("{}", serde_json::to_string_pretty(&val).unwrap());
         }
+        Some("ws") => match args.get(1).map(String::as_str) {
+            Some("focus") => {
+                let Some(target) = args.get(2).cloned() else {
+                    eprintln!("komactl ws focus: missing <ws_id|name>");
+                    process::exit(2);
+                };
+                let mut client = AdminClient::connect()?;
+                let (val, _) = client.call_raw("ws.focus", json!({ "ws_id": target }))?;
+                println!("{}", serde_json::to_string_pretty(&val).unwrap());
+            }
+            other => {
+                eprintln!(
+                    "komactl ws: unknown subcommand {:?} (expected: focus <ws_id|name>)",
+                    other.unwrap_or("")
+                );
+                process::exit(2);
+            }
+        },
         Some("token") if args.get(1).map(String::as_str) == Some("mint") => {
             let label = args
                 .get(2)
