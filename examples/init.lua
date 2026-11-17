@@ -158,7 +158,7 @@ koma.appearance({
 -- Example: koma.unbind("Mod + P")
 koma.unbind("Mod + P")
 koma.bind("Mod + P",         koma.act.window.pseudotile_toggle(), { desc = "Toggle Dwindle pseudotile" })
-koma.bind("Mod + Return", koma.act.spawn({ "ghostty" }), { desc = "Open terminal" })
+koma.bind("Mod + Return", koma.act.spawn({ "bitty" }), { desc = "Open terminal" })
 koma.bind("Mod + D",      koma.act.spawn({ "fuzzel" }),  { desc = "Application launcher" })
 koma.bind("Mod + Q",         koma.act.window.close(),             { desc = "Close active window" })
 koma.bind("Mod + V",         koma.act.window.float_toggle(),      { desc = "Toggle floating layer" })
@@ -223,7 +223,7 @@ koma.bind("Ctrl + Alt + H", koma.act.macro.run("wps.drag_first_line_indent", { d
 -- 6. Baseline Window Rules (Frosted-Glass Terminals & Protected Credential Blackout)
 koma.rule.window({
     name = "frosted-glass-terminals",
-    matches = { { app_id = "^(com\\.mitchellh\\.ghostty|org\\.wezfurlong\\.wezterm|foot)$" } },
+    matches = { { app_id = "^(run\\.bitty\\.Bitty|com\\.mitchellh\\.ghostty|org\\.wezfurlong\\.wezterm|foot)$" } },
     opacity = 0.90,
     inactive_opacity = 0.85,
     corner_radius = 12,

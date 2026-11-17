@@ -203,6 +203,17 @@ const ROOT_SUBS: &[Cmd] = &[
         }],
     },
     Cmd {
+        name: "ws",
+        desc: "Workspace navigation (focus)",
+        opts: &[],
+        subs: &[Cmd {
+            name: "focus",
+            desc: "Focus an existing workspace by id or name",
+            opts: &[],
+            subs: &[],
+        }],
+    },
+    Cmd {
         name: "capture",
         desc: "Capture a workspace frame to a raw file",
         opts: &[],

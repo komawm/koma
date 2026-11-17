@@ -223,6 +223,24 @@ pub fn effective_window_opacity(item: &WindowSceneItem<'_>, dim: &DimConfig) -> 
     effective_window_opacity_for(item.opacity, item.is_focused, dim)
 }
 
+/// Computes the physical origin of a toplevel's surface tree inside its frame.
+///
+/// Client-side-decorated clients keep their drop shadow (and any other decoration) inside the
+/// buffer and describe the visible area through `xdg_surface.set_window_geometry`. Compositing the
+/// surface tree at `inner_rect.loc` would therefore put the visible area at
+/// `inner_rect.loc + geometry.loc`, shifting the content down-right by the decoration inset and
+/// clipping its right/bottom edge. Subtracting the geometry origin makes the visible area start
+/// exactly at `inner_rect.loc`; server-side-decorated and XWayland windows report a `(0, 0)`
+/// geometry origin and are placed unchanged.
+#[must_use]
+pub fn toplevel_surface_origin(
+    inner_rect_loc: Point<f64, Logical>,
+    window_geometry_loc: Point<i32, Logical>,
+    output_scale: Scale<f64>,
+) -> Point<i32, Physical> {
+    (inner_rect_loc - window_geometry_loc.to_f64()).to_physical_precise_round(output_scale)
+}
+
 /// Resolves `(start_rgba, end_rgba, angle_rad)` for a gradient border interpolated smoothly by `focus_factor`.
 #[must_use]
 pub fn resolve_border_gradient(
@@ -474,8 +492,10 @@ where
         // 2c. Main toplevel surface tree (clipped to `inner_rect` + `inner_radii` when shader available)
         if let Some(toplevel) = item.window.toplevel() {
             let wl_surface = toplevel.wl_surface();
-            let surface_loc_phys: Point<i32, Physical> =
-                inner_rect.loc.to_physical_precise_round(output_scale);
+            // CSD buffers carry their own decoration/shadow inset; place the visible window
+            // geometry on the frame instead of the buffer origin (komawm/koma#41).
+            let surface_loc_phys =
+                toplevel_surface_origin(inner_rect.loc, item.window.geometry().loc, output_scale);
             let surface_elems: Vec<WaylandSurfaceRenderElement<R>> =
                 render_elements_from_surface_tree(
                     renderer,
@@ -886,6 +906,39 @@ mod tests {
         // Inactive window scales by (1 - 0.25) * 0.8 = 0.6
         let inactive = effective_window_opacity_for(1.0, false, &dim);
         assert!((inactive - 0.6).abs() < 1e-5);
+    }
+
+    #[test]
+    fn csd_toplevel_surface_origin_subtracts_the_window_geometry_inset() {
+        // A GTK/Chrome-style CSD buffer puts a shadow band left/top of the window geometry.
+        let inner_loc = Point::<f64, Logical>::from((100.0, 50.0));
+        let geometry_loc = Point::<i32, Logical>::from((12, 8));
+
+        let origin = toplevel_surface_origin(inner_loc, geometry_loc, Scale::from(1.0));
+
+        assert_eq!(origin, Point::<i32, Physical>::from((88, 42)));
+        // The client's visible area (surface origin + geometry inset) lands on the frame.
+        assert_eq!(
+            origin + Point::<i32, Physical>::from((12, 8)),
+            Point::<i32, Physical>::from((100, 50))
+        );
+    }
+
+    #[test]
+    fn toplevel_surface_origin_keeps_ssd_windows_in_place_and_scales() {
+        let inner_loc = Point::<f64, Logical>::from((100.0, 50.0));
+        let no_inset = Point::<i32, Logical>::from((0, 0));
+
+        assert_eq!(
+            toplevel_surface_origin(inner_loc, no_inset, Scale::from(1.0)),
+            Point::<i32, Physical>::from((100, 50)),
+            "SSD/XWayland windows must not move"
+        );
+        assert_eq!(
+            toplevel_surface_origin(inner_loc, no_inset, Scale::from(2.0)),
+            Point::<i32, Physical>::from((200, 100)),
+            "the inset has to be applied before the output scale"
+        );
     }
 
     #[test]
