@@ -237,7 +237,7 @@ pub(crate) fn append_layer_tier_elements<R>(
     renderer: &mut R,
     output: &Output,
     output_scale: smithay::utils::Scale<f64>,
-    tiers: [Layer; 2],
+    tiers: &[Layer],
     elements: &mut Vec<koma_render::elements::KomaRenderElement<R>>,
 ) where
     R: smithay::backend::renderer::Renderer + smithay::backend::renderer::ImportAll,
@@ -249,7 +249,7 @@ pub(crate) fn append_layer_tier_elements<R>(
 
     let map = layer_map_for_output(output);
     for layer_tier in tiers {
-        for layer in map.layers_on(layer_tier).rev() {
+        for layer in map.layers_on(*layer_tier).rev() {
             if let Some(geo) = map.layer_geometry(layer) {
                 let loc_phys = geo.loc.to_f64().to_physical_precise_round(output_scale);
                 let l_elems: Vec<WaylandSurfaceRenderElement<R>> =
@@ -494,18 +494,19 @@ pub fn render_winit_frame(state: &mut KomaState) -> anyhow::Result<()> {
                 output_scale,
                 &mut elements,
             );
+            let layer_tiers = state.output_layer_tiers(&out_ws_id);
             append_layer_tier_elements(
                 winit_state.backend.renderer(),
                 &winit_state.output,
                 output_scale,
-                [Layer::Overlay, Layer::Top],
+                layer_tiers.above_toplevels,
                 &mut elements,
             );
             append_layer_tier_elements(
                 winit_state.backend.renderer(),
                 &winit_state.output,
                 output_scale,
-                [Layer::Bottom, Layer::Background],
+                layer_tiers.below_toplevels,
                 &mut bg_layer_elements,
             );
 
@@ -552,7 +553,7 @@ pub fn render_winit_frame(state: &mut KomaState) -> anyhow::Result<()> {
 
             if let Some(ws) = state.workspaces.get(&out_ws_id)
                 && ws.layout_mode == koma_model::LayoutMode::Scrolling
-                && ws.fullscreen_window.is_none()
+                && ws.presented_window_id().is_none()
             {
                 let cam_x = ws.scrolling.peek_camera_x(state.elapsed_ms());
                 let tab_segs = ws.scrolling.tab_indicator_segments_at(viewport, cam_x);

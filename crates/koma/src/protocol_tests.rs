@@ -1584,8 +1584,6 @@ fn foreign_toplevel_wlr_and_ext_list_lifecycle_and_lock_guard() {
 
     editor_handle.set_maximized();
     editor_handle.set_minimized();
-    editor_handle.set_fullscreen(None);
-    editor_handle.set_rectangle(&surf1, 10, 20, 300, 200);
     env.pump();
     let m1 = env
         .state
@@ -1593,9 +1591,23 @@ fn foreign_toplevel_wlr_and_ext_list_lifecycle_and_lock_guard() {
         .iter()
         .find(|m| m.win_id == win1)
         .expect("win1");
-    assert!(m1.is_maximized);
+    assert!(env.state.is_window_maximized(win1));
     assert!(m1.is_minimized);
-    assert_eq!(env.state.workspaces[&ws1].fullscreen_window, Some(win1));
+    assert_eq!(env.state.workspaces[&ws1].fullscreen_window(), None);
+    assert_eq!(
+        m1.rect,
+        env.state.workspaces[&ws1].maximized_rect(),
+        "maximize must apply real work-area geometry, not the dwindle tile"
+    );
+
+    editor_handle.set_fullscreen(None);
+    editor_handle.set_rectangle(&surf1, 10, 20, 300, 200);
+    env.pump();
+    assert_eq!(env.state.workspaces[&ws1].fullscreen_window(), Some(win1));
+    assert!(
+        !env.state.is_window_maximized(win1),
+        "fullscreen and maximize are mutually exclusive"
+    );
 
     editor_handle.unset_maximized();
     editor_handle.unset_minimized();
@@ -1607,9 +1619,9 @@ fn foreign_toplevel_wlr_and_ext_list_lifecycle_and_lock_guard() {
         .iter()
         .find(|m| m.win_id == win1)
         .expect("win1");
-    assert!(!m1.is_maximized);
+    assert!(!env.state.is_window_maximized(win1));
     assert!(!m1.is_minimized);
-    assert_eq!(env.state.workspaces[&ws1].fullscreen_window, None);
+    assert_eq!(env.state.workspaces[&ws1].fullscreen_window(), None);
 
     // Locked session blocks foreign activation.
     assert!(env.state.session_lock.try_lock(None));
@@ -2303,6 +2315,171 @@ fn multi_monitor_window_move_fractional_scale_and_notch_layer_shell_composition(
     layer_surf.destroy();
     bar2_buf.destroy();
     bar2_pool.destroy();
+    bar_buf.destroy();
+    bar_pool.destroy();
+}
+
+#[test]
+fn fullscreen_window_suppresses_top_and_overlay_layer_tiers_but_keeps_background() {
+    use smithay::desktop::layer_map_for_output;
+    use smithay::wayland::shell::wlr_layer::Layer;
+
+    let mut env = ClientEnv::new();
+    let qh = env.queue.handle();
+    let compositor =
+        env.client
+            .bind::<wl_compositor::WlCompositor>(&env.registry, &qh, "wl_compositor");
+    let layer_shell = env.client.bind::<zwlr_layer_shell_v1::ZwlrLayerShellV1>(
+        &env.registry,
+        &qh,
+        "zwlr_layer_shell_v1",
+    );
+    let shm = env
+        .client
+        .bind::<wl_shm::WlShm>(&env.registry, &qh, "wl_shm");
+    env.client.compositor = Some(compositor.clone());
+    env.client.shm = Some(shm.clone());
+
+    // Real Waybar-shaped client: `Top` tier, anchored top edge with a 24 px exclusive zone.
+    let bar_surf = compositor.create_surface(&qh, ());
+    let wl_out = env.client.outputs[0].clone();
+    let bar_layer = layer_shell.get_layer_surface(
+        &bar_surf,
+        Some(&wl_out),
+        zwlr_layer_shell_v1::Layer::Top,
+        "koma-bar".to_owned(),
+        &qh,
+        (),
+    );
+    bar_layer.set_size(1920, 24);
+    bar_layer.set_anchor(zwlr_layer_surface_v1::Anchor::Top);
+    bar_layer.set_exclusive_zone(24);
+    bar_surf.commit();
+    env.pump();
+    let bar_fd = create_portable_shm_fd(1920 * 24 * 4, None);
+    let bar_pool = shm.create_pool(bar_fd.as_fd(), 1920 * 24 * 4, &qh, ());
+    let bar_buf = bar_pool.create_buffer(0, 1920, 24, 1920 * 4, wl_shm::Format::Argb8888, &qh, ());
+    bar_surf.attach(Some(&bar_buf), 0, 0);
+    bar_surf.commit();
+    env.pump();
+
+    let (_surf1, _xs1, _tl1) = env.spawn_window("Editor", "org.koma.editor");
+    let (_surf2, _xs2, _tl2) = env.spawn_window("Browser", "org.koma.browser");
+
+    let ws_id = env.state.active_workspace_for_output("DP-1");
+    let win1 = env.state.mapped_windows[0].win_id;
+    assert_eq!(env.state.mapped_windows.len(), 2);
+
+    // Panels are composited above toplevels and the desktop background stays behind them.
+    let tiers = env.state.output_layer_tiers(&ws_id);
+    assert_eq!(
+        tiers.above_toplevels,
+        [Layer::Overlay, Layer::Top].as_slice(),
+        "Top/Overlay tiers composite above tiled windows while nothing is fullscreen"
+    );
+    assert_eq!(
+        tiers.below_toplevels,
+        [Layer::Bottom, Layer::Background].as_slice()
+    );
+
+    let ws = env
+        .state
+        .workspaces
+        .get_mut(&ws_id)
+        .expect("DP-1 workspace");
+    let work_area = ws.viewport.work_area_rect();
+    assert_eq!(
+        work_area.y, 24,
+        "the 24 px bar must reserve work area before fullscreen"
+    );
+    ws.set_fullscreen(win1, true);
+    env.state.sync_workspace_geometries(&ws_id);
+
+    // Fullscreen: the bar tier is skipped for this output, background tier survives.
+    let tiers = env.state.output_layer_tiers(&ws_id);
+    assert!(
+        tiers.above_toplevels.is_empty(),
+        "Top/Overlay tiers must not composite over a fullscreen window"
+    );
+    assert_eq!(
+        tiers.below_toplevels,
+        [Layer::Bottom, Layer::Background].as_slice(),
+        "background layers must stay composited behind a fullscreen window"
+    );
+
+    // The policy is render-time only: the bar stays mapped and reclaims the output afterwards.
+    let map = layer_map_for_output(&env._output);
+    assert_eq!(
+        map.layers_on(Layer::Top).count(),
+        1,
+        "the layer surface must remain mapped, only its tier is skipped"
+    );
+    drop(map);
+
+    // The fullscreen toplevel is the only window element, hence front-most, and covers the
+    // physical output rect including the reserved bar strip.
+    let ws = env.state.workspaces.get(&ws_id).expect("DP-1 workspace");
+    assert_eq!(
+        ws.compute_visible_geometries(),
+        vec![(win1, koma_model::LogicalRect::new(0, 0, 1920, 1080), false)]
+    );
+    let items = env.state.collect_workspace_scene_items(&ws_id, false);
+    assert_eq!(items.len(), 1, "sibling windows are not composited");
+    let expected_root = env
+        .state
+        .mapped_windows
+        .iter()
+        .find(|m| m.win_id == win1)
+        .and_then(|m| m.window.toplevel().map(|t| t.wl_surface().clone()))
+        .expect("fullscreen toplevel surface");
+    assert!(
+        items[0]
+            .window
+            .toplevel()
+            .is_some_and(|t| *t.wl_surface() == expected_root),
+        "the fullscreen toplevel must be the front-most window element"
+    );
+
+    // Leaving fullscreen restores the bar tier.
+    env.state
+        .workspaces
+        .get_mut(&ws_id)
+        .expect("DP-1 workspace")
+        .set_fullscreen(win1, false);
+    let tiers = env.state.output_layer_tiers(&ws_id);
+    assert_eq!(
+        tiers.above_toplevels,
+        [Layer::Overlay, Layer::Top].as_slice()
+    );
+
+    // Maximize is distinct from fullscreen: the bar stays composited and the window fills only
+    // the gapped work area.
+    let maximized = {
+        let ws = env
+            .state
+            .workspaces
+            .get_mut(&ws_id)
+            .expect("DP-1 workspace");
+        ws.set_maximized(win1, true);
+        let maximized = ws.maximized_rect();
+        assert_eq!(maximized.y, work_area.y + ws.outer_gap() as i32);
+        assert_ne!(maximized, ws.viewport.full_rect());
+        maximized
+    };
+    env.state.sync_workspace_geometries(&ws_id);
+    let tiers = env.state.output_layer_tiers(&ws_id);
+    assert_eq!(
+        tiers.above_toplevels,
+        [Layer::Overlay, Layer::Top].as_slice(),
+        "maximize must not hide the bar"
+    );
+    let ws = env.state.workspaces.get(&ws_id).expect("DP-1 workspace");
+    assert_eq!(
+        ws.compute_visible_geometries(),
+        vec![(win1, maximized, false)]
+    );
+
+    bar_layer.destroy();
     bar_buf.destroy();
     bar_pool.destroy();
 }

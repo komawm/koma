@@ -343,9 +343,10 @@ impl KeybindTable {
                 None,
             ),
             (30, "Mod + C", ActionDescriptor::ScrollingCenterColumn, None),
+            (31, "Mod + M", ActionDescriptor::WindowMaximizeToggle, None),
             (
-                31,
-                "Mod + M",
+                36,
+                "Mod + Shift + M",
                 ActionDescriptor::ScrollingMaximizeColumn,
                 None,
             ),
@@ -1885,7 +1886,19 @@ pub fn execute_action_descriptor(
                     ws.toggle_fullscreen(id);
                 }
                 state.sync_workspace_geometries(&ws_id);
+                state.sync_foreign_toplevels();
                 state.queue_redraw();
+            }
+        }
+
+        ActionDescriptor::WindowMaximizeToggle => {
+            let ws_id = state.effective_interactive_ws_id();
+            let active_id = state
+                .workspaces
+                .get(&ws_id)
+                .and_then(WorkspaceState::active_window);
+            if let Some(id) = active_id {
+                state.toggle_window_maximized(id);
             }
         }
 
@@ -2591,6 +2604,35 @@ mod tests {
             Some(ActionDescriptor::Spawn {
                 argv: vec!["bitty".to_owned()]
             })
+        );
+    }
+
+    #[test]
+    fn builtin_mod_m_maximizes_and_mod_f_stays_fullscreen() {
+        let defaults = KeybindTable::with_builtin_defaults();
+        let action_for = |spec: &str| {
+            let chord = parse_chord_spec(spec).expect("valid chord");
+            defaults
+                .binds
+                .iter()
+                .find(|b| b.chord == chord)
+                .and_then(|b| b.press_action.clone())
+        };
+
+        assert_eq!(
+            action_for("Mod + M"),
+            Some(ActionDescriptor::WindowMaximizeToggle),
+            "Mod + M must toggle the maximize presentation state"
+        );
+        assert_eq!(
+            action_for("Mod + F"),
+            Some(ActionDescriptor::WindowFullscreenToggle),
+            "Mod + F must stay fullscreen"
+        );
+        assert_eq!(
+            action_for("Mod + Shift + M"),
+            Some(ActionDescriptor::ScrollingMaximizeColumn),
+            "the scrolling-only maximize column action must remain reachable"
         );
     }
 

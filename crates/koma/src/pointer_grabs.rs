@@ -367,8 +367,8 @@ impl MoveWindowGrab {
         let Some(ws) = state.workspaces.get_mut(&self.ws_id) else {
             return false;
         };
-        if ws.fullscreen_window == Some(self.win_id) {
-            ws.fullscreen_window = None;
+        if ws.presented_window_id() == Some(self.win_id) {
+            ws.window_presentation = None;
         }
         let now_ms = state.elapsed_ms();
         let Some(ws) = state.workspaces.get_mut(&self.ws_id) else {
@@ -770,7 +770,7 @@ impl ResizeWindowGrab {
         explicit_corner: Option<ResizeCorner>,
     ) -> Option<(Self, ResizeCorner)> {
         let ws = state.workspaces.get(&ws_id)?;
-        if ws.fullscreen_window == Some(win_id) {
+        if ws.presented_window_id() == Some(win_id) {
             return None;
         }
         let mapped = state.mapped_windows.iter().find(|m| m.win_id == win_id)?;

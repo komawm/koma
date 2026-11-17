@@ -403,7 +403,7 @@ fn build_snapshots(
         .iter()
         .map(|m| {
             let ws = state.workspaces.get(&m.ws_id);
-            let fullscreen = ws.is_some_and(|w| w.fullscreen_window == Some(m.win_id));
+            let fullscreen = ws.is_some_and(|w| w.is_fullscreen(m.win_id));
             let parent_win_id = m
                 .window
                 .toplevel()
@@ -439,7 +439,7 @@ fn build_snapshots(
                 ToplevelSnapshot {
                     title: m.title.clone(),
                     app_id: m.app_id.clone(),
-                    maximized: m.is_maximized,
+                    maximized: state.is_window_maximized(m.win_id),
                     minimized: m.is_minimized,
                     activated: focused_win == Some(m.win_id) && !m.is_minimized,
                     fullscreen,

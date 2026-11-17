@@ -37,6 +37,7 @@ pub enum ActionDescriptor {
     },
     WindowClose,
     WindowFullscreenToggle,
+    WindowMaximizeToggle,
     WindowFloatToggle,
     WindowPseudotileToggle,
     WindowDragMove,

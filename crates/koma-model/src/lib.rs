@@ -66,6 +66,7 @@ pub use crate::{
         VIEW_GESTURE_WORKING_AREA_MOVEMENT,
     },
     workspace::{
-        DEFAULT_SCRATCHPAD_NAME, PresentationTarget, SPECIAL_WORKSPACE_PREFIX, WorkspaceState,
+        DEFAULT_SCRATCHPAD_NAME, PresentationTarget, SPECIAL_WORKSPACE_PREFIX, WindowPresentation,
+        WorkspaceState,
     },
 };

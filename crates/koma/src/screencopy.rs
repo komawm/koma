@@ -918,9 +918,8 @@ fn build_screencopy_elements<'a>(
     agent_cursor: Option<&AgentCursorFrameSnapshot>,
     now_ms: u64,
 ) -> Vec<KomaRenderElement<GlesRenderer>> {
-    use smithay::wayland::shell::wlr_layer::Layer;
-
     let output_scale = smithay::utils::Scale::from(output.current_scale().fractional_scale());
+    let layer_tiers = state.output_layer_tiers(ws_id);
     let mut elements = Vec::new();
 
     // Front-to-back order: human cursor -> agent cursor/trail -> overlay/top layers -> IME popups -> special overlay -> workspace -> bottom/background layers.
@@ -928,7 +927,7 @@ fn build_screencopy_elements<'a>(
         renderer,
         output,
         output_scale,
-        [Layer::Overlay, Layer::Top],
+        layer_tiers.above_toplevels,
         &mut elements,
     );
     append_ime_popup_elements(renderer, state, output, output_scale, &mut elements);
@@ -950,7 +949,7 @@ fn build_screencopy_elements<'a>(
 
     if let Some(ws) = state.workspaces.get(ws_id)
         && ws.layout_mode == LayoutMode::Scrolling
-        && ws.fullscreen_window.is_none()
+        && ws.presented_window_id().is_none()
     {
         let cam_x = ws.scrolling.peek_camera_x(now_ms);
         let tab_segs = ws.scrolling.tab_indicator_segments_at(viewport, cam_x);
@@ -974,7 +973,7 @@ fn build_screencopy_elements<'a>(
         renderer,
         output,
         output_scale,
-        [Layer::Bottom, Layer::Background],
+        layer_tiers.below_toplevels,
         &mut elements,
     );
 
