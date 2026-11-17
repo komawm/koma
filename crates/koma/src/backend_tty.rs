@@ -76,17 +76,15 @@ use smithay::{
         wayland_server::backend::GlobalId,
     },
     utils::{DeviceFd, Point, SERIAL_COUNTER, Scale as MathScale},
-    wayland::{
-        dmabuf::{DmabufFeedback, DmabufFeedbackBuilder, DmabufGlobal},
-        shell::wlr_layer::Layer,
-    },
+    wayland::dmabuf::{DmabufFeedback, DmabufFeedbackBuilder, DmabufGlobal},
 };
 use smithay_drm_extras::drm_scanner::{DrmScanEvent, DrmScanner};
 use tracing::{debug, info, trace, warn};
 
 use crate::{
     backend_winit::{
-        append_ime_popup_elements, append_layer_tier_elements, assemble_locked_frame_elements,
+        BACKGROUND_LAYER_TIERS, FOREGROUND_LAYER_TIERS, append_ime_popup_elements,
+        append_layer_tier_elements, assemble_locked_frame_elements,
         dispatch_output_frame_callbacks_filtered,
     },
     edid::ParsedEdid,
@@ -2203,7 +2201,7 @@ fn render_single_drm_surface(
                 renderer.as_mut(),
                 &surface.output,
                 output_scale,
-                [Layer::Bottom, Layer::Background],
+                BACKGROUND_LAYER_TIERS,
                 &mut gles_bg_elems,
             );
             state
@@ -2238,7 +2236,7 @@ fn render_single_drm_surface(
             &mut renderer,
             &surface.output,
             output_scale,
-            [Layer::Overlay, Layer::Top],
+            FOREGROUND_LAYER_TIERS,
             &mut elements,
         );
 
@@ -2291,7 +2289,7 @@ fn render_single_drm_surface(
             &mut renderer,
             &surface.output,
             output_scale,
-            [Layer::Bottom, Layer::Background],
+            BACKGROUND_LAYER_TIERS,
             &mut elements,
         );
 
