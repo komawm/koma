@@ -32,6 +32,69 @@ impl LogicalRect {
     }
 }
 
+/// Client-advertised `xdg_toplevel` size constraints (`set_min_size` / `set_max_size`).
+///
+/// `0` means "unconstrained" on that axis, matching the xdg-shell convention. Tiled layouts must
+/// never hand a client a rectangle outside these bounds: clients such as Chromium and Firefox
+/// refuse to shrink below their minimum and keep committing a cropped, un-reflowed buffer, which
+/// is then masked to the (too small) tile and reads as "clipped instead of resized".
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SizeHints {
+    pub min_w: u32,
+    pub min_h: u32,
+    pub max_w: u32,
+    pub max_h: u32,
+}
+
+impl SizeHints {
+    #[must_use]
+    pub const fn new(min_w: u32, min_h: u32, max_w: u32, max_h: u32) -> Self {
+        Self {
+            min_w,
+            min_h,
+            max_w,
+            max_h,
+        }
+    }
+
+    /// Builds hints from a raw `(width, height)` min/max pair as read from `xdg_toplevel`.
+    #[must_use]
+    pub const fn from_min_max(min: (u32, u32), max: (u32, u32)) -> Self {
+        Self::new(min.0, min.1, max.0, max.1)
+    }
+
+    /// `true` when neither axis carries a constraint (the common case for unconstrained clients).
+    #[must_use]
+    pub const fn is_unconstrained(&self) -> bool {
+        self.min_w == 0 && self.min_h == 0 && self.max_w == 0 && self.max_h == 0
+    }
+
+    /// Clamps `rect` to these hints while preserving its origin.
+    ///
+    /// The minimum always wins over a conflicting maximum: handing a client less than its minimum
+    /// is what produces clipped, un-reflowed buffers, whereas an over-large maximum is only a hint
+    /// (clients with an exact-size window already auto-float before ever reaching this path).
+    #[must_use]
+    pub fn clamp_rect(&self, rect: LogicalRect) -> LogicalRect {
+        let mut w = rect.w;
+        let mut h = rect.h;
+        if self.min_w > 0 {
+            w = w.max(self.min_w);
+        }
+        if self.min_h > 0 {
+            h = h.max(self.min_h);
+        }
+        if self.max_w > self.min_w {
+            w = w.min(self.max_w);
+        }
+        if self.max_h > self.min_h {
+            h = h.min(self.max_h);
+        }
+        LogicalRect::new(rect.x, rect.y, w.max(1), h.max(1))
+    }
+}
+
 /// Logical safe-area insets (e.g. MacBook Pro camera notch / rounded screen cutouts)
 /// subtracted in addition to `wlr-layer-shell` `exclusive_zone` when computing `work_area`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -394,6 +457,38 @@ mod tests {
         assert_eq!(
             composed.work_area_rect(),
             LogicalRect::new(20, 38, 1478, 928)
+        );
+    }
+
+    #[test]
+    fn size_hints_never_shrink_a_tile_below_the_client_minimum() {
+        let tile = LogicalRect::new(10, 10, 372, 911);
+
+        // Unconstrained hints are a no-op.
+        assert!(SizeHints::default().is_unconstrained());
+        assert_eq!(SizeHints::default().clamp_rect(tile), tile);
+
+        // Chromium advertises 500x87 minimum; the too-narrow split box grows to it in place.
+        let chromium = SizeHints::new(500, 87, 0, 0);
+        assert_eq!(
+            chromium.clamp_rect(tile),
+            LogicalRect::new(10, 10, 500, 911)
+        );
+
+        // A maximum only shrinks boxes that exceed it, and a conflicting minimum always wins.
+        assert_eq!(
+            SizeHints::new(0, 0, 300, 0).clamp_rect(tile),
+            LogicalRect::new(10, 10, 300, 911)
+        );
+        assert_eq!(
+            SizeHints::new(500, 0, 300, 0).clamp_rect(tile),
+            LogicalRect::new(10, 10, 500, 911)
+        );
+
+        // Degenerate hints can never collapse the tile.
+        assert_eq!(
+            SizeHints::new(0, 0, 0, 0).clamp_rect(LogicalRect::new(0, 0, 0, 0)),
+            LogicalRect::new(0, 0, 1, 1)
         );
     }
 }

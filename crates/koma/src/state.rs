@@ -19,7 +19,7 @@ use koma_lua::{
 use koma_model::{
     AgentCursorConfig, AgentCursorFrameSnapshot, AgentCursorVisualDynamics, LayoutMode,
     LogicalPoint, LogicalRect, LogicalViewport, OpenMode, OutputLayout, OutputTransform,
-    PresentationTarget, SafeAreaInsets, SavedOutputConfig, WindowAnimationTable,
+    PresentationTarget, SafeAreaInsets, SavedOutputConfig, SizeHints, WindowAnimationTable,
     WindowMatchContext, WindowRuleEngine, WorkspaceLeaseState, WorkspaceState,
     WorkspaceTransitionTable, is_waydroid_app_id,
 };
@@ -1999,15 +1999,18 @@ impl KomaState {
             .unwrap_or_default();
 
         // If `xdg_toplevel` already has a parent or explicit fixed `max_size`, don't force full-screen size
-        let (_, max_sz) = read_toplevel_min_max_size(toplevel.wl_surface());
+        let (min_sz, max_sz) = read_toplevel_min_max_size(toplevel.wl_surface());
+        let hints = SizeHints::from_min_max(min_sz, max_sz);
         let has_parent = toplevel.parent().is_some();
         let initial_size = if has_parent || (max_sz.0 > 0 && max_sz.1 > 0) {
             None
         } else {
             let wa = viewport.work_area_rect();
-            let inner_w = wa.w.saturating_sub(24) as i32;
-            let inner_h = wa.h.saturating_sub(24) as i32;
-            Some(Size::from((inner_w.max(64), inner_h.max(64))))
+            let inner_w = wa.w.saturating_sub(24);
+            let inner_h = wa.h.saturating_sub(24);
+            let clamped =
+                hints.clamp_rect(LogicalRect::new(0, 0, inner_w.max(64), inner_h.max(64)));
+            Some(Size::from((clamped.w as i32, clamped.h as i32)))
         };
 
         toplevel.with_pending_state(|state| {
@@ -2233,6 +2236,7 @@ impl KomaState {
         let now_ms = self.elapsed_ms();
         let is_floating = if let Some(ws) = self.workspaces.get_mut(&ws_id) {
             ws.frame_clock.record_activity(now_ms);
+            let _ = ws.set_size_hints(unmapped.win_id, SizeHints::from_min_max(min_sz, max_sz));
             let floated = ws.insert_window(
                 unmapped.win_id,
                 want_floating,
