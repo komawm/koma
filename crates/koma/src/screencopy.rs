@@ -52,7 +52,10 @@ use smithay::{
 use tracing::{debug, warn};
 
 use crate::{
-    backend_winit::{append_ime_popup_elements, append_layer_tier_elements},
+    backend_winit::{
+        BACKGROUND_LAYER_TIERS, FOREGROUND_LAYER_TIERS, append_ime_popup_elements,
+        append_layer_tier_elements,
+    },
     security_context::client_is_unrestricted,
     state::KomaState,
 };
@@ -918,8 +921,6 @@ fn build_screencopy_elements<'a>(
     agent_cursor: Option<&AgentCursorFrameSnapshot>,
     now_ms: u64,
 ) -> Vec<KomaRenderElement<GlesRenderer>> {
-    use smithay::wayland::shell::wlr_layer::Layer;
-
     let output_scale = smithay::utils::Scale::from(output.current_scale().fractional_scale());
     let mut elements = Vec::new();
 
@@ -928,7 +929,7 @@ fn build_screencopy_elements<'a>(
         renderer,
         output,
         output_scale,
-        [Layer::Overlay, Layer::Top],
+        FOREGROUND_LAYER_TIERS,
         &mut elements,
     );
     append_ime_popup_elements(renderer, state, output, output_scale, &mut elements);
@@ -974,7 +975,7 @@ fn build_screencopy_elements<'a>(
         renderer,
         output,
         output_scale,
-        [Layer::Bottom, Layer::Background],
+        BACKGROUND_LAYER_TIERS,
         &mut elements,
     );
 

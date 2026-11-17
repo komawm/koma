@@ -85,7 +85,7 @@ use crate::{
     security_context::is_surface_from_restricted_client,
     state::{
         ClientState, KomaState, UnmappedToplevel, is_surface_mapped, output_logical_viewport,
-        read_toplevel_metadata,
+        read_toplevel_metadata, read_toplevel_min_max_size,
     },
 };
 
@@ -301,10 +301,21 @@ impl CompositorHandler for KomaState {
             let (app_id, title) = read_toplevel_metadata(&root_surface);
             self.mapped_windows[idx].app_id = app_id;
             self.mapped_windows[idx].title = title;
+            let win_id = self.mapped_windows[idx].win_id;
             let ws_id = self.mapped_windows[idx].ws_id.clone();
+            // Clients may (re)advertise `xdg_toplevel` size constraints at any commit; Chromium
+            // sends `set_min_size` right after every settled configure. A tiled box below that
+            // minimum can never be honoured, so refresh the hints and re-run the geometry sync.
+            let (min_sz, max_sz) = read_toplevel_min_max_size(&root_surface);
+            let hints_changed = self.workspaces.get_mut(&ws_id).is_some_and(|ws| {
+                ws.set_size_hints(win_id, koma_model::SizeHints::from_min_max(min_sz, max_sz))
+            });
             let now = self.elapsed_ms();
             if let Some(ws) = self.workspaces.get_mut(&ws_id) {
                 ws.frame_clock.record_activity(now);
+            }
+            if hints_changed {
+                self.sync_workspace_geometries(&ws_id);
             }
             notify_workspace_surface_damage(self, &ws_id);
             self.reconcile_idle_inhibitors();

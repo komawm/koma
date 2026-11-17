@@ -519,10 +519,13 @@ fn deserialize_opt_xkb_options<'de, D: Deserializer<'de>>(
     }
 }
 
-/// Default keyboard repeat delay (`ms`) matching initial seat setup.
-pub const DEFAULT_KEYBOARD_REPEAT_DELAY_MS: i32 = 220;
-/// Default keyboard repeat rate (`Hz`) matching initial seat setup.
-pub const DEFAULT_KEYBOARD_REPEAT_RATE_HZ: i32 = 35;
+/// Default keyboard repeat delay (`ms`), matching Hyprland's `repeat_delay` default so a
+/// configuration migrated from Hyprland keeps the same typing feel
+/// (komawm/koma#44).
+pub const DEFAULT_KEYBOARD_REPEAT_DELAY_MS: i32 = 600;
+/// Default keyboard repeat rate (`Hz`), matching Hyprland's `repeat_rate` default
+/// (komawm/koma#44).
+pub const DEFAULT_KEYBOARD_REPEAT_RATE_HZ: i32 = 25;
 
 /// Typed XKB & repeat-rate settings under `koma.input({ keyboard = { ... } })`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1669,6 +1672,22 @@ mod tests {
             is_trackball: false,
             is_trackpoint: false,
         }
+    }
+
+    #[test]
+    fn keyboard_repeat_defaults_match_hyprland() {
+        // A config migrated from Hyprland that never sets `repeat_delay`/`repeat_rate` must keep
+        // Hyprland's 600 ms / 25 Hz defaults (komawm/koma#44).
+        let spec = KeyboardInputSpec::default();
+        assert_eq!(spec.effective_repeat_delay(), 600);
+        assert_eq!(spec.effective_repeat_rate(), 25);
+        assert_eq!(
+            (
+                DEFAULT_KEYBOARD_REPEAT_DELAY_MS,
+                DEFAULT_KEYBOARD_REPEAT_RATE_HZ
+            ),
+            (600, 25)
+        );
     }
 
     #[test]
