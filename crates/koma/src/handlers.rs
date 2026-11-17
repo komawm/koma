@@ -696,7 +696,11 @@ impl SeatHandler for KomaState {
         set_primary_focus(dh, seat, allow_primary.then_some(client).flatten());
 
         if self.is_locked_or_abandoned() {
-            self.clear_ime_state_for_lock();
+            // `focus_changed` runs while Smithay holds the keyboard mutex: only the IME half of
+            // the lock barrier is legal here. Shortcut inhibitors are reconciled with the explicit
+            // `focused` argument below, which avoids re-entering `KeyboardHandle::current_focus()`
+            // (komawm/koma#37).
+            self.clear_ime_focus_for_lock();
         } else if !self.ime_popups.is_empty() {
             let popups = self.ime_popups.clone();
             for popup in &popups {
