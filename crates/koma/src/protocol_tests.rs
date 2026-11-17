@@ -19,6 +19,9 @@ use smithay::reexports::wayland_protocols::ext::foreign_toplevel_list::v1::clien
 use smithay::reexports::wayland_protocols::ext::idle_notify::v1::client::{
     ext_idle_notification_v1, ext_idle_notifier_v1,
 };
+use smithay::reexports::wayland_protocols::ext::session_lock::v1::client::{
+    ext_session_lock_manager_v1, ext_session_lock_surface_v1, ext_session_lock_v1,
+};
 use smithay::reexports::wayland_protocols::wp::fractional_scale::v1::client::{
     wp_fractional_scale_manager_v1, wp_fractional_scale_v1,
 };
@@ -195,6 +198,9 @@ struct ClientHarness {
     gamma_sizes: Vec<u32>,
     gamma_failed: usize,
     locked_events: Vec<&'static str>,
+    session_lock_locked: usize,
+    session_lock_finished: usize,
+    session_lock_configures: Vec<(u32, u32, u32)>,
     confined_events: Vec<&'static str>,
     relative_motions: Vec<(f64, f64, f64, f64)>,
     icon_sizes: Vec<i32>,
@@ -418,6 +424,55 @@ impl Dispatch<wl_registry::WlRegistry, ()> for ClientHarness {
                 _ => {}
             }
             state.globals.insert(interface, (name, version));
+        }
+    }
+}
+
+impl Dispatch<ext_session_lock_manager_v1::ExtSessionLockManagerV1, ()> for ClientHarness {
+    fn event(
+        _: &mut Self,
+        _: &ext_session_lock_manager_v1::ExtSessionLockManagerV1,
+        _: ext_session_lock_manager_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &wayland_client::QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<ext_session_lock_v1::ExtSessionLockV1, ()> for ClientHarness {
+    fn event(
+        state: &mut Self,
+        _: &ext_session_lock_v1::ExtSessionLockV1,
+        event: ext_session_lock_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &wayland_client::QueueHandle<Self>,
+    ) {
+        match event {
+            ext_session_lock_v1::Event::Locked => state.session_lock_locked += 1,
+            ext_session_lock_v1::Event::Finished => state.session_lock_finished += 1,
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<ext_session_lock_surface_v1::ExtSessionLockSurfaceV1, ()> for ClientHarness {
+    fn event(
+        state: &mut Self,
+        _: &ext_session_lock_surface_v1::ExtSessionLockSurfaceV1,
+        event: ext_session_lock_surface_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &wayland_client::QueueHandle<Self>,
+    ) {
+        if let ext_session_lock_surface_v1::Event::Configure {
+            serial,
+            width,
+            height,
+        } = event
+        {
+            state.session_lock_configures.push((serial, width, height));
         }
     }
 }
@@ -4191,6 +4246,132 @@ mod kom_0024_compat_tests {
             Some(koma_proto::DeliverySemantics::not_delivered_safe())
         );
     }
+}
+
+/// Drives the real `ext-session-lock-v1` wire protocol (`Locked` -> `Confirm` -> `Unlock`) against
+/// the headless seat and asserts every phase reaches a render pass (komawm/koma#37).
+///
+/// Reproduces the KOM-0043 hang: `SessionLockHandler::new_surface` reconciles keyboard focus while
+/// the session is locked, Smithay calls `SeatHandler::focus_changed` while holding the keyboard
+/// mutex, and the locked branch re-entered `KeyboardHandle::current_focus()` -> self-deadlock.
+#[test]
+fn session_lock_acquire_confirm_unlock_cycles_schedule_rendering() {
+    use crate::state::{SessionLockPhase, is_surface_mapped, output_logical_viewport};
+
+    let mut env = ClientEnv::new();
+    let qh = env.queue.handle();
+    let manager = env
+        .client
+        .bind::<ext_session_lock_manager_v1::ExtSessionLockManagerV1>(
+            &env.registry,
+            &qh,
+            "ext_session_lock_manager_v1",
+        );
+    let compositor =
+        env.client
+            .bind::<wl_compositor::WlCompositor>(&env.registry, &qh, "wl_compositor");
+    let shm = env
+        .client
+        .bind::<wl_shm::WlShm>(&env.registry, &qh, "wl_shm");
+    let wl_out = env.client.outputs[0].clone();
+
+    let out = env.state.test_outputs[0].clone();
+    let (width, height, scale) = output_logical_viewport(&out);
+    assert_eq!(scale, 1.0, "test output must be integer-scaled");
+    let stride = width * 4;
+    let shm_fd = create_portable_shm_fd((stride * height) as usize, None);
+    let pool = shm.create_pool(shm_fd.as_fd(), (stride * height) as i32, &qh, ());
+    let buffer = pool.create_buffer(
+        0,
+        width as i32,
+        height as i32,
+        stride as i32,
+        wl_shm::Format::Argb8888,
+        &qh,
+        (),
+    );
+
+    for cycle in 0..3 {
+        // --- Acquire ------------------------------------------------------------
+        env.state.redraw_queued = false;
+        let lock = manager.lock(&qh, ());
+        env.pump();
+        assert_eq!(
+            env.client.session_lock_locked,
+            cycle + 1,
+            "client got Locked"
+        );
+        assert!(
+            matches!(env.state.session_lock.phase, SessionLockPhase::Locked(_)),
+            "compositor must transition to Locked"
+        );
+        assert!(
+            env.state.redraw_queued,
+            "acquire must schedule a blackout render pass"
+        );
+
+        // --- Confirm: lock surface create + configure + first commit ------------
+        let surface = compositor.create_surface(&qh, ());
+        let lock_surface = lock.get_lock_surface(&surface, &wl_out, &qh, ());
+        env.state.redraw_queued = false;
+        env.pump();
+        assert_eq!(
+            env.state.session_lock.surfaces.len(),
+            1,
+            "LockSurface must be registered for the output"
+        );
+        let configure = *env
+            .client
+            .session_lock_configures
+            .last()
+            .expect("lock surface must receive a configure");
+        assert_eq!((configure.1, configure.2), (width, height));
+
+        lock_surface.ack_configure(configure.0);
+        surface.attach(Some(&buffer), 0, 0);
+        env.state.redraw_queued = false;
+        surface.commit();
+        env.pump();
+        let lock_surface_ref = env
+            .state
+            .session_lock
+            .active_lock_surface_for_output(&out)
+            .cloned()
+            .expect("lock surface stays active");
+        assert!(
+            is_surface_mapped(lock_surface_ref.wl_surface()),
+            "committed lock surface must be mapped so the locked frame draws it"
+        );
+        assert!(
+            env.state.redraw_queued,
+            "LockSurface commit must schedule a render pass while locked"
+        );
+
+        // --- Unlock -------------------------------------------------------------
+        env.state.redraw_queued = false;
+        lock.unlock_and_destroy();
+        env.pump();
+        assert_eq!(
+            env.state.session_lock.phase,
+            SessionLockPhase::Unlocked,
+            "unlock must return to Unlocked"
+        );
+        assert!(
+            env.state.session_lock.surfaces.is_empty(),
+            "unlock must not leak LockSurface handles"
+        );
+        assert!(
+            env.state.redraw_queued,
+            "unlock must schedule a render pass of the unlocked scene"
+        );
+
+        surface.destroy();
+        env.pump();
+    }
+
+    assert_eq!(env.client.session_lock_finished, 0);
+    buffer.destroy();
+    pool.destroy();
 }
 
 /// `komawm/koma#33`: a split must never configure a client below the `xdg_toplevel.set_min_size`

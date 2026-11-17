@@ -3568,13 +3568,27 @@ impl KomaState {
 impl KomaState {
     /// Fail-closed IME barrier enforced whenever `SessionLockPhase != Unlocked`:
     /// drops active `zwp_text_input_v3` focus/enter and discards all IME popup surfaces.
-    pub fn clear_ime_state_for_lock(&mut self) {
+    ///
+    /// Safe to call from inside a Smithay seat callback: it never re-enters the seat handles.
+    /// Callers that are *not* running inside [`crate::state::KomaState::focus_changed`] should
+    /// also reconcile keyboard-shortcut inhibitors ([`Self::clear_ime_state_for_lock`] does).
+    pub fn clear_ime_focus_for_lock(&mut self) {
         let text_input = self.seat.text_input();
         if text_input.focus().is_some() {
             text_input.leave();
             text_input.set_focus(None);
         }
         self.ime_popups.clear();
+    }
+
+    /// Full lock barrier: drops IME focus/popups and re-evaluates keyboard-shortcut inhibitors.
+    ///
+    /// Must NOT be called from a seat callback that already holds the keyboard mutex
+    /// (`SeatHandler::focus_changed`), because [`Self::reconcile_keyboard_shortcuts_inhibitors`]
+    /// takes `KeyboardHandle::current_focus()` on the same non-reentrant mutex
+    /// (komawm/koma#37: `ext-session-lock-v1` acquire deadlocked the whole event loop).
+    pub fn clear_ime_state_for_lock(&mut self) {
+        self.clear_ime_focus_for_lock();
         self.reconcile_keyboard_shortcuts_inhibitors();
     }
 
