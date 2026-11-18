@@ -2,9 +2,9 @@
 
 ## Scope and authority
 
-This repository owns Koma's nine Rust crates, Koma configuration examples and session resources. Canonical specifications belong to [koma-docs](https://github.com/komawm/docs), Jiku belongs to [jiku](https://github.com/komawm/jiku), and the LuaLS snapshot belongs to [koma-types](https://github.com/komawm/koma-types). Read the [workspace guidance](https://github.com/komawm/.github/blob/main/workspace/AGENTS.md), [current-state inventory](https://github.com/komawm/docs/blob/main/docs/development/current-state.md), and relevant specifications before editing. The [repository descriptor](https://github.com/komawm/koma/blob/main/repo.toml) owns identity; the [workspace map](https://github.com/komawm/.github/blob/main/workspace/workspace.toml) owns checkout routing.
+This repository owns Koma's eight Rust crates, Koma configuration examples and session resources. Canonical specifications belong to [koma-docs](https://github.com/komawm/docs), Jiku belongs to [jiku](https://github.com/komawm/jiku), and the LuaLS snapshot belongs to [koma-types](https://github.com/komawm/koma-types). Read the [workspace guidance](https://github.com/komawm/.github/blob/main/workspace/AGENTS.md), [current-state inventory](https://github.com/komawm/docs/blob/main/docs/development/current-state.md), and relevant specifications before editing. The [repository descriptor](https://github.com/komawm/koma/blob/main/repo.toml) owns identity; the [workspace map](https://github.com/komawm/.github/blob/main/workspace/workspace.toml) owns checkout routing.
 
-Keep the nine Koma crates within this Git repository. There are no submodules. Phodopus is an independent upstream repository and a Cargo dependency; do not copy its implementation here or change its ABI incidentally. Jiku is an independent repository with its own CLI and daemon; do not duplicate or silently re-implement its orchestration here. Do not describe proposed or unmeasured behavior as shipped, secure, portable, or latency-verified.
+Keep the eight Koma crates within this Git repository. There are no submodules. Phodopus is an independent upstream repository and a Cargo dependency; do not copy its implementation here or change its ABI incidentally. Jiku is an independent repository with its own CLI and daemon; do not duplicate or silently re-implement its orchestration here. Do not describe proposed or unmeasured behavior as shipped, secure, portable, or latency-verified.
 
 ## Work lifecycle
 
@@ -24,7 +24,7 @@ Read the [CarryCtx rule catalog](https://github.com/komawm/koma/blob/main/.carry
 
 Use the pinned [toolchain](https://github.com/komawm/koma/blob/main/rust-toolchain.toml) and [justfile](https://github.com/komawm/koma/blob/main/justfile) for local and CI commands. Begin with `just --list`, then relevant metadata, formatting, core tests and full feature checks. A passing core suite does not establish Phodopus integration, Smithay compilation, rendering, session lifecycle, security isolation or hardware behavior. Report preexisting failures with their commands and logs. Do not weaken CI to make an unresolved baseline appear green.
 
-Keep protocol changes coordinated across `koma-proto`, compositor handlers, `komactl`, `koma-mcp` and the [IPC specification](https://github.com/komawm/docs/blob/main/docs/IPC_SPEC.md). Preserve epoch/capability checks, input release symmetry, protected-capture behavior and bounded host execution. Treat timing and isolation guarantees as acceptance requirements requiring measurements and adversarial tests.
+Keep protocol changes coordinated across `koma-proto`, compositor handlers, `komactl`, the `koma mcp` subcommand and the [IPC specification](https://github.com/komawm/docs/blob/main/docs/IPC_SPEC.md). Preserve epoch/capability checks, input release symmetry, protected-capture behavior and bounded host execution. Treat timing and isolation guarantees as acceptance requirements requiring measurements and adversarial tests.
 
 ## Local environment and artifacts
 

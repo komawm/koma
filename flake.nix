@@ -68,7 +68,7 @@
             pname = "koma";
             strictDeps = true;
             buildInputs = runtimeLibs;
-            cargoExtraArgs = "--locked -p koma -p komactl -p koma-mcp -p koma-overview";
+            cargoExtraArgs = "--locked -p koma -p komactl -p koma-overview";
           };
 
           cargoArtifacts = craneLib.buildDepsOnly commonArgs;
@@ -96,7 +96,7 @@
 
             postFixup = ''
               rpath="${pkgs.lib.makeLibraryPath runtimeLibs}"
-              for bin in "$out/bin/koma" "$out/bin/komactl" "$out/bin/koma-mcp" "$out/bin/koma-overview"; do
+              for bin in "$out/bin/koma" "$out/bin/komactl" "$out/bin/koma-overview"; do
                 if [ -x "$bin" ]; then
                   existing="$(patchelf --print-rpath "$bin" || true)"
                   if [ -n "$existing" ]; then

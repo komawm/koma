@@ -152,7 +152,6 @@ jobs:
             -p koma-lua \
             -p koma-seat \
             -p komactl \
-            -p koma-mcp \
             -- --test-threads=4
           # shellcheck disable=SC2086
           cargo check --locked $EXTRA_FLAGS -p koma-overview --no-default-features --all-targets

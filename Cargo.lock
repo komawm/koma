@@ -687,18 +687,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "koma-mcp"
-version = "0.0.2"
-dependencies = [
- "base64",
- "koma-lua",
- "koma-proto",
- "serde",
- "serde_json",
- "thiserror 2.0.21",
-]
-
-[[package]]
 name = "koma-model"
 version = "0.0.2"
 dependencies = [

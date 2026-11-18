@@ -8,7 +8,6 @@ members = [
     "crates/koma-seat",
     "crates/koma",
     "crates/komactl",
-    "crates/koma-mcp",
     "crates/koma-overview",
 ]
 default-members = [
@@ -16,7 +15,6 @@ default-members = [
     "crates/koma-model",
     "crates/koma-lua",
     "crates/komactl",
-    "crates/koma-mcp",
     "crates/koma-overview",
 ]
 

@@ -4,7 +4,7 @@
 //! Enforces Koma's core TOCTOU safety invariant:
 //! 1. An agent can NEVER execute a mutating tool on a workspace whose UI state has not been
 //!    observed (`koma_capture_frame` or `koma_scene_inventory`) at the current `Epoch`.
-//! 2. When `koma-agent.sock` rejects an action with `4090 ERR_STALE_EPOCH`, `koma-mcp` NEVER
+//! 2. When `koma-agent.sock` rejects an action with `4090 ERR_STALE_EPOCH`, `koma mcp` NEVER
 //!    blindly retries the stale click/keystroke/macro with the new epoch—instead, it immediately
 //!    performs a zero-copy `capture.frame` re-observation, records the new `Epoch`, and bundles
 //!    the fresh PNG screenshot + updated `new_observed_epoch` directly in the error response so
@@ -97,7 +97,7 @@ impl EpochObservationTracker {
     }
 
     /// Marks local state upon receiving an `IpcError` from `koma-agent.sock` and indicates whether
-    /// `koma-mcp` should immediately attach a fresh zero-copy `capture.frame` re-observation!
+    /// `koma mcp` should immediately attach a fresh zero-copy `capture.frame` re-observation!
     pub fn on_mutation_ipc_error(
         &mut self,
         ws_id: &WorkspaceId,
