@@ -15,10 +15,11 @@ use std::{
         fd::AsFd as _,
         unix::{fs::PermissionsExt as _, net::UnixListener},
     },
+    panic::AssertUnwindSafe,
+    path::PathBuf,
     time::{Duration, Instant},
 };
 
-use anyhow::Context as _;
 use calloop::{
     EventLoop, Interest, Mode, PostAction,
     generic::Generic,
@@ -26,7 +27,12 @@ use calloop::{
 };
 use calloop_wayland_source::WaylandSource;
 use koma_model::LogicalRect;
-use koma_proto::{WorkspaceId, rpc::WorkspaceModeSpec, scm_unix::create_writable_shm_fd};
+use koma_proto::{
+    WorkspaceId,
+    overview::{OverviewProbe, probe_overview_daemon, remove_owned_file, write_pid_file},
+    rpc::WorkspaceModeSpec,
+    scm_unix::create_writable_shm_fd,
+};
 use tracing::{debug, info, warn};
 use wayland_client::{
     Connection, Dispatch, QueueHandle, WEnum,
@@ -58,7 +64,7 @@ use crate::{
         HoverDwellMachine, HoverEffect, POPUP_CARD_HEIGHT, POPUP_CARD_WIDTH, POPUP_HEADER_HEIGHT,
         POPUP_PADDING_PX, PREVIEW_REFRESH_MS, THUMBNAIL_HEIGHT, THUMBNAIL_WIDTH,
     },
-    ipc_bridge::{AdminIpcClient, InventoryWorkspaceItem, control_socket_path},
+    ipc_bridge::{AdminIpcClient, InventoryWorkspaceItem},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,16 +73,179 @@ pub enum LayerRoleTag {
     FullscreenGrid,
 }
 
+/// How long a freshly created layer surface may stay unconfigured before it is recreated.
+pub const CONFIGURE_TIMEOUT: Duration = Duration::from_millis(750);
+
+/// How many times one role's layer surface is recreated before the daemon gives up on it.
+pub const MAX_SURFACE_RECREATES: u8 = 3;
+
+/// Largest canvas the daemon will allocate for one frame (`256 MiB`), so a bogus configure size
+/// cannot abort the process through an allocation failure.
+pub const MAX_CANVAS_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Whether a layer surface created at `created_at` is still unconfigured after
+/// [`CONFIGURE_TIMEOUT`].
+///
+/// Split out of [`ActiveLayerWindow`] so the watchdog decision is testable without a live Wayland
+/// object: a compositor that never sends `configure` is the case that used to leave the daemon
+/// waiting silently.
+#[must_use]
+fn configure_is_overdue(configured: bool, created_at: Instant, now: Instant) -> bool {
+    !configured && now.saturating_duration_since(created_at) >= CONFIGURE_TIMEOUT
+}
+
+/// Why [`run_overview_daemon`] returned.
+///
+/// The daemon used to return a bare `anyhow::Result`, so a normal `quit` was indistinguishable from
+/// a fatal error and a panic left nothing behind. Every arm now carries a human-readable reason that
+/// `main` logs with `info!`/`error!` and mirrors to stderr, which is journald's stream for this
+/// process (komawm/koma#75).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DaemonExit {
+    /// A `quit` line arrived on the control socket (only `komawm/koma` tests and operators do this).
+    ControlQuit {
+        /// Control socket the daemon owned.
+        socket: PathBuf,
+        /// How long the daemon served before the command.
+        uptime_ms: u64,
+    },
+    /// The host Wayland connection broke: the compositor exited, or it dropped this client.
+    WaylandDisconnected {
+        /// The IO error that ended the loop (`Broken pipe`, `Connection reset`, ...).
+        detail: String,
+        /// How long the daemon served before the connection broke.
+        uptime_ms: u64,
+    },
+    /// The `calloop` event loop failed for a reason other than a lost Wayland connection.
+    EventLoopError {
+        /// Full error chain reported by `calloop`.
+        detail: String,
+        /// How long the daemon served before the loop failed.
+        uptime_ms: u64,
+    },
+    /// A callback panicked; the loop was stopped instead of letting the process abort silently.
+    Panicked {
+        /// Panic message.
+        detail: String,
+        /// How long the daemon served before the panic.
+        uptime_ms: u64,
+    },
+    /// The daemon never reached its event loop (display, protocol, socket or pid file failure).
+    Startup {
+        /// What failed.
+        detail: String,
+    },
+}
+
+impl DaemonExit {
+    /// Builds a startup failure.
+    #[must_use]
+    pub fn startup(detail: impl Into<String>) -> Self {
+        Self::Startup {
+            detail: detail.into(),
+        }
+    }
+
+    /// Human-readable reason, used verbatim in the journal line.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        match self {
+            Self::ControlQuit { socket, uptime_ms } => {
+                format!(
+                    "`quit` requested on {} after {uptime_ms} ms",
+                    socket.display()
+                )
+            }
+            Self::WaylandDisconnected { detail, uptime_ms } => {
+                format!("Wayland connection lost after {uptime_ms} ms: {detail}")
+            }
+            Self::EventLoopError { detail, uptime_ms } => {
+                format!("event loop failed after {uptime_ms} ms: {detail}")
+            }
+            Self::Panicked { detail, uptime_ms } => {
+                format!("panicked after {uptime_ms} ms: {detail}")
+            }
+            Self::Startup { detail } => format!("startup failed: {detail}"),
+        }
+    }
+
+    /// Process exit code: `0` only for a requested `quit`.
+    #[must_use]
+    pub fn exit_code(&self) -> i32 {
+        match self {
+            Self::ControlQuit { .. } => 0,
+            _ => 1,
+        }
+    }
+}
+
+impl std::fmt::Display for DaemonExit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.describe())
+    }
+}
+
+/// Classifies a `calloop` dispatch failure.
+///
+/// `calloop-wayland-source` surfaces a lost display as an IO error inside a
+/// [`calloop::Error::OtherError`] chain (`other error during loop operation: underlying IO error:
+/// Broken pipe`), which is the exact line the daemon logged before it exited during compositor
+/// shutdown. Those are reported as [`DaemonExit::WaylandDisconnected`] so the reason reads
+/// `Wayland connection lost` instead of a generic loop error.
+#[must_use]
+pub fn classify_loop_error(err: &calloop::Error, uptime_ms: u64) -> DaemonExit {
+    let io = find_io_error(err);
+    match io.map(std::io::Error::kind) {
+        Some(
+            std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::NotConnected
+            | std::io::ErrorKind::UnexpectedEof,
+        ) => DaemonExit::WaylandDisconnected {
+            detail: io.map_or_else(|| err.to_string(), std::string::ToString::to_string),
+            uptime_ms,
+        },
+        _ => DaemonExit::EventLoopError {
+            detail: err.to_string(),
+            uptime_ms,
+        },
+    }
+}
+
+/// Walks an error's `source()` chain looking for an [`std::io::Error`].
+fn find_io_error<'a>(error: &'a (dyn std::error::Error + 'static)) -> Option<&'a std::io::Error> {
+    let mut current = Some(error);
+    while let Some(link) = current {
+        if let Some(io) = link.downcast_ref::<std::io::Error>() {
+            return Some(io);
+        }
+        current = link.source();
+    }
+    None
+}
+
 struct ActiveLayerWindow {
     wl_surface: WlSurface,
     layer_surface: ZwlrLayerSurfaceV1,
     configured_size: Option<(u32, u32)>,
+    /// When this surface was created, used to notice a missing `configure`.
+    created_at: Instant,
+    /// How many times this role's surface was already recreated for lack of a configure.
+    recreates: u8,
+    /// Anchor margins of the popup surface, preserved across recreations (`(left, top)`).
+    popup_margins: (i32, i32),
 }
 
 impl ActiveLayerWindow {
     fn destroy(self) {
         self.layer_surface.destroy();
         self.wl_surface.destroy();
+    }
+
+    /// `true` once the surface waited longer than [`CONFIGURE_TIMEOUT`] without a `configure`.
+    fn configure_is_overdue(&self, now: Instant) -> bool {
+        configure_is_overdue(self.configured_size.is_some(), self.created_at, now)
     }
 }
 
@@ -98,6 +267,9 @@ pub struct OverviewDaemon {
     // Active layer surfaces
     popup_win: Option<ActiveLayerWindow>,
     grid_win: Option<ActiveLayerWindow>,
+    /// Set once a role exhausted [`MAX_SURFACE_RECREATES`], so the give-up warning is emitted once.
+    grid_recreate_suppressed: bool,
+    popup_recreate_suppressed: bool,
 
     // State machines & Koma IPC cache
     hover_fsm: HoverDwellMachine,
@@ -204,6 +376,10 @@ impl OverviewDaemon {
             existing.wl_surface.commit();
             return;
         }
+        self.create_popup_surface(margin_left, margin_top, 0);
+    }
+
+    fn create_popup_surface(&mut self, margin_left: i32, margin_top: i32, recreates: u8) {
         let (Some(comp), Some(ls)) = (&self.compositor, &self.layer_shell) else {
             return;
         };
@@ -227,6 +403,9 @@ impl OverviewDaemon {
             wl_surface,
             layer_surface,
             configured_size: None,
+            created_at: Instant::now(),
+            recreates,
+            popup_margins: (margin_left, margin_top),
         });
     }
 
@@ -245,8 +424,16 @@ impl OverviewDaemon {
         }
         let wl_surface = popup.wl_surface.clone();
 
+        let Some(canvas_len) = canvas_byte_len(POPUP_CARD_WIDTH, POPUP_CARD_HEIGHT) else {
+            warn!(
+                width = POPUP_CARD_WIDTH,
+                height = POPUP_CARD_HEIGHT,
+                "refusing to allocate an oversized hover-popup frame"
+            );
+            return;
+        };
         let meta = self.build_card_meta(ws_id, true);
-        let mut canvas = vec![0_u8; (POPUP_CARD_WIDTH * POPUP_CARD_HEIGHT * 4) as usize];
+        let mut canvas = vec![0_u8; canvas_len];
         let card_rect = LogicalRect::new(0, 0, POPUP_CARD_WIDTH, POPUP_CARD_HEIGHT);
         let header_rect = LogicalRect::new(
             POPUP_PADDING_PX as i32,
@@ -301,7 +488,14 @@ impl OverviewDaemon {
         self.grid.is_open = true;
         self.grid
             .recompute_layout(self.output_size.0, self.output_size.1, &ws_ids);
+        self.create_grid_surface(0);
+    }
 
+    /// Creates (or recreates) the full-screen grid surface.
+    ///
+    /// `recreates` counts how many times this surface was already recreated because the compositor
+    /// closed it or never configured it; a transient configure failure must never end the daemon.
+    fn create_grid_surface(&mut self, recreates: u8) {
         let (Some(comp), Some(ls)) = (&self.compositor, &self.layer_shell) else {
             return;
         };
@@ -324,7 +518,92 @@ impl OverviewDaemon {
             wl_surface,
             layer_surface,
             configured_size: None,
+            created_at: Instant::now(),
+            recreates,
+            popup_margins: (0, 0),
         });
+    }
+
+    /// Recreates the grid surface after a compositor `closed` event or a missing `configure`.
+    ///
+    /// Bounded by [`MAX_SURFACE_RECREATES`]: after that the daemon keeps running and reports once
+    /// that the compositor is refusing the surface, instead of exiting.
+    fn recreate_grid_surface(&mut self, reason: &str) {
+        let recreates = self.grid_win.as_ref().map_or(0, |win| win.recreates);
+        if recreates >= MAX_SURFACE_RECREATES {
+            if !self.grid_recreate_suppressed {
+                self.grid_recreate_suppressed = true;
+                warn!(
+                    namespace = "koma-overview",
+                    reason,
+                    recreates,
+                    "compositor keeps refusing the overview layer surface; keeping the daemon alive \
+                     without the grid"
+                );
+            }
+            if let Some(win) = self.grid_win.take() {
+                win.destroy();
+            }
+            self.grid.is_open = false;
+            return;
+        }
+        warn!(
+            namespace = "koma-overview",
+            reason,
+            attempt = recreates + 1,
+            "recreating the overview layer surface"
+        );
+        if let Some(win) = self.grid_win.take() {
+            win.destroy();
+        }
+        self.create_grid_surface(recreates + 1);
+    }
+
+    /// Recreates the hover popup after a compositor `closed` event, bounded like the grid.
+    fn recreate_popup_surface(&mut self, reason: &str) {
+        let Some(win) = self.popup_win.take() else {
+            return;
+        };
+        let recreates = win.recreates;
+        let (margin_left, margin_top) = win.popup_margins;
+        win.destroy();
+        if recreates >= MAX_SURFACE_RECREATES {
+            if !self.popup_recreate_suppressed {
+                self.popup_recreate_suppressed = true;
+                warn!(
+                    namespace = "koma-overview-popup",
+                    reason,
+                    recreates,
+                    "compositor keeps refusing the hover popup layer surface; hover preview disabled"
+                );
+            }
+            return;
+        }
+        self.create_popup_surface(margin_left, margin_top, recreates + 1);
+    }
+
+    /// `calloop` timer hook: notices a layer surface that never received a `configure`.
+    ///
+    /// A compositor that refuses the surface (`zwlr_layer_surface_v1.closed`, or a configure it
+    /// drops) used to leave the daemon waiting forever with no diagnostic; here the surface is
+    /// recreated a bounded number of times and the daemon keeps serving the control socket.
+    fn poll_surface_configure(&mut self) {
+        let now = Instant::now();
+        if self
+            .grid_win
+            .as_ref()
+            .is_some_and(|win| win.configure_is_overdue(now))
+        {
+            self.recreate_grid_surface("configure timeout");
+            return;
+        }
+        if self
+            .popup_win
+            .as_ref()
+            .is_some_and(|win| win.configure_is_overdue(now))
+        {
+            self.recreate_popup_surface("configure timeout");
+        }
     }
 
     fn close_fullscreen_grid(&mut self) {
@@ -372,7 +651,15 @@ impl OverviewDaemon {
             }
         }
 
-        let mut canvas = vec![0_u8; (w * h * 4) as usize];
+        let Some(canvas_len) = canvas_byte_len(w, h) else {
+            warn!(
+                width = w,
+                height = h,
+                "refusing to allocate an oversized overview grid frame"
+            );
+            return;
+        };
+        let mut canvas = vec![0_u8; canvas_len];
         clear_argb8888_canvas(&mut canvas, ARGB_BACKDROP_DIM);
         for slot in &slots_snapshot {
             let meta = self.build_card_meta(&slot.ws_id, slot.is_selected);
@@ -438,9 +725,40 @@ impl OverviewDaemon {
     }
 }
 
-pub fn run_overview_daemon() -> anyhow::Result<()> {
-    let conn = Connection::connect_to_env()
-        .context("failed connecting to host Wayland display (WAYLAND_DISPLAY)")?;
+/// Runs the persistent daemon until something ends it, and reports why.
+///
+/// Every exit path is a [`DaemonExit`]; nothing returns silently. A layer-surface configure failure
+/// is *not* an exit path any more: the surface is recreated a bounded number of times while the
+/// control socket keeps answering (`recreate_grid_surface` / `poll_surface_configure`).
+pub fn run_overview_daemon() -> DaemonExit {
+    let start = Instant::now();
+    let paths = match crate::ipc_bridge::runtime_lifecycle_paths() {
+        Ok(paths) => paths,
+        Err(err) => {
+            return DaemonExit::startup(format!(
+                "instance runtime directory is unavailable: {err}"
+            ));
+        }
+    };
+
+    // Refuse to steal a live daemon's socket: the old code unlinked and rebound, which left the
+    // first daemon running with no reachable socket (`komawm/koma#75`).
+    if let OverviewProbe::Live { pid } = probe_overview_daemon(&paths) {
+        return DaemonExit::startup(format!(
+            "another koma-overview daemon {} already listens on {}",
+            pid.map_or_else(|| "of unknown pid".to_owned(), |pid| format!("(pid {pid})")),
+            paths.socket.display()
+        ));
+    }
+
+    let conn = match Connection::connect_to_env() {
+        Ok(conn) => conn,
+        Err(err) => {
+            return DaemonExit::startup(format!(
+                "failed connecting to the host Wayland display: {err:#}"
+            ));
+        }
+    };
     let mut event_queue = conn.new_event_queue::<OverviewDaemon>();
     let qh = event_queue.handle();
 
@@ -448,7 +766,7 @@ pub fn run_overview_daemon() -> anyhow::Result<()> {
     let _registry = display.get_registry(&qh, ());
 
     let mut daemon = OverviewDaemon {
-        start_time: Instant::now(),
+        start_time: start,
         should_exit: false,
         qh,
         compositor: None,
@@ -461,6 +779,8 @@ pub fn run_overview_daemon() -> anyhow::Result<()> {
         pointer_xy: (0.0, 0.0),
         popup_win: None,
         grid_win: None,
+        grid_recreate_suppressed: false,
+        popup_recreate_suppressed: false,
         hover_fsm: HoverDwellMachine::default(),
         grid: OverviewGridState::default(),
         ipc: None,
@@ -468,81 +788,194 @@ pub fn run_overview_daemon() -> anyhow::Result<()> {
         frame_cache: HashMap::new(),
     };
 
-    event_queue
-        .roundtrip(&mut daemon)
-        .context("initial Wayland registry roundtrip failed")?;
-
+    if let Err(err) = event_queue.roundtrip(&mut daemon) {
+        return DaemonExit::startup(format!("initial Wayland registry roundtrip failed: {err}"));
+    }
     if daemon.layer_shell.is_none() {
-        anyhow::bail!("host Wayland compositor does not advertise zwlr_layer_shell_v1");
+        return DaemonExit::startup(
+            "the host compositor does not advertise zwlr_layer_shell_v1 (not a wlroots-compatible \
+             layer-shell host?)",
+        );
     }
 
-    let mut event_loop: EventLoop<'static, OverviewDaemon> = EventLoop::try_new()?;
+    let mut event_loop: EventLoop<'static, OverviewDaemon> = match EventLoop::try_new() {
+        Ok(event_loop) => event_loop,
+        Err(err) => return DaemonExit::startup(format!("failed creating the calloop loop: {err}")),
+    };
 
-    // 1. Multiplex Wayland client queue onto `calloop`
-    WaylandSource::new(conn, event_queue)
-        .insert(event_loop.handle())
-        .map_err(|e| anyhow::anyhow!("failed inserting WaylandSource into calloop: {e}"))?;
-
-    // 2. Bind local control socket (`koma-overview.ctl.sock`) for Waybar / Ironbar / keybind triggers
-    if let Ok(ctl_path) = control_socket_path() {
-        if ctl_path.exists() {
-            let _ = fs::remove_file(&ctl_path);
-        }
-        if let Some(parent) = ctl_path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        let listener = UnixListener::bind(&ctl_path)
-            .with_context(|| format!("failed binding {}", ctl_path.display()))?;
-        fs::set_permissions(&ctl_path, fs::Permissions::from_mode(0o600))?;
-        listener.set_nonblocking(true)?;
-        info!(ctl_socket = %ctl_path.display(), "koma-overview control socket listening");
-
-        event_loop
-            .handle()
-            .insert_source(
-                Generic::new(listener, Interest::READ, Mode::Level),
-                |_, listener, state| {
-                    while let Ok((mut stream, _)) = listener.accept() {
-                        let mut cmd = String::new();
-                        let _ = stream.read_to_string(&mut cmd);
-                        for line in cmd.lines() {
-                            state.handle_control_command(line.trim());
-                        }
-                    }
-                    Ok(PostAction::Continue)
-                },
-            )
-            .map_err(|e| anyhow::anyhow!("failed inserting control socket source: {e}"))?;
+    // 1. Multiplex the Wayland client queue onto `calloop`.
+    if let Err(err) = WaylandSource::new(conn, event_queue).insert(event_loop.handle()) {
+        return DaemonExit::startup(format!(
+            "failed inserting the Wayland source into calloop: {err}"
+        ));
     }
 
-    // 3. Periodic timer driving 150ms hover dwell checks & 8Hz live preview refreshes only when active
-    event_loop
-        .handle()
-        .insert_source(
-            Timer::from_duration(Duration::from_millis(25)),
-            |_, _, state| {
-                let now = state.elapsed_ms();
-                if let Some(fx) = state.hover_fsm.poll_tick(now) {
-                    state.apply_hover_effect(fx);
+    // 2. Bind the control socket for Waybar / Ironbar / keybind triggers.
+    if let Some(parent) = paths.socket.parent()
+        && let Err(err) = fs::create_dir_all(parent)
+    {
+        return DaemonExit::startup(format!("failed creating {}: {err}", parent.display()));
+    }
+    // Only reached when no listener answered, so the file is a stale inode from a dead daemon.
+    if paths.socket.exists() {
+        if let Err(err) = fs::remove_file(&paths.socket) {
+            return DaemonExit::startup(format!(
+                "failed reclaiming stale control socket {}: {err}",
+                paths.socket.display()
+            ));
+        }
+        debug!(
+            socket = %paths.socket.display(),
+            "reclaimed a stale koma-overview control socket"
+        );
+    }
+    let listener = match UnixListener::bind(&paths.socket) {
+        Ok(listener) => listener,
+        Err(err) => {
+            return DaemonExit::startup(format!(
+                "failed binding control socket {}: {err}",
+                paths.socket.display()
+            ));
+        }
+    };
+    if let Err(err) = fs::set_permissions(&paths.socket, fs::Permissions::from_mode(0o600)) {
+        return DaemonExit::startup(format!(
+            "failed setting control socket permissions on {}: {err}",
+            paths.socket.display()
+        ));
+    }
+    if let Err(err) = listener.set_nonblocking(true) {
+        return DaemonExit::startup(format!(
+            "failed making the control socket non-blocking: {err}"
+        ));
+    }
+    if let Err(err) = write_pid_file(&paths.pid_file) {
+        // Not fatal: the pid file only sharpens diagnostics, the socket is what callers use.
+        warn!(
+            pid_file = %paths.pid_file.display(),
+            %err,
+            "failed writing the koma-overview pid file"
+        );
+    }
+    info!(
+        ctl_socket = %paths.socket.display(),
+        pid = std::process::id(),
+        "koma-overview control socket listening"
+    );
+
+    if let Err(err) = event_loop.handle().insert_source(
+        Generic::new(listener, Interest::READ, Mode::Level),
+        |_, listener, state| {
+            while let Ok((mut stream, _)) = listener.accept() {
+                // A client that connects and never writes must not freeze the daemon: the
+                // accepted socket is blocking, so bound the read instead of waiting for EOF.
+                let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
+                let mut cmd = String::new();
+                let _ = stream.read_to_string(&mut cmd);
+                for line in cmd.lines() {
+                    state.handle_control_command(line.trim());
                 }
-                if state.grid.is_open {
-                    state.capture_and_draw_grid();
-                }
-                let next_ms = if state.grid.is_open {
-                    PREVIEW_REFRESH_MS
-                } else {
-                    25
+            }
+            Ok(PostAction::Continue)
+        },
+    ) {
+        let _ = fs::remove_file(&paths.socket);
+        remove_owned_file(&paths.pid_file, std::process::id());
+        return DaemonExit::startup(format!("failed inserting the control socket source: {err}"));
+    }
+
+    // 3. Periodic timer: 150ms hover dwell checks, 8Hz preview refresh while active, and a
+    //    configure watchdog for both layer surfaces.
+    if let Err(err) = event_loop.handle().insert_source(
+        Timer::from_duration(Duration::from_millis(25)),
+        |_, _, state| {
+            let now = state.elapsed_ms();
+            if let Some(fx) = state.hover_fsm.poll_tick(now) {
+                state.apply_hover_effect(fx);
+            }
+            state.poll_surface_configure();
+            if state.grid.is_open {
+                state.capture_and_draw_grid();
+            }
+            let next_ms = if state.grid.is_open {
+                PREVIEW_REFRESH_MS
+            } else {
+                25
+            };
+            TimeoutAction::ToDuration(Duration::from_millis(next_ms))
+        },
+    ) {
+        let _ = fs::remove_file(&paths.socket);
+        remove_owned_file(&paths.pid_file, std::process::id());
+        return DaemonExit::startup(format!("failed inserting the overview timer: {err}"));
+    }
+
+    let exit = loop {
+        if daemon.should_exit {
+            break DaemonExit::ControlQuit {
+                socket: paths.socket.clone(),
+                uptime_ms: uptime_ms(start),
+            };
+        }
+        // A panic in a rendering callback used to end the process with only a stderr line; the
+        // guard turns it into a described exit that `main` logs, and the panic hook adds the
+        // backtrace-friendly line.
+        match std::panic::catch_unwind(AssertUnwindSafe(|| {
+            event_loop.dispatch(Some(Duration::from_millis(50)), &mut daemon)
+        })) {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => break classify_loop_error(&err, uptime_ms(start)),
+            Err(payload) => {
+                break DaemonExit::Panicked {
+                    detail: panic_payload_message(payload.as_ref()),
+                    uptime_ms: uptime_ms(start),
                 };
-                TimeoutAction::ToDuration(Duration::from_millis(next_ms))
-            },
-        )
-        .map_err(|e| anyhow::anyhow!("failed inserting overview timer: {e}"))?;
+            }
+        }
+    };
 
-    while !daemon.should_exit {
-        event_loop.dispatch(Some(Duration::from_millis(50)), &mut daemon)?;
+    // Closing the loop first releases the `UnixListener`, so removing the path below cannot take
+    // away a socket that another daemon rebound in the meantime.
+    drop(event_loop);
+    // Remove this process' own socket and pid file so the next daemon binds cleanly and
+    // `komactl doctor` does not report a phantom socket.
+    let _ = fs::remove_file(&paths.socket);
+    remove_owned_file(&paths.pid_file, std::process::id());
+    debug!(
+        socket = %paths.socket.display(),
+        "removed the koma-overview control socket"
+    );
+    exit
+}
+
+/// Milliseconds since the daemon start, saturating for very long sessions.
+fn uptime_ms(start: Instant) -> u64 {
+    u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Renders a panic payload without assuming it is a `String`.
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_owned()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "non-string panic payload".to_owned()
     }
+}
 
-    Ok(())
+/// Largest canvas for `width x height` ARGB buffers, or `None` when the configure size is absurd.
+///
+/// A bogus size used to reach `vec![0; w * h * 4]`, whose multiplication could overflow or abort
+/// the whole daemon; refusing the frame keeps the socket alive.
+fn canvas_byte_len(width: u32, height: u32) -> Option<usize> {
+    let bytes = u64::from(width)
+        .checked_mul(u64::from(height))?
+        .checked_mul(4)?;
+    if bytes == 0 || bytes > MAX_CANVAS_BYTES {
+        return None;
+    }
+    usize::try_from(bytes).ok()
 }
 
 // ==============================================================================
@@ -640,12 +1073,23 @@ impl Dispatch<ZwlrLayerSurfaceV1, LayerRoleTag> for OverviewDaemon {
             }
             zwlr_layer_surface_v1::Event::Closed => match role {
                 LayerRoleTag::HoverPopup => {
+                    // Drop the closed proxy before the hover FSM tears the popup down, so a later
+                    // hover cannot send requests to a destroyed object.
+                    if let Some(win) = state.popup_win.take() {
+                        win.destroy();
+                    }
                     if let Some(fx) = state.hover_fsm.on_hover_leave() {
                         state.apply_hover_effect(fx);
                     }
+                    debug!(
+                        namespace = "koma-overview-popup",
+                        "compositor closed the hover popup layer surface"
+                    );
                 }
                 LayerRoleTag::FullscreenGrid => {
-                    state.close_fullscreen_grid();
+                    // The compositor closed the surface (no output, refused namespace, reload):
+                    // recreate it a bounded number of times instead of ending the daemon.
+                    state.recreate_grid_surface("compositor closed the layer surface");
                 }
             },
             _ => {}
@@ -881,5 +1325,116 @@ impl Dispatch<ZwlrLayerShellV1, ()> for OverviewDaemon {
         _c: &Connection,
         _q: &QueueHandle<Self>,
     ) {
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+
+    use super::*;
+
+    #[test]
+    fn a_broken_wayland_pipe_is_reported_as_a_lost_display() {
+        // The exact shape `calloop-wayland-source` produced in the live session:
+        // `other error during loop operation: underlying IO error: Broken pipe (os error 32)`.
+        let observed =
+            calloop::Error::OtherError(Box::new(io::Error::from(io::ErrorKind::BrokenPipe)));
+        let exit = classify_loop_error(&observed, 1_234);
+        match &exit {
+            DaemonExit::WaylandDisconnected { detail, uptime_ms } => {
+                assert!(*uptime_ms == 1_234);
+                assert!(
+                    detail.to_lowercase().contains("broken pipe"),
+                    "the io detail must be preserved: {detail}"
+                );
+            }
+            other => panic!("expected a lost display, got {other:?}"),
+        }
+        assert_eq!(exit.exit_code(), 1);
+        let described = exit.describe();
+        assert!(described.contains("Wayland connection lost"), "{described}");
+        assert!(described.contains("1234 ms"), "{described}");
+
+        let direct = classify_loop_error(
+            &calloop::Error::IoError(io::Error::from(io::ErrorKind::ConnectionReset)),
+            5,
+        );
+        assert!(matches!(direct, DaemonExit::WaylandDisconnected { .. }));
+    }
+
+    #[test]
+    fn other_loop_failures_keep_their_full_error_chain() {
+        let exit = classify_loop_error(&calloop::Error::InvalidToken, 10);
+        match &exit {
+            DaemonExit::EventLoopError { detail, uptime_ms } => {
+                assert_eq!(*uptime_ms, 10);
+                assert!(detail.contains("invalid token"), "{detail}");
+            }
+            other => panic!("expected an event-loop error, got {other:?}"),
+        }
+        assert!(exit.describe().contains("event loop failed"));
+        assert_eq!(exit.exit_code(), 1);
+    }
+
+    #[test]
+    fn a_requested_quit_is_a_clean_exit_with_the_socket_path() {
+        let exit = DaemonExit::ControlQuit {
+            socket: PathBuf::from("/run/user/1000/koma/1_wayland-1/koma-overview.ctl.sock"),
+            uptime_ms: 42,
+        };
+        assert_eq!(exit.exit_code(), 0);
+        let described = exit.describe();
+        assert!(described.contains("quit"), "{described}");
+        assert!(described.contains("koma-overview.ctl.sock"), "{described}");
+        assert!(described.contains("42 ms"), "{described}");
+    }
+
+    #[test]
+    fn startup_failures_and_panics_are_never_clean_exits() {
+        assert_eq!(DaemonExit::startup("no display").exit_code(), 1);
+        assert!(
+            DaemonExit::startup("no display")
+                .describe()
+                .contains("startup failed: no display")
+        );
+        let panicked = DaemonExit::Panicked {
+            detail: "index out of bounds".to_owned(),
+            uptime_ms: 7,
+        };
+        assert_eq!(panicked.exit_code(), 1);
+        assert!(panicked.describe().contains("panicked after 7 ms"));
+    }
+
+    #[test]
+    fn a_surface_without_a_configure_is_recreated_after_the_timeout() {
+        let created = Instant::now();
+        assert!(!configure_is_overdue(false, created, created));
+        assert!(!configure_is_overdue(
+            false,
+            created,
+            created + CONFIGURE_TIMEOUT / 2
+        ));
+        assert!(configure_is_overdue(
+            false,
+            created,
+            created + CONFIGURE_TIMEOUT
+        ));
+        // A configured surface is never "overdue", however long it has been on screen.
+        assert!(!configure_is_overdue(
+            true,
+            created,
+            created + CONFIGURE_TIMEOUT * 100
+        ));
+        // At least one recreation must be allowed, otherwise the watchdog would only give up.
+        const { assert!(MAX_SURFACE_RECREATES >= 1) };
+    }
+
+    #[test]
+    fn oversized_configure_sizes_are_refused_instead_of_allocating() {
+        assert_eq!(canvas_byte_len(2560, 1600), Some(2560 * 1600 * 4));
+        assert_eq!(canvas_byte_len(0, 10), None);
+        assert_eq!(canvas_byte_len(u32::MAX, u32::MAX), None);
+        assert_eq!(canvas_byte_len(65_536, 65_536), None);
     }
 }

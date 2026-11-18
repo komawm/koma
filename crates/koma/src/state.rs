@@ -7,6 +7,7 @@ use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
     ffi::OsString,
+    path::PathBuf,
     sync::{Arc, atomic::AtomicU64},
     time::{Duration, Instant},
 };
@@ -703,6 +704,11 @@ pub struct KomaState {
     pub keybind_repeat_timer_token: Option<RegistrationToken>,
     pub socket_name: OsString,
     pub instance_signature: Option<String>,
+    /// `$XDG_RUNTIME_DIR/koma/<instance_signature>`, owner of the admin socket and the
+    /// `koma-overview` control socket/pid file this compositor supervises (`komawm/koma#75`).
+    pub instance_runtime_dir: Option<PathBuf>,
+    /// Lifecycle state of the overview daemon (`Mod + Tab`).
+    pub overview_supervisor: crate::overview_daemon::OverviewSupervisor,
     pub primary_satellite: Option<SatelliteSlot>,
     pub workspace_satellites: HashMap<WorkspaceId, SatelliteSlot>,
     pub jailed_wayland_sockets: HashMap<WorkspaceId, JailedWaylandSocket>,
@@ -976,6 +982,8 @@ impl KomaState {
             keybind_repeat_timer_token: None,
             socket_name,
             instance_signature: None,
+            instance_runtime_dir: None,
+            overview_supervisor: crate::overview_daemon::OverviewSupervisor::default(),
             primary_satellite: None,
             workspace_satellites: HashMap::new(),
             jailed_wayland_sockets: HashMap::new(),

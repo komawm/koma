@@ -29,6 +29,19 @@ desktop, hardware support, or security guarantees.
   `--json` and `--grep <pattern>`, works offline, and merges the live
   configuration path, generation, and lock state when a socket is reachable.
 
+### Fixed
+
+- `koma-overview` daemon lifetime (`komawm/koma#75`): every exit path now logs a reason (startup
+  failure, requested `quit`, lost Wayland connection, event loop error, panic) instead of the daemon
+  disappearing silently, a panic hook routes panics to the journal, a compositor-closed or
+  never-configured layer surface is recreated a bounded number of times instead of ending the
+  process, an oversized `configure` size no longer reaches an unchecked allocation, and a duplicate
+  start refuses to unlink a live daemon's control socket. `koma-overview toggle` restarts a dead
+  daemon once (single-flight spawn lock, shared respawn budget, exponential backoff) and retries the
+  command; the compositor sends the toggle straight to the control socket and supervises the daemon
+  it starts through the child reaper, warning once with the socket path and stale pid instead of
+  failing every press, and `komactl doctor` gained `environment.overview-daemon`.
+
 ### Changed
 
 - `ext-workspace-v1`: an empty workspace now reports `hidden`, so a status bar

@@ -7,6 +7,7 @@ pub mod error;
 pub mod event;
 pub mod frame;
 pub mod ids;
+pub mod overview;
 pub mod rpc;
 
 #[cfg(unix)]

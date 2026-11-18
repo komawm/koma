@@ -48,6 +48,16 @@ pub fn control_socket_path() -> io::Result<PathBuf> {
     Ok(runtime_instance_dir()?.join(OVERVIEW_CONTROL_SOCK_NAME))
 }
 
+/// Every path the daemon lifecycle needs (socket, pid file, spawn lock, respawn budget).
+///
+/// Shared with the compositor supervisor and `komactl doctor` through `koma-proto`, so all three
+/// actors name the same files in their diagnostics.
+pub fn runtime_lifecycle_paths() -> io::Result<koma_proto::overview::OverviewPaths> {
+    Ok(koma_proto::overview::OverviewPaths::in_runtime_dir(
+        &runtime_instance_dir()?,
+    ))
+}
+
 pub struct AdminIpcClient {
     stream: UnixStream,
     next_id: u64,

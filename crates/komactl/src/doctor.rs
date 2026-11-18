@@ -22,6 +22,7 @@ use koma_lua::{
     ActionDescriptor, BindSpec, DEFAULT_HEAP_LIMIT_BYTES, KEYBIND_CATALOG, KomaConfigRegistry,
     TEMPLATE_VERSION, phodopus_bridge::PhodopusSandbox,
 };
+use koma_proto::overview::{OverviewPaths, OverviewProbe, probe_overview_daemon};
 use serde_json::{Value, json};
 
 use crate::{
@@ -115,14 +116,27 @@ impl Outputs {
 pub(crate) struct DoctorContext {
     pub outputs: Outputs,
     pub live: LiveProbe,
+    /// Control socket, pid file and respawn bookkeeping of the session's `koma-overview` daemon.
+    ///
+    /// `None` when no Koma instance runtime directory could be resolved at all; tests pass explicit
+    /// paths so the check is hermetic.
+    pub overview: Option<OverviewPaths>,
 }
 
 impl DoctorContext {
     #[must_use]
     pub(crate) fn detect() -> Self {
+        let live = config_probe::probe_live();
+        let admin_socket = match &live {
+            LiveProbe::Reachable { admin_socket, .. }
+            | LiveProbe::Unreachable { admin_socket, .. } => Some(admin_socket.clone()),
+            LiveProbe::Offline { .. } => None,
+        };
+        let overview = crate::admin_rpc::discover_overview_paths(admin_socket.as_deref());
         Self {
             outputs: Outputs::detect(),
-            live: config_probe::probe_live(),
+            live,
+            overview,
         }
     }
 }
@@ -982,6 +996,73 @@ fn check_runtime_dir(report: &mut Report) {
     }
 }
 
+/// Reports the state of the session's `koma-overview` daemon (`Mod + Tab`).
+///
+/// The daemon is a separate process with its own lifetime: a control socket file can outlive it,
+/// which is exactly the state in which every toggle used to fail with `ECONNREFUSED`
+/// (komawm/koma#75). The distinction between "answers", "file present but listener dead" and "never
+/// started" is what makes that diagnosable.
+fn check_overview_daemon(overview: Option<&OverviewPaths>, report: &mut Report) {
+    const CHECK: &str = "environment.overview-daemon";
+    let Some(paths) = overview else {
+        report.push(
+            "environment",
+            CHECK,
+            Severity::Skip,
+            "no Koma instance runtime directory found; start a session or set \
+             KOMA_INSTANCE_SIGNATURE to check the overview daemon"
+                .to_owned(),
+        );
+        return;
+    };
+
+    match probe_overview_daemon(paths) {
+        OverviewProbe::Live { pid } => report.push(
+            "environment",
+            CHECK,
+            Severity::Ok,
+            format!(
+                "{} answers{}",
+                paths.socket.display(),
+                pid.map_or_else(String::new, |pid| format!(" (daemon pid {pid})"))
+            ),
+        ),
+        OverviewProbe::Stale {
+            recorded_pid,
+            live_pid,
+            detail,
+        } => {
+            let pid_note = match (recorded_pid, live_pid) {
+                (Some(pid), None) => format!("; recorded daemon pid {pid} is gone"),
+                (Some(pid), Some(_)) => {
+                    format!("; recorded daemon pid {pid} is still running without serving it")
+                }
+                (None, _) => String::new(),
+            };
+            report.push(
+                "environment",
+                CHECK,
+                Severity::Warn,
+                format!(
+                    "{} exists but nothing is listening ({detail}){pid_note}; press the overview \
+                     chord to restart it (`Mod + Tab`)",
+                    paths.socket.display()
+                ),
+            );
+        }
+        OverviewProbe::Absent => report.push(
+            "environment",
+            CHECK,
+            Severity::Skip,
+            format!(
+                "no koma-overview control socket in {}; no overview daemon was started for this \
+                 instance",
+                paths.runtime_dir().display()
+            ),
+        ),
+    }
+}
+
 fn check_live(
     live: &LiveProbe,
     config_path: &Path,
@@ -1212,6 +1293,7 @@ pub(crate) fn diagnose(config_path: &Path, context: &DoctorContext) -> Report {
     }
 
     check_runtime_dir(&mut report);
+    check_overview_daemon(context.overview.as_ref(), &mut report);
     check_live(&context.live, config_path, installed_template, &mut report);
 
     report
@@ -1255,7 +1337,7 @@ pub(crate) fn render_human(report: &Report) -> String {
             out.push_str(&format!("{area}\n"));
         }
         out.push_str(&format!(
-            "  {:<5} {:<20} {}\n",
+            "  {:<5} {:<28} {}\n",
             finding.severity.label(),
             finding.check,
             finding.message
@@ -1341,7 +1423,8 @@ Runs every non-destructive check and groups the rows by area:
   monitors     koma.monitor output names vs the kernel's connected connectors
   workspaces   duplicate workspace names, preferred outputs that are not connected
   rules        window/layer rule regexes, gesture specs
-  environment  XDG_RUNTIME_DIR, admin-socket reachability, live generation, lock state
+  environment  XDG_RUNTIME_DIR, admin-socket reachability, koma-overview daemon state,
+               live generation, lock state
 
 `doctor` reuses the same jailed Shadow-VM evaluation as `komactl validate`. A
 syntax error is reported as `error` and can never fail the compositor: Koma keeps
@@ -1462,6 +1545,14 @@ mod tests {
             live: LiveProbe::Offline {
                 detail: "unit test".to_owned(),
             },
+            overview: None,
+        }
+    }
+
+    fn context_with_overview(outputs: Outputs, overview: OverviewPaths) -> DoctorContext {
+        DoctorContext {
+            overview: Some(overview),
+            ..context(outputs)
         }
     }
 
@@ -1760,6 +1851,119 @@ mod tests {
         assert_eq!(connectors.len(), 1);
         assert_eq!(connectors[0].severity, Severity::Skip);
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// `environment.overview-daemon` — `ok` when the daemon answers.
+    #[test]
+    fn overview_daemon_answering_is_reported_as_ok() {
+        use std::os::unix::net::UnixListener;
+
+        let root = fixture("overview-ok", "koma.layout(\"dwindle\")\n");
+        let instance = temp_root("overview-ok-instance");
+        let paths = OverviewPaths::in_runtime_dir(&instance);
+        let listener = UnixListener::bind(&paths.socket).expect("bind the control socket");
+        fs::write(&paths.pid_file, format!("{}\n", std::process::id())).expect("write pid file");
+
+        let report = diagnose(
+            &root.join("init.lua"),
+            &context_with_overview(Outputs::Unavailable("unit test".to_owned()), paths.clone()),
+        );
+        let rows = finding(&report, "environment.overview-daemon");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].severity, Severity::Ok);
+        assert!(
+            rows[0].message.contains("koma-overview.ctl.sock"),
+            "{}",
+            rows[0].message
+        );
+        assert!(
+            rows[0].message.contains(&std::process::id().to_string()),
+            "the answering daemon pid must be named: {}",
+            rows[0].message
+        );
+        assert!(!report.has_warn());
+
+        drop(listener);
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&instance);
+    }
+
+    /// `environment.overview-daemon` — `warn` when the socket file outlived the listener.
+    #[test]
+    fn overview_socket_without_listener_is_a_warning_naming_the_stale_pid() {
+        use std::os::unix::net::UnixListener;
+
+        let root = fixture("overview-warn", "koma.layout(\"dwindle\")\n");
+        let instance = temp_root("overview-warn-instance");
+        let paths = OverviewPaths::in_runtime_dir(&instance);
+        // Bind and drop: the socket inode survives, the listener does not — the exact state every
+        // `Mod + Tab` press failed against in komawm/koma#75.
+        let listener = UnixListener::bind(&paths.socket).expect("bind the control socket");
+        drop(listener);
+        fs::write(&paths.pid_file, "4000000\n").expect("write a dead pid");
+
+        let report = diagnose(
+            &root.join("init.lua"),
+            &context_with_overview(Outputs::Unavailable("unit test".to_owned()), paths.clone()),
+        );
+        let rows = finding(&report, "environment.overview-daemon");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].severity, Severity::Warn);
+        assert!(
+            rows[0].message.contains("nothing is listening"),
+            "{}",
+            rows[0].message
+        );
+        assert!(rows[0].message.contains("4000000"), "{}", rows[0].message);
+        assert!(rows[0].message.contains("is gone"), "{}", rows[0].message);
+        assert!(report.has_warn());
+        assert_eq!(
+            report.exit_code(),
+            0,
+            "warnings stay non-fatal without --strict"
+        );
+
+        let mut strict = report.clone();
+        strict.strict = true;
+        assert_eq!(strict.exit_code(), 1, "--strict gates the warning");
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&instance);
+    }
+
+    /// `environment.overview-daemon` — `skip` when no daemon was ever started for the instance.
+    #[test]
+    fn overview_daemon_absent_is_skipped() {
+        let root = fixture("overview-skip", "koma.layout(\"dwindle\")\n");
+        let instance = temp_root("overview-skip-instance");
+        let paths = OverviewPaths::in_runtime_dir(&instance);
+
+        let report = diagnose(
+            &root.join("init.lua"),
+            &context_with_overview(Outputs::Unavailable("unit test".to_owned()), paths),
+        );
+        let rows = finding(&report, "environment.overview-daemon");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].severity, Severity::Skip);
+        assert!(
+            rows[0].message.contains("no overview daemon"),
+            "{}",
+            rows[0].message
+        );
+
+        // Without a resolvable instance directory the row is still present and skipped.
+        let report = diagnose(&root.join("init.lua"), &offline_context());
+        let rows = finding(&report, "environment.overview-daemon");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].severity, Severity::Skip);
+        assert!(
+            rows[0].message.contains("KOMA_INSTANCE_SIGNATURE"),
+            "{}",
+            rows[0].message
+        );
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&instance);
     }
 
     #[test]

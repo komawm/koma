@@ -10,6 +10,10 @@ use std::{
 
 use koma_proto::{
     ADMIN_SOCKET_NAME, AGENT_SOCKET_NAME, IpcRequest, IpcResponse, PrivilegeLevel, WorkspaceId,
+    overview::{
+        OVERVIEW_CONTROL_SOCK_NAME, OVERVIEW_PID_FILE_NAME, OVERVIEW_SPAWN_LOCK_NAME,
+        OVERVIEW_SPAWN_STATE_NAME, OverviewPaths,
+    },
     scm_unix::sync_roundtrip,
 };
 use serde::Deserialize;
@@ -83,6 +87,58 @@ pub(crate) fn existing_admin_sockets() -> Vec<PathBuf> {
     }
     sockets.sort();
     sockets
+}
+
+/// Resolves the `koma-overview` daemon's socket, pid file and respawn bookkeeping.
+///
+/// Prefers the runtime directory of the compositor that answered (or whose socket exists), then the
+/// declared `KOMA_INSTANCE_SIGNATURE`, then the newest instance directory that holds any overview
+/// file. Returns `None` only when no instance directory can be found, which `komactl doctor`
+/// reports as `skip`.
+#[must_use]
+pub(crate) fn discover_overview_paths(admin_socket: Option<&Path>) -> Option<OverviewPaths> {
+    if let Some(dir) = admin_socket.and_then(Path::parent) {
+        return Some(OverviewPaths::in_runtime_dir(dir));
+    }
+
+    if let Ok(sig) = env::var("KOMA_INSTANCE_SIGNATURE") {
+        let bases = candidate_runtime_bases();
+        for base in &bases {
+            let dir = base.join("koma").join(&sig);
+            if dir.is_dir() {
+                return Some(OverviewPaths::in_runtime_dir(&dir));
+            }
+        }
+        // The declared instance has no runtime directory (yet, or any more). Diagnose *that*
+        // instance instead of silently reporting a different one found by the scan below.
+        return bases
+            .first()
+            .map(|base| OverviewPaths::in_runtime_dir(&base.join("koma").join(&sig)));
+    }
+
+    // External TTY / SSH invocation: select the newest instance that has any overview lifecycle
+    // file, so doctor still diagnoses a daemon whose compositor socket is not visible here.
+    let mut candidates = Vec::new();
+    for base in candidate_runtime_bases() {
+        let Ok(entries) = fs::read_dir(base.join("koma")) else {
+            continue;
+        };
+        candidates.extend(
+            entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|dir| {
+                    dir.join(OVERVIEW_CONTROL_SOCK_NAME).exists()
+                        || dir.join(OVERVIEW_PID_FILE_NAME).exists()
+                        || dir.join(OVERVIEW_SPAWN_STATE_NAME).exists()
+                        || dir.join(OVERVIEW_SPAWN_LOCK_NAME).exists()
+                }),
+        );
+    }
+    candidates.sort();
+    candidates
+        .pop()
+        .map(|dir| OverviewPaths::in_runtime_dir(&dir))
 }
 
 /// Resolves `$XDG_RUNTIME_DIR/koma/<signature>/koma-admin.sock` either from
