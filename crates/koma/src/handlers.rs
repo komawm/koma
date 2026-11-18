@@ -772,13 +772,22 @@ impl SeatHandler for KomaState {
             self.queue_redraw();
         }
 
-        if let Some(pointer) = self.ptr()
-            && let Some(ptr_surf) = pointer.current_focus()
-        {
-            let mut ptr_root = ptr_surf;
-            while let Some(p) = get_parent(&ptr_root) {
-                ptr_root = p;
-            }
+        // Smithay calls this while it holds the keyboard mutex, so the seat guard is tracking the
+        // callback scope: the pointer focus must be reduced to its root in its own acquisition
+        // scope, because `break_active_pointer_constraints` acquires the pointer again. Nesting
+        // that acquisition used to be swallowed by the guard, which also meant a focus change
+        // never actually broke a locked pointer constraint (komawm/koma#64).
+        let pointer_root = self
+            .ptr()
+            .and_then(|pointer| pointer.current_focus())
+            .map(|ptr_surf| {
+                let mut root = ptr_surf;
+                while let Some(parent) = get_parent(&root) {
+                    root = parent;
+                }
+                root
+            });
+        if let Some(ptr_root) = pointer_root {
             let same_root = focused.is_some_and(|f| {
                 let mut kb_root = f.clone();
                 while let Some(p) = get_parent(&kb_root) {
