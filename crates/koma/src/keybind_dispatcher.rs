@@ -32,7 +32,7 @@ use crate::{
     macro_runtime::{execute_queued_host_actions, rearm_trampoline_timer},
     pointer_grabs::{
         BTN_EXTRA, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, BTN_SIDE, cancel_active_pointer_grab,
-        start_compositor_move_grab, start_compositor_resize_grab,
+        start_compositor_move_grab, start_compositor_resize_grab, start_frame_edge_resize_grab,
     },
     state::KomaState,
 };
@@ -1065,7 +1065,26 @@ pub fn process_pointer_button_event(
         }
     }
 
-    // 4. Normal unintercepted click: clear any stale suppression, apply layer/window focus, and forward!
+    // 4. Frame edge/corner drag starts an interactive resize with no modifier
+    //    (`Hyprland` border-drag parity, komawm/koma#42).
+    if button_code == BTN_LEFT
+        && let Some(edge) = state.frame_edge_under_pointer(state.pointer_location)
+        && start_frame_edge_resize_grab(state, button_code, serial, edge)
+    {
+        pointer.button(
+            state,
+            &ButtonEvent {
+                button: button_code,
+                state: btn_state,
+                serial,
+                time,
+            },
+        );
+        pointer.frame(state);
+        return;
+    }
+
+    // 5. Normal unintercepted click: clear any stale suppression, apply layer/window focus, and forward!
     state.keybinds.suppressed_buttons.remove(&button_code);
     let cursor_pos = state.pointer_location;
     state.handle_pointer_button_focus(cursor_pos);

@@ -34,6 +34,23 @@ pub enum LayoutMode {
     Deck,
 }
 
+impl LayoutMode {
+    /// Whether a frame-edge drag can resize a window in this layout (`komawm/koma#42`).
+    ///
+    /// Floating windows are always resizable — they own their rectangle. Tiled windows resize the
+    /// split ratio or the strip column, which `Dwindle` and `Scrolling` both model. `Deck` lays the
+    /// active window out full-viewport, so there is no tile geometry to drag; a deck window has to be
+    /// floated first. This is the single policy table the grab entry point consults, so no layout
+    /// silently swallows a resize again.
+    #[must_use]
+    pub const fn supports_frame_edge_resize(self, is_floating: bool) -> bool {
+        match self {
+            Self::Dwindle | Self::Scrolling => true,
+            Self::Deck => is_floating,
+        }
+    }
+}
+
 /// Z-ordered floating window entry managed by `FloatingStack` (`Hyprland` `CDefaultFloatingAlgorithm`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FloatingEntry {
@@ -407,5 +424,19 @@ mod tests {
         );
         assert!(grown.w >= 240);
         assert!(grown.h >= 180);
+    }
+
+    #[test]
+    fn frame_edge_resize_policy_covers_every_layout_instead_of_a_silent_no_op() {
+        // Tiled resizing means "split ratio" (Dwindle) or "column width" (Scrolling): both defined.
+        assert!(LayoutMode::Dwindle.supports_frame_edge_resize(false));
+        assert!(LayoutMode::Scrolling.supports_frame_edge_resize(false));
+        // Deck lays the active window out full-viewport, so only a floating deck window resizes.
+        assert!(!LayoutMode::Deck.supports_frame_edge_resize(false));
+        assert!(LayoutMode::Deck.supports_frame_edge_resize(true));
+        // Floating windows own their rectangle in any layout.
+        for mode in [LayoutMode::Dwindle, LayoutMode::Scrolling, LayoutMode::Deck] {
+            assert!(mode.supports_frame_edge_resize(true), "{mode:?}");
+        }
     }
 }

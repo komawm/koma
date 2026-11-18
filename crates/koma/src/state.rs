@@ -19,9 +19,9 @@ use koma_lua::{
 use koma_model::{
     AgentCursorConfig, AgentCursorFrameSnapshot, AgentCursorVisualDynamics, LayoutMode,
     LogicalPoint, LogicalRect, LogicalViewport, OpenMode, OutputLayout, OutputTransform,
-    PresentationTarget, SafeAreaInsets, SavedOutputConfig, SizeHints, WindowAnimationTable,
-    WindowMatchContext, WindowRuleEngine, WorkspaceLeaseState, WorkspaceState,
-    WorkspaceTransitionTable, is_waydroid_app_id,
+    PresentationTarget, ResizeCorner, SafeAreaInsets, SavedOutputConfig, SizeHints,
+    WindowAnimationTable, WindowMatchContext, WindowRuleEngine, WorkspaceLeaseState,
+    WorkspaceState, WorkspaceTransitionTable, is_waydroid_app_id,
 };
 use koma_proto::{
     CapabilityToken, Epoch, EventTopic, OutputId, SeatId, TokenClaims, WindowId, WorkspaceEvent,
@@ -760,6 +760,11 @@ pub struct KomaState {
     /// Active `MoveWindowGrab` cursor state `(ws_id, cursor_x)` driving continuous VBlank edge auto-scroll.
     pub active_drag_edge_scroll: Option<(WorkspaceId, f64)>,
     pub edge_scroll_keep_alive: bool,
+    /// Frame edge currently hovered for interactive resize: `(win_id, corner)` plus the cursor
+    /// status to restore once the pointer leaves the edge (`Hyprland` border-drag parity).
+    pub frame_edge_hover: Option<(WindowId, ResizeCorner)>,
+    /// Cursor status captured when `frame_edge_hover` was entered, restored on exit.
+    pub cursor_before_frame_edge: Option<CursorImageStatus>,
     pub backdrop_blur_cache: RefCell<CachedBackdropBlur>,
     pub fbo_pool: LazyFboPool,
     pub offscreen_surfaces: HashMap<WorkspaceId, LazyOffscreenSurface>,
@@ -990,6 +995,8 @@ impl KomaState {
             active_drop_preview: None,
             active_drag_edge_scroll: None,
             edge_scroll_keep_alive: false,
+            frame_edge_hover: None,
+            cursor_before_frame_edge: None,
             backdrop_blur_cache: RefCell::new(CachedBackdropBlur::default()),
             fbo_pool: LazyFboPool::default(),
             offscreen_surfaces: HashMap::new(),
@@ -2956,6 +2963,109 @@ impl KomaState {
         };
         let out_origin = self.workspace_output_origin(ws_id);
         self.hit_test_window_in_workspace(ws_id, ws_local_pos, out_origin, b_off)
+    }
+
+    /// Resolves the interactive-resize grab edge under `global_pos`, front-to-back, so a frame
+    /// border or corner starts a resize without a modifier (`Hyprland` `DragController` parity).
+    ///
+    /// The grab zone is the outer frame ring: `appearance.border.width` plus a small slop, which is
+    /// exactly the strip Koma paints and the client surface does not cover. Fullscreen windows are
+    /// never resize targets, and a window whose frame is thinner than the slop on both axes still
+    /// resolves to its nearer edge.
+    #[must_use]
+    pub fn frame_edge_under_pointer(
+        &self,
+        global_pos: Point<f64, Logical>,
+    ) -> Option<(WindowId, WorkspaceId, ResizeCorner)> {
+        let border_cfg = self.lua_sandbox.config_snapshot().appearance.border;
+        let border_w = if border_cfg.enabled {
+            f64::from(border_cfg.width.max(0.0))
+        } else {
+            0.0
+        };
+        let threshold = (border_w + 4.0).max(6.0);
+
+        let has_outputs = !self.all_outputs().is_empty();
+        let output_name = match (has_outputs, self.output_at_point_strict(global_pos)) {
+            (true, None) => return None,
+            (_, Some(out)) => out.name(),
+            (false, None) => self.focused_output_name.clone().unwrap_or_default(),
+        };
+        let ws_id = self.active_workspace_for_output(&output_name);
+        let origin = self.workspace_output_origin(&ws_id);
+
+        // A `special:<name>` Scratchpad sits above the workspace and owns the pointer while open.
+        let mut candidates: Vec<&MappedWindow> = self
+            .mapped_windows
+            .iter()
+            .filter(|m| m.ws_id == ws_id && !m.is_minimized)
+            .collect();
+        let focused = self
+            .workspaces
+            .get(&ws_id)
+            .and_then(|ws| ws.active_window());
+        let fullscreen = self
+            .workspaces
+            .get(&ws_id)
+            .and_then(|ws| ws.fullscreen_window);
+        // Focused window first, then the rest: shared tiled borders resize the focused tile.
+        candidates.sort_by_key(|m| Some(m.win_id) != focused);
+
+        for mapped in candidates {
+            if fullscreen == Some(mapped.win_id) {
+                continue;
+            }
+            let frame = LogicalRect::new(
+                mapped.rect.x + origin.x as i32,
+                mapped.rect.y + origin.y as i32,
+                mapped.rect.w,
+                mapped.rect.h,
+            );
+            let point = LogicalPoint {
+                x: global_pos.x,
+                y: global_pos.y,
+            };
+            if let Some(corner) = ResizeCorner::frame_edge_at(frame, point, threshold) {
+                return Some((mapped.win_id, ws_id, corner));
+            }
+        }
+        None
+    }
+
+    /// Refreshes the interactive-resize hover cursor for `global_pos` and returns the edge under it.
+    ///
+    /// Entering an edge saves the current cursor status; leaving restores it, so a client-provided
+    /// cursor (I-beam, hand) is never permanently clobbered by Koma's resize arrow.
+    pub fn refresh_frame_edge_hover(
+        &mut self,
+        global_pos: Point<f64, Logical>,
+    ) -> Option<(WindowId, WorkspaceId, ResizeCorner)> {
+        let edge = self.frame_edge_under_pointer(global_pos);
+        match edge.clone() {
+            Some((win_id, _ws_id, corner)) => {
+                if self.frame_edge_hover.map(|(id, _)| id) != Some(win_id)
+                    || self.frame_edge_hover.map(|(_, c)| c) != Some(corner)
+                {
+                    if self.frame_edge_hover.is_none() {
+                        self.cursor_before_frame_edge = Some(self.cursor_manager.status().clone());
+                    }
+                    self.frame_edge_hover = Some((win_id, corner));
+                }
+                self.set_cursor_status(CursorImageStatus::Named(
+                    crate::pointer_grabs::cursor_icon_for_corner(corner),
+                ));
+            }
+            None => {
+                if self.frame_edge_hover.take().is_some() {
+                    let restore = self
+                        .cursor_before_frame_edge
+                        .take()
+                        .unwrap_or_else(CursorImageStatus::default_named);
+                    self.set_cursor_status(restore);
+                }
+            }
+        }
+        edge
     }
 
     /// Hit-tests `global_pos` across any open `special:<name>` Scratchpad first, then the output's
