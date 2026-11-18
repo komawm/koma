@@ -700,7 +700,6 @@ dependencies = [
 name = "koma-overview"
 version = "0.0.3"
 dependencies = [
- "anyhow",
  "calloop",
  "calloop-wayland-source",
  "koma-model",

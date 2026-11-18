@@ -2427,10 +2427,10 @@ pub fn execute_action_descriptor(
         }
 
         ActionDescriptor::OverviewToggle | ActionDescriptor::OverviewOpen => {
-            let mut cmd = Command::new("koma-overview");
-            cmd.arg("toggle");
-            state.configure_child_env(&mut cmd, None);
-            let _ = crate::child_reaper::spawn_detached(&mut cmd, "keybind.overview");
+            // The daemon is supervised by the compositor: the toggle is written straight to its
+            // control socket, a dead daemon is restarted with backoff, and the press is delivered
+            // once it answers (komawm/koma#75).
+            crate::overview_daemon::request_toggle(state);
         }
 
         ActionDescriptor::WorkspaceFocus(target) | ActionDescriptor::WorkspacePeek(target) => {

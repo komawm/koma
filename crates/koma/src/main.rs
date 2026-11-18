@@ -111,6 +111,8 @@ mod mcp;
 mod output_management;
 #[cfg(feature = "smithay-winit")]
 mod output_power;
+#[allow(clippy::module_name_repetitions)]
+mod overview_daemon;
 #[cfg(feature = "smithay-winit")]
 mod pointer_grabs;
 #[cfg(all(test, feature = "smithay-winit"))]
@@ -351,6 +353,7 @@ fn run_nested_winit(
     let ipc_paths =
         crate::ipc_server::start_dual_socket_server(&event_loop.handle(), &socket_name)?;
     state.instance_signature = Some(ipc_paths.instance_signature.clone());
+    state.instance_runtime_dir = Some(ipc_paths.runtime_dir.clone());
     crate::signals::listen_for_termination(&event_loop.handle())?;
     crate::xwayland_satellite::setup_primary_satellite(&mut state);
     finalize_session_startup(&state, is_session);
@@ -452,6 +455,7 @@ fn run_bare_metal_tty(
     let ipc_paths =
         crate::ipc_server::start_dual_socket_server(&event_loop.handle(), &socket_name)?;
     state.instance_signature = Some(ipc_paths.instance_signature.clone());
+    state.instance_runtime_dir = Some(ipc_paths.runtime_dir.clone());
     crate::signals::listen_for_termination(&event_loop.handle())?;
     crate::xwayland_satellite::setup_primary_satellite(&mut state);
     finalize_session_startup(&state, is_session);

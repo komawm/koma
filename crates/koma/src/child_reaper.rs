@@ -30,8 +30,9 @@
 //! entry would reintroduce the leak this module exists to prevent.
 
 use std::{
+    collections::VecDeque,
     io,
-    process::{Child, Command},
+    process::{Child, Command, ExitStatus},
     sync::{Mutex, MutexGuard, OnceLock},
     thread,
     time::Duration,
@@ -42,8 +43,19 @@ use tracing::{debug, error, warn};
 /// How often the reaper thread polls registered children.
 const REAP_INTERVAL: Duration = Duration::from_millis(500);
 
+/// How many reaped exit statuses are kept for supervisors that poll them after the fact.
+const RECENT_EXITS_CAPACITY: usize = 32;
+
 /// Children spawned by Koma that still need a `waitpid` call.
 static CHILDREN: OnceLock<Mutex<Vec<TrackedChild>>> = OnceLock::new();
+
+/// Exit statuses of recently reaped children, keyed by pid.
+///
+/// A supervisor (`koma-overview`, `xwayland-satellite`) needs to explain *why* the child it owns
+/// disappeared; the reaper is the only code that performs the `waitpid`, so it publishes the status
+/// here instead of dropping it into a `debug!` line. Bounded to the last
+/// [`RECENT_EXITS_CAPACITY`] exits: a caller that never asks cannot grow the map.
+static RECENT_EXITS: OnceLock<Mutex<VecDeque<(u32, ExitStatus)>>> = OnceLock::new();
 
 /// One registered child, tagged with its call site so a leak can be traced back.
 struct TrackedChild {
@@ -60,6 +72,39 @@ fn registry_guard() -> MutexGuard<'static, Vec<TrackedChild>> {
     registry()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn recent_exits() -> &'static Mutex<VecDeque<(u32, ExitStatus)>> {
+    RECENT_EXITS.get_or_init(|| Mutex::new(VecDeque::new()))
+}
+
+fn publish_exit(pid: u32, status: ExitStatus) {
+    let mut exits = recent_exits()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if exits.len() == RECENT_EXITS_CAPACITY {
+        exits.pop_front();
+    }
+    exits.push_back((pid, status));
+}
+
+/// Taken exit status of a child spawned through [`spawn_detached`], if it already exited.
+///
+/// The status is removed on the first call, so exactly one supervisor observes it; a child that is
+/// still running (or was never spawned through this module) returns `None`.
+pub(crate) fn take_exit_status(pid: u32) -> Option<ExitStatus> {
+    let mut exits = recent_exits()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let index = exits.iter().position(|(exited, _)| *exited == pid)?;
+    exits.remove(index).map(|(_, status)| status)
+}
+
+/// Whether `pid` is still registered as a running child of this compositor.
+pub(crate) fn is_running(pid: u32) -> bool {
+    registry_guard()
+        .iter()
+        .any(|tracked| tracked.child.id() == pid)
 }
 
 fn ensure_reaper_thread() {
@@ -91,6 +136,7 @@ pub(crate) fn reap_exited_children() {
     let mut children = registry_guard();
     children.retain_mut(|tracked| match tracked.child.try_wait() {
         Ok(Some(status)) => {
+            publish_exit(tracked.child.id(), status);
             debug!(
                 pid = tracked.child.id(),
                 origin = tracked.origin,
@@ -270,6 +316,39 @@ mod tests {
             "a running child must not be dropped from the registry"
         );
 
+        let leaked = wait_until_unregistered(&[pid], Duration::from_secs(10));
+        assert!(leaked.is_empty(), "child {pid} was never reaped");
+    }
+
+    /// A supervisor must be able to explain a child's disappearance, not just notice it.
+    #[test]
+    fn reaped_exit_status_is_published_once_for_supervisors() {
+        let pid = spawn_exiting_child();
+        let leaked = wait_until_unregistered(&[pid], Duration::from_secs(10));
+        assert!(leaked.is_empty(), "child {pid} was never reaped");
+
+        let status = take_exit_status(pid).expect("the exit status must be published");
+        assert!(
+            status.success(),
+            "`sh -c 'exit 0'` exits successfully: {status:?}"
+        );
+        assert!(
+            take_exit_status(pid).is_none(),
+            "the status is consumed by the supervisor that asks for it"
+        );
+        assert!(
+            !is_running(pid),
+            "a reaped pid must not be reported as running"
+        );
+    }
+
+    #[test]
+    fn running_child_is_reported_as_running() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "sleep 0.2"]);
+        let pid = spawn_detached(&mut cmd, "test.running_probe").expect("spawn `sleep`");
+        assert!(is_running(pid));
+        assert!(take_exit_status(pid).is_none());
         let leaked = wait_until_unregistered(&[pid], Duration::from_secs(10));
         assert!(leaked.is_empty(), "child {pid} was never reaped");
     }
