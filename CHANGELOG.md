@@ -10,6 +10,59 @@ desktop, hardware support, or security guarantees.
 
 ### Added
 
+- `Mod + M` toggles **maximize**: the focused window fills the work area minus
+  gaps and exclusive zones, so the bar stays visible. `Mod + F` is true
+  fullscreen: it covers the whole monitor including gaps and suppresses
+  `Overlay`/`Top` layer surfaces for that output while staying mapped, so the
+  bar returns the moment fullscreen ends. The two are mutually exclusive and
+  both derive from one `WindowPresentation` state, so geometry, xdg states,
+  foreign-toplevel and hit-testing cannot disagree. `Mod + Shift + M` keeps
+  `ScrollingMaximizeColumn`, and the new Lua action is
+  `koma.act.window.maximize_toggle()`.
+- Dragging a window's frame edge or corner resizes it with no modifier, with
+  W/E/N/S/NW/NE/SW/SE cursor shapes and the previous cursor restored on exit
+  (including a client-provided one). `Mod + right-drag` still works. Deck
+  refuses a tiled edge drag and says why instead of doing nothing silently;
+  `LayoutMode::supports_frame_edge_resize` is the single policy table.
+- `koma.input({ pointer = { follow_mouse = ... } })` is implemented with
+  Hyprland's `input:follow_mouse` semantics: `off` (0, click-to-focus only),
+  `normal` (1, default: focus follows and raises), and `focus_only` (2: focus
+  follows without changing the workspace's active window or stacking). Unknown
+  values fall back to `normal`.
+- `move_to_workspace` follows the moved window to the destination workspace;
+  `koma.act.window.move_to_workspace(ws, { follow = false })` keeps the source
+  workspace focused (Hyprland `movetoworkspacesilent`).
+
+### Fixed
+
+- Tiled clients are no longer configured below the `xdg_toplevel` minimum size
+  they advertise. Chromium and Firefox refused to shrink past their minimum and
+  kept committing a cropped, un-reflowed buffer, which the compositor masked to
+  the too-small tile; splitting such a window to half width showed only its left
+  half. Per-window `SizeHints` now clamp every tiled geometry path, including
+  fullscreen and maximize rects.
+- A nested `koma --winit` presents upright. The EGL window surface handed the
+  parent compositor a vertically mirrored buffer while the compose step is
+  target-independent, so the nested desktop appeared upside down; the nested
+  damage tracker now composes with `Flipped180` while the output transform stays
+  `Normal`, and input needs no remap because the two mirrors cancel.
+- `ext-session-lock-v1` acquire no longer freezes the compositor. `set_focus`
+  dispatches `focus_changed` while holding Smithay's non-reentrant keyboard
+  mutex, and the locked-mode IME barrier re-entered it through
+  `current_focus()`, deadlocking the single event loop: no frames, no input and
+  an ignored SIGTERM.
+- Spawned children are reaped, so `spawn` no longer accumulates zombies that
+  break `pkill X || X`.
+- Client-side-decorated windows are no longer composited down and right by the
+  height of their window geometry.
+- Held keys repeat at 600 ms / 25 Hz, matching the Hyprland defaults a migrated
+  desktop expects, and the applied values are logged.
+- Translucent overlays no longer wash the screen: solid-color elements
+  premultiply their straight-alpha colors for the premultiplied GLES blender, so
+  the drag drop-zone fill, scratchpad scrim, grid hairlines and tab indicators
+  render at their intended opacity instead of `1/alpha`.
+- `Mod + left-drag` moving a window no longer flashes the background: the
+  drop-zone fill was the same premultiplication bug, painted at full intensity.
 - `komactl init [dir] [--force]` scaffolds a commented configuration tree
   (`init.lua`, `lua/input.lua`, `lua/workspaces.lua`, `lua/appearance.lua`,
   `lua/window_rules.lua`, `lua/keybinds.lua`, `lua/macros/example.lua`). The
