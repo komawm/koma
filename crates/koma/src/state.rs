@@ -19,7 +19,7 @@ use koma_lua::{
 use koma_model::{
     AgentCursorConfig, AgentCursorFrameSnapshot, AgentCursorVisualDynamics, LayoutMode,
     LogicalPoint, LogicalRect, LogicalViewport, OpenMode, OutputLayout, OutputTransform,
-    PresentationTarget, SafeAreaInsets, SavedOutputConfig, WindowAnimationTable,
+    PresentationTarget, SafeAreaInsets, SavedOutputConfig, SizeHints, WindowAnimationTable,
     WindowMatchContext, WindowRuleEngine, WorkspaceLeaseState, WorkspaceState,
     WorkspaceTransitionTable, is_waydroid_app_id,
 };
@@ -113,7 +113,7 @@ const TILED_TOPLEVEL_STATES: [xdg_toplevel::State; 4] = [
 #[cfg(feature = "smithay-tty")]
 use crate::backend_tty::TtyBackendState;
 use crate::{
-    backend_winit::WinitBackendState,
+    backend_winit::{BACKGROUND_LAYER_TIERS, FOREGROUND_LAYER_TIERS, WinitBackendState},
     config_watcher::{ConfigWatcherHandle, KomaConfigPath},
     cursor::CursorManager,
     desktop_protocols::{ActivationTokenPolicy, DeferredXdgActivation, StoredToplevelIcon},
@@ -2007,15 +2007,18 @@ impl KomaState {
             .unwrap_or_default();
 
         // If `xdg_toplevel` already has a parent or explicit fixed `max_size`, don't force full-screen size
-        let (_, max_sz) = read_toplevel_min_max_size(toplevel.wl_surface());
+        let (min_sz, max_sz) = read_toplevel_min_max_size(toplevel.wl_surface());
+        let hints = SizeHints::from_min_max(min_sz, max_sz);
         let has_parent = toplevel.parent().is_some();
         let initial_size = if has_parent || (max_sz.0 > 0 && max_sz.1 > 0) {
             None
         } else {
             let wa = viewport.work_area_rect();
-            let inner_w = wa.w.saturating_sub(24) as i32;
-            let inner_h = wa.h.saturating_sub(24) as i32;
-            Some(Size::from((inner_w.max(64), inner_h.max(64))))
+            let inner_w = wa.w.saturating_sub(24);
+            let inner_h = wa.h.saturating_sub(24);
+            let clamped =
+                hints.clamp_rect(LogicalRect::new(0, 0, inner_w.max(64), inner_h.max(64)));
+            Some(Size::from((clamped.w as i32, clamped.h as i32)))
         };
 
         toplevel.with_pending_state(|state| {
@@ -2240,6 +2243,7 @@ impl KomaState {
         let now_ms = self.elapsed_ms();
         let is_floating = if let Some(ws) = self.workspaces.get_mut(&ws_id) {
             ws.frame_clock.record_activity(now_ms);
+            let _ = ws.set_size_hints(unmapped.win_id, SizeHints::from_min_max(min_sz, max_sz));
             let floated = ws.insert_window(
                 unmapped.win_id,
                 want_floating,
@@ -3486,9 +3490,9 @@ impl KomaState {
             above_toplevels: if fullscreen {
                 &[]
             } else {
-                &[Layer::Overlay, Layer::Top]
+                &FOREGROUND_LAYER_TIERS
             },
-            below_toplevels: &[Layer::Bottom, Layer::Background],
+            below_toplevels: &BACKGROUND_LAYER_TIERS,
         }
     }
 
@@ -3593,13 +3597,27 @@ impl KomaState {
 impl KomaState {
     /// Fail-closed IME barrier enforced whenever `SessionLockPhase != Unlocked`:
     /// drops active `zwp_text_input_v3` focus/enter and discards all IME popup surfaces.
-    pub fn clear_ime_state_for_lock(&mut self) {
+    ///
+    /// Safe to call from inside a Smithay seat callback: it never re-enters the seat handles.
+    /// Callers that are *not* running inside [`crate::state::KomaState::focus_changed`] should
+    /// also reconcile keyboard-shortcut inhibitors ([`Self::clear_ime_state_for_lock`] does).
+    pub fn clear_ime_focus_for_lock(&mut self) {
         let text_input = self.seat.text_input();
         if text_input.focus().is_some() {
             text_input.leave();
             text_input.set_focus(None);
         }
         self.ime_popups.clear();
+    }
+
+    /// Full lock barrier: drops IME focus/popups and re-evaluates keyboard-shortcut inhibitors.
+    ///
+    /// Must NOT be called from a seat callback that already holds the keyboard mutex
+    /// (`SeatHandler::focus_changed`), because [`Self::reconcile_keyboard_shortcuts_inhibitors`]
+    /// takes `KeyboardHandle::current_focus()` on the same non-reentrant mutex
+    /// (komawm/koma#37: `ext-session-lock-v1` acquire deadlocked the whole event loop).
+    pub fn clear_ime_state_for_lock(&mut self) {
+        self.clear_ime_focus_for_lock();
         self.reconcile_keyboard_shortcuts_inhibitors();
     }
 

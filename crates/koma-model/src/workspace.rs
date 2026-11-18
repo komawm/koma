@@ -2,12 +2,14 @@
 //! (`Tiled`: `Dwindle` | `Scrolling` | `Deck` + `Floating`: `FloatingStack`) architecture
 //! and `special:<name>` Scratchpad overlay semantics.
 
+use std::collections::BTreeMap;
+
 use koma_proto::{OutputId, SeatId, WindowId, WorkspaceId};
 
 use crate::{
     clock::{AdaptiveFrameClock, FrameClockConfig},
     dwindle::{CardinalDir, DwindleConfig, DwindleInsertOutcome, DwindleTree},
-    geometry::{LogicalPoint, LogicalRect, LogicalViewport},
+    geometry::{LogicalPoint, LogicalRect, LogicalViewport, SizeHints},
     layout::{DeckStashStack, FloatingStack, LayoutMode},
     lease::WorkspaceLease,
     scrolling::{ScrollingConfig, ScrollingStrip},
@@ -58,6 +60,9 @@ pub struct WorkspaceState {
     pub window_presentation: Option<(WindowId, WindowPresentation)>,
     pub lease: WorkspaceLease,
     pub frame_clock: AdaptiveFrameClock,
+    /// Per-window `xdg_toplevel` min/max size constraints, applied to every tiled geometry this
+    /// workspace reports (see [`SizeHints`]). Floating windows keep their own placement.
+    size_hints: BTreeMap<WindowId, SizeHints>,
 }
 
 impl WorkspaceState {
@@ -115,6 +120,57 @@ impl WorkspaceState {
             window_presentation: None,
             lease: WorkspaceLease::default(),
             frame_clock: AdaptiveFrameClock::new(is_headed, FrameClockConfig::default(), now_ms),
+            size_hints: BTreeMap::new(),
+        }
+    }
+
+    /// Records (or clears) the `xdg_toplevel` size constraints advertised by `win_id`.
+    ///
+    /// Returns `true` when the stored hints changed, so callers can re-run
+    /// `sync_workspace_geometries` and re-configure a client that updated its minimum size after a
+    /// configure (Chromium does this on every settled resize).
+    pub fn set_size_hints(&mut self, win_id: WindowId, hints: SizeHints) -> bool {
+        if hints.is_unconstrained() {
+            return self.size_hints.remove(&win_id).is_some();
+        }
+        match self.size_hints.get(&win_id) {
+            Some(existing) if *existing == hints => false,
+            _ => {
+                self.size_hints.insert(win_id, hints);
+                true
+            }
+        }
+    }
+
+    #[must_use]
+    pub fn size_hints(&self, win_id: WindowId) -> Option<SizeHints> {
+        self.size_hints.get(&win_id).copied()
+    }
+
+    /// Clamps every presented/tiled geometry to the owning client's advertised size constraints.
+    ///
+    /// A layout box narrower/shorter than a client's minimum cannot be honoured by that client: it
+    /// keeps its minimum content size and commits a cropped buffer, which the compositor then masks
+    /// to the smaller tile ("clipped instead of resized"). Growing the reported tile to the minimum
+    /// makes the layout honest again.
+    ///
+    /// Fullscreen/maximize presentation rects go through the same clamp, so a presentation never
+    /// hands a client a size below its `xdg_toplevel` minimum.
+    ///
+    /// When the workspace genuinely cannot fit both neighbours' minimums the clamped tile overlaps
+    /// its sibling (the focused window stays complete and usable). Propagating minimums through the
+    /// split ratios so the sibling yields space is a follow-up, not a regression of this fix.
+    fn clamp_tiled_size_hints(&self, out: &mut [(WindowId, LogicalRect, bool)]) {
+        if self.size_hints.is_empty() {
+            return;
+        }
+        for (win_id, rect, is_floating) in out {
+            if *is_floating {
+                continue;
+            }
+            if let Some(hints) = self.size_hints.get(win_id) {
+                *rect = hints.clamp_rect(*rect);
+            }
         }
     }
 
@@ -212,6 +268,7 @@ impl WorkspaceState {
             self.window_presentation = None;
         }
         let _ = self.deck.remove(win_id);
+        self.size_hints.remove(&win_id);
         let was_floating = self.floating.remove(win_id).is_some();
         let next_tiled = if !was_floating {
             let d_next = self.dwindle.remove(win_id, self.viewport);
@@ -568,7 +625,9 @@ impl WorkspaceState {
     #[must_use]
     pub fn compute_animation_target_geometries(&self) -> Vec<(WindowId, LogicalRect, bool)> {
         if let Some((win_id, rect)) = self.presentation_geometry() {
-            return vec![(win_id, rect, false)];
+            let mut out = vec![(win_id, rect, false)];
+            self.clamp_tiled_size_hints(&mut out);
+            return out;
         }
 
         let mut out: Vec<(WindowId, LogicalRect, bool)> = match self.layout_mode {
@@ -596,6 +655,7 @@ impl WorkspaceState {
             out.push((entry.win_id, entry.rect, true));
         }
 
+        self.clamp_tiled_size_hints(&mut out);
         out
     }
 
@@ -604,7 +664,9 @@ impl WorkspaceState {
     #[must_use]
     pub fn compute_visible_geometries_at(&self, now_ms: u64) -> Vec<(WindowId, LogicalRect, bool)> {
         if let Some((win_id, rect)) = self.presentation_geometry() {
-            return vec![(win_id, rect, false)];
+            let mut out = vec![(win_id, rect, false)];
+            self.clamp_tiled_size_hints(&mut out);
+            return out;
         }
 
         let mut out: Vec<(WindowId, LogicalRect, bool)> = match self.layout_mode {
@@ -634,6 +696,7 @@ impl WorkspaceState {
             out.push((entry.win_id, entry.rect, true));
         }
 
+        self.clamp_tiled_size_hints(&mut out);
         out
     }
 
@@ -641,7 +704,9 @@ impl WorkspaceState {
     #[must_use]
     pub fn compute_visible_geometries(&self) -> Vec<(WindowId, LogicalRect, bool)> {
         if let Some((win_id, rect)) = self.presentation_geometry() {
-            return vec![(win_id, rect, false)];
+            let mut out = vec![(win_id, rect, false)];
+            self.clamp_tiled_size_hints(&mut out);
+            return out;
         }
 
         let mut out: Vec<(WindowId, LogicalRect, bool)> = match self.layout_mode {
@@ -669,6 +734,7 @@ impl WorkspaceState {
             out.push((entry.win_id, entry.rect, true));
         }
 
+        self.clamp_tiled_size_hints(&mut out);
         out
     }
 }
@@ -728,6 +794,84 @@ mod tests {
             ws.compute_visible_geometries(),
             vec![(w1, LogicalRect::new(0, 0, 1920, 1080), false)]
         );
+    }
+
+    /// `komawm/koma#33`: a dwindle split may not hand a client a tile narrower than the
+    /// `xdg_toplevel.set_min_size` it advertised, or Chromium/Firefox keep their minimum content
+    /// size and commit a cropped buffer that the compositor then masks ("clipped, not resized").
+    #[test]
+    fn size_hints_clamp_tiled_geometry_to_the_client_minimum() {
+        let vp = LogicalViewport::new(800, 600, 1.0);
+        let mut ws = WorkspaceState::new(
+            WorkspaceId::new("main"),
+            "main",
+            SeatId::new("seat0"),
+            vp,
+            PresentationTarget::Physical(OutputId::new("eDP-1")),
+            LayoutMode::Dwindle,
+            0,
+        );
+        ws.dwindle.config.outer_gap = 0;
+        ws.dwindle.config.inner_gap = 0;
+        ws.dwindle.config.smart_split = false;
+        ws.dwindle.config.split_width_multiplier = 0.1;
+
+        let browser = WindowId::new(1, 1);
+        let terminal = WindowId::new(2, 1);
+        ws.insert_window(browser, false, None, None, None, None, false, true, 0);
+        assert!(ws.set_size_hints(browser, SizeHints::new(500, 87, 0, 0)));
+        assert!(!ws.set_size_hints(browser, SizeHints::new(500, 87, 0, 0)));
+        ws.insert_window(terminal, false, None, None, None, None, false, true, 1);
+
+        // The raw dwindle box is a 400 px half, but the reported/configured tile must be the
+        // 500 px minimum the client can actually honour.
+        let targets = ws.compute_animation_target_geometries();
+        let (_, browser_rect, browser_float) = targets
+            .iter()
+            .find(|(w, _, _)| *w == browser)
+            .copied()
+            .expect("browser geometry");
+        assert!(!browser_float);
+        assert_eq!(browser_rect.w, 500);
+        assert_eq!(browser_rect.h, 600);
+        assert_eq!(ws.dwindle.rect_of(browser).map(|r| r.w), Some(400));
+
+        // The visible-geometry, settled and animated sampling paths must agree, otherwise the
+        // renderer would draw the client back into the too-small box.
+        for (w, rect, _) in ws.compute_visible_geometries() {
+            if w == browser {
+                assert_eq!(rect.w, 500);
+            }
+        }
+        for (w, rect, _) in ws.compute_visible_geometries_at(2) {
+            if w == browser {
+                assert_eq!(rect.w, 500);
+            }
+        }
+
+        // Unconstrained clients keep the raw layout box untouched.
+        let (_, terminal_rect, _) = targets
+            .iter()
+            .find(|(w, _, _)| *w == terminal)
+            .copied()
+            .expect("terminal geometry");
+        assert_eq!(terminal_rect.w, 400);
+
+        // Closing the browser drops its hints.
+        let _ = ws.remove_window(browser, 3);
+        assert!(ws.size_hints(browser).is_none());
+
+        // Floating windows are placed by the floating stack and never clamped by tiled hints.
+        let dialog = WindowId::new(3, 1);
+        ws.insert_window(dialog, true, None, None, None, None, false, true, 4);
+        assert!(ws.set_size_hints(dialog, SizeHints::new(900, 700, 0, 0)));
+        let (_, float_rect, float) = ws
+            .compute_visible_geometries()
+            .into_iter()
+            .find(|(w, _, _)| *w == dialog)
+            .expect("dialog geometry");
+        assert!(float);
+        assert!(float_rect.w < 900, "floating rect keeps its own size");
     }
 
     #[test]

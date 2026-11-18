@@ -26,7 +26,7 @@ use smithay::{
         renderer::{Color32F, ImportDma as _, damage::OutputDamageTracker, gles::GlesRenderer},
         winit::{self, WinitEvent, WinitGraphicsBackend},
     },
-    desktop::{layer_map_for_output, utils::send_frames_surface_tree},
+    desktop::{LayerMap, LayerSurface, layer_map_for_output, utils::send_frames_surface_tree},
     input::{
         keyboard::KeyboardSource,
         pointer::{CursorIcon, CursorImageStatus},
@@ -36,7 +36,7 @@ use smithay::{
         cursor::Cursor as WinitCursor, dpi::LogicalSize,
         platform::wayland::WindowAttributesWayland, window::WindowAttributes,
     },
-    utils::{Point, SERIAL_COUNTER},
+    utils::{IsAlive, Point, Rectangle, SERIAL_COUNTER},
     wayland::{
         dmabuf::{DmabufFeedbackBuilder, DmabufGlobal},
         shell::wlr_layer::Layer,
@@ -233,6 +233,57 @@ impl WinitBackendState {
     }
 }
 
+/// Layer tiers drawn above workspace toplevels (front-to-back), shared by every backend so the
+/// three frame assemblers cannot drift.
+pub(crate) const FOREGROUND_LAYER_TIERS: [Layer; 2] = [Layer::Overlay, Layer::Top];
+
+/// Layer tiers drawn below workspace toplevels, immediately above the clear colour
+/// (`assemble_workspace_elements` documents the front-to-back list). `Layer::Bottom` precedes
+/// `Layer::Background` so a `Bottom` surface paints over a `Background` wallpaper.
+pub(crate) const BACKGROUND_LAYER_TIERS: [Layer; 2] = [Layer::Bottom, Layer::Background];
+
+/// Resolves the top-left of a layer surface in output-logical coordinates.
+///
+/// A missing cached geometry (for example because `LayerMap::arrange` ran before the output had a
+/// mode) must not hide a buffer-backed surface: the output origin is the only meaningful fallback
+/// for the full-output `Background`/`Bottom` surfaces that wallpapers and backdrops use
+/// (komawm/koma#31).
+pub(crate) fn layer_entry_location(
+    geometry: Option<Rectangle<i32, smithay::utils::Logical>>,
+) -> Point<i32, smithay::utils::Logical> {
+    geometry.map_or_else(Point::default, |geo| geo.loc)
+}
+
+/// Selects the layer surfaces of `tiers` that contribute pixels to this frame, front-to-back.
+///
+/// A layer is skipped only when it cannot contribute anything: it is dead, or no surface in its
+/// tree has committed a buffer yet (the first frame of a layer client is buffer-less by protocol).
+/// Buffer-backed layers are always returned, so a `Background` wallpaper can never be dropped from
+/// the element list for lack of a cached geometry (komawm/koma#31).
+///
+/// `tiers` is a slice so the fullscreen policy can suppress the foreground tiers entirely
+/// (`KomaState::output_layer_tiers`) while every tier literal still lives in the two constants above.
+pub(crate) fn layer_tier_entries(
+    map: &LayerMap,
+    tiers: &[Layer],
+) -> Vec<(LayerSurface, Point<i32, smithay::utils::Logical>)> {
+    let mut entries = Vec::new();
+    for tier in tiers {
+        for layer in map.layers_on(*tier).rev() {
+            if !layer.alive() {
+                continue;
+            }
+            let bbox = layer.bbox();
+            if bbox.size.w <= 0 || bbox.size.h <= 0 {
+                continue;
+            }
+            let location = layer_entry_location(map.layer_geometry(layer));
+            entries.push((layer.clone(), location));
+        }
+    }
+    entries
+}
+
 pub(crate) fn append_layer_tier_elements<R>(
     renderer: &mut R,
     output: &Output,
@@ -248,19 +299,15 @@ pub(crate) fn append_layer_tier_elements<R>(
     };
 
     let map = layer_map_for_output(output);
-    for layer_tier in tiers {
-        for layer in map.layers_on(*layer_tier).rev() {
-            if let Some(geo) = map.layer_geometry(layer) {
-                let loc_phys = geo.loc.to_f64().to_physical_precise_round(output_scale);
-                let l_elems: Vec<WaylandSurfaceRenderElement<R>> =
-                    AsRenderElements::render_elements(layer, renderer, loc_phys, output_scale, 1.0);
-                elements.extend(
-                    l_elems
-                        .into_iter()
-                        .map(koma_render::elements::KomaRenderElement::from),
-                );
-            }
-        }
+    for (layer, location) in layer_tier_entries(&map, tiers) {
+        let loc_phys = location.to_f64().to_physical_precise_round(output_scale);
+        let l_elems: Vec<WaylandSurfaceRenderElement<R>> =
+            AsRenderElements::render_elements(&layer, renderer, loc_phys, output_scale, 1.0);
+        elements.extend(
+            l_elems
+                .into_iter()
+                .map(koma_render::elements::KomaRenderElement::from),
+        );
     }
 }
 

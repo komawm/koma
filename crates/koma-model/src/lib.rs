@@ -42,7 +42,9 @@ pub use crate::{
         CardinalDir, DropZonePreview, DwindleConfig, DwindleInsertOutcome, DwindleTree,
         ResizeCorner,
     },
-    geometry::{Anchor9, AnchorPoint, LogicalPoint, LogicalRect, LogicalViewport, SafeAreaInsets},
+    geometry::{
+        Anchor9, AnchorPoint, LogicalPoint, LogicalRect, LogicalViewport, SafeAreaInsets, SizeHints,
+    },
     kinematics::{
         BezierPointerSolver, MAX_POINTER_SPRING_MS, MinimumJerkSolver, PointerSpring2D,
         PointerTrajectorySpec, PointerTrajectoryTrack, SpringSolver, TrajectorySolver,
