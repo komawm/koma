@@ -87,13 +87,33 @@ pub struct KeybindCatalogEntry {
     pub group: &'static str,
 }
 
-const WINDOW: &str = "Windows";
-const LAYOUT: &str = "Dwindle and Scrolling layout";
-const SCRATCHPAD: &str = "Scratchpad";
-const FOCUS: &str = "Focus and movement";
-const WORKSPACES: &str = "Workspaces";
-const POINTER: &str = "Pointer drag and wheel";
-const SESSION: &str = "Session";
+/// Presentation group names, shared by the generated scaffold and the keybind overlay.
+pub const GROUP_WINDOWS: &str = "Windows";
+pub const GROUP_LAYOUT: &str = "Dwindle and Scrolling layout";
+pub const GROUP_SCRATCHPAD: &str = "Scratchpad";
+pub const GROUP_FOCUS: &str = "Focus and movement";
+pub const GROUP_WORKSPACES: &str = "Workspaces";
+pub const GROUP_POINTER: &str = "Pointer drag and wheel";
+pub const GROUP_SESSION: &str = "Session";
+
+/// Stable presentation order for every catalogue group.
+pub const KEYBIND_GROUP_ORDER: &[&str] = &[
+    GROUP_WINDOWS,
+    GROUP_LAYOUT,
+    GROUP_FOCUS,
+    GROUP_WORKSPACES,
+    GROUP_SCRATCHPAD,
+    GROUP_POINTER,
+    GROUP_SESSION,
+];
+
+const WINDOW: &str = GROUP_WINDOWS;
+const LAYOUT: &str = GROUP_LAYOUT;
+const SCRATCHPAD: &str = GROUP_SCRATCHPAD;
+const FOCUS: &str = GROUP_FOCUS;
+const WORKSPACES: &str = GROUP_WORKSPACES;
+const POINTER: &str = GROUP_POINTER;
+const SESSION: &str = GROUP_SESSION;
 
 /// The complete built-in keymap, in a stable presentation order.
 ///
@@ -583,6 +603,15 @@ pub const KEYBIND_CATALOG: &[KeybindCatalogEntry] = &[
         chord: "Mod + Shift + E",
         lua_action: "koma.act.quit()",
         description: "Quit the compositor gracefully",
+        cooldown_ms: None,
+        repeat: BindRepeat::Once,
+        group: SESSION,
+    },
+    KeybindCatalogEntry {
+        id: 37,
+        chord: "Mod + Shift + Slash",
+        lua_action: "koma.act.overlay.keybinds_toggle()",
+        description: "Show the keybind overview",
         cooldown_ms: None,
         repeat: BindRepeat::Once,
         group: SESSION,

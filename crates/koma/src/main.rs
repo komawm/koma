@@ -100,6 +100,7 @@ mod handlers;
 mod ipc_server;
 #[cfg(feature = "smithay-winit")]
 mod keybind_dispatcher;
+mod keybind_overlay;
 #[cfg(feature = "smithay-winit")]
 mod keybind_repeat;
 #[cfg(feature = "smithay-winit")]

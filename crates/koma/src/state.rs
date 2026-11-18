@@ -791,6 +791,10 @@ pub struct KomaState {
     pub pointer_location: Point<f64, Logical>,
     pub cursor_manager: CursorManager,
     pub cursor_anim_timer_token: Option<RegistrationToken>,
+    /// Bumped whenever the cursor status changes, so a timer armed for the previous
+    /// status can recognise itself as stale instead of being removed mid-dispatch
+    /// (komawm/koma#53).
+    pub cursor_anim_generation: u64,
     /// Active client `wl_data_device` drag-and-drop grab, including its optional icon surface.
     pub dnd_drag: Option<ActiveDnd>,
 
@@ -806,6 +810,8 @@ pub struct KomaState {
     pub vseats: HashMap<SeatId, VirtualSeatLedger>,
     pub rules: WindowRuleEngine,
     pub keybinds: KeybindTable,
+    /// Open compositor-rendered keybind overview, if any.
+    pub keybind_overlay: Option<crate::keybind_overlay::KeybindOverlay>,
     pub gestures: GestureTable,
     pub pending_passthrough_actions: Vec<ActionDescriptor>,
     pub lua_scheduler: TrampolineScheduler,
@@ -1042,6 +1048,7 @@ impl KomaState {
             )),
             cursor_manager: CursorManager::new(),
             cursor_anim_timer_token: None,
+            cursor_anim_generation: 0,
             dnd_drag: None,
             output_layout: OutputLayout::new(),
             output_workspaces: HashMap::new(),
@@ -1053,6 +1060,7 @@ impl KomaState {
             vseats,
             rules: WindowRuleEngine::new(),
             keybinds: KeybindTable::default(),
+            keybind_overlay: None,
             gestures: GestureTable::default(),
             pending_passthrough_actions: Vec::new(),
             lua_scheduler: TrampolineScheduler::default(),
@@ -2185,6 +2193,8 @@ impl KomaState {
         self.keybinds.reset_scroll_trackers();
         self.cancel_keybind_repeat("session_lock");
         self.gestures.reset_active_sessions();
+        // Never leave the keybind overview visible above a locked session.
+        self.keybind_overlay = None;
 
         let now_input = smithay::backend::input::InputTime::now();
         self.break_active_pointer_constraints();
@@ -4249,14 +4259,18 @@ impl KomaState {
         }
     }
 
-    /// Updates active cursor status, clears any pending animation timer, and requests redraw.
+    /// Updates active cursor status, invalidates any armed animation timer, and requests redraw.
+    ///
+    /// The armed source is deliberately **not** removed here. Removing a calloop source while its
+    /// fd is still readable in the batch being dispatched makes calloop log
+    /// `Received an event for non-existent source` and drop the event; with an animated XCursor
+    /// that fires on every status change and floods the journal (komawm/koma#53). Bumping the
+    /// generation instead lets the pending timer fire, notice it is stale and self-drop.
     pub fn set_cursor_status(&mut self, status: CursorImageStatus) {
         self.cursor_manager.set_status(status);
-        if let Some(token) = self.cursor_anim_timer_token.take()
-            && let Some(handle) = &self.loop_handle
-        {
-            handle.remove(token);
-        }
+        let armed = self.cursor_anim_timer_token.take().is_some();
+        self.cursor_anim_generation =
+            Self::next_cursor_generation(self.cursor_anim_generation, armed);
         self.queue_redraw();
     }
 
@@ -4269,9 +4283,12 @@ impl KomaState {
             return;
         };
         let timer = calloop::timer::Timer::from_duration(Duration::from_millis(delay_ms.max(8)));
-        if let Ok(token) = handle.insert_source(timer, |_, _, state| {
-            state.cursor_anim_timer_token = None;
-            state.queue_redraw();
+        let generation = self.cursor_anim_generation;
+        if let Ok(token) = handle.insert_source(timer, move |_, _, state| {
+            if state.cursor_timer_is_current(generation) {
+                state.cursor_anim_timer_token = None;
+                state.queue_redraw();
+            }
             calloop::timer::TimeoutAction::Drop
         }) {
             self.cursor_anim_timer_token = Some(token);
@@ -4426,6 +4443,30 @@ impl KomaState {
     #[must_use]
     pub fn pointer_handle(&self) -> Option<smithay::input::pointer::PointerHandle<Self>> {
         self.seat.get_pointer()
+    }
+
+    /// Whether a cursor-animation timer captured at `generation` still owns the pending redraw.
+    ///
+    /// The timer is never removed eagerly: it fires once, sees it is stale and drops itself, which
+    /// keeps calloop from dispatching an event for a source that is already gone
+    /// (komawm/koma#53).
+    #[must_use]
+    pub fn cursor_timer_is_current(&self, captured_generation: u64) -> bool {
+        self.cursor_anim_generation == captured_generation
+    }
+
+    /// Advances the cursor-animation generation so an in-flight timer knows it is stale.
+    ///
+    /// The armed source is never removed eagerly: removing a calloop source whose fd is still
+    /// readable in the batch being dispatched makes calloop log
+    /// `Received an event for non-existent source` and drop the event (komawm/koma#53).
+    #[must_use]
+    pub const fn next_cursor_generation(generation: u64, armed: bool) -> u64 {
+        if armed {
+            generation.wrapping_add(1)
+        } else {
+            generation
+        }
     }
 
     /// Fail-closed IME barrier enforced whenever `SessionLockPhase != Unlocked`:
@@ -4949,6 +4990,10 @@ impl KomaState {
     {
         self.reconcile_session_lock();
         self.notify_user_activity();
+        if self.keybind_overlay_is_open() && !self.is_locked_or_abandoned() {
+            self.dismiss_keybind_overlay();
+            return;
+        }
         let Some(pos) = self.resolve_touch_position::<B, _>(&event) else {
             return;
         };
@@ -4977,6 +5022,9 @@ impl KomaState {
         B::Device: smithay::backend::input::Device,
     {
         self.notify_user_activity();
+        if self.keybind_overlay_is_open() && !self.is_locked_or_abandoned() {
+            return;
+        }
         let Some(pos) = self.resolve_touch_position::<B, _>(&event) else {
             return;
         };
@@ -5006,6 +5054,9 @@ impl KomaState {
 
     pub fn handle_touch_up<B: InputBackend>(&mut self, event: B::TouchUpEvent) {
         self.notify_user_activity();
+        if self.keybind_overlay_is_open() && !self.is_locked_or_abandoned() {
+            return;
+        }
         let Some(touch) = self.touch() else {
             return;
         };
@@ -6463,5 +6514,32 @@ pub(crate) mod tests {
             .map(|id| state.workspaces[id].name.clone())
             .collect();
         assert_eq!(names, ["1", "2", "3", "7", "10"]);
+    }
+
+    #[test]
+    fn cursor_status_changes_invalidate_the_pending_animation_timer_instead_of_removing_it() {
+        // komawm/koma#53: removing the calloop source while its fd is still readable in the current
+        // batch makes calloop warn "Received an event for non-existent source". The status change
+        // must invalidate the armed timer instead, so the timer can fire and drop itself.
+        assert_eq!(
+            KomaState::next_cursor_generation(0, false),
+            0,
+            "an unarmed timer is nothing to invalidate"
+        );
+        assert_eq!(
+            KomaState::next_cursor_generation(7, true),
+            8,
+            "an armed timer is invalidated by bumping the generation"
+        );
+        assert_eq!(
+            KomaState::next_cursor_generation(u64::MAX, true),
+            0,
+            "the generation wraps instead of overflowing"
+        );
+
+        let (_event_loop, _display, state) = make_headless_test_state();
+        assert_eq!(state.cursor_anim_generation, 0);
+        assert!(state.cursor_timer_is_current(0));
+        assert!(!state.cursor_timer_is_current(1));
     }
 }

@@ -5,6 +5,7 @@
 //! Bridges `Phodopus` (`SequencePoll::Suspend(HostOpHandle)`, `Fuel`, and `MemoryLimit`)
 //! to `Koma`'s non-blocking `calloop` event loop without holding native Rust stack frames.
 
+pub mod effective_keymap;
 pub mod host_abi;
 pub mod keybind_catalog;
 pub mod recorder;
@@ -16,11 +17,15 @@ pub mod typegen;
 pub mod phodopus_bridge;
 
 pub use crate::{
+    effective_keymap::{
+        ChordKind, EffectiveBind, chord_identity, chord_kind, describe_action, format_chord,
+        group_for_action, lua_quote, merge_binds, short_action,
+    },
     host_abi::{
         CONFIG_FUEL_BUDGET, DEFAULT_HEAP_LIMIT_BYTES, HostBridge, LAYOUT_HOOK_FUEL_BUDGET,
         MACRO_SLICE_FUEL_BUDGET, ParkedMacroTask, PendingHostOp, TrampolineScheduler,
     },
-    keybind_catalog::{BindRepeat, KEYBIND_CATALOG, KeybindCatalogEntry},
+    keybind_catalog::{BindRepeat, KEYBIND_CATALOG, KEYBIND_GROUP_ORDER, KeybindCatalogEntry},
     recorder::{RecordedStep, compile_recorded_macro},
     scaffold::{
         ConfigTemplateFile, ScaffoldError, TEMPLATE_MARKER, TEMPLATE_VERSION,

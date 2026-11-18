@@ -667,6 +667,9 @@ pub fn reload_from_lua_source(
     // A pending repeat belongs to the old bind table: cancel it before the atomic swap.
     state.cancel_keybind_repeat("config_reload");
     state.keybinds = compiled_binds;
+    // The open overview snapshots the previous effective keymap; close it on reload so it can
+    // never show bindings the compositor no longer accepts.
+    state.keybind_overlay = None;
     state.gestures = compiled_gestures;
 
     // 2. Reconcile declarative `koma.workspace(...)` specs losslessly (never dropping existing

@@ -377,6 +377,12 @@ impl KeybindTable {
                 ActionDescriptor::ScrollingMaximizeColumn,
                 None,
             ),
+            (
+                37,
+                "Mod + Shift + Slash",
+                ActionDescriptor::OverlayKeybindsToggle,
+                None,
+            ),
             (7, "Mod + S", ActionDescriptor::ScratchpadToggle(None), None),
             (
                 12,
@@ -969,6 +975,19 @@ pub fn process_pointer_button_event(
 ) {
     state.reconcile_session_lock();
     state.notify_user_activity();
+
+    // The keybind overview consumes every pointer button: a press dismisses it and is not
+    // forwarded to the client below the scrim.
+    if state.keybind_overlay_is_open() && !state.is_locked_or_abandoned() {
+        if btn_state == ButtonState::Pressed {
+            state.dismiss_keybind_overlay();
+            state.keybinds.suppressed_buttons.insert(button_code);
+        } else {
+            state.keybinds.suppressed_buttons.remove(&button_code);
+        }
+        return;
+    }
+
     let serial = SERIAL_COUNTER.next_serial();
     // Held across key-binding dispatch and `refresh_pointer_hover_focus`, which re-acquires the
     // pointer; Smithay releases its pointer mutex between calls, so no scope is claimed here.
@@ -1195,6 +1214,8 @@ pub fn process_keyboard_key_event(
         TogglePreempt,
         CancelPointerGrab,
         ExitSubmapMode,
+        DismissKeybindOverlay,
+        ConsumeKey,
         FireAction {
             bind_id: Option<BindHandleId>,
             action: ActionDescriptor,
@@ -1209,6 +1230,10 @@ pub fn process_keyboard_key_event(
     // 1. On physical key release, dispatch pending `TriggerEdge::Release`/`Both` action and
     //    reset scroll trackers if any modifier bit changed (`niri` modifier release rule).
     //    Fail-closed on locked sessions: never deliver lock-screen key events into an active IME grab!
+    if key_state == KeyState::Released && state.keybind_overlay_is_open() {
+        // The overview owns a keyboard grab: never leak releases to the focused client.
+        return;
+    }
     if key_state == KeyState::Released {
         let prev_mask = modifiers_mask_from_smithay(&keyboard.modifier_state());
         if state.keybinds.repeat.is_repeating_keycode(raw_keycode) {
@@ -1281,6 +1306,17 @@ pub fn process_keyboard_key_event(
 
             let held_mask = modifiers_mask_from_smithay(modifiers);
             let phys_mod = state.keybinds.effective_mod_key(is_bare_metal_tty);
+            let overlay_open = state.keybind_overlay_is_open() && !is_locked;
+
+            // Gate 0a3: the keybind overview owns the keyboard grab. `Escape` closes it and every
+            // other chord is either the overlay toggle itself or swallowed before reaching a client.
+            if overlay_open
+                && key_state == KeyState::Pressed
+                && mod_raw == keysyms::KEY_Escape
+                && held_mask == 0
+            {
+                return FilterResult::Intercept(InterceptOutcome::DismissKeybindOverlay);
+            }
 
             // A modifier pressed (or a chord re-pressed) outside the repeating chord cancels it.
             if state
@@ -1307,7 +1343,7 @@ pub fn process_keyboard_key_event(
 
             // Gate 0c: Honor active `zwp_keyboard_shortcuts_inhibit_v1` for unrestricted focused surfaces
             // while keeping Ring-0 VT switching and `Mod + G` human preempt takeover un-inhibitable.
-            if !is_locked && state.are_shortcuts_inhibited_for_focused_surface() {
+            if !overlay_open && !is_locked && state.are_shortcuts_inhibited_for_focused_surface() {
                 return FilterResult::Forward;
             }
 
@@ -1358,6 +1394,9 @@ pub fn process_keyboard_key_event(
             }
 
             let Some(idx) = matched_idx else {
+                if overlay_open {
+                    return FilterResult::Intercept(InterceptOutcome::ConsumeKey);
+                }
                 if !is_locked
                     && active_mode.is_some()
                     && mod_raw == keysyms::KEY_Escape
@@ -1371,6 +1410,16 @@ pub fn process_keyboard_key_event(
             let bind = &state.keybinds.binds[idx];
             let bind_id = bind.id;
             let pass_through = bind.options.pass_through;
+
+            // Only the overlay toggle itself may fire while the overview holds the grab.
+            if overlay_open
+                && !matches!(
+                    bind.press_action,
+                    Some(ActionDescriptor::OverlayKeybindsToggle)
+                )
+            {
+                return FilterResult::Intercept(InterceptOutcome::ConsumeKey);
+            }
 
             // Enforce optional `cooldown_ms` rate-limiting (`niri/src/input/mod.rs` line 5082)
             if let Some(cd_ms) = bind.options.cooldown_ms
@@ -1484,6 +1533,10 @@ pub fn process_keyboard_key_event(
             info!(prev_mode = ?state.keybinds.active_mode, "exited keybind submap mode via Escape");
             state.keybinds.active_mode = None;
         }
+        InterceptOutcome::DismissKeybindOverlay => {
+            state.handle_keybind_overlay_key(true);
+        }
+        InterceptOutcome::ConsumeKey => {}
         InterceptOutcome::FireAction {
             bind_id: Some(_),
             action,
@@ -1514,6 +1567,9 @@ pub fn process_pointer_axis_event<B: InputBackend>(
 ) {
     state.reconcile_session_lock();
     state.notify_user_activity();
+    if state.keybind_overlay_is_open() && !state.is_locked_or_abandoned() {
+        return;
+    }
     let source = event.source();
     let time = event.time();
 
@@ -2364,6 +2420,10 @@ pub fn execute_action_descriptor(
             state.sync_workspace_geometries(&ws_id);
             state.focus_active_deck_window();
             state.queue_redraw();
+        }
+
+        ActionDescriptor::OverlayKeybindsToggle => {
+            state.toggle_keybind_overlay();
         }
 
         ActionDescriptor::OverviewToggle | ActionDescriptor::OverviewOpen => {
