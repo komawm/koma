@@ -1979,10 +1979,143 @@ impl WindowAnimationTable {
             .retarget(target, now_ms, &border_curve, None);
     }
 
-    /// Starts a close shrink/fade-out spring (`1.0 -> close_scale_to`, `opacity -> 0.0`), or
-    /// removes immediately if animations are disabled.
+    /// Drops every spring track for `win_id` without animating.
+    ///
+    /// Used for windows that never had a visible frame to fade out (never mapped, already
+    /// settled, or a compositor configured with animations disabled). Mapped windows leave the
+    /// layout through [`Self::start_close`] instead.
     pub fn remove_immediately(&mut self, win_id: WindowId) {
         self.entries.remove(&win_id);
+    }
+
+    /// Starts the `windows_close` shrink/fade-out for a toplevel that is leaving the layout
+    /// (`scale -> close_scale_to`, `opacity -> 0.0`) and marks the entry as closing so the
+    /// compositor keeps compositing its last frame until the spring settles.
+    ///
+    /// Returns `true` when an animation is in flight. Returns `false` when nothing animated:
+    /// animations disabled, `windows_close` disabled, an `Instant` curve, or a `"none"` style.
+    /// The entry is removed in that case, so callers must not keep a lingering frame.
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_close(
+        &mut self,
+        win_id: WindowId,
+        rect: LogicalRect,
+        viewport: LogicalViewport,
+        now_ms: u64,
+        cfg: &AnimationConfig,
+        style_override: Option<&str>,
+    ) -> bool {
+        let parsed_style = style_override.and_then(WindowOpenStyle::parse).or_else(|| {
+            cfg.windows_close
+                .style
+                .as_deref()
+                .and_then(WindowOpenStyle::parse)
+        });
+        let explicit_curve_override = if parsed_style.is_none() {
+            style_override
+        } else {
+            None
+        };
+        let close_curve = cfg.channel_curve(&cfg.windows_close, explicit_curve_override);
+        if !cfg.enabled
+            || matches!(close_curve, CurveSpec::Instant)
+            || matches!(parsed_style, Some(WindowOpenStyle::None))
+        {
+            self.entries.remove(&win_id);
+            return false;
+        }
+
+        let style = parsed_style.unwrap_or(WindowOpenStyle::Popin(None));
+        let entry = self
+            .entries
+            .entry(win_id)
+            .or_insert_with(|| WindowSpringEntry {
+                x: MotionTrack::settled_at(f64::from(rect.x), &close_curve),
+                y: MotionTrack::settled_at(f64::from(rect.y), &close_curve),
+                w: MotionTrack::settled_at(f64::from(rect.w), &close_curve),
+                h: MotionTrack::settled_at(f64::from(rect.h), &close_curve),
+                scale: MotionTrack::settled_at(1.0, &close_curve),
+                opacity: MotionTrack::settled_at(1.0, &close_curve),
+                focus_factor: MotionTrack::settled_at(1.0, &close_curve),
+                instant_override: false,
+                closing: false,
+            });
+        // Re-anchor the (unscaled) geometry on the last known rect: a closing window is no longer
+        // laid out, so only `scale` and `opacity` move from here on.
+        entry.x.snap_to(f64::from(rect.x));
+        entry.y.snap_to(f64::from(rect.y));
+        entry.w.snap_to(f64::from(rect.w));
+        entry.h.snap_to(f64::from(rect.h));
+
+        let shrink_to = match style {
+            WindowOpenStyle::Popin(pct) => pct.unwrap_or(cfg.close_scale_to).clamp(0.2, 1.0),
+            WindowOpenStyle::Gnomed => 0.55,
+            // Fade keeps the window at whatever scale it currently has; only opacity animates.
+            WindowOpenStyle::Fade => entry.scale.sample(now_ms),
+            WindowOpenStyle::Slide(edge) => {
+                match edge.unwrap_or_else(|| nearest_viewport_edge(rect, viewport)) {
+                    SlideEdge::Left => {
+                        entry
+                            .x
+                            .retarget(-f64::from(rect.w), now_ms, &close_curve, None);
+                    }
+                    SlideEdge::Right => {
+                        entry
+                            .x
+                            .retarget(f64::from(viewport.width), now_ms, &close_curve, None);
+                    }
+                    SlideEdge::Top => {
+                        entry
+                            .y
+                            .retarget(-f64::from(rect.h), now_ms, &close_curve, None);
+                    }
+                    SlideEdge::Bottom => {
+                        entry
+                            .y
+                            .retarget(f64::from(viewport.height), now_ms, &close_curve, None);
+                    }
+                }
+                1.0
+            }
+            WindowOpenStyle::None => 1.0,
+        };
+        entry.scale.retarget(shrink_to, now_ms, &close_curve, None);
+        entry.opacity.retarget(0.0, now_ms, &close_curve, None);
+        entry.instant_override = false;
+        entry.closing = true;
+        true
+    }
+
+    /// Returns `true` if `win_id` still owns an in-flight close spring.
+    #[must_use]
+    pub fn is_closing(&self, win_id: WindowId) -> bool {
+        self.entries.get(&win_id).is_some_and(|entry| entry.closing)
+    }
+
+    /// Evaluates the close spring for `win_id`, or `None` when it is not closing.
+    pub fn sample_close(&mut self, win_id: WindowId, now_ms: u64) -> Option<SampledWindowVisual> {
+        let entry = self.entries.get_mut(&win_id)?;
+        if !entry.closing {
+            return None;
+        }
+        Some(Self::sample_entry(entry, now_ms))
+    }
+
+    /// Removes every settled close spring and returns the released window ids.
+    ///
+    /// The compositor drops the matching captured frame once its id appears here; until then the
+    /// entry keeps [`Self::has_active_animations`] `true` so the frame loop keeps repainting.
+    pub fn take_settled_closing(&mut self, now_ms: u64) -> Vec<WindowId> {
+        let mut settled: Vec<WindowId> = Vec::new();
+        for (win_id, entry) in &mut self.entries {
+            if entry.closing && !Self::step_entry_animating(entry, now_ms) {
+                settled.push(*win_id);
+            }
+        }
+        for win_id in &settled {
+            self.entries.remove(win_id);
+        }
+        settled
     }
 
     /// Evaluates the interpolated visual rectangle, opacity multiplier, and border focus factor at `now_ms`.
@@ -2000,7 +2133,10 @@ impl WindowAnimationTable {
                 is_animating: false,
             };
         };
+        Self::sample_entry(entry, now_ms)
+    }
 
+    fn sample_entry(entry: &mut WindowSpringEntry, now_ms: u64) -> SampledWindowVisual {
         let rx = entry.x.sample(now_ms);
         let ry = entry.y.sample(now_ms);
         let rw = entry.w.sample(now_ms).max(32.0);
@@ -2024,7 +2160,6 @@ impl WindowAnimationTable {
             && entry.opacity.is_settled()
             && entry.focus_factor.is_settled());
 
-        let _ = entry.closing;
         SampledWindowVisual {
             rect: LogicalRect::new(sx, sy, scaled_w, scaled_h),
             opacity_multiplier: alpha,
@@ -2459,5 +2594,103 @@ mod tests {
         let w_end = ws_tbl.sample("eDP-1", 1200);
         assert_eq!(w_end.offset_y, 0);
         assert!(!w_end.is_animating);
+    }
+
+    #[test]
+    fn close_spring_shrinks_and_fades_until_settled_then_releases() {
+        let cfg = AnimationConfig::default();
+        let vp = LogicalViewport::new(1920, 1080, 1.0);
+        let mut win_tbl = WindowAnimationTable::default();
+        let wid = WindowId::new(7, 0);
+        let rect = LogicalRect::new(200, 150, 800, 600);
+
+        assert!(
+            win_tbl.start_close(wid, rect, vp, 0, &cfg, None),
+            "animated close must report an in-flight spring"
+        );
+        assert!(win_tbl.is_closing(wid));
+
+        let start = win_tbl.sample_close(wid, 0).expect("closing entry");
+        assert!((start.opacity_multiplier - 1.0).abs() < 1e-3);
+        assert!(start.is_animating);
+
+        let mid = win_tbl.sample_close(wid, 60).expect("closing entry");
+        assert!(mid.is_animating, "spring must still be in flight at 60 ms");
+        assert!(mid.opacity_multiplier < 1.0 && mid.opacity_multiplier > 0.0);
+        assert!(
+            mid.rect.w < rect.w && mid.rect.h < rect.h,
+            "closing window shrinks towards close_scale_to: {mid:?}"
+        );
+
+        // Still in flight shortly before a typical settle window.
+        assert!(win_tbl.take_settled_closing(120).is_empty());
+        assert!(win_tbl.is_closing(wid));
+
+        // Once the spring converges the entry is released exactly once.
+        assert_eq!(win_tbl.take_settled_closing(2000), vec![wid]);
+        assert!(!win_tbl.is_closing(wid));
+        assert!(win_tbl.sample_close(wid, 2000).is_none());
+        assert!(win_tbl.take_settled_closing(2000).is_empty());
+        assert!(!win_tbl.has_active_animations(2000));
+    }
+
+    #[test]
+    fn close_spring_honours_close_scale_and_slide_styles() {
+        let vp = LogicalViewport::new(1920, 1080, 1.0);
+        let rect = LogicalRect::new(100, 100, 400, 300);
+
+        let cfg = AnimationConfig {
+            close_scale_to: 0.6,
+            ..AnimationConfig::default()
+        };
+        let mut win_tbl = WindowAnimationTable::default();
+        let wid = WindowId::new(8, 0);
+        assert!(win_tbl.start_close(wid, rect, vp, 0, &cfg, None));
+        let settled = win_tbl.sample_close(wid, 2000).expect("closing entry");
+        let expected = ((f64::from(rect.w) * 0.6).round() as u32).max(24);
+        assert_eq!(settled.rect.w, expected);
+        assert_eq!(settled.opacity_multiplier, 0.0);
+
+        let mut cfg_slide = AnimationConfig::default();
+        cfg_slide.windows_close.style = Some("slide left".to_owned());
+        let mut win_tbl = WindowAnimationTable::default();
+        let wid = WindowId::new(9, 0);
+        assert!(win_tbl.start_close(wid, rect, vp, 0, &cfg_slide, None));
+        let mid = win_tbl.sample_close(wid, 80).expect("closing entry");
+        assert!(
+            mid.rect.x < rect.x,
+            "slide left must move the closing frame towards the left edge: {mid:?}"
+        );
+    }
+
+    #[test]
+    fn disabled_animations_remove_close_state_immediately() {
+        let vp = LogicalViewport::new(1920, 1080, 1.0);
+        let rect = LogicalRect::new(0, 0, 640, 480);
+        let mut win_tbl = WindowAnimationTable::default();
+        let wid = WindowId::new(10, 0);
+
+        let cfg = AnimationConfig {
+            enabled: false,
+            ..AnimationConfig::default()
+        };
+        assert!(!win_tbl.start_close(wid, rect, vp, 0, &cfg, None));
+        assert!(!win_tbl.is_closing(wid));
+        assert!(win_tbl.sample_close(wid, 0).is_none());
+        assert!(win_tbl.take_settled_closing(0).is_empty());
+
+        let cfg = AnimationConfig {
+            windows_close: AnimationChannelConfig {
+                enabled: Some(false),
+                ..AnimationChannelConfig::default()
+            },
+            ..AnimationConfig::default()
+        };
+        assert!(!win_tbl.start_close(wid, rect, vp, 0, &cfg, None));
+        assert!(!win_tbl.is_closing(wid));
+
+        let cfg = AnimationConfig::default();
+        assert!(!win_tbl.start_close(wid, rect, vp, 0, &cfg, Some("none")));
+        assert!(!win_tbl.is_closing(wid));
     }
 }

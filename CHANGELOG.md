@@ -36,6 +36,17 @@ desktop, hardware support, or security guarantees.
 - The standalone `koma-mcp` binary is now `koma mcp [--print-tools]
   [--auto-mint-admin]`; release archives, Nix builds, BSD CI and completions no
   longer install or reference a separate binary.
+- `appearance.animations.windows_close` and `close_scale_to` now drive a real
+  close animation. Each mapped toplevel's last committed frame is cached in GPU
+  memory on `wl_surface.commit` (the only moment a client buffer is readable),
+  read back once when the window leaves the layout, and composited with a
+  `windows_close` shrink/fade spring while the window is already gone from the
+  layout, hit-testing, focus and `scene.inventory`. `WindowAnimationTable`
+  reports the close spring through `start_close`, `sample_close`,
+  `is_closing` and `take_settled_closing`, and the frame loop reaps the captured
+  frame only when the spring settles. With animations disabled, a
+  `"none"`/`instant` close style, or no renderer, the window's state is freed
+  synchronously as before.
 
 ## [0.0.2] - 2026-11-17
 
@@ -98,27 +109,27 @@ Initial development prerelease of the imported incubation baseline.
   `koma-model`, `koma-lua`, `koma-render`, `koma-seat`, the `koma` compositor
   binary, `komactl`, `koma-mcp` and `koma-overview`.
 - Lua configuration through the Phodopus sandbox with configurable defaults:
-  - `Dwindle` is the default workspace layout; `koma.layout(...)`,
-    `koma.workspace({...})`, `koma.dwindle({...})` and `koma.scrolling({...})`
-    select and tune layouts globally or per workspace.
-  - Hyprland-compatible default keybinds loaded when
-    `inherit_default_binds = true`; `koma.bind(...)` overrides individual
-    chords in place and `koma.unbind(chord)` removes specific defaults.
-  - Typed appearance settings for borders, focus ring, shadow, dim, blur and
-    animations.
+    - `Dwindle` is the default workspace layout; `koma.layout(...)`,
+      `koma.workspace({...})`, `koma.dwindle({...})` and `koma.scrolling({...})`
+      select and tune layouts globally or per workspace.
+    - Hyprland-compatible default keybinds loaded when
+      `inherit_default_binds = true`; `koma.bind(...)` overrides individual
+      chords in place and `koma.unbind(chord)` removes specific defaults.
+    - Typed appearance settings for borders, focus ring, shadow, dim, blur and
+      animations.
 - `komactl gen-types` emits LuaLS definitions for the configuration API;
   `komactl validate` checks a configuration offline.
 - Compatibility & input protocols:
-  - `wp_single_pixel_buffer_v1` and `wp_presentation` feedback alongside
-    `wl_shm` `Abgr8888`/`Xbgr8888` pixel formats for `waybar`, `ironbar`,
-    `quickshell`, and Android/`Waydroid` surfaces.
-  - Full `wlr_layer_shell` `get_popup`, `xdg_popup` unconstraining and
-    pointer/keyboard grabs, plus `zwlr_virtual_pointer_manager_v1` and
-    `zwp_keyboard_shortcuts_inhibit_manager_v1` (with `Mod + G` / VT switch
-    kept un-inhibitable) for `RustDesk` and remote desktop tools.
-  - 2D damped Hooke's law semi-implicit Euler spring kinematics (`pointer.spring` /
-    `pointer.curve`) for smooth macro & cursor motion, plus smart `Waydroid`
-    `no_blur`, `clip_to_geometry` gating, and empty `input_region` click-through.
+    - `wp_single_pixel_buffer_v1` and `wp_presentation` feedback alongside
+      `wl_shm` `Abgr8888`/`Xbgr8888` pixel formats for `waybar`, `ironbar`,
+      `quickshell`, and Android/`Waydroid` surfaces.
+    - Full `wlr_layer_shell` `get_popup`, `xdg_popup` unconstraining and
+      pointer/keyboard grabs, plus `zwlr_virtual_pointer_manager_v1` and
+      `zwp_keyboard_shortcuts_inhibit_manager_v1` (with `Mod + G` / VT switch
+      kept un-inhibitable) for `RustDesk` and remote desktop tools.
+    - 2D damped Hooke's law semi-implicit Euler spring kinematics (`pointer.spring` /
+      `pointer.curve`) for smooth macro & cursor motion, plus smart `Waydroid`
+      `no_blur`, `clip_to_geometry` gating, and empty `input_region` click-through.
 - Session resources (desktop entry, systemd units, portals configuration,
   greetd example) and example configuration under `examples/`.
 - Shared local/CI quality gates (`just check`: descriptor validation,
