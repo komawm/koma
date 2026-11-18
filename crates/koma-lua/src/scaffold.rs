@@ -137,7 +137,7 @@ fn render_workspaces_lua() -> String {
 -- status bar with `ignore-hidden: true` (waybar `ext/workspaces`) lists only the
 -- workspaces that hold a window instead of every configured one. Add
 -- `persistent = true` to keep one empty workspace visible, for example:
--- koma.workspace({{ name = \"10\", persistent = true }})
+-- koma.workspace({{ name = \"9\", persistent = true }})
 
 koma.layout(\"dwindle\")
 

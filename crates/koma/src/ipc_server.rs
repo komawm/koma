@@ -1948,6 +1948,7 @@ pub(crate) fn dispatch_rpc(
                     "locked": state.is_locked_or_abandoned(),
                     "lock_phase": state.session_lock.phase_label(),
                     "input": config_status_input_json(&input),
+                    "frame_perf": state.frame_perf.snapshot_json(),
                 }),
                 Vec::new(),
             ))

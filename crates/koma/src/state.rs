@@ -693,8 +693,110 @@ impl AgentCursorRuntime {
     }
 }
 
+/// Fixed-bucket compositor frame-time histogram with zero heap allocations on the render path.
+#[derive(Debug, Clone, Default)]
+pub struct FrameTimeHistogram {
+    /// Buckets: `[<1ms, 1-2ms, 2-4ms, 4-8ms, 8-16ms, >=16ms]`.
+    pub buckets: [u64; 6],
+    pub rendered_frames: u64,
+    pub skipped_frames: u64,
+    pub total_us: u64,
+    pub max_us: u64,
+    pub last_us: u64,
+}
+
+impl FrameTimeHistogram {
+    const BUCKET_LABELS: [&'static str; 6] =
+        ["<1ms", "1-2ms", "2-4ms", "4-8ms", "8-16ms", ">=16ms"];
+
+    fn bucket_index(elapsed_us: u64) -> usize {
+        match elapsed_us {
+            0..=999 => 0,
+            1_000..=1_999 => 1,
+            2_000..=3_999 => 2,
+            4_000..=7_999 => 3,
+            8_000..=15_999 => 4,
+            _ => 5,
+        }
+    }
+
+    /// Records a rendered frame duration and emits a periodic `tracing::debug!` summary.
+    pub fn record_rendered(&mut self, elapsed: Duration) {
+        let us = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+        self.rendered_frames = self.rendered_frames.saturating_add(1);
+        self.total_us = self.total_us.saturating_add(us);
+        self.max_us = self.max_us.max(us);
+        self.last_us = us;
+        self.buckets[Self::bucket_index(us)] += 1;
+
+        if self.rendered_frames.is_multiple_of(1_000) {
+            tracing::debug!(
+                rendered_frames = self.rendered_frames,
+                skipped_frames = self.skipped_frames,
+                avg_us = self.avg_us(),
+                p50 = self.percentile_bucket(50, 100),
+                p95 = self.percentile_bucket(95, 100),
+                max_us = self.max_us,
+                buckets = ?self.buckets,
+                "compositor frame-time histogram"
+            );
+        }
+    }
+
+    /// Records a tick where rendering was skipped (zero damage or transient DRM skip).
+    pub fn record_skipped(&mut self) {
+        self.skipped_frames = self.skipped_frames.saturating_add(1);
+    }
+
+    #[must_use]
+    pub fn avg_us(&self) -> u64 {
+        self.total_us.checked_div(self.rendered_frames).unwrap_or(0)
+    }
+
+    #[must_use]
+    pub fn percentile_bucket(&self, pct_num: u64, pct_den: u64) -> &'static str {
+        if self.rendered_frames == 0 {
+            return "none";
+        }
+        let target = self
+            .rendered_frames
+            .saturating_mul(pct_num)
+            .div_ceil(pct_den.max(1));
+        let mut acc = 0_u64;
+        for (idx, count) in self.buckets.iter().enumerate() {
+            acc = acc.saturating_add(*count);
+            if acc >= target {
+                return Self::BUCKET_LABELS[idx];
+            }
+        }
+        Self::BUCKET_LABELS[5]
+    }
+
+    #[must_use]
+    pub fn snapshot_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "rendered_frames": self.rendered_frames,
+            "skipped_frames": self.skipped_frames,
+            "avg_us": self.avg_us(),
+            "max_us": self.max_us,
+            "last_us": self.last_us,
+            "p50_bucket": self.percentile_bucket(50, 100),
+            "p95_bucket": self.percentile_bucket(95, 100),
+            "buckets": {
+                "lt_1ms": self.buckets[0],
+                "ms_1_2": self.buckets[1],
+                "ms_2_4": self.buckets[2],
+                "ms_4_8": self.buckets[3],
+                "ms_8_16": self.buckets[4],
+                "ge_16ms": self.buckets[5],
+            },
+        })
+    }
+}
+
 pub struct KomaState {
     pub start_time: Instant,
+    pub frame_perf: FrameTimeHistogram,
     pub clock: Clock<Monotonic>,
     pub presentation_seq: AtomicU64,
     pub display_handle: DisplayHandle,
@@ -993,6 +1095,7 @@ impl KomaState {
 
         Self {
             start_time: Instant::now(),
+            frame_perf: FrameTimeHistogram::default(),
             clock,
             presentation_seq: AtomicU64::new(0),
             display_handle,
@@ -7296,5 +7399,34 @@ pub(crate) mod tests {
             resolve_floating_rect(wa, size, koma_model::Anchor9::BottomRight, -20, -20)
                 .expect("bottom-right anchor resolves");
         assert_eq!(bottom_right, LogicalRect::new(580, 330, 1000, 650));
+    }
+
+    #[test]
+    fn frame_time_histogram_records_buckets_percentiles_and_skips() {
+        let mut hist = FrameTimeHistogram::default();
+        assert_eq!(hist.percentile_bucket(50, 100), "none");
+
+        for _ in 0..9 {
+            hist.record_rendered(Duration::from_micros(600));
+        }
+        hist.record_rendered(Duration::from_micros(12_500));
+        hist.record_skipped();
+        hist.record_skipped();
+
+        assert_eq!(hist.rendered_frames, 10);
+        assert_eq!(hist.skipped_frames, 2);
+        assert_eq!(hist.buckets, [9, 0, 0, 0, 1, 0]);
+        assert_eq!(hist.max_us, 12_500);
+        assert_eq!(hist.last_us, 12_500);
+        assert_eq!(hist.percentile_bucket(50, 100), "<1ms");
+        assert_eq!(hist.percentile_bucket(95, 100), "8-16ms");
+
+        let json = hist.snapshot_json();
+        assert_eq!(json["rendered_frames"], 10);
+        assert_eq!(json["skipped_frames"], 2);
+        assert_eq!(json["p50_bucket"], "<1ms");
+        assert_eq!(json["p95_bucket"], "8-16ms");
+        assert_eq!(json["buckets"]["lt_1ms"], 9);
+        assert_eq!(json["buckets"]["ms_8_16"], 1);
     }
 }

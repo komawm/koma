@@ -525,6 +525,7 @@ pub(crate) fn dispatch_output_frame_callbacks_filtered(
 
 /// Executes a complete single-frame render pass onto the Winit EGL swapchain (`Frame 1` & live updates).
 pub fn render_winit_frame(state: &mut KomaState) -> anyhow::Result<()> {
+    let frame_start = std::time::Instant::now();
     state.redraw_queued = false;
     state.reconcile_session_lock();
     let locked = state.is_locked_or_abandoned();
@@ -755,6 +756,9 @@ pub fn render_winit_frame(state: &mut KomaState) -> anyhow::Result<()> {
             .backend
             .submit(Some(damage))
             .map_err(|e| anyhow::anyhow!("failed submitting Winit damage: {e:?}"))?;
+        state.frame_perf.record_rendered(frame_start.elapsed());
+    } else {
+        state.frame_perf.record_skipped();
     }
 
     // 3. Dispatch `wl_surface.frame` callbacks strictly respecting session lock masking
