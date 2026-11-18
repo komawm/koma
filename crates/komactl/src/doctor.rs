@@ -2457,7 +2457,13 @@ mod tests {
             "the answering daemon pid must be named: {}",
             rows[0].message
         );
-        assert!(!report.has_warn());
+        // Deliberately not `!report.has_warn()`: the shared fixture also runs the environment
+        // checks, and `XDG_RUNTIME_DIR` legitimately warns in a bare CI image (seen on OpenBSD),
+        // which made this test fail for a reason unrelated to the overview daemon.
+        assert!(
+            rows.iter().all(|row| row.severity == Severity::Ok),
+            "the overview row must be the only verdict here: {rows:?}"
+        );
 
         drop(listener);
         let _ = fs::remove_dir_all(&root);
@@ -2490,8 +2496,8 @@ mod tests {
             terminal.message
         );
         assert!(
-            !report.has_warn(),
-            "a stock config with an empty PATH must not warn: {:?}",
+            rows.iter().all(|row| row.severity != Severity::Warn),
+            "a stock config with an empty PATH must not warn about spawn targets: {:?}",
             report
                 .findings
                 .iter()
