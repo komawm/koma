@@ -1020,7 +1020,26 @@ pub(crate) fn dispatch_rpc(
                     "stash_windows": stash_wins,
                 }));
             }
-            Ok((json!({ "workspaces": list }), Vec::new()))
+            // Output to workspace mapping, so "which workspace is monitor 2 on?" is answerable
+            // without moving windows around (komawm/koma#95). Sorted for a stable document.
+            let mut outputs: Vec<(&String, &WorkspaceId)> =
+                state.output_workspaces.iter().collect();
+            outputs.sort_by(|a, b| a.0.cmp(b.0));
+            let outputs: Vec<Value> = outputs
+                .into_iter()
+                .map(|(name, ws_id)| {
+                    json!({
+                        "name": name,
+                        "ws_id": ws_id,
+                        "ws_name": state.workspaces.get(ws_id).map(|ws| ws.name.clone()),
+                        "focused": state.focused_output_name.as_deref() == Some(name.as_str()),
+                    })
+                })
+                .collect();
+            Ok((
+                json!({ "workspaces": list, "outputs": outputs }),
+                Vec::new(),
+            ))
         }
 
         "capture.frame" => {

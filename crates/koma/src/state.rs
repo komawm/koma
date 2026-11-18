@@ -1623,11 +1623,23 @@ impl KomaState {
             {
                 ws.presentation = PresentationTarget::Physical(OutputId::new(&out_name));
             }
+            info!(
+                output = %out_name,
+                ws_id = %saved_ws,
+                branch = "hotplug-memory",
+                "claimed a workspace for the output"
+            );
             return saved_ws;
         }
 
         // 2. Claim an existing unassigned physical workspace with matching `preferred_output`.
         if let Some(ws_id) = self.initial_workspace_candidate(&out_name) {
+            info!(
+                output = %out_name,
+                ws_id = %ws_id,
+                branch = "preferred-output-match",
+                "claimed a workspace for the output"
+            );
             self.output_workspaces.insert(out_name, ws_id.clone());
             return ws_id;
         }
@@ -1643,6 +1655,12 @@ impl KomaState {
             if let Some(ws) = self.workspaces.get_mut(&ws_id) {
                 ws.presentation = PresentationTarget::Physical(OutputId::new(&out_name));
             }
+            info!(
+                output = %out_name,
+                ws_id = %ws_id,
+                branch = "startup-workspace",
+                "claimed a workspace for the output"
+            );
             self.output_workspaces.insert(out_name, ws_id.clone());
             return ws_id;
         }
@@ -1664,6 +1682,12 @@ impl KomaState {
         if let Some(ws) = self.workspaces.get_mut(&ws_id) {
             ws.presentation = PresentationTarget::Physical(OutputId::new(&out_name));
         }
+        info!(
+            output = %out_name,
+            ws_id = %ws_id,
+            branch = "fresh-workspace",
+            "claimed a workspace for the output"
+        );
         self.output_workspaces.insert(out_name, ws_id.clone());
         ws_id
     }
