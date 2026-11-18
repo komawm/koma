@@ -2541,6 +2541,7 @@ fn render_single_drm_surface(
     if !device.drm.is_active() {
         return None;
     }
+    let frame_start = std::time::Instant::now();
     let target_render_node = device.render_node.unwrap_or(tty.primary_render_node);
     let surface = device.surfaces.get_mut(&crtc)?;
     let out_name = surface.output.name();
@@ -2782,12 +2783,14 @@ fn render_single_drm_surface(
             if !res.is_empty {
                 match surface.compositor.queue_frame(()) {
                     Ok(()) => {
+                        state.frame_perf.record_rendered(frame_start.elapsed());
                         surface.redraw_state = SurfaceRedrawState::WaitingForVBlank {
                             redraw_needed: !locked && state.has_active_animations(),
                         };
                         return None;
                     }
                     Err(err) => {
+                        state.frame_perf.record_skipped();
                         warn!(
                             connector = %surface.connector_name,
                             "DrmCompositor::queue_frame failed: {err}"
@@ -2797,6 +2800,7 @@ fn render_single_drm_surface(
                 }
             } else {
                 // Zero damage this tick; release frame callbacks so clients don't stall
+                state.frame_perf.record_skipped();
                 surface.redraw_state = SurfaceRedrawState::Idle;
                 let interval =
                     Duration::from_secs_f64(1_000.0 / f64::from(surface.refresh_mhz.max(1_000)));
@@ -2805,6 +2809,7 @@ fn render_single_drm_surface(
         }
         Err(err) => {
             // Expected transiently if switching VTs mid-frame
+            state.frame_perf.record_skipped();
             debug!(
                 connector = %surface.connector_name,
                 "DrmCompositor::render_frame skipped: {err}"
