@@ -2537,24 +2537,9 @@ impl KomaState {
             ((wa.w * 3 / 5).max(360), (wa.h * 3 / 5).max(260))
         };
 
-        let explicit_float_rect =
-            initial_rules
-                .default_floating_pos
-                .and_then(|(anchor, dx, dy)| {
-                    let pt = koma_model::AnchorPoint::AnchorOffset {
-                        anchor,
-                        dx: f64::from(dx),
-                        dy: f64::from(dy),
-                    }
-                    .resolve_in(wa)
-                    .ok()?;
-                    Some(LogicalRect::new(
-                        pt.x.round() as i32,
-                        pt.y.round() as i32,
-                        preferred_size.0,
-                        preferred_size.1,
-                    ))
-                });
+        let explicit_float_rect = initial_rules
+            .default_floating_pos
+            .and_then(|(anchor, dx, dy)| resolve_floating_rect(wa, preferred_size, anchor, dx, dy));
 
         let opt_max_size = (max_sz.0 > 0 || max_sz.1 > 0).then_some(max_sz);
         let ws_origin = self.workspace_output_origin(&ws_id);
@@ -5698,6 +5683,45 @@ pub fn read_toplevel_min_max_size(wl_surface: &WlSurface) -> ((u32, u32), (u32, 
     })
 }
 
+/// Resolves a floating window's top-left `LogicalRect` in `wa` so that the window edge or
+/// center corresponding to `anchor` sits at the anchor point `(anchor_origin + (dx, dy))`.
+fn resolve_floating_rect(
+    wa: LogicalRect,
+    size: (u32, u32),
+    anchor: koma_model::Anchor9,
+    dx: i32,
+    dy: i32,
+) -> Option<LogicalRect> {
+    use koma_model::Anchor9;
+    let pt = koma_model::AnchorPoint::AnchorOffset {
+        anchor,
+        dx: f64::from(dx),
+        dy: f64::from(dy),
+    }
+    .resolve_in(wa)
+    .ok()?;
+
+    let w = f64::from(size.0);
+    let h = f64::from(size.1);
+    let x_offset = match anchor {
+        Anchor9::TopLeft | Anchor9::Left | Anchor9::BottomLeft => 0.0,
+        Anchor9::Top | Anchor9::Center | Anchor9::Bottom => w * 0.5,
+        Anchor9::TopRight | Anchor9::Right | Anchor9::BottomRight => w,
+    };
+    let y_offset = match anchor {
+        Anchor9::TopLeft | Anchor9::Top | Anchor9::TopRight => 0.0,
+        Anchor9::Left | Anchor9::Center | Anchor9::Right => h * 0.5,
+        Anchor9::BottomLeft | Anchor9::Bottom | Anchor9::BottomRight => h,
+    };
+
+    Some(LogicalRect::new(
+        (pt.x - x_offset).round() as i32,
+        (pt.y - y_offset).round() as i32,
+        size.0,
+        size.1,
+    ))
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -7253,5 +7277,24 @@ pub(crate) mod tests {
         assert_eq!(state.cursor_anim_generation, 0);
         assert!(state.cursor_timer_is_current(0));
         assert!(!state.cursor_timer_is_current(1));
+    }
+
+    #[test]
+    fn resolve_floating_rect_aligns_window_by_anchor() {
+        let wa = LogicalRect::new(0, 32, 1600, 968);
+        let size = (1000, 650);
+
+        let centered = resolve_floating_rect(wa, size, koma_model::Anchor9::Center, 0, 0)
+            .expect("center anchor resolves");
+        assert_eq!(centered, LogicalRect::new(300, 191, 1000, 650));
+
+        let top_left = resolve_floating_rect(wa, size, koma_model::Anchor9::TopLeft, 20, 120)
+            .expect("top-left anchor resolves");
+        assert_eq!(top_left, LogicalRect::new(20, 152, 1000, 650));
+
+        let bottom_right =
+            resolve_floating_rect(wa, size, koma_model::Anchor9::BottomRight, -20, -20)
+                .expect("bottom-right anchor resolves");
+        assert_eq!(bottom_right, LogicalRect::new(580, 330, 1000, 650));
     }
 }
