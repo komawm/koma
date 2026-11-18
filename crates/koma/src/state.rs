@@ -31,7 +31,8 @@ use koma_render::{
     LazyFboPool,
     blur_pipeline::CachedBackdropBlur,
     frame_composer::{
-        ClosingWindowSceneItem, WindowSceneItem, capture_window_snapshot, window_snapshot_elements,
+        ClosingWindowSceneItem, WindowSceneItem, capture_window_snapshot, surface_origin,
+        window_snapshot_elements,
     },
     offscreen_fbo::{LazyOffscreenSurface, WindowFrameCache},
 };
@@ -3134,12 +3135,17 @@ impl KomaState {
             if mapped.is_minimized {
                 continue;
             }
-            let local_origin = Point::from((f64::from(rect.x) + b_off, f64::from(rect.y) + b_off));
-            let local_pos = output_local - local_origin;
-            let global_origin = local_origin + out_origin;
+            // Frame space: the inner rect is the window geometry (border/border-fallback checks).
+            let inner_origin = Point::from((f64::from(rect.x) + b_off, f64::from(rect.y) + b_off));
+            let local_pos = output_local - inner_origin;
+            // Surface space: CSD surfaces extend above/left of the geometry rect, so hit-test the
+            // surface tree at its real `(0, 0)` and report that same origin for pointer focus.
+            let win_surface_origin = surface_origin(inner_origin, mapped.window.geometry().loc);
+            let surface_pos = output_local - win_surface_origin;
+            let global_origin = win_surface_origin + out_origin;
             if let Some((surf, surf_offset)) = mapped
                 .window
-                .surface_under(local_pos, WindowSurfaceType::ALL)
+                .surface_under(surface_pos, WindowSurfaceType::ALL)
             {
                 return Some((win_id, surf, surf_offset.to_f64() + global_origin));
             }
@@ -4508,15 +4514,21 @@ impl KomaState {
             .find(|m| m.window.toplevel().is_some_and(|t| t.wl_surface() == &root));
 
         if let Some(m) = win_match {
-            let win_geo_loc = m.window.geometry().loc;
-            let ws_origin = self.workspace_output_origin(&m.ws_id).to_i32_round::<i32>();
-            return Rectangle::new(
-                Point::from((
-                    ws_origin.x + m.rect.x - win_geo_loc.x,
-                    ws_origin.y + m.rect.y - win_geo_loc.y,
-                )),
-                Size::from((m.rect.w.max(1) as i32, m.rect.h.max(1) as i32)),
-            );
+            let border = self.lua_sandbox.config_snapshot().appearance.border;
+            let b_off = if border.enabled {
+                f64::from(border.width.max(0.0))
+            } else {
+                0.0
+            };
+            let ws_origin = self.workspace_output_origin(&m.ws_id);
+            let inner_origin =
+                Point::from((f64::from(m.rect.x) + b_off, f64::from(m.rect.y) + b_off));
+            let win_surface_origin = surface_origin(inner_origin, m.window.geometry().loc);
+            let inner_size = Size::from((
+                (f64::from(m.rect.w) - 2.0 * b_off).max(1.0).round() as i32,
+                (f64::from(m.rect.h) - 2.0 * b_off).max(1.0).round() as i32,
+            ));
+            return Rectangle::new((ws_origin + win_surface_origin).to_i32_round(), inner_size);
         }
 
         for output in self.all_outputs() {
