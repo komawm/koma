@@ -15,7 +15,7 @@
 
 use std::{
     collections::HashMap,
-    env, mem,
+    env, io, mem,
     os::fd::{AsFd, BorrowedFd},
     path::{Path, PathBuf},
     time::Duration,
@@ -39,7 +39,7 @@ use libc::dev_t;
 use smithay::{
     backend::{
         allocator::{
-            Fourcc,
+            Format, Fourcc,
             dmabuf::Dmabuf,
             format::FormatSet,
             gbm::{GbmAllocator, GbmBufferFlags, GbmDevice},
@@ -73,6 +73,7 @@ use smithay::{
         gbm::Modifier,
         input::Libinput,
         rustix::{fs::OFlags, io::Errno},
+        wayland_protocols::wp::linux_dmabuf::zv1::server::zwp_linux_dmabuf_feedback_v1::TrancheFlags,
         wayland_server::backend::GlobalId,
     },
     utils::{DeviceFd, Point, SERIAL_COUNTER, Scale as MathScale},
@@ -1219,39 +1220,20 @@ impl TtyBackendState {
             .and_then(|d| d.render_node)
             .unwrap_or(self.primary_render_node);
 
+        let (is_display_only, is_software) = self.devices.get(&node).map_or((false, false), |d| {
+            (d.render_node.is_none(), d.software_rendering)
+        });
+
         let render_formats: FormatSet = {
             let renderer = self.gpu_manager.single_renderer(&target_render_node)?;
             let raw_formats = renderer.as_ref().egl_context().dmabuf_render_formats();
-            let (is_display_only, is_software) =
-                self.devices.get(&node).map_or((false, false), |d| {
-                    (d.render_node.is_none(), d.software_rendering)
-                });
-
-            raw_formats
-                .iter()
-                .copied()
-                .filter(|fmt| {
-                    if is_display_only {
-                        return fmt.modifier == Modifier::Linear;
-                    }
-                    if is_software {
-                        // `kms_swrast` allocates linear dumb buffers, often without modifier support.
-                        return matches!(fmt.modifier, Modifier::Linear | Modifier::Invalid);
-                    }
-                    // Exclude high-bandwidth Intel CCS modifiers (`niri/src/backend/tty.rs` lines 1440-1458)
-                    !matches!(
-                        fmt.modifier,
-                        Modifier::I915_y_tiled_ccs
-                            | Modifier::Unrecognized(0x100000000000005)
-                            | Modifier::I915_y_tiled_gen12_rc_ccs
-                            | Modifier::I915_y_tiled_gen12_mc_ccs
-                            | Modifier::Unrecognized(0x100000000000008)
-                            | Modifier::Unrecognized(0x10000000000000a)
-                            | Modifier::Unrecognized(0x10000000000000b)
-                            | Modifier::Unrecognized(0x10000000000000c)
-                    )
-                })
-                .collect()
+            filter_render_formats(
+                raw_formats,
+                self.primary_render_node,
+                target_render_node,
+                is_display_only,
+                is_software,
+            )
         };
 
         let output = Output::new(
@@ -1303,7 +1285,9 @@ impl TtyBackendState {
                 let _ = drm_surface.use_vrr(false);
             }
 
-            let color_formats = SUPPORTED_COLOR_FORMATS_10BIT.iter().copied();
+            let color_formats = select_initial_color_formats(disable_10bit_output_requested())
+                .iter()
+                .copied();
             let exporter =
                 GbmFramebufferExporter::new(device.gbm.clone(), device.render_node.into());
             match DrmCompositor::new(
@@ -1353,9 +1337,29 @@ impl TtyBackendState {
             .single_renderer(&self.primary_render_node)
             .ok()
             .and_then(|r| {
-                DmabufFeedbackBuilder::new(self.primary_render_node.dev_id(), r.dmabuf_formats())
-                    .build()
-                    .ok()
+                let primary_formats = r.dmabuf_formats();
+                match surface_dmabuf_feedback(
+                    &compositor,
+                    primary_formats.clone(),
+                    self.primary_render_node,
+                    target_render_node,
+                    is_display_only,
+                    node,
+                ) {
+                    Ok(feedback) => Some(feedback),
+                    Err(err) => {
+                        warn!(
+                            connector = %connector_name,
+                            "surface_dmabuf_feedback failed ({err:?}); falling back to primary render formats"
+                        );
+                        DmabufFeedbackBuilder::new(
+                            self.primary_render_node.dev_id(),
+                            primary_formats,
+                        )
+                        .build()
+                        .ok()
+                    }
+                }
             });
 
         let wl_global = Some(output.create_global::<KomaState>(&state.display_handle));
@@ -1644,6 +1648,174 @@ fn try_register_egl_render_node(
         );
     }
     Ok(render_node)
+}
+
+/// Filters EGL `dmabuf_render_formats()` for a DRM connector's scanout compositor.
+///
+/// Cross-GPU (`target_render_node != primary_render_node`) and display-only outputs restrict
+/// allocation to `Modifier::Linear` so cross-device scanout avoids tiled modifier negotiation
+/// failures or `cpu-copy` fallbacks. Software rasterizers (`kms_swrast`) allow `Linear | Invalid`,
+/// while same-GPU hardware outputs preserve non-CCS tiled modifiers and exclude high-bandwidth
+/// Intel CCS modifiers (`niri/src/backend/tty.rs` lines 1440-1458).
+fn filter_render_formats<N: Eq>(
+    raw_formats: &FormatSet,
+    primary_render_node: N,
+    target_render_node: N,
+    is_display_only: bool,
+    is_software: bool,
+) -> FormatSet {
+    let is_cross_gpu = target_render_node != primary_render_node;
+    raw_formats
+        .iter()
+        .copied()
+        .filter(|fmt| {
+            if is_cross_gpu || is_display_only {
+                return fmt.modifier == Modifier::Linear;
+            }
+            if is_software {
+                // `kms_swrast` allocates linear dumb buffers, often without modifier support.
+                return matches!(fmt.modifier, Modifier::Linear | Modifier::Invalid);
+            }
+            // Exclude high-bandwidth Intel CCS modifiers (`niri/src/backend/tty.rs` lines 1440-1458)
+            !matches!(
+                fmt.modifier,
+                Modifier::I915_y_tiled_ccs
+                    | Modifier::Unrecognized(0x100000000000005)
+                    | Modifier::I915_y_tiled_gen12_rc_ccs
+                    | Modifier::I915_y_tiled_gen12_mc_ccs
+                    | Modifier::Unrecognized(0x100000000000008)
+                    | Modifier::Unrecognized(0x10000000000000a)
+                    | Modifier::Unrecognized(0x10000000000000b)
+                    | Modifier::Unrecognized(0x10000000000000c)
+            )
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ScanoutFeedbackFormats {
+    primary: Vec<Format>,
+    primary_or_overlay: Vec<Format>,
+}
+
+fn collect_scanout_feedback_formats<N: Eq>(
+    primary_plane_formats: &FormatSet,
+    overlay_plane_formats: impl IntoIterator<Item = Format>,
+    primary_render_formats: &FormatSet,
+    primary_render_node: N,
+    target_render_node: N,
+    is_display_only: bool,
+) -> ScanoutFeedbackFormats {
+    let primary_or_overlay_plane_formats: FormatSet = primary_plane_formats
+        .iter()
+        .copied()
+        .chain(overlay_plane_formats)
+        .collect();
+
+    // Limit scanout tranches to formats the primary renderer can also import/composite if direct
+    // scanout is rejected during an atomic commit test.
+    let mut primary = primary_plane_formats
+        .intersection(primary_render_formats)
+        .copied()
+        .collect::<Vec<_>>();
+    let mut primary_or_overlay = primary_or_overlay_plane_formats
+        .intersection(primary_render_formats)
+        .copied()
+        .collect::<Vec<_>>();
+
+    // Cross-GPU and display-only surfaces cannot safely scan out vendor-tiled cross-device
+    // buffers (`niri/src/backend/tty.rs` lines 2972-2980).
+    if target_render_node != primary_render_node || is_display_only {
+        primary.retain(|f| f.modifier == Modifier::Linear);
+        primary_or_overlay.retain(|f| f.modifier == Modifier::Linear);
+    }
+
+    ScanoutFeedbackFormats {
+        primary,
+        primary_or_overlay,
+    }
+}
+
+fn build_surface_dmabuf_feedback(
+    primary_render_dev_id: dev_t,
+    surface_scanout_dev_id: dev_t,
+    primary_formats: FormatSet,
+    scanout_formats: ScanoutFeedbackFormats,
+) -> io::Result<DmabufFeedback> {
+    DmabufFeedbackBuilder::new(primary_render_dev_id, primary_formats)
+        .add_preference_tranche(
+            surface_scanout_dev_id,
+            TrancheFlags::Scanout,
+            scanout_formats.primary,
+            4..=6,
+        )
+        .add_preference_tranche(
+            surface_scanout_dev_id,
+            TrancheFlags::Scanout,
+            scanout_formats.primary_or_overlay,
+            4..=6,
+        )
+        .build()
+}
+
+/// Builds a multi-tranche `DmabufFeedback` for an output surface (`niri/src/backend/tty.rs:2944-3017`).
+///
+/// Prefers primary-plane scanout formats first, then primary+overlay scanout formats on the
+/// surface device (`TrancheFlags::Scanout`), falling back to `primary_formats` on
+/// `primary_render_node`.
+fn surface_dmabuf_feedback(
+    compositor: &GbmDrmCompositor,
+    primary_formats: FormatSet,
+    primary_render_node: DrmNode,
+    target_render_node: DrmNode,
+    is_display_only: bool,
+    surface_scanout_node: DrmNode,
+) -> io::Result<DmabufFeedback> {
+    let surface = compositor.surface();
+    let planes = surface.planes();
+    let primary_plane_formats = &surface.plane_info().formats;
+    let scanout = collect_scanout_feedback_formats(
+        primary_plane_formats,
+        planes
+            .overlay
+            .iter()
+            .flat_map(|p| p.formats.iter().copied()),
+        &primary_formats,
+        primary_render_node,
+        target_render_node,
+        is_display_only,
+    );
+
+    trace!(
+        primary_scanout_formats = scanout.primary.len(),
+        overlay_scanout_added = scanout
+            .primary_or_overlay
+            .len()
+            .saturating_sub(scanout.primary.len()),
+        linear_only = target_render_node != primary_render_node || is_display_only,
+        "built multi-tranche surface DmabufFeedback"
+    );
+
+    build_surface_dmabuf_feedback(
+        primary_render_node.dev_id(),
+        surface_scanout_node.dev_id(),
+        primary_formats,
+        scanout,
+    )
+}
+
+/// 10-bit KMS scanout (`Abgr2101010`) is attempted first unless
+/// `KOMA_DISABLE_10BIT_OUTPUT=1` (or `true`) is set.
+fn disable_10bit_output_requested() -> bool {
+    is_truthy_env_value(env::var("KOMA_DISABLE_10BIT_OUTPUT").ok().as_deref())
+}
+
+fn select_initial_color_formats(disable_10bit: bool) -> &'static [Fourcc] {
+    if disable_10bit {
+        &SUPPORTED_COLOR_FORMATS_8BIT
+    } else {
+        &SUPPORTED_COLOR_FORMATS_10BIT
+    }
 }
 
 /// Software rendering on a display-only primary device is on unless
@@ -2810,5 +2982,264 @@ mod tests {
         assert!(
             (resolve_connector_scale(Some(&fixed_spec), 3024, 1964, 302, 196) - 1.5).abs() < 1e-6
         );
+    }
+
+    #[test]
+    fn filter_render_formats_handles_same_gpu_cross_gpu_display_only_and_software() {
+        let linear = Format {
+            code: Fourcc::Argb8888,
+            modifier: Modifier::Linear,
+        };
+        let invalid = Format {
+            code: Fourcc::Argb8888,
+            modifier: Modifier::Invalid,
+        };
+        let x_tiled = Format {
+            code: Fourcc::Argb8888,
+            modifier: Modifier::I915_x_tiled,
+        };
+        let y_tiled = Format {
+            code: Fourcc::Xrgb8888,
+            modifier: Modifier::I915_y_tiled,
+        };
+        let ccs_modifiers = [
+            Modifier::I915_y_tiled_ccs,
+            Modifier::Unrecognized(0x100000000000005),
+            Modifier::I915_y_tiled_gen12_rc_ccs,
+            Modifier::I915_y_tiled_gen12_mc_ccs,
+            Modifier::Unrecognized(0x100000000000008),
+            Modifier::Unrecognized(0x10000000000000a),
+            Modifier::Unrecognized(0x10000000000000b),
+            Modifier::Unrecognized(0x10000000000000c),
+        ];
+        let mut raw_vec = vec![linear, invalid, x_tiled, y_tiled];
+        for modifier in ccs_modifiers {
+            raw_vec.push(Format {
+                code: Fourcc::Argb8888,
+                modifier,
+            });
+        }
+        let raw_formats: FormatSet = raw_vec.into_iter().collect();
+
+        // Same-GPU hardware output excludes Intel CCS modifiers and preserves tiled + linear + invalid.
+        let same_gpu = filter_render_formats(&raw_formats, 128_u32, 128_u32, false, false);
+        assert!(same_gpu.contains(&linear));
+        assert!(same_gpu.contains(&invalid));
+        assert!(same_gpu.contains(&x_tiled));
+        assert!(same_gpu.contains(&y_tiled));
+        for modifier in ccs_modifiers {
+            assert!(!same_gpu.contains(&Format {
+                code: Fourcc::Argb8888,
+                modifier,
+            }));
+        }
+
+        // Cross-GPU (`target_render_node != primary_render_node`) restricts to `Modifier::Linear`.
+        let cross_gpu = filter_render_formats(&raw_formats, 128_u32, 129_u32, false, false);
+        assert_eq!(cross_gpu.iter().copied().collect::<Vec<_>>(), vec![linear]);
+
+        // Display-only (`render_node.is_none()`) restricts to `Modifier::Linear` even when
+        // `target_render_node` borrows `primary_render_node`.
+        let display_only = filter_render_formats(&raw_formats, 128_u32, 128_u32, true, false);
+        assert_eq!(
+            display_only.iter().copied().collect::<Vec<_>>(),
+            vec![linear]
+        );
+
+        // Software rasterizer allows `Linear | Invalid` only.
+        let software = filter_render_formats(&raw_formats, 128_u32, 128_u32, false, true);
+        assert!(software.contains(&linear));
+        assert!(software.contains(&invalid));
+        assert!(!software.contains(&x_tiled));
+        assert!(!software.contains(&y_tiled));
+        assert_eq!(software.iter().count(), 2);
+    }
+
+    #[test]
+    fn select_initial_color_formats_respects_disable_10bit_toggle() {
+        let default_formats = select_initial_color_formats(false);
+        assert_eq!(default_formats, &SUPPORTED_COLOR_FORMATS_10BIT);
+        assert_eq!(default_formats[0], Fourcc::Abgr2101010);
+
+        let fallback_8bit = select_initial_color_formats(true);
+        assert_eq!(fallback_8bit, &SUPPORTED_COLOR_FORMATS_8BIT);
+        assert!(!fallback_8bit.contains(&Fourcc::Abgr2101010));
+        assert!(fallback_8bit.contains(&Fourcc::Argb8888));
+        assert!(fallback_8bit.contains(&Fourcc::Abgr8888));
+    }
+
+    #[test]
+    fn multi_tranche_scanout_feedback_same_gpu_vs_cross_gpu_and_display_only() {
+        let argb_linear = Format {
+            code: Fourcc::Argb8888,
+            modifier: Modifier::Linear,
+        };
+        let argb_x_tiled = Format {
+            code: Fourcc::Argb8888,
+            modifier: Modifier::I915_x_tiled,
+        };
+        let xrgb_linear = Format {
+            code: Fourcc::Xrgb8888,
+            modifier: Modifier::Linear,
+        };
+        let abgr_y_tiled = Format {
+            code: Fourcc::Abgr8888,
+            modifier: Modifier::I915_y_tiled,
+        };
+        let abgr10_linear = Format {
+            code: Fourcc::Abgr2101010,
+            modifier: Modifier::Linear,
+        };
+        let plane_only_unsupported = Format {
+            code: Fourcc::Xbgr8888,
+            modifier: Modifier::Linear,
+        };
+        let overlay_only_unsupported = Format {
+            code: Fourcc::Abgr2101010,
+            modifier: Modifier::I915_x_tiled,
+        };
+
+        let primary_render_formats: FormatSet = [
+            argb_linear,
+            argb_x_tiled,
+            xrgb_linear,
+            abgr_y_tiled,
+            abgr10_linear,
+        ]
+        .into_iter()
+        .collect();
+        let primary_plane_formats: FormatSet = [argb_linear, argb_x_tiled, plane_only_unsupported]
+            .into_iter()
+            .collect();
+        let overlay_plane_formats = [abgr_y_tiled, xrgb_linear, overlay_only_unsupported];
+
+        // Same-GPU keeps non-linear scanout formats intersected with `primary_render_formats`.
+        let same_gpu = collect_scanout_feedback_formats(
+            &primary_plane_formats,
+            overlay_plane_formats,
+            &primary_render_formats,
+            128_u32,
+            128_u32,
+            false,
+        );
+        let same_gpu_primary: FormatSet = same_gpu.primary.iter().copied().collect();
+        let same_gpu_overlay: FormatSet = same_gpu.primary_or_overlay.iter().copied().collect();
+        assert_eq!(same_gpu_primary.iter().count(), 2);
+        assert!(same_gpu_primary.contains(&argb_linear));
+        assert!(same_gpu_primary.contains(&argb_x_tiled));
+        assert!(!same_gpu_primary.contains(&plane_only_unsupported));
+        assert_eq!(same_gpu_overlay.iter().count(), 4);
+        assert!(same_gpu_overlay.contains(&abgr_y_tiled));
+        assert!(same_gpu_overlay.contains(&xrgb_linear));
+        assert!(!same_gpu_overlay.contains(&overlay_only_unsupported));
+
+        // Cross-GPU retains `Modifier::Linear` only in both scanout tranches.
+        let cross_gpu = collect_scanout_feedback_formats(
+            &primary_plane_formats,
+            overlay_plane_formats,
+            &primary_render_formats,
+            128_u32,
+            129_u32,
+            false,
+        );
+        assert_eq!(cross_gpu.primary, vec![argb_linear]);
+        let cross_gpu_overlay: FormatSet = cross_gpu.primary_or_overlay.iter().copied().collect();
+        assert_eq!(cross_gpu_overlay.iter().count(), 2);
+        assert!(cross_gpu_overlay.contains(&argb_linear));
+        assert!(cross_gpu_overlay.contains(&xrgb_linear));
+
+        // Display-only also retains `Modifier::Linear` only in both scanout tranches.
+        let display_only = collect_scanout_feedback_formats(
+            &primary_plane_formats,
+            overlay_plane_formats,
+            &primary_render_formats,
+            128_u32,
+            128_u32,
+            true,
+        );
+        assert_eq!(display_only, cross_gpu);
+
+        // Verify `DmabufFeedback` builder preserves tranche ordering and fallback render device.
+        const PRIMARY_RENDER_DEV: dev_t = 0xE280;
+        const SAME_GPU_CARD_DEV: dev_t = 0xE200;
+        const CROSS_GPU_CARD_DEV: dev_t = 0xE201;
+
+        let same_gpu_feedback = build_surface_dmabuf_feedback(
+            PRIMARY_RENDER_DEV,
+            SAME_GPU_CARD_DEV,
+            primary_render_formats.clone(),
+            same_gpu.clone(),
+        )
+        .expect("build same-GPU DmabufFeedback");
+        let expected_same_gpu =
+            DmabufFeedbackBuilder::new(PRIMARY_RENDER_DEV, primary_render_formats.clone())
+                .add_preference_tranche(
+                    SAME_GPU_CARD_DEV,
+                    TrancheFlags::Scanout,
+                    same_gpu.primary,
+                    4..=6,
+                )
+                .add_preference_tranche(
+                    SAME_GPU_CARD_DEV,
+                    TrancheFlags::Scanout,
+                    same_gpu.primary_or_overlay,
+                    4..=6,
+                )
+                .build()
+                .expect("build expected same-GPU DmabufFeedback");
+        assert_eq!(same_gpu_feedback, expected_same_gpu);
+
+        let fallback_only_feedback =
+            DmabufFeedbackBuilder::new(PRIMARY_RENDER_DEV, primary_render_formats.clone())
+                .build()
+                .expect("build fallback-only DmabufFeedback");
+        assert_ne!(same_gpu_feedback, fallback_only_feedback);
+
+        let cross_gpu_feedback = build_surface_dmabuf_feedback(
+            PRIMARY_RENDER_DEV,
+            CROSS_GPU_CARD_DEV,
+            primary_render_formats.clone(),
+            cross_gpu.clone(),
+        )
+        .expect("build cross-GPU DmabufFeedback");
+        let expected_cross_gpu =
+            DmabufFeedbackBuilder::new(PRIMARY_RENDER_DEV, primary_render_formats.clone())
+                .add_preference_tranche(
+                    CROSS_GPU_CARD_DEV,
+                    TrancheFlags::Scanout,
+                    vec![argb_linear],
+                    4..=6,
+                )
+                .add_preference_tranche(
+                    CROSS_GPU_CARD_DEV,
+                    TrancheFlags::Scanout,
+                    vec![argb_linear, xrgb_linear],
+                    4..=6,
+                )
+                .build()
+                .expect("build expected cross-GPU DmabufFeedback");
+        assert_eq!(cross_gpu_feedback, expected_cross_gpu);
+        assert_ne!(cross_gpu_feedback, fallback_only_feedback);
+
+        // When no Linear scanout formats intersect on cross-GPU, empty scanout tranches are omitted
+        // and feedback gracefully falls back to the primary render tranche.
+        let empty_cross_gpu = collect_scanout_feedback_formats(
+            &[argb_x_tiled].into_iter().collect(),
+            [abgr_y_tiled],
+            &primary_render_formats,
+            128_u32,
+            129_u32,
+            false,
+        );
+        assert!(empty_cross_gpu.primary.is_empty());
+        assert!(empty_cross_gpu.primary_or_overlay.is_empty());
+        let empty_scanout_feedback = build_surface_dmabuf_feedback(
+            PRIMARY_RENDER_DEV,
+            CROSS_GPU_CARD_DEV,
+            primary_render_formats,
+            empty_cross_gpu,
+        )
+        .expect("build empty-scanout fallback DmabufFeedback");
+        assert_eq!(empty_scanout_feedback, fallback_only_feedback);
     }
 }
