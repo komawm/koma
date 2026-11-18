@@ -106,17 +106,29 @@ impl CompositorHandler for KomaState {
             .compositor_state
     }
 
+    fn new_subsurface(&mut self, surface: &WlSurface, parent: &WlSurface) {
+        let mut root = parent.clone();
+        while let Some(next) = get_parent(&root) {
+            root = next;
+        }
+        self.subsurface_roots.insert(surface.clone(), root);
+    }
+
     fn commit(&mut self, surface: &WlSurface) {
         // 1. Import committed wl_shm / linux-dmabuf buffer into Smithay's RendererSurfaceState
         on_commit_buffer_handler::<Self>(surface);
-        if is_sync_subsurface(surface) {
-            return;
-        }
 
         // Resolve child `wl_subsurface` commits (e.g., `foot` CSD borders/titlebars) to their root.
         let mut root_surface = surface.clone();
         while let Some(parent) = get_parent(&root_surface) {
             root_surface = parent;
+        }
+        if surface != &root_surface {
+            self.subsurface_roots
+                .insert(surface.clone(), root_surface.clone());
+        }
+        if is_sync_subsurface(surface) {
+            return;
         }
 
         // 2. Track popup state commits & reset active workspace damage-settle timer
@@ -341,9 +353,11 @@ impl CompositorHandler for KomaState {
             if hints_changed {
                 self.sync_workspace_geometries(&ws_id);
             }
-            // Cache the frame while the client's buffer is still readable; a later unmap commit
-            // attaches a null buffer and destroy releases the pixels entirely.
-            self.refresh_window_frame(win_id);
+            // Active commit (including async subsurfaces): zero offscreen FBO rendering; drop any
+            // stale snapshot captured before a non-fatal subsurface teardown.
+            if !self.window_frames.is_empty() {
+                self.window_frames.remove(&win_id);
+            }
             notify_workspace_surface_damage(self, &ws_id);
             self.reconcile_idle_inhibitors();
             self.maybe_activate_pointer_constraint();
@@ -379,6 +393,25 @@ impl CompositorHandler for KomaState {
             self.focused_ondemand_layer = None;
             self.reconcile_keyboard_focus();
         }
+        // Snapshot a mapped toplevel once when it or any child subsurface is destroyed before
+        // `toplevel_destroyed`, while Smithay's surface tree and buffers are still intact.
+        // `wl_subsurface.destroy` detaches `get_parent` before `wl_surface.destroyed`, so fall
+        // back to the last recorded `subsurface_roots` mapping.
+        let mut root_surface = surface.clone();
+        while let Some(parent) = get_parent(&root_surface) {
+            root_surface = parent;
+        }
+        if let Some(recorded_root) = self.subsurface_roots.get(&root_surface) {
+            root_surface = recorded_root.clone();
+        }
+        if let Some(win_id) = find_mapped_window_id(self, &root_surface)
+            && !self.window_frames.contains_key(&win_id)
+        {
+            self.refresh_window_frame(win_id);
+        }
+        self.subsurface_roots
+            .retain(|child, root| child != surface && root != surface);
+        self.remove_toplevel_pre_commit_hook(surface);
         self.reconcile_idle_inhibitors();
     }
 }
@@ -417,6 +450,7 @@ impl XdgShellHandler for KomaState {
         let win_id = self.allocate_window_id();
         let wl_surface = surface.wl_surface().clone();
         let window = Window::new_wayland_window(surface);
+        self.register_toplevel_pre_commit_hook(&wl_surface);
         self.unmapped_windows.insert(
             wl_surface,
             UnmappedToplevel {
@@ -635,6 +669,7 @@ impl XdgShellHandler for KomaState {
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
         let wl_surface = surface.wl_surface();
+        self.remove_toplevel_pre_commit_hook(wl_surface);
         self.unmapped_windows.remove(wl_surface);
 
         if let Some(pos) = self.mapped_windows.iter().position(|m| {

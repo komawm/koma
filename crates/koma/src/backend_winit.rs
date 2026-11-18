@@ -9,6 +9,7 @@ use koma_model::LogicalViewport;
 use koma_proto::OverlayKind;
 use koma_render::{
     RenderTargetKind,
+    elements::FrameDecorationCache,
     frame_composer::{
         DEFAULT_BACKDROP_CLEAR, FrameBlurContext, append_closing_window_elements,
         append_scratchpad_dim_scrim, append_tab_indicator_elements, assemble_workspace_elements,
@@ -75,6 +76,7 @@ pub struct WinitBackendState {
     pub output: Output,
     pub backend: WinitGraphicsBackend<GlesRenderer>,
     pub damage_tracker: OutputDamageTracker,
+    pub decoration_cache: FrameDecorationCache,
     pub render_node: Option<DrmNode>,
     pub dmabuf_global: Option<DmabufGlobal>,
     last_host_cursor_visible: Option<bool>,
@@ -198,6 +200,7 @@ impl WinitBackendState {
                 output,
                 backend,
                 damage_tracker,
+                decoration_cache: FrameDecorationCache::default(),
                 render_node: None,
                 dmabuf_global: None,
                 last_host_cursor_visible: Some(false),
@@ -572,6 +575,7 @@ pub fn render_winit_frame(state: &mut KomaState) -> anyhow::Result<()> {
 
     // 1. Assemble front-to-back render elements & composite damaged regions into Winit framebuffer
     let render_res = {
+        winit_state.decoration_cache.begin_frame();
         let (elements, clear_color) = if locked {
             (
                 assemble_locked_frame_elements(
@@ -621,21 +625,17 @@ pub fn render_winit_frame(state: &mut KomaState) -> anyhow::Result<()> {
 
             let frame_blur_ctx = if any_window_needs_blur {
                 let phys_sz = winit_state.backend.window_size();
-                state
-                    .backdrop_blur_cache
-                    .borrow_mut()
-                    .update_and_blur(
-                        winit_state.backend.renderer(),
-                        phys_sz,
-                        output_scale,
-                        DEFAULT_BACKDROP_CLEAR,
-                        &bg_layer_elements,
-                        blur_cfg,
-                    )
-                    .map(|texture| FrameBlurContext {
-                        texture,
-                        config: blur_cfg,
-                    })
+                let mut blur_cache = state.backdrop_blur_cache.borrow_mut();
+                let tex = blur_cache.update_and_blur(
+                    winit_state.backend.renderer(),
+                    phys_sz,
+                    output_scale,
+                    DEFAULT_BACKDROP_CLEAR,
+                    &bg_layer_elements,
+                    blur_cfg,
+                );
+                let blur_gen = blur_cache.blur_generation();
+                tex.map(|texture| FrameBlurContext::from_cached(texture, blur_cfg, blur_gen))
             } else {
                 None
             };
@@ -655,9 +655,14 @@ pub fn render_winit_frame(state: &mut KomaState) -> anyhow::Result<()> {
                     frame_blur_ctx.as_ref(),
                     sp_drop,
                     sp_items,
+                    Some(&mut winit_state.decoration_cache),
                 );
                 elements.extend(sp_elems);
-                append_scratchpad_dim_scrim(viewport, &mut elements);
+                append_scratchpad_dim_scrim(
+                    viewport,
+                    Some(&mut winit_state.decoration_cache),
+                    &mut elements,
+                );
             }
 
             if let Some(ws) = state.workspaces.get(&out_ws_id)
@@ -670,6 +675,7 @@ pub fn render_winit_frame(state: &mut KomaState) -> anyhow::Result<()> {
                     winit_state.backend.renderer(),
                     output_scale,
                     &tab_segs,
+                    Some(&mut winit_state.decoration_cache),
                     &mut elements,
                 );
             }
@@ -684,6 +690,7 @@ pub fn render_winit_frame(state: &mut KomaState) -> anyhow::Result<()> {
                 frame_blur_ctx.as_ref(),
                 base_drop,
                 &base_scene_items,
+                Some(&mut winit_state.decoration_cache),
             );
             elements.extend(ws_elements);
             // Captured closing frames linger above the window layers while `windows_close` settles.
@@ -700,7 +707,11 @@ pub fn render_winit_frame(state: &mut KomaState) -> anyhow::Result<()> {
             );
             elements.extend(bg_layer_elements);
             if state.config_error_banner.is_some() {
-                prepend_config_error_banner(viewport, &mut elements);
+                prepend_config_error_banner(
+                    viewport,
+                    Some(&mut winit_state.decoration_cache),
+                    &mut elements,
+                );
             }
             if state.keybind_overlay_is_open() {
                 prepend_keybind_overlay_elements(
@@ -717,6 +728,7 @@ pub fn render_winit_frame(state: &mut KomaState) -> anyhow::Result<()> {
                 RenderTargetKind::PhysicalOutput,
                 output_scale,
                 agent_cursor_snap.as_ref(),
+                Some(&mut winit_state.decoration_cache),
                 &mut elements,
             );
             let cursor_len = cursor_elems.len();
@@ -724,6 +736,7 @@ pub fn render_winit_frame(state: &mut KomaState) -> anyhow::Result<()> {
             elements.splice(cursor_len..cursor_len, dnd_icon_elems);
             (elements, DEFAULT_BACKDROP_CLEAR)
         };
+        winit_state.decoration_cache.end_frame();
 
         let (renderer, mut framebuffer) = winit_state
             .backend

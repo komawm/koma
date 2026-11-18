@@ -2008,6 +2008,7 @@ fn execute_zero_copy_capture_frame(
                     .is_some_and(|p| p.blocks_agent_capture());
                 let appearance = &state.lua_sandbox.config_snapshot().appearance;
                 vec![WindowSceneItem {
+                    win_id: mapped.win_id,
                     window: &mapped.window,
                     rect: mapped.rect,
                     is_floating: mapped.is_floating,
@@ -2055,11 +2056,13 @@ fn execute_zero_copy_capture_frame(
                 None,
                 None,
                 &scene_items,
+                None,
             );
             prepend_agent_cursor_elements(
                 renderer,
                 RenderTargetKind::AgentCapture,
                 Scale::from(viewport.scale),
+                None,
                 None,
                 &mut elements,
             );
