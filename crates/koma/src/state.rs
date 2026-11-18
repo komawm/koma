@@ -19,9 +19,9 @@ use koma_lua::{
 use koma_model::{
     AgentCursorConfig, AgentCursorFrameSnapshot, AgentCursorVisualDynamics, LayoutMode,
     LogicalPoint, LogicalRect, LogicalViewport, OpenMode, OutputLayout, OutputTransform,
-    PresentationTarget, SafeAreaInsets, SavedOutputConfig, SizeHints, WindowAnimationTable,
-    WindowMatchContext, WindowRuleEngine, WorkspaceLeaseState, WorkspaceState,
-    WorkspaceTransitionTable, is_waydroid_app_id,
+    PresentationTarget, ResizeCorner, SafeAreaInsets, SavedOutputConfig, SizeHints,
+    WindowAnimationTable, WindowMatchContext, WindowRuleEngine, WorkspaceLeaseState,
+    WorkspaceState, WorkspaceTransitionTable, is_waydroid_app_id,
 };
 use koma_proto::{
     CapabilityToken, Epoch, EventTopic, OutputId, SeatId, TokenClaims, WindowId, WorkspaceEvent,
@@ -760,6 +760,11 @@ pub struct KomaState {
     /// Active `MoveWindowGrab` cursor state `(ws_id, cursor_x)` driving continuous VBlank edge auto-scroll.
     pub active_drag_edge_scroll: Option<(WorkspaceId, f64)>,
     pub edge_scroll_keep_alive: bool,
+    /// Frame edge currently hovered for interactive resize: `(win_id, corner)` plus the cursor
+    /// status to restore once the pointer leaves the edge (`Hyprland` border-drag parity).
+    pub frame_edge_hover: Option<(WindowId, ResizeCorner)>,
+    /// Cursor status captured when `frame_edge_hover` was entered, restored on exit.
+    pub cursor_before_frame_edge: Option<CursorImageStatus>,
     pub backdrop_blur_cache: RefCell<CachedBackdropBlur>,
     pub fbo_pool: LazyFboPool,
     pub offscreen_surfaces: HashMap<WorkspaceId, LazyOffscreenSurface>,
@@ -990,6 +995,8 @@ impl KomaState {
             active_drop_preview: None,
             active_drag_edge_scroll: None,
             edge_scroll_keep_alive: false,
+            frame_edge_hover: None,
+            cursor_before_frame_edge: None,
             backdrop_blur_cache: RefCell::new(CachedBackdropBlur::default()),
             fbo_pool: LazyFboPool::default(),
             offscreen_surfaces: HashMap::new(),
@@ -1776,10 +1783,85 @@ impl KomaState {
         true
     }
 
+    /// Makes `ws_id` the focused workspace, switching the output that owns it when needed.
+    ///
+    /// This is the single workspace-switch path shared by `workspace.focus`, `ws.focus` and
+    /// window moves that follow the window (`Hyprland` `movetoworkspace`), so a followed move
+    /// lands in exactly the same state as an explicit workspace focus.
+    pub fn focus_workspace(&mut self, ws_id: &WorkspaceId) -> bool {
+        let Some(is_special) = self.workspaces.get(ws_id).map(|ws| ws.is_special) else {
+            return false;
+        };
+        self.break_active_pointer_constraints();
+        if is_special {
+            self.active_special_ws_id = Some(ws_id.clone());
+            self.focus_active_deck_window();
+            self.reconcile_idle_inhibitors();
+            self.sync_foreign_toplevels();
+            self.queue_redraw();
+            return true;
+        }
+
+        if let Some(hosting_out) = self
+            .output_workspaces
+            .iter()
+            .find(|(_, id)| *id == ws_id)
+            .map(|(name, _)| name.clone())
+        {
+            return self.focus_output(&hosting_out);
+        }
+
+        self.active_special_ws_id = None;
+        let prev_ws_id = self.active_ws_id.clone();
+        self.active_ws_id = ws_id.clone();
+        let mut switched_out: Option<String> = None;
+        if let Some(focused_out) = self.focused_output() {
+            let out_name = focused_out.name();
+            self.output_workspaces
+                .insert(out_name.clone(), ws_id.clone());
+            let vp = self.viewport_for_output(&focused_out);
+            let now_ms = self.elapsed_ms();
+            if let Some(ws) = self.workspaces.get_mut(ws_id) {
+                ws.presentation = PresentationTarget::Physical(OutputId::new(&out_name));
+                if ws.viewport != vp {
+                    ws.viewport = vp;
+                    ws.recalculate(now_ms);
+                }
+            }
+            self.sync_workspace_geometries(ws_id);
+            self.sync_window_output_membership(ws_id);
+            switched_out = Some(out_name);
+        }
+        self.focus_active_deck_window();
+        if let Some(out_name) = switched_out {
+            self.trigger_workspace_transition(&out_name, &prev_ws_id, ws_id, 0);
+        }
+        self.reconcile_idle_inhibitors();
+        self.sync_foreign_toplevels();
+        self.queue_redraw();
+        true
+    }
+
+    /// Moves the active window of `src_ws_id` into `dst_ws_id` and follows it, like
+    /// `Hyprland` `movetoworkspace`.
     pub fn move_active_window_between_workspaces(
         &mut self,
         src_ws_id: &WorkspaceId,
         dst_ws_id: &WorkspaceId,
+    ) -> bool {
+        self.move_active_window_between_workspaces_with_follow(src_ws_id, dst_ws_id, true)
+    }
+
+    /// Moves the active window of `src_ws_id` into `dst_ws_id`.
+    ///
+    /// With `follow` the destination workspace is focused and the moved window takes
+    /// keyboard focus. Without it the source workspace keeps focus, matching `Hyprland`
+    /// `movetoworkspacesilent`.
+    pub fn move_active_window_between_workspaces_with_follow(
+        &mut self,
+        src_ws_id: &WorkspaceId,
+        dst_ws_id: &WorkspaceId,
+        follow: bool,
     ) -> bool {
         if src_ws_id == dst_ws_id {
             return false;
@@ -1829,7 +1911,11 @@ impl KomaState {
         self.sync_workspace_geometries(src_ws_id);
         self.sync_workspace_geometries(dst_ws_id);
         self.sync_window_output_membership(dst_ws_id);
-        self.focus_active_deck_window();
+        if follow {
+            self.focus_workspace(dst_ws_id);
+        } else {
+            self.focus_active_deck_window();
+        }
         self.queue_redraw();
         true
     }
@@ -2958,6 +3044,109 @@ impl KomaState {
         self.hit_test_window_in_workspace(ws_id, ws_local_pos, out_origin, b_off)
     }
 
+    /// Resolves the interactive-resize grab edge under `global_pos`, front-to-back, so a frame
+    /// border or corner starts a resize without a modifier (`Hyprland` `DragController` parity).
+    ///
+    /// The grab zone is the outer frame ring: `appearance.border.width` plus a small slop, which is
+    /// exactly the strip Koma paints and the client surface does not cover. Fullscreen windows are
+    /// never resize targets, and a window whose frame is thinner than the slop on both axes still
+    /// resolves to its nearer edge.
+    #[must_use]
+    pub fn frame_edge_under_pointer(
+        &self,
+        global_pos: Point<f64, Logical>,
+    ) -> Option<(WindowId, WorkspaceId, ResizeCorner)> {
+        let border_cfg = self.lua_sandbox.config_snapshot().appearance.border;
+        let border_w = if border_cfg.enabled {
+            f64::from(border_cfg.width.max(0.0))
+        } else {
+            0.0
+        };
+        let threshold = (border_w + 4.0).max(6.0);
+
+        let has_outputs = !self.all_outputs().is_empty();
+        let output_name = match (has_outputs, self.output_at_point_strict(global_pos)) {
+            (true, None) => return None,
+            (_, Some(out)) => out.name(),
+            (false, None) => self.focused_output_name.clone().unwrap_or_default(),
+        };
+        let ws_id = self.active_workspace_for_output(&output_name);
+        let origin = self.workspace_output_origin(&ws_id);
+
+        // A `special:<name>` Scratchpad sits above the workspace and owns the pointer while open.
+        let mut candidates: Vec<&MappedWindow> = self
+            .mapped_windows
+            .iter()
+            .filter(|m| m.ws_id == ws_id && !m.is_minimized)
+            .collect();
+        let focused = self
+            .workspaces
+            .get(&ws_id)
+            .and_then(|ws| ws.active_window());
+        let fullscreen = self
+            .workspaces
+            .get(&ws_id)
+            .and_then(|ws| ws.fullscreen_window);
+        // Focused window first, then the rest: shared tiled borders resize the focused tile.
+        candidates.sort_by_key(|m| Some(m.win_id) != focused);
+
+        for mapped in candidates {
+            if fullscreen == Some(mapped.win_id) {
+                continue;
+            }
+            let frame = LogicalRect::new(
+                mapped.rect.x + origin.x as i32,
+                mapped.rect.y + origin.y as i32,
+                mapped.rect.w,
+                mapped.rect.h,
+            );
+            let point = LogicalPoint {
+                x: global_pos.x,
+                y: global_pos.y,
+            };
+            if let Some(corner) = ResizeCorner::frame_edge_at(frame, point, threshold) {
+                return Some((mapped.win_id, ws_id, corner));
+            }
+        }
+        None
+    }
+
+    /// Refreshes the interactive-resize hover cursor for `global_pos` and returns the edge under it.
+    ///
+    /// Entering an edge saves the current cursor status; leaving restores it, so a client-provided
+    /// cursor (I-beam, hand) is never permanently clobbered by Koma's resize arrow.
+    pub fn refresh_frame_edge_hover(
+        &mut self,
+        global_pos: Point<f64, Logical>,
+    ) -> Option<(WindowId, WorkspaceId, ResizeCorner)> {
+        let edge = self.frame_edge_under_pointer(global_pos);
+        match edge.clone() {
+            Some((win_id, _ws_id, corner)) => {
+                if self.frame_edge_hover.map(|(id, _)| id) != Some(win_id)
+                    || self.frame_edge_hover.map(|(_, c)| c) != Some(corner)
+                {
+                    if self.frame_edge_hover.is_none() {
+                        self.cursor_before_frame_edge = Some(self.cursor_manager.status().clone());
+                    }
+                    self.frame_edge_hover = Some((win_id, corner));
+                }
+                self.set_cursor_status(CursorImageStatus::Named(
+                    crate::pointer_grabs::cursor_icon_for_corner(corner),
+                ));
+            }
+            None => {
+                if self.frame_edge_hover.take().is_some() {
+                    let restore = self
+                        .cursor_before_frame_edge
+                        .take()
+                        .unwrap_or_else(CursorImageStatus::default_named);
+                    self.set_cursor_status(restore);
+                }
+            }
+        }
+        edge
+    }
+
     /// Hit-tests `global_pos` across any open `special:<name>` Scratchpad first, then the output's
     /// active workspace, strictly in **front-to-back** Z-order (`FloatingStack` topmost -> bottom -> Tiled panes).
     #[must_use]
@@ -3568,13 +3757,27 @@ impl KomaState {
 impl KomaState {
     /// Fail-closed IME barrier enforced whenever `SessionLockPhase != Unlocked`:
     /// drops active `zwp_text_input_v3` focus/enter and discards all IME popup surfaces.
-    pub fn clear_ime_state_for_lock(&mut self) {
+    ///
+    /// Safe to call from inside a Smithay seat callback: it never re-enters the seat handles.
+    /// Callers that are *not* running inside [`crate::state::KomaState::focus_changed`] should
+    /// also reconcile keyboard-shortcut inhibitors ([`Self::clear_ime_state_for_lock`] does).
+    pub fn clear_ime_focus_for_lock(&mut self) {
         let text_input = self.seat.text_input();
         if text_input.focus().is_some() {
             text_input.leave();
             text_input.set_focus(None);
         }
         self.ime_popups.clear();
+    }
+
+    /// Full lock barrier: drops IME focus/popups and re-evaluates keyboard-shortcut inhibitors.
+    ///
+    /// Must NOT be called from a seat callback that already holds the keyboard mutex
+    /// (`SeatHandler::focus_changed`), because [`Self::reconcile_keyboard_shortcuts_inhibitors`]
+    /// takes `KeyboardHandle::current_focus()` on the same non-reentrant mutex
+    /// (komawm/koma#37: `ext-session-lock-v1` acquire deadlocked the whole event loop).
+    pub fn clear_ime_state_for_lock(&mut self) {
+        self.clear_ime_focus_for_lock();
         self.reconcile_keyboard_shortcuts_inhibitors();
     }
 
@@ -4764,6 +4967,80 @@ pub(crate) mod tests {
             LogicalViewport::new(1920, 1080, 1.0),
         );
         (event_loop, display, state)
+    }
+
+    fn insert_test_window(state: &mut KomaState, ws_id: &WorkspaceId, win_id: WindowId) {
+        let now_ms = state.elapsed_ms();
+        state
+            .workspaces
+            .get_mut(ws_id)
+            .expect("workspace exists")
+            .insert_window(win_id, false, None, None, None, None, false, true, now_ms);
+    }
+
+    #[test]
+    fn move_to_workspace_follows_window_and_focuses_destination() {
+        let (_el, _disp, mut state) = make_headless_test_state();
+        let src = state.active_ws_id.clone();
+        let dst = state.ensure_workspace_by_name_or_id("2");
+        let win = WindowId::new(1, 1);
+        insert_test_window(&mut state, &src, win);
+        assert_eq!(state.workspaces[&src].focused_window, Some(win));
+
+        assert!(state.move_active_window_between_workspaces_with_follow(&src, &dst, true));
+
+        assert_eq!(state.active_ws_id, dst);
+        assert_eq!(state.effective_interactive_ws_id(), dst);
+        assert_eq!(state.workspaces[&dst].focused_window, Some(win));
+        assert_eq!(state.workspaces[&dst].active_window(), Some(win));
+        assert_ne!(state.workspaces[&src].active_window(), Some(win));
+        assert!(
+            state.workspaces[&src].active_window().is_none(),
+            "source workspace must not keep a dangling active window"
+        );
+    }
+
+    #[test]
+    fn silent_move_to_workspace_keeps_source_focused_and_window_unfocused() {
+        let (_el, _disp, mut state) = make_headless_test_state();
+        let src = state.active_ws_id.clone();
+        let dst = state.ensure_workspace_by_name_or_id("2");
+        let stay = WindowId::new(1, 1);
+        let moved = WindowId::new(2, 1);
+        insert_test_window(&mut state, &src, stay);
+        insert_test_window(&mut state, &src, moved);
+        assert_eq!(state.workspaces[&src].focused_window, Some(moved));
+
+        assert!(state.move_active_window_between_workspaces_with_follow(&src, &dst, false));
+
+        assert_eq!(state.active_ws_id, src);
+        assert_eq!(state.effective_interactive_ws_id(), src);
+        assert_eq!(state.workspaces[&src].focused_window, Some(stay));
+        assert_eq!(state.workspaces[&dst].active_window(), Some(moved));
+        assert_ne!(
+            state.workspaces[&state.effective_interactive_ws_id()].active_window(),
+            Some(moved),
+            "silent move must not leave the moved window keyboard-focused"
+        );
+    }
+
+    #[test]
+    fn moving_last_window_away_leaves_no_dangling_focus() {
+        let (_el, _disp, mut state) = make_headless_test_state();
+        let src = state.active_ws_id.clone();
+        let dst = state.ensure_workspace_by_name_or_id("2");
+        let moved = WindowId::new(1, 1);
+        insert_test_window(&mut state, &src, moved);
+
+        assert!(state.move_active_window_between_workspaces_with_follow(&src, &dst, false));
+
+        assert_eq!(state.effective_interactive_ws_id(), src);
+        assert_eq!(state.workspaces[&src].focused_window, None);
+        assert_eq!(state.workspaces[&src].active_window(), None);
+        assert!(
+            state.active_deck_wl_surface().is_none(),
+            "an emptied source workspace must not resolve a keyboard focus surface"
+        );
     }
 
     #[test]

@@ -1771,10 +1771,23 @@ fn build_act_namespace<'gc>(ctx: Context<'gc>) -> Result<Table<'gc>, LuaError<'g
         ctx,
         "move_to_workspace",
         Callback::from_fn(&ctx, |ctx, _, mut stack| {
-            let ws: std::string::String = stack.consume(ctx)?;
+            let (workspace, opts): (std::string::String, Option<Table>) = stack.consume(ctx)?;
+            // `follow = false` is the `Hyprland` `movetoworkspacesilent` equivalent:
+            // the window moves but the source workspace keeps the keyboard focus.
+            let follow = match opts {
+                Some(tbl) => tbl
+                    .get::<_, Option<bool>>(ctx, "follow")
+                    .ok()
+                    .flatten()
+                    .unwrap_or(true),
+                None => true,
+            };
             stack.replace(
                 ctx,
-                UserData::new_static(&ctx, ActionDescriptor::WindowMoveToWorkspace(ws)),
+                UserData::new_static(
+                    &ctx,
+                    ActionDescriptor::WindowMoveToWorkspace { workspace, follow },
+                ),
             );
             Ok(CallbackReturn::Return)
         }),
@@ -3288,6 +3301,38 @@ mod tests {
             cfg.binds[3].action,
             ActionDescriptor::WindowMoveToMonitor("eDP-1".to_owned())
         );
+    }
+
+    #[test]
+    fn window_move_to_workspace_defaults_to_follow_and_accepts_silent_option() {
+        let mut sandbox = PhodopusSandbox::new(DEFAULT_HEAP_LIMIT_BYTES, None).unwrap();
+        let lua = r#"
+            koma.bind("Mod + Shift + 2", koma.act.window.move_to_workspace("2"))
+            koma.bind("Mod + Shift + 3", koma.act.window.move_to_workspace("3", { follow = false }))
+        "#;
+        let cfg = sandbox
+            .eval_init_lua(lua)
+            .expect("window.move_to_workspace options must evaluate cleanly");
+        assert_eq!(cfg.binds.len(), 2);
+        assert_eq!(
+            cfg.binds[0].action,
+            ActionDescriptor::WindowMoveToWorkspace {
+                workspace: "2".to_owned(),
+                follow: true,
+            }
+        );
+        assert_eq!(
+            cfg.binds[1].action,
+            ActionDescriptor::WindowMoveToWorkspace {
+                workspace: "3".to_owned(),
+                follow: false,
+            }
+        );
+
+        let stubs = crate::generate_luals_stubs();
+        assert!(stubs.contains(
+            "move_to_workspace: fun(ws: string, opts?: { follow?: boolean }): KomaAction"
+        ));
     }
 
     #[test]

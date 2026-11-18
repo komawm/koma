@@ -175,6 +175,66 @@ pub fn start_compositor_resize_grab(
     true
 }
 
+/// Initiates an interactive resize from a frame edge/corner drag, no modifier required
+/// (`Hyprland` `DragController` border-drag parity). Returns `true` when a grab was installed.
+///
+/// `Deck` has no resize semantics — the active window always fills the viewport — so the request is
+/// refused with an explicit `debug!` instead of falling through the grab's silent `Deck => {}` arm.
+pub fn start_frame_edge_resize_grab(
+    state: &mut KomaState,
+    button_code: u32,
+    serial: Serial,
+    edge: (WindowId, WorkspaceId, ResizeCorner),
+) -> bool {
+    let (win_id, ws_id, corner) = edge;
+    state.reconcile_session_lock();
+    if state.is_locked_or_abandoned() {
+        return false;
+    }
+    state.break_active_pointer_constraints();
+    let Some(pointer) = state.seat.get_pointer() else {
+        return false;
+    };
+    if pointer.is_grabbed() {
+        return false;
+    }
+
+    let Some(ws) = state.workspaces.get(&ws_id) else {
+        return false;
+    };
+    let is_floating = ws.floating.contains(win_id);
+    if !ws.layout_mode.supports_frame_edge_resize(is_floating) {
+        debug!(
+            layout = ?ws.layout_mode,
+            "Deck lays the focused window out full-viewport, so a frame edge cannot resize it; \
+             float the window first (komawm/koma#42)"
+        );
+        return false;
+    }
+
+    let now_ms = state.elapsed_ms();
+    if let Some(ws) = state.workspaces.get_mut(&ws_id) {
+        ws.activate_window(win_id, now_ms);
+    }
+    state.focus_active_deck_window();
+
+    let start_data = PointerGrabStartData {
+        focus: None,
+        button: button_code,
+        location: state.pointer_location,
+    };
+    let Some((grab, corner)) =
+        ResizeWindowGrab::new(state, start_data, win_id, ws_id, Some(corner))
+    else {
+        return false;
+    };
+
+    pointer.set_grab(state, grab, serial, Focus::Clear);
+    state.set_cursor_status(CursorImageStatus::Named(cursor_icon_for_corner(corner)));
+    state.frame_edge_hover = Some((win_id, corner));
+    true
+}
+
 /// Initiates a client-requested CSD `xdg_toplevel.move` grab after validating serial & active
 /// interactive workspace ownership (`niri/src/handlers/xdg_shell.rs` lines 71-182 & Hyprland `#15856`).
 pub fn start_csd_move_grab(
@@ -899,7 +959,14 @@ impl ResizeWindowGrab {
                             now_ms,
                         );
                     }
-                    LayoutMode::Deck => {}
+                    LayoutMode::Deck => {
+                        // Deck keeps the focused window full-viewport, so a split-ratio resize has
+                        // no target. Log instead of silently doing nothing (komawm/koma#42).
+                        debug!(
+                            win_id = ?self.win_id,
+                            "Deck has no split ratio to resize; the frame keeps the viewport geometry"
+                        );
+                    }
                 }
             }
             // Snap sibling dividers 1:1 with the pointer during manual drag (`PANIMATE == 0` default)

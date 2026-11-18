@@ -838,6 +838,7 @@ impl KomaState {
         );
         pointer.relative_motion(self, under, &rel_event);
         pointer.frame(self);
+        self.refresh_frame_edge_hover(clamped);
         self.maybe_activate_pointer_constraint();
         self.queue_redraw();
     }
