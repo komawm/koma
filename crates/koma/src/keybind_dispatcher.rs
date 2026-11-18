@@ -2227,6 +2227,8 @@ pub fn execute_action_descriptor(
                 state.sync_workspace_geometries(&sp_id);
             }
             state.focus_active_deck_window();
+            // Toggling the overlay changes which workspace is displayed, outside `focus_workspace`.
+            crate::ext_workspace::sync_ext_workspaces(state);
             state.queue_redraw();
         }
 
@@ -2245,6 +2247,8 @@ pub fn execute_action_descriptor(
                 }
             }
             state.focus_active_deck_window();
+            // A non-silent stash also opens the overlay, so republish the displayed workspace.
+            crate::ext_workspace::sync_ext_workspaces(state);
             state.queue_redraw();
         }
 

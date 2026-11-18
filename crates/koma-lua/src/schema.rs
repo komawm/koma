@@ -397,6 +397,10 @@ pub struct WorkspaceSpec {
     pub has_explicit_gaps: bool,
     pub frame_clock: FrameClockConfig,
     pub isolate_vseat: bool,
+    /// Keeps an empty workspace in `ext-workspace-v1` status bars. Koma hides empty workspaces by
+    /// default so a bar shows only the workspaces in use; set this for a workspace that must stay
+    /// clickable while it holds no window (for example a reserved slot in a fixed bar layout).
+    pub persistent: bool,
 }
 
 impl Default for WorkspaceSpec {
@@ -417,6 +421,7 @@ impl Default for WorkspaceSpec {
             has_explicit_gaps: false,
             frame_clock: FrameClockConfig::default(),
             isolate_vseat: false,
+            persistent: false,
         }
     }
 }

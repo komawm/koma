@@ -26,6 +26,9 @@ koma.monitor({
 })
 
 -- Workspaces 1..4 inherit the global default `dwindle` binary tree; Workspace 5 opts into Niri `scrolling`!
+-- Koma reports an empty workspace as `hidden` over `ext-workspace-v1`, so a bar with
+-- `ignore-hidden: true` (waybar `ext/workspaces`) lists only the workspaces in use. Add
+-- `persistent = true` to a workspace to keep it listed while it holds no window.
 koma.layout("dwindle")
 
 for i = 1, 4 do
