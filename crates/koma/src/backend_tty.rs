@@ -2160,6 +2160,9 @@ fn render_single_drm_surface(
         state
             .cursor_manager
             .render_elements(&mut renderer, pointer_loc, output_scale, now_ms);
+    let dnd_icon_elems = state.dnd_icon().map_or_else(Vec::new, |icon| {
+        crate::dnd::icon_render_elements(icon, &mut renderer, pointer_loc, output_scale)
+    });
     if let Some(delay_ms) = state
         .cursor_manager
         .next_frame_delay_ms(output_scale.x, now_ms)
@@ -2319,7 +2322,9 @@ fn render_single_drm_surface(
             agent_cursor_snap.as_ref(),
             &mut elements,
         );
+        let cursor_len = cursor_elems.len();
         elements.splice(0..0, cursor_elems);
+        elements.splice(cursor_len..cursor_len, dnd_icon_elems);
         (elements, DEFAULT_BACKDROP_CLEAR)
     };
 

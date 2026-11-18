@@ -56,8 +56,9 @@ use smithay::utils::{Point, Rectangle, SERIAL_COUNTER, Size};
 use smithay::wayland::compositor::{RectangleKind, RegionAttributes};
 use smithay::wayland::seat::WaylandFocus as _;
 use wayland_client::protocol::{
-    wl_buffer, wl_callback, wl_compositor, wl_keyboard, wl_output, wl_pointer, wl_region,
-    wl_registry, wl_seat, wl_shm, wl_shm_pool, wl_surface,
+    wl_buffer, wl_callback, wl_compositor, wl_data_device, wl_data_device_manager,
+    wl_data_offer, wl_data_source, wl_keyboard, wl_output, wl_pointer, wl_region, wl_registry,
+    wl_seat, wl_shm, wl_shm_pool, wl_surface,
 };
 use wayland_client::{
     Connection, Dispatch, EventQueue, Proxy as _, WEnum, delegate_noop, event_created_child,
@@ -205,6 +206,14 @@ struct CapturedExtWorkspaceGroup {
     removed: bool,
 }
 
+#[derive(Debug, Clone, Default)]
+struct CapturedDataSource {
+    cancelled: usize,
+    drop_performed: usize,
+    finished: usize,
+    targets: Vec<Option<String>>,
+}
+
 #[derive(Default)]
 struct ClientHarness {
     sync_done: bool,
@@ -212,6 +221,17 @@ struct ClientHarness {
     outputs: Vec<wl_output::WlOutput>,
     seats: Vec<wl_seat::WlSeat>,
     pointers: Vec<wl_pointer::WlPointer>,
+    /// `wl_pointer.button` events with the server serial that clients use for `start_drag`.
+    pointer_buttons: Vec<(u32, wl_pointer::ButtonState, u32)>,
+    data_device: Option<wl_data_device::WlDataDevice>,
+    data_source_events: BTreeMap<u32, CapturedDataSource>,
+    data_offer_mimes: BTreeMap<u32, Vec<String>>,
+    data_offer_proxies: BTreeMap<u32, wl_data_offer::WlDataOffer>,
+    data_device_enter_serial: Option<u32>,
+    data_device_enters: usize,
+    data_device_motions: usize,
+    data_device_leaves: usize,
+    data_device_drops: usize,
     compositor: Option<wl_compositor::WlCompositor>,
     shm: Option<wl_shm::WlShm>,
     xdg_wm_base: Option<xdg_wm_base::XdgWmBase>,
@@ -265,16 +285,23 @@ impl ClientHarness {
         display: &Display<KomaState>,
         restricted: bool,
     ) -> (Connection, EventQueue<Self>, Self, wl_registry::WlRegistry) {
+        Self::connect_with(
+            display,
+            ClientState {
+                restricted,
+                ..Default::default()
+            },
+        )
+    }
+
+    fn connect_with(
+        display: &Display<KomaState>,
+        client_state: ClientState,
+    ) -> (Connection, EventQueue<Self>, Self, wl_registry::WlRegistry) {
         let (server_sock, client_sock) = UnixStream::pair().expect("UnixStream::pair");
         display
             .handle()
-            .insert_client(
-                server_sock,
-                Arc::new(ClientState {
-                    restricted,
-                    ..Default::default()
-                }),
-            )
+            .insert_client(server_sock, Arc::new(client_state))
             .expect("insert wayland test client");
         let conn = Connection::from_socket(client_sock).expect("Connection::from_socket");
         let queue = conn.new_event_queue::<Self>();
@@ -400,11 +427,19 @@ struct ClientEnv {
 
 impl ClientEnv {
     fn new() -> Self {
+        Self::with_client_state(|_| ClientState::default())
+    }
+
+    /// Builds the harness with a client connection that carries `client_state`
+    /// (used to model jailed sandbox clients).
+    fn with_client_state(make_client_state: impl FnOnce(&KomaState) -> ClientState) -> Self {
         let (mut event_loop, mut display, mut state) = make_headless_test_state();
         let output = test_output("DP-1");
         let output_global = output.create_global::<KomaState>(&state.display_handle);
         state.test_outputs.push(output.clone());
-        let (conn, mut queue, mut client, registry) = ClientHarness::connect(&display, false);
+        let client_state = make_client_state(&state);
+        let (conn, mut queue, mut client, registry) =
+            ClientHarness::connect_with(&display, client_state);
         pump(
             &conn,
             &mut queue,
@@ -1100,7 +1135,7 @@ delegate_noop!(ClientHarness: ignore wl_shm_pool::WlShmPool);
 delegate_noop!(ClientHarness: ignore wl_buffer::WlBuffer);
 delegate_noop!(ClientHarness: ignore wl_output::WlOutput);
 delegate_noop!(ClientHarness: ignore wl_seat::WlSeat);
-delegate_noop!(ClientHarness: ignore wl_pointer::WlPointer);
+delegate_noop!(ClientHarness: ignore wl_data_device_manager::WlDataDeviceManager);
 delegate_noop!(ClientHarness: ignore wl_keyboard::WlKeyboard);
 delegate_noop!(ClientHarness: ignore zxdg_decoration_manager_v1::ZxdgDecorationManagerV1);
 delegate_noop!(ClientHarness: ignore xdg_toplevel_icon_v1::XdgToplevelIconV1);
@@ -1116,6 +1151,100 @@ delegate_noop!(ClientHarness: ignore zwp_relative_pointer_manager_v1::ZwpRelativ
 delegate_noop!(ClientHarness: ignore wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1);
 delegate_noop!(ClientHarness: ignore zwlr_layer_shell_v1::ZwlrLayerShellV1);
 delegate_noop!(ClientHarness: ignore zwlr_output_configuration_head_v1::ZwlrOutputConfigurationHeadV1);
+
+impl Dispatch<wl_pointer::WlPointer, ()> for ClientHarness {
+    fn event(
+        state: &mut Self,
+        _: &wl_pointer::WlPointer,
+        event: wl_pointer::Event,
+        _: &(),
+        _: &Connection,
+        _: &wayland_client::QueueHandle<Self>,
+    ) {
+        if let wl_pointer::Event::Button {
+            button,
+            state: WEnum::Value(btn_state),
+            serial,
+            ..
+        } = event
+        {
+            state.pointer_buttons.push((button, btn_state, serial));
+        }
+    }
+}
+
+impl Dispatch<wl_data_source::WlDataSource, ()> for ClientHarness {
+    fn event(
+        state: &mut Self,
+        source: &wl_data_source::WlDataSource,
+        event: wl_data_source::Event,
+        _: &(),
+        _: &Connection,
+        _: &wayland_client::QueueHandle<Self>,
+    ) {
+        let captured = state
+            .data_source_events
+            .entry(source.id().protocol_id())
+            .or_default();
+        match event {
+            wl_data_source::Event::Cancelled => captured.cancelled += 1,
+            wl_data_source::Event::DndDropPerformed => captured.drop_performed += 1,
+            wl_data_source::Event::DndFinished => captured.finished += 1,
+            wl_data_source::Event::Target { mime_type } => captured.targets.push(mime_type),
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<wl_data_offer::WlDataOffer, ()> for ClientHarness {
+    fn event(
+        state: &mut Self,
+        offer: &wl_data_offer::WlDataOffer,
+        event: wl_data_offer::Event,
+        _: &(),
+        _: &Connection,
+        _: &wayland_client::QueueHandle<Self>,
+    ) {
+        if let wl_data_offer::Event::Offer { mime_type } = event {
+            state
+                .data_offer_mimes
+                .entry(offer.id().protocol_id())
+                .or_default()
+                .push(mime_type);
+        }
+    }
+}
+
+impl Dispatch<wl_data_device::WlDataDevice, ()> for ClientHarness {
+    event_created_child!(ClientHarness, wl_data_device::WlDataDevice, [
+        wl_data_device::EVT_DATA_OFFER_OPCODE => (wl_data_offer::WlDataOffer, ())
+    ]);
+
+    fn event(
+        state: &mut Self,
+        _: &wl_data_device::WlDataDevice,
+        event: wl_data_device::Event,
+        _: &(),
+        _: &Connection,
+        _: &wayland_client::QueueHandle<Self>,
+    ) {
+        match event {
+            wl_data_device::Event::DataOffer { id } => {
+                let id_key = id.id().protocol_id();
+                state.data_offer_mimes.entry(id_key).or_default();
+                state.data_offer_proxies.insert(id_key, id);
+            }
+            wl_data_device::Event::Enter { serial, .. } => {
+                state.data_device_enters += 1;
+                state.data_device_enter_serial = Some(serial);
+            }
+            wl_data_device::Event::Motion { .. } => state.data_device_motions += 1,
+            wl_data_device::Event::Leave => state.data_device_leaves += 1,
+            wl_data_device::Event::Drop => state.data_device_drops += 1,
+            _ => {}
+        }
+    }
+}
 
 impl Dispatch<wp_fractional_scale_v1::WpFractionalScaleV1, ()> for ClientHarness {
     fn event(
@@ -5614,4 +5743,523 @@ fn split_resize_configures_tiled_clients_above_their_minimum_size() {
         terminal.rect.w as i32 - border_inset,
         "unconstrained clients are still configured at their tile size"
     );
+}
+
+/// Client `wl_data_device` drag-and-drop grab coverage (`komawm/koma#68`).
+mod dnd_tests {
+    use super::*;
+    use smithay::{
+        backend::input::{ButtonState, KeyState},
+        input::{
+            dnd::{DndAction, GrabType, Source, SourceMetadata},
+            keyboard::Keycode,
+        },
+        utils::{IsAlive, SERIAL_COUNTER},
+    };
+
+    use crate::pointer_grabs::BTN_LEFT;
+
+    /// Linux evdev code for Escape; XKB keycodes are `evdev + 8` in this harness.
+    const EVDEV_ESC: u32 = 1;
+    const MIME: &str = "text/plain;charset=utf-8";
+
+    /// Counts source lifecycle events so grab preconditions can be asserted without a client.
+    #[derive(Debug, Default)]
+    struct RecordingSource {
+        cancelled: Arc<AtomicU64>,
+        finished: Arc<AtomicU64>,
+        dropped: Arc<AtomicU64>,
+    }
+
+    impl IsAlive for RecordingSource {
+        fn alive(&self) -> bool {
+            true
+        }
+    }
+
+    impl Source for RecordingSource {
+        fn metadata(&self) -> Option<SourceMetadata> {
+            Some(SourceMetadata {
+                mime_types: vec![MIME.to_owned()],
+                ..SourceMetadata::default()
+            })
+        }
+
+        fn choose_action(&self, _action: DndAction) {}
+
+        fn send(&self, _mime_type: &str, _fd: OwnedFd) {}
+
+        fn drop_performed(&self) {
+            self.dropped.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn cancel(&self) {
+            self.cancelled.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn finished(&self) {
+            self.finished.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn pointer_grabbed(state: &KomaState) -> bool {
+        state.seat.get_pointer().is_some_and(|p| p.is_grabbed())
+    }
+
+    fn source_events(
+        client: &ClientHarness,
+        source: &wl_data_source::WlDataSource,
+    ) -> CapturedDataSource {
+        client
+            .data_source_events
+            .get(&source.id().protocol_id())
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Presses `button` through the real pointer-button dispatcher and returns the serial the
+    /// compositor delivered to the client, which is the serial `wl_data_device.start_drag` needs.
+    fn press_button(env: &mut ClientEnv, button: u32) -> u32 {
+        crate::keybind_dispatcher::process_pointer_button_event(
+            &mut env.state,
+            button,
+            ButtonState::Pressed,
+            InputTime::from_millis(10),
+            false,
+        );
+        env.pump();
+        env.client
+            .pointer_buttons
+            .iter()
+            .rev()
+            .find(|(code, _, _)| *code == button)
+            .map(|(_, _, serial)| *serial)
+            .expect("client must observe the implicit-grab button press")
+    }
+
+    fn release_button(env: &mut ClientEnv, button: u32) {
+        crate::keybind_dispatcher::process_pointer_button_event(
+            &mut env.state,
+            button,
+            ButtonState::Released,
+            InputTime::from_millis(20),
+            false,
+        );
+        env.pump();
+    }
+
+    fn data_device_manager(env: &mut ClientEnv) -> wl_data_device_manager::WlDataDeviceManager {
+        let qh = env.queue.handle();
+        let manager = env
+            .client
+            .bind::<wl_data_device_manager::WlDataDeviceManager>(
+                &env.registry,
+                &qh,
+                "wl_data_device_manager",
+            );
+        env.pump();
+        manager
+    }
+
+    fn create_source(
+        env: &mut ClientEnv,
+        manager: &wl_data_device_manager::WlDataDeviceManager,
+        mime_types: &[&str],
+    ) -> wl_data_source::WlDataSource {
+        let qh = env.queue.handle();
+        let source = manager.create_data_source(&qh, ());
+        // Sources advertise the actions they are willing to perform; without this the target's
+        // `wl_data_offer.set_actions` negotiation cannot select an action and the drop is
+        // rejected even though the target accepted it.
+        source.set_actions(
+            wl_data_device_manager::DndAction::Copy | wl_data_device_manager::DndAction::Move,
+        );
+        for mime in mime_types {
+            source.offer((*mime).to_owned());
+        }
+        env.client
+            .data_source_events
+            .entry(source.id().protocol_id())
+            .or_default();
+        source
+    }
+
+    /// Creates and commits the client drag icon surface (role `dnd_icon` on `start_drag`).
+    fn create_drag_icon(env: &mut ClientEnv) -> wl_surface::WlSurface {
+        let qh = env.queue.handle();
+        let compositor = env
+            .client
+            .compositor
+            .clone()
+            .expect("spawn_window bound wl_compositor");
+        let shm = env.client.shm.clone().expect("spawn_window bound wl_shm");
+        let icon = compositor.create_surface(&qh, ());
+        let fd = create_portable_shm_fd(24 * 24 * 4, None);
+        let pool = shm.create_pool(fd.as_fd(), 24 * 24 * 4, &qh, ());
+        let buffer = pool.create_buffer(0, 24, 24, 24 * 4, wl_shm::Format::Argb8888, &qh, ());
+        icon.attach(Some(&buffer), 0, 0);
+        icon.commit();
+        env.pump();
+        buffer.destroy();
+        pool.destroy();
+        icon
+    }
+
+    /// Moves the pointer onto `win_id`'s visible geometry and returns the probe point.
+    fn place_pointer_on_window(
+        env: &mut ClientEnv,
+        win_id: koma_proto::WindowId,
+    ) -> Point<f64, smithay::utils::Logical> {
+        let ws_id = env.state.active_ws_id.clone();
+        let probe = probe_inside(env, &ws_id, win_id);
+        move_pointer(env, probe);
+        probe
+    }
+
+    fn spawn_origin_window(env: &mut ClientEnv) -> (wl_surface::WlSurface, koma_proto::WindowId) {
+        let (surface, _xdg_surface, _toplevel) = env.spawn_window("Browser", "org.koma.browser");
+        let win_id = env
+            .state
+            .mapped_windows
+            .last()
+            .expect("mapped window")
+            .win_id;
+        (surface, win_id)
+    }
+
+    fn start_client_drag_request(
+        env: &mut ClientEnv,
+        origin: &wl_surface::WlSurface,
+        icon: Option<&wl_surface::WlSurface>,
+        source: &wl_data_source::WlDataSource,
+        serial: u32,
+    ) {
+        let qh = env.queue.handle();
+        let manager = data_device_manager(env);
+        let seat = env.client.seats.first().expect("seat").clone();
+        let device = manager.get_data_device(&seat, &qh, ());
+        device.start_drag(Some(source), origin, icon, serial);
+        env.pump();
+        env.client.data_device = Some(device);
+    }
+
+    #[test]
+    fn start_drag_is_refused_while_locked_and_cancels_the_source() {
+        let (_event_loop, _display, mut state) = make_headless_test_state();
+        assert!(state.session_lock.try_lock(None));
+        let seat = state.seat.clone();
+        let source = RecordingSource::default();
+        let cancelled = source.cancelled.clone();
+
+        let installed = crate::dnd::start_client_drag(
+            &mut state,
+            source,
+            None,
+            seat,
+            SERIAL_COUNTER.next_serial(),
+            GrabType::Pointer,
+        );
+
+        assert!(!installed, "a locked session must not install a DnD grab");
+        assert_eq!(
+            cancelled.load(Ordering::SeqCst),
+            1,
+            "the refused source must be cancelled so the client can tear down its drag state"
+        );
+        assert!(state.dnd_drag.is_none());
+        assert!(!pointer_grabbed(&state));
+    }
+
+    #[test]
+    fn start_drag_requires_the_serial_of_the_live_implicit_grab() {
+        let (_event_loop, _display, mut state) = make_headless_test_state();
+        let seat = state.seat.clone();
+        let source = RecordingSource::default();
+        let cancelled = source.cancelled.clone();
+
+        let installed = crate::dnd::start_client_drag(
+            &mut state,
+            source,
+            None,
+            seat,
+            SERIAL_COUNTER.next_serial(),
+            GrabType::Pointer,
+        );
+
+        assert!(!installed, "no implicit grab exists, so no drag may start");
+        assert_eq!(cancelled.load(Ordering::SeqCst), 1);
+        assert!(state.dnd_drag.is_none());
+        assert!(!pointer_grabbed(&state));
+    }
+
+    #[test]
+    fn start_drag_installs_a_grab_tracks_the_icon_and_does_not_cancel_the_source() {
+        let mut env = ClientEnv::new();
+        let (origin, win_id) = spawn_origin_window(&mut env);
+        place_pointer_on_window(&mut env, win_id);
+        let serial = press_button(&mut env, BTN_LEFT);
+
+        let icon = create_drag_icon(&mut env);
+        let manager = data_device_manager(&mut env);
+        let source = create_source(&mut env, &manager, &[MIME]);
+        start_client_drag_request(&mut env, &origin, Some(&icon), &source, serial);
+
+        assert!(
+            pointer_grabbed(&env.state),
+            "`wl_data_device.start_drag` must replace the click grab with a DnD grab"
+        );
+        let drag = env
+            .state
+            .dnd_drag
+            .as_ref()
+            .expect("the drag must be tracked while the grab runs");
+        let tracked_icon = drag.icon().expect("the requested icon must be tracked");
+        assert_eq!(tracked_icon.offset(), Point::from((0, 0)));
+        assert_eq!(
+            source_events(&env.client, &source).cancelled,
+            0,
+            "installing the grab must not cancel the client source"
+        );
+        assert_eq!(source_events(&env.client, &source).drop_performed, 0);
+
+        // A second `start_drag` while the first still owns the seat is refused and cancelled.
+        let other = create_source(&mut env, &manager, &[MIME]);
+        start_client_drag_request(&mut env, &origin, None, &other, serial);
+        assert_eq!(
+            source_events(&env.client, &other).cancelled,
+            1,
+            "a second concurrent drag must be refused instead of replacing the active grab"
+        );
+        assert!(
+            env.state.dnd_drag.is_some(),
+            "refusing the second drag must keep the first drag alive"
+        );
+
+        release_button(&mut env, BTN_LEFT);
+        assert!(!pointer_grabbed(&env.state));
+        assert!(env.state.dnd_drag.is_none());
+    }
+
+    #[test]
+    fn motion_over_a_toplevel_sets_an_offer_and_drop_finishes_the_source() {
+        let mut env = ClientEnv::new();
+        let (origin, win_id) = spawn_origin_window(&mut env);
+        let probe = place_pointer_on_window(&mut env, win_id);
+        let serial = press_button(&mut env, BTN_LEFT);
+
+        let icon = create_drag_icon(&mut env);
+        let manager = data_device_manager(&mut env);
+        let source = create_source(&mut env, &manager, &[MIME]);
+        start_client_drag_request(&mut env, &origin, Some(&icon), &source, serial);
+        assert!(pointer_grabbed(&env.state));
+        // Motion after `start_drag` is what offers the drag to the surface under the cursor.
+        move_pointer(&mut env, probe + Point::from((8.0, 8.0)));
+        env.pump();
+
+        assert_eq!(
+            env.client.data_device_enters, 1,
+            "the toplevel under the cursor must receive `wl_data_device.enter`"
+        );
+        let offer_id = *env
+            .client
+            .data_offer_proxies
+            .keys()
+            .next()
+            .expect("the target must receive a data offer");
+        assert!(
+            env.client.data_offer_mimes[&offer_id].contains(&MIME.to_owned()),
+            "the offered mime types must be forwarded to the target"
+        );
+        let offer = env.client.data_offer_proxies[&offer_id].clone();
+        let enter_serial = env
+            .client
+            .data_device_enter_serial
+            .expect("enter carries the serial used to accept the offer");
+        offer.accept(enter_serial, Some(MIME.to_owned()));
+        offer.set_actions(
+            wl_data_device_manager::DndAction::Copy,
+            wl_data_device_manager::DndAction::Copy,
+        );
+        env.pump();
+
+        release_button(&mut env, BTN_LEFT);
+
+        assert_eq!(
+            env.client.data_device_drops, 1,
+            "releasing the button must deliver `wl_data_device.drop` to the accepted target"
+        );
+        assert_eq!(
+            source_events(&env.client, &source).drop_performed,
+            1,
+            "an accepted drop must reach the source as `wl_data_source.dnd_drop_performed`"
+        );
+        assert_eq!(source_events(&env.client, &source).cancelled, 0);
+        assert!(!pointer_grabbed(&env.state));
+        assert!(
+            env.state.dnd_drag.is_none(),
+            "the drag icon must disappear once the drop completes"
+        );
+
+        // The target acknowledges the transfer, which is the only path to `dnd_finished`.
+        offer.finish();
+        env.pump();
+        assert_eq!(
+            source_events(&env.client, &source).finished,
+            1,
+            "`wl_data_offer.finish` must finish the source, not cancel it"
+        );
+        assert_eq!(source_events(&env.client, &source).cancelled, 0);
+    }
+
+    #[test]
+    fn escape_cancels_the_source_and_leaves_no_grab_or_icon() {
+        let mut env = ClientEnv::new();
+        let (origin, win_id) = spawn_origin_window(&mut env);
+        let probe = place_pointer_on_window(&mut env, win_id);
+        let serial = press_button(&mut env, BTN_LEFT);
+
+        let icon = create_drag_icon(&mut env);
+        let manager = data_device_manager(&mut env);
+        let source = create_source(&mut env, &manager, &[MIME]);
+        start_client_drag_request(&mut env, &origin, Some(&icon), &source, serial);
+        move_pointer(&mut env, probe + Point::from((4.0, 4.0)));
+        env.pump();
+        assert!(env.state.dnd_drag.is_some());
+
+        // Real `Escape` key path: `process_keyboard_key_event` intercepts it while a grab owns
+        // the pointer and routes it to `cancel_active_pointer_grab`.
+        crate::keybind_dispatcher::process_keyboard_key_event(
+            &mut env.state,
+            Keycode::from(EVDEV_ESC + 8),
+            KeyState::Pressed,
+            InputTime::from_millis(30),
+            false,
+        );
+        env.pump();
+
+        assert_eq!(
+            source_events(&env.client, &source).cancelled,
+            1,
+            "an aborted drag must cancel the source"
+        );
+        assert_eq!(source_events(&env.client, &source).finished, 0);
+        assert!(!pointer_grabbed(&env.state));
+        assert!(env.state.dnd_drag.is_none());
+    }
+
+    #[test]
+    fn acquiring_the_session_lock_cancels_the_active_drag() {
+        let mut env = ClientEnv::new();
+        let (origin, win_id) = spawn_origin_window(&mut env);
+        let probe = place_pointer_on_window(&mut env, win_id);
+        let serial = press_button(&mut env, BTN_LEFT);
+
+        let icon = create_drag_icon(&mut env);
+        let manager = data_device_manager(&mut env);
+        let source = create_source(&mut env, &manager, &[MIME]);
+        start_client_drag_request(&mut env, &origin, Some(&icon), &source, serial);
+        move_pointer(&mut env, probe + Point::from((4.0, 4.0)));
+        env.pump();
+        assert!(env.state.dnd_drag.is_some());
+
+        // Mirrors `SessionLockHandler::lock`, which acquires the lock and then revokes all input.
+        assert!(env.state.session_lock.try_lock(None));
+        env.state.clear_inputs_for_lock();
+        env.pump();
+
+        assert_eq!(
+            source_events(&env.client, &source).cancelled,
+            1,
+            "locking the session must cancel the drag source"
+        );
+        assert!(!pointer_grabbed(&env.state));
+        assert!(env.state.dnd_drag.is_none());
+    }
+
+    #[test]
+    fn jailed_sandbox_clients_cannot_start_a_host_drag() {
+        // A `security-context-v1` sandbox client never receives host data-device focus, so it must
+        // not be able to originate a drag that offers its data to host clients either.
+        let mut env = ClientEnv::with_client_state(|state| ClientState {
+            jailed_workspace: Some(state.active_ws_id.clone()),
+            ..ClientState::default()
+        });
+        let (origin, win_id) = spawn_origin_window(&mut env);
+        place_pointer_on_window(&mut env, win_id);
+        let serial = press_button(&mut env, BTN_LEFT);
+
+        let icon = create_drag_icon(&mut env);
+        let manager = data_device_manager(&mut env);
+        let source = create_source(&mut env, &manager, &[MIME]);
+        start_client_drag_request(&mut env, &origin, Some(&icon), &source, serial);
+
+        assert!(
+            env.state.dnd_drag.is_none(),
+            "a jailed client must not install a drag grab"
+        );
+        assert_eq!(
+            source_events(&env.client, &source).cancelled,
+            1,
+            "the refused jailed source must be cancelled"
+        );
+        assert!(
+            env.state.dnd_icon().is_none(),
+            "no drag icon may be tracked"
+        );
+
+        // The plain implicit click grab is still installed until the button is released, but it
+        // must not turn into a drag.
+        release_button(&mut env, BTN_LEFT);
+        assert!(!pointer_grabbed(&env.state));
+        assert!(env.state.dnd_drag.is_none());
+    }
+
+    #[test]
+    fn icon_offset_follows_committed_surface_offset_requests() {
+        let mut env = ClientEnv::new();
+        let (origin, win_id) = spawn_origin_window(&mut env);
+        place_pointer_on_window(&mut env, win_id);
+        let serial = press_button(&mut env, BTN_LEFT);
+
+        let icon = create_drag_icon(&mut env);
+        let manager = data_device_manager(&mut env);
+        let source = create_source(&mut env, &manager, &[MIME]);
+        start_client_drag_request(&mut env, &origin, Some(&icon), &source, serial);
+        assert_eq!(
+            env.state.dnd_icon().map(|i| i.offset()),
+            Some(Point::from((0, 0)))
+        );
+
+        let qh = env.queue.handle();
+        let shm = env.client.shm.clone().expect("wl_shm");
+        let fd = create_portable_shm_fd(24 * 24 * 4, None);
+        let pool = shm.create_pool(fd.as_fd(), 24 * 24 * 4, &qh, ());
+        let buffer = pool.create_buffer(0, 24, 24, 24 * 4, wl_shm::Format::Argb8888, &qh, ());
+        icon.offset(-6, -10);
+        icon.attach(Some(&buffer), 0, 0);
+        icon.commit();
+        env.pump();
+
+        assert_eq!(
+            env.state.dnd_icon().map(|i| i.offset()),
+            Some(Point::from((-6, -10))),
+            "`wl_surface.offset` must move the icon hot spot off the cursor"
+        );
+
+        // Toolkits re-offset their icon several times per drag (centring, then per-target hints);
+        // every commit is a delta relative to the previous buffer, not an absolute position.
+        icon.offset(-2, 4);
+        icon.attach(Some(&buffer), 0, 0);
+        icon.commit();
+        env.pump();
+        assert_eq!(
+            env.state.dnd_icon().map(|i| i.offset()),
+            Some(Point::from((-8, -6))),
+            "successive offsets accumulate instead of replacing the hot spot"
+        );
+
+        release_button(&mut env, BTN_LEFT);
+        buffer.destroy();
+        pool.destroy();
+    }
 }

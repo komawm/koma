@@ -844,7 +844,16 @@ impl KomaState {
         // motion hot path performs no extra hit-testing or allocation for focus decisions.
         let hit = self.hit_test_target(clamped);
         self.follow_pointer_focus(hit.as_ref(), clamped);
-        let under = hit.map(|target| (target.surface().clone(), target.origin()));
+        let mut under = hit.map(|target| (target.surface().clone(), target.origin()));
+        // A running client drag must not offer host data into a jailed sandbox workspace; the
+        // grab then sees no focus and withdraws its offer.
+        if self.dnd_drag.is_some()
+            && under.as_ref().is_some_and(|(surface, _)| {
+                !crate::dnd::surface_may_exchange_drag_data(self, surface)
+            })
+        {
+            under = None;
+        }
         pointer.motion(
             self,
             under.clone(),

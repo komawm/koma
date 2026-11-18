@@ -85,6 +85,8 @@ mod cursor;
 #[cfg(feature = "smithay-winit")]
 mod desktop_protocols;
 #[cfg(feature = "smithay-winit")]
+mod dnd;
+#[cfg(feature = "smithay-winit")]
 mod ext_workspace;
 #[cfg(feature = "smithay-winit")]
 mod foreign_toplevel;

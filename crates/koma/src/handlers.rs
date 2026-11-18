@@ -19,6 +19,7 @@ use smithay::{
     },
     input::{
         Seat, SeatHandler, SeatState,
+        dnd::{DndGrabHandler, DndTarget, GrabType, Source},
         pointer::{CursorImageStatus, Focus},
         tablet::TabletSeatHandler,
     },
@@ -149,6 +150,21 @@ impl CompositorHandler for KomaState {
             .cursor_manager
             .on_surface_commit(surface, &root_surface)
         {
+            self.queue_redraw();
+            return;
+        }
+
+        // 2a2. Move the active drag icon by its committed `wl_surface` attach/offset delta
+        if self
+            .dnd_icon()
+            .is_some_and(|icon| icon.surface() == &root_surface)
+        {
+            let delta = crate::dnd::take_buffer_delta(&root_surface);
+            if let Some(delta) = delta
+                && let Some(icon) = self.dnd_drag.as_mut().and_then(|drag| drag.icon_mut())
+            {
+                icon.apply_buffer_delta(delta);
+            }
             self.queue_redraw();
             return;
         }
@@ -338,6 +354,14 @@ impl CompositorHandler for KomaState {
 
     fn destroyed(&mut self, surface: &WlSurface) {
         self.idle_inhibitors.remove(surface);
+        if self
+            .dnd_icon()
+            .is_some_and(|icon| icon.surface() == surface)
+        {
+            // A drag icon is never mapped, so its destruction can only mean the drag source gave
+            // up (or the client vanished): release the grab instead of leaving the seat wedged.
+            self.cancel_client_drag("drag icon surface destroyed");
+        }
         if matches!(
             self.cursor_manager.status(),
             CursorImageStatus::Surface(active) if active == surface
@@ -807,7 +831,56 @@ impl DataDeviceHandler for KomaState {
     }
 }
 
-impl WaylandDndGrabHandler for KomaState {}
+impl WaylandDndGrabHandler for KomaState {
+    fn dnd_requested<S: Source>(
+        &mut self,
+        source: S,
+        icon: Option<WlSurface>,
+        seat: Seat<Self>,
+        serial: Serial,
+        type_: GrabType,
+    ) {
+        // `wl_data_device.start_drag` must never reach Smithay's default handler: it cancels the
+        // source immediately, which is what broke tab reordering and every other client DnD.
+        let _ = crate::dnd::start_client_drag(self, source, icon, seat, serial, type_);
+    }
+}
+
+impl DndGrabHandler for KomaState {
+    fn dropped(
+        &mut self,
+        target: Option<DndTarget<'_, Self>>,
+        validated: bool,
+        seat: Seat<Self>,
+        location: smithay::utils::Point<f64, smithay::utils::Logical>,
+    ) {
+        let _ = (target, seat);
+        tracing::debug!(
+            validated,
+            x = location.x,
+            y = location.y,
+            "client drag-and-drop dropped"
+        );
+        // Smithay already reported the outcome to the source: an accepted offer received
+        // `drop_performed` (and `finished` once the target sends `wl_data_offer.finish`), a
+        // rejected one was cancelled. Only the local icon state is Koma's to clear.
+        crate::dnd::finish_client_drag(self, "drop completed");
+    }
+
+    fn cancelled(
+        &mut self,
+        seat: Seat<Self>,
+        location: smithay::utils::Point<f64, smithay::utils::Logical>,
+    ) {
+        let _ = seat;
+        tracing::debug!(
+            x = location.x,
+            y = location.y,
+            "client drag-and-drop cancelled"
+        );
+        crate::dnd::finish_client_drag(self, "grab cancelled");
+    }
+}
 
 impl PrimarySelectionHandler for KomaState {
     fn primary_selection_state(&mut self) -> &mut PrimarySelectionState {

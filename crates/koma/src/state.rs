@@ -124,6 +124,7 @@ use crate::{
     config_watcher::{ConfigWatcherHandle, KomaConfigPath},
     cursor::CursorManager,
     desktop_protocols::{ActivationTokenPolicy, DeferredXdgActivation, StoredToplevelIcon},
+    dnd::{ActiveDnd, DndIcon},
     ext_workspace::{ExtWorkspaceState, sync_ext_workspaces},
     foreign_toplevel::WlrForeignToplevelState,
     gamma_control::{GammaControlState, GammaLut},
@@ -785,6 +786,8 @@ pub struct KomaState {
     pub pointer_location: Point<f64, Logical>,
     pub cursor_manager: CursorManager,
     pub cursor_anim_timer_token: Option<RegistrationToken>,
+    /// Active client `wl_data_device` drag-and-drop grab, including its optional icon surface.
+    pub dnd_drag: Option<ActiveDnd>,
 
     // Koma pure domain model (`koma-model` + `koma-lua` + `koma-seat`)
     pub output_layout: OutputLayout,
@@ -1035,6 +1038,7 @@ impl KomaState {
             )),
             cursor_manager: CursorManager::new(),
             cursor_anim_timer_token: None,
+            dnd_drag: None,
             output_layout: OutputLayout::new(),
             output_workspaces: HashMap::new(),
             focused_output_name: None,
@@ -4179,6 +4183,40 @@ impl KomaState {
             self.cursor_anim_timer_token = Some(token);
         }
     }
+
+    /// The client drag icon currently attached to the cursor, if a drag provided one.
+    #[must_use]
+    pub fn dnd_icon(&self) -> Option<&DndIcon> {
+        self.dnd_drag.as_ref().and_then(ActiveDnd::icon)
+    }
+
+    /// Cancels the active client drag-and-drop grab and drops its icon.
+    ///
+    /// Used when the drag cannot continue (icon surface destroyed, session lock acquired) so the
+    /// client receives `wl_data_source.cancelled` promptly instead of being left with a stuck
+    /// grab. `DndGrabHandler::cancelled` clears the tracked state, so this only has to release the
+    /// seat grab and request a redraw.
+    pub fn cancel_client_drag(&mut self, reason: &'static str) {
+        if self.dnd_drag.take().is_none() {
+            return;
+        }
+        tracing::debug!(reason, "cancelling client drag-and-drop grab");
+        let serial = SERIAL_COUNTER.next_serial();
+        let time = smithay::backend::input::InputTime::now();
+        // `KomaState::ptr`/`touch` respect the seat re-entrancy guards, so a cancel triggered from
+        // inside a seat callback fails soft instead of wedging the event loop.
+        if let Some(pointer) = self.ptr()
+            && pointer.is_grabbed()
+        {
+            pointer.unset_grab(self, serial, time);
+        }
+        if let Some(touch) = self.touch()
+            && touch.is_grabbed()
+        {
+            touch.unset_grab(self);
+        }
+        self.queue_redraw();
+    }
 }
 
 impl KomaState {
@@ -4815,7 +4853,16 @@ impl KomaState {
         let Some(touch) = self.touch() else {
             return;
         };
-        let under = self.surface_under(pos);
+        let mut under = self.surface_under(pos);
+        // Same sandbox rule as pointer motion: a running client drag is never offered into a
+        // jailed workspace.
+        if self.dnd_drag.is_some()
+            && under.as_ref().is_some_and(|(surface, _)| {
+                !crate::dnd::surface_may_exchange_drag_data(self, surface)
+            })
+        {
+            under = None;
+        }
         touch.motion(
             self,
             under,
