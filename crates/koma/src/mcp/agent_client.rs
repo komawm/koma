@@ -18,7 +18,7 @@ use koma_proto::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::{
+use crate::mcp::{
     epoch_loop::{EpochObservationTracker, RecoveryDirective},
     png_codec::read_sealed_memfd_and_encode_png,
 };
@@ -81,7 +81,7 @@ impl KomaAgentSession {
             method: "auth.authenticate".to_owned(),
             params: json!({
                 "token": token.0,
-                "client_name": "koma-mcp-stdio",
+                "client_name": "koma mcp (stdio)",
                 "protocol_version": koma_proto::PROTOCOL_VERSION,
             }),
         };
@@ -348,7 +348,7 @@ fn mint_dev_token_via_admin(admin_sock: &Path) -> Result<CapabilityToken, IpcErr
         id: 1,
         method: "auth.mint_token".to_owned(),
         params: json!({
-            "label": "koma-mcp-local-dev",
+            "label": "koma mcp local dev",
             "ttl_secs": 28_800,
             "can_create_headless": true,
             "max_owned_workspaces": 4,

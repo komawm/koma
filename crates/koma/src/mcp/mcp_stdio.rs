@@ -11,13 +11,13 @@ use koma_proto::{Epoch, ErrorSymbol, OverlayKind, WorkspaceId};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::agent_client::{CapturedPngObservation, KomaAgentSession, MutateOutcome};
+use crate::mcp::agent_client::{CapturedPngObservation, KomaAgentSession, MutateOutcome};
 
 pub const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 
 pub const KOMA_MCP_INSTRUCTIONS: &str = "Koma is an Agent-native Wayland tiling compositor with isolated Headless workspaces, per-workspace virtual seats (vSeat), Zero-IME text/MIME injection, and monotonic Epoch concurrency fencing. 1) Always call `koma_scene_inventory` or `koma_capture_frame` before mutating a workspace so you hold a Fresh `expected_epoch`. 2) Prefer isolated Headless workspaces (`koma_ws_create`) so the human user's physical monitor and seat0 clipboard remain completely undisturbed. 3) If a tool returns `ERR_STALE_EPOCH` (`isError: true`), the action was safely aborted BEFORE execution and the attached PNG image is ALREADY a fresh re-observed snapshot at `new_observed_epoch`—inspect the new image and recompute your next action using `new_observed_epoch`. 4) If a tool returns `ERR_HUMAN_PREEMPTED` or `ERR_PROTECTED_SURFACE`, pause and ask the user.";
 
-/// Lazy connection wrapper so `koma-mcp` can respond to `initialize`, `tools/list`,
+/// Lazy connection wrapper so `koma mcp` can respond to `initialize`, `tools/list`,
 /// `resources/list`, and `prompts/list` before a Koma compositor session is running.
 pub struct LazyKomaSession {
     auto_mint: bool,
@@ -127,7 +127,7 @@ pub fn builtin_mcp_tool_schemas(dynamic_macros: &[MacroDefinition]) -> Vec<Value
     let mut tools = vec![
         json!({
             "name": "koma_ping",
-            "description": "Reports whether `koma-mcp` can currently reach a running Koma compositor session (works offline).",
+            "description": "Reports whether `koma mcp` can currently reach a running Koma compositor session (works offline).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -548,7 +548,7 @@ pub fn handle_mcp_request(
                     "prompts": { "listChanged": false }
                 },
                 "serverInfo": {
-                    "name": "koma-mcp",
+                    "name": "koma mcp",
                     "version": env!("CARGO_PKG_VERSION"),
                 },
                 "instructions": KOMA_MCP_INSTRUCTIONS,
@@ -936,6 +936,11 @@ mod tests {
     #[test]
     fn builtin_mcp_tool_schemas_expose_koma_path_and_vseat_primitives() {
         let schemas = builtin_mcp_tool_schemas(&[]);
+        assert_eq!(
+            schemas.len(),
+            17,
+            "`koma mcp --print-tools` must expose the 17 built-in tool schemas"
+        );
         let path_tool = schemas
             .iter()
             .find(|s| s.get("name").and_then(Value::as_str) == Some("koma_path"))

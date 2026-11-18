@@ -6,7 +6,9 @@
 //! to `Koma`'s non-blocking `calloop` event loop without holding native Rust stack frames.
 
 pub mod host_abi;
+pub mod keybind_catalog;
 pub mod recorder;
+pub mod scaffold;
 pub mod schema;
 pub mod typegen;
 
@@ -18,7 +20,13 @@ pub use crate::{
         CONFIG_FUEL_BUDGET, DEFAULT_HEAP_LIMIT_BYTES, HostBridge, LAYOUT_HOOK_FUEL_BUDGET,
         MACRO_SLICE_FUEL_BUDGET, ParkedMacroTask, PendingHostOp, TrampolineScheduler,
     },
+    keybind_catalog::{KEYBIND_CATALOG, KeybindCatalogEntry},
     recorder::{RecordedStep, compile_recorded_macro},
+    scaffold::{
+        ConfigTemplateFile, ScaffoldError, TEMPLATE_MARKER, TEMPLATE_VERSION,
+        installed_template_version, render_config_template, scaffold_config_tree,
+        template_version_in,
+    },
     schema::{
         AccelProfileSpec, ActionDescriptor, AppearanceSpec, BindHandleId, BindOptions, BindSpec,
         ClickMethodSpec, DEFAULT_KEYBOARD_REPEAT_DELAY_MS, DEFAULT_KEYBOARD_REPEAT_RATE_HZ,

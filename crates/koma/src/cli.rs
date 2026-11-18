@@ -43,6 +43,22 @@ pub enum CliAction {
     Version,
     /// Print a shell completion script for the named shell.
     Completions(String),
+    /// Print (or unset) the environment of the live Koma instance.
+    Init {
+        shell: String,
+        unset: bool,
+    },
+    /// Run the stdio Model Context Protocol server.
+    Mcp(McpOptions),
+}
+
+/// Options for the `koma mcp` stdio server.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct McpOptions {
+    /// Dump the tool schemas and exit without touching the agent socket.
+    pub print_tools: bool,
+    /// Mint an admin token locally instead of requiring `KOMA_CAPABILITY_TOKEN`.
+    pub auto_mint_admin: bool,
 }
 
 /// Invalid command line; the binary prints the message plus usage and exits with status 2.
@@ -50,6 +66,7 @@ pub enum CliAction {
 pub enum CliError {
     UnknownArgument(String),
     UnknownShell(String),
+    UnknownInitShell(String),
     MissingValue(&'static str),
     ConflictingModes(&'static str, &'static str),
 }
@@ -61,6 +78,10 @@ impl fmt::Display for CliError {
             Self::UnknownShell(shell) => {
                 write!(f, "unknown shell `{shell}` (expected bash, zsh, or fish)")
             }
+            Self::UnknownInitShell(shell) => write!(
+                f,
+                "unknown shell `{shell}` (expected bash, zsh, fish, or nushell)"
+            ),
             Self::MissingValue(flag) => write!(f, "option `{flag}` requires a value"),
             Self::ConflictingModes(a, b) => {
                 write!(f, "options `{a}` and `{b}` select different backends")
@@ -96,7 +117,11 @@ Options:
   -V, --version           Print the version and exit
 
 Subcommands:
+  init <bash|zsh|fish|nushell> [--unset]
+                          Print shell-native environment assignments for the live instance
   completions <bash|zsh|fish>   Print a shell completion script and exit
+  mcp [--print-tools] [--auto-mint-admin]
+                          Run the stdio Model Context Protocol server (koma-agent.sock)
 
 Signals: SIGTERM, SIGINT and SIGHUP stop the compositor gracefully (exit status 0).
 ",
@@ -157,6 +182,31 @@ where
                     return Err(CliError::UnknownShell(shell));
                 }
                 return Ok(CliAction::Completions(shell));
+            }
+            "init" if inline_value.is_none() => {
+                let shell = args.next().ok_or(CliError::MissingValue("init"))?;
+                if crate::session_env::Shell::parse(&shell).is_none() {
+                    return Err(CliError::UnknownInitShell(shell));
+                }
+                let mut unset = false;
+                for extra in args.by_ref() {
+                    match extra.as_str() {
+                        "--unset" => unset = true,
+                        other => return Err(CliError::UnknownArgument(other.to_owned())),
+                    }
+                }
+                return Ok(CliAction::Init { shell, unset });
+            }
+            "mcp" if inline_value.is_none() => {
+                let mut opts = McpOptions::default();
+                for extra in args.by_ref() {
+                    match extra.as_str() {
+                        "--print-tools" => opts.print_tools = true,
+                        "--auto-mint-admin" => opts.auto_mint_admin = true,
+                        other => return Err(CliError::UnknownArgument(other.to_owned())),
+                    }
+                }
+                return Ok(CliAction::Mcp(opts));
             }
             "-h" | "--help" if inline_value.is_none() => return Ok(CliAction::Help),
             "-V" | "--version" if inline_value.is_none() => return Ok(CliAction::Version),
@@ -283,6 +333,65 @@ mod tests {
     }
 
     #[test]
+    fn init_subcommand_parses_every_supported_shell() {
+        for shell in ["bash", "zsh", "fish", "nushell"] {
+            assert_eq!(
+                parse_args(["init", shell]),
+                Ok(CliAction::Init {
+                    shell: shell.to_owned(),
+                    unset: false
+                })
+            );
+        }
+        assert_eq!(
+            parse_args(["init", "fish", "--unset"]),
+            Ok(CliAction::Init {
+                shell: "fish".to_owned(),
+                unset: true
+            })
+        );
+    }
+
+    #[test]
+    fn init_rejects_unknown_shells_values_and_extra_arguments() {
+        assert_eq!(
+            parse_args(["init", "powershell"]),
+            Err(CliError::UnknownInitShell("powershell".to_owned()))
+        );
+        assert_eq!(parse_args(["init"]), Err(CliError::MissingValue("init")));
+        assert_eq!(
+            parse_args(["init", "bash", "--bogus"]),
+            Err(CliError::UnknownArgument("--bogus".to_owned()))
+        );
+    }
+
+    #[test]
+    fn mcp_subcommand_parses_server_flags() {
+        assert_eq!(
+            parse_args(["mcp"]),
+            Ok(CliAction::Mcp(McpOptions::default()))
+        );
+        assert_eq!(
+            parse_args(["mcp", "--print-tools"]),
+            Ok(CliAction::Mcp(McpOptions {
+                print_tools: true,
+                auto_mint_admin: false
+            }))
+        );
+        assert_eq!(
+            parse_args(["mcp", "--auto-mint-admin", "--print-tools"]),
+            Ok(CliAction::Mcp(McpOptions {
+                print_tools: true,
+                auto_mint_admin: true
+            }))
+        );
+        assert_eq!(
+            parse_args(["mcp", "--bogus"]),
+            Err(CliError::UnknownArgument("--bogus".to_owned()))
+        );
+    }
+
+    #[test]
     fn usage_mentions_every_flag() {
         let text = usage();
         for flag in [
@@ -294,6 +403,11 @@ mod tests {
             "--config",
             "--help",
             "--version",
+            "init <bash|zsh|fish|nushell>",
+            "--unset",
+            "mcp",
+            "--print-tools",
+            "--auto-mint-admin",
         ] {
             assert!(text.contains(flag), "usage is missing {flag}");
         }

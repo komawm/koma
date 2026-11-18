@@ -1,9 +1,10 @@
 # Contributing to Koma
 
 Thank you for contributing to Koma (`komawm/koma`). This repository owns Koma's
-nine Rust crates (`koma-proto`, `koma-model`, `koma-lua`, `koma-render`,
-`koma-seat`, `koma`, `komactl`, `koma-mcp`, and `koma-overview`), example Lua
-configurations, and session integration resources.
+eight Rust crates (`koma-proto`, `koma-model`, `koma-lua`, `koma-render`,
+`koma-seat`, `koma`, `komactl`, and `koma-overview`), example Lua
+configurations, and session integration resources. The MCP adapter lives in the
+`koma` binary as the `koma mcp` subcommand.
 
 Start by reading [AGENTS.md](https://github.com/komawm/koma/blob/main/AGENTS.md),
 the [organization contribution guide](https://github.com/komawm/.github/blob/main/CONTRIBUTING.md),
@@ -92,7 +93,7 @@ alter host services during routine development.
    tokens, runtime sockets, raw CarryCtx databases, ISO images, VM disks, or
    private captures.
 4. Keep protocol changes synchronized across `koma-proto`, compositor handlers,
-   `komactl`, `koma-mcp`, and the
+   `komactl`, `koma mcp`, and the
    [IPC specification](https://github.com/komawm/docs/blob/main/docs/IPC_SPEC.md).
    Keep Lua schema changes synchronized with `komactl gen-types` and
    [komawm/koma-types](https://github.com/komawm/koma-types).
@@ -103,7 +104,7 @@ alter host services during routine development.
 
 ## Licensing
 
-All nine Koma crates, including `koma-proto`, are licensed under
+All eight Koma crates, including `koma-proto`, are licensed under
 `GPL-3.0-or-later` and share the single root
 [LICENSE](https://github.com/komawm/koma/blob/main/LICENSE). Do not add
 per-crate `LICENSE*` files or `LICENSES/` directories. Third-party dependency

@@ -8,6 +8,35 @@ desktop, hardware support, or security guarantees.
 
 ## [Unreleased]
 
+### Added
+
+- `komactl init [dir] [--force]` scaffolds a commented configuration tree
+  (`init.lua`, `lua/input.lua`, `lua/workspaces.lua`, `lua/appearance.lua`,
+  `lua/window_rules.lua`, `lua/keybinds.lua`, `lua/macros/example.lua`). The
+  keymap is a full expansion of a single Rust keybind catalogue shared with the
+  runtime defaults, and the tree validates with `inherit_default_binds = false`
+  and no `koma.monitor` block. Existing files are refused unless `--force` is
+  given. The header carries a template version marker, and `komactl config-status`
+  reports when the on-disk template is older than the shipped one.
+- `koma init <bash|zsh|fish|nushell> [--unset]` prints the live instance
+  environment (`WAYLAND_DISPLAY`, `KOMA_INSTANCE_SIGNATURE`, `XDG_RUNTIME_DIR`,
+  `DISPLAY` while XWayland is up, `XDG_SESSION_TYPE`, `XDG_CURRENT_DESKTOP`) so
+  `koma init fish | source` works from an external terminal. It scans
+  `$XDG_RUNTIME_DIR/koma/` read-only, fails clearly when zero or several
+  instances are live, and never prints capability tokens.
+- First-run auto-scaffold for a missing `$XDG_CONFIG_HOME/koma/init.lua`,
+  disabled with `KOMA_NO_SCAFFOLD=1`, skipped for `--headless-check`, and
+  compiled out of test builds.
+- `koma.act.reload_config()` and `koma.act.quit()` Lua actions so the generated
+  keymap can express `Mod + Shift + R` and `Mod + Shift + E` without a native
+  code path.
+
+### Changed
+
+- The standalone `koma-mcp` binary is now `koma mcp [--print-tools]
+  [--auto-mint-admin]`; release archives, Nix builds, BSD CI and completions no
+  longer install or reference a separate binary.
+
 ## [0.0.2] - 2026-11-17
 
 ### Added

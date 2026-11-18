@@ -2768,4 +2768,136 @@ mod tests {
             }
         }
     }
+
+    /// Cross-checks the single Rust keybind catalogue against the runtime fallback
+    /// keymap. A catalogue entry without a matching `with_builtin_defaults()` bind,
+    /// or a built-in bind missing from the catalogue, fails this test.
+    #[test]
+    fn builtin_keybind_catalog_matches_runtime_defaults() {
+        use std::collections::BTreeSet;
+
+        use koma_lua::KEYBIND_CATALOG;
+
+        let defaults = KeybindTable::with_builtin_defaults();
+        assert_eq!(
+            defaults.binds.len(),
+            KEYBIND_CATALOG.len(),
+            "the catalogue and `with_builtin_defaults()` disagree on the number of binds"
+        );
+
+        let mut catalog_ids = BTreeSet::new();
+        for entry in KEYBIND_CATALOG {
+            assert!(
+                catalog_ids.insert(entry.id),
+                "duplicate catalogue id {} for `{}`",
+                entry.id,
+                entry.chord
+            );
+            let bind = defaults
+                .binds
+                .iter()
+                .find(|bind| bind.raw_chord == entry.chord)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "catalogue chord `{}` is missing from `with_builtin_defaults()`",
+                        entry.chord
+                    )
+                });
+            assert_eq!(
+                bind.id.0, entry.id,
+                "catalogue id for `{}` does not match the runtime bind id",
+                entry.chord
+            );
+            assert_eq!(
+                bind.options.cooldown_ms, entry.cooldown_ms,
+                "catalogue cooldown for `{}` does not match the runtime bind",
+                entry.chord
+            );
+            assert!(
+                bind.press_action.is_some(),
+                "built-in bind `{}` has no press action",
+                entry.chord
+            );
+        }
+
+        for bind in &defaults.binds {
+            assert!(
+                KEYBIND_CATALOG
+                    .iter()
+                    .any(|entry| entry.chord == bind.raw_chord),
+                "built-in bind `{}` is missing from the keybind catalogue",
+                bind.raw_chord
+            );
+        }
+    }
+
+    /// The generated `keybinds.lua` must reproduce exactly the runtime fallback
+    /// actions, so `inherit_default_binds = false` is a true full expansion.
+    #[test]
+    fn scaffolded_keymap_reproduces_every_builtin_action() {
+        use std::{collections::BTreeMap, fs, path::PathBuf};
+
+        use koma_lua::{
+            DEFAULT_HEAP_LIMIT_BYTES, KEYBIND_CATALOG, phodopus_bridge::PhodopusSandbox,
+            scaffold_config_tree,
+        };
+
+        let root: PathBuf = std::path::Path::new("/tmp/koma").join(format!(
+            "action-parity-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.subsec_nanos())
+        ));
+        let _ = fs::remove_dir_all(&root);
+        scaffold_config_tree(&root, false).expect("scaffold config tree");
+
+        let init_lua = root.join("init.lua");
+        let source = fs::read_to_string(&init_lua).expect("read init.lua");
+        let mut sandbox = PhodopusSandbox::new(DEFAULT_HEAP_LIMIT_BYTES, Some(&root))
+            .expect("build sandbox with generated modules");
+        let registry = sandbox
+            .eval_init_lua(&source)
+            .expect("generated tree must evaluate");
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(
+            registry.binds.len(),
+            KEYBIND_CATALOG.len(),
+            "generated keymap must bind every catalogue entry"
+        );
+        assert!(
+            !registry.input.inherit_default_binds,
+            "the scaffold must disable inherited built-in binds"
+        );
+        assert!(
+            registry.monitors.is_empty(),
+            "the scaffold must not declare a monitor block"
+        );
+
+        let generated: BTreeMap<&str, &ActionDescriptor> = registry
+            .binds
+            .iter()
+            .map(|bind| (bind.chord.as_str(), &bind.action))
+            .collect();
+        let defaults = KeybindTable::with_builtin_defaults();
+        for bind in &defaults.binds {
+            let action = generated
+                .get(bind.raw_chord.as_str())
+                .unwrap_or_else(|| panic!("generated keymap is missing `{}`", bind.raw_chord));
+            assert_eq!(
+                *action,
+                bind.press_action
+                    .as_ref()
+                    .expect("runtime bind press action"),
+                "generated action for `{}` differs from the runtime default",
+                bind.raw_chord
+            );
+        }
+        assert_eq!(
+            generated.len(),
+            defaults.binds.len(),
+            "generated keymap must not add binds beyond the built-in catalogue"
+        );
+    }
 }

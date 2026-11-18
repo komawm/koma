@@ -27,7 +27,7 @@ skip = []
 skip-tree = []
 
 [licenses]
-# All nine Koma workspace crates use GPL-3.0-or-later under the single root LICENSE.
+# All eight Koma workspace crates use GPL-3.0-or-later under the single root LICENSE.
 # Third-party dependencies in Cargo.lock are restricted to reviewed permissive
 # OSI/FSF-compatible licenses present in the resolved graph.
 allow = [
