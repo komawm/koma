@@ -6,7 +6,7 @@ incubation versions; `v0.1.0` will be the first independently accepted product
 release. A `0.0.x` tag is a development prerelease and does not claim a working
 desktop, hardware support, or security guarantees.
 
-## [Unreleased]
+## [0.0.4] - 2026-11-19
 
 ### Added
 
