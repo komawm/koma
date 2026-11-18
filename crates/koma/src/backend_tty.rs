@@ -83,8 +83,7 @@ use tracing::{debug, info, trace, warn};
 
 use crate::{
     backend_winit::{
-        BACKGROUND_LAYER_TIERS, FOREGROUND_LAYER_TIERS, append_ime_popup_elements,
-        append_layer_tier_elements, assemble_locked_frame_elements,
+        append_ime_popup_elements, append_layer_tier_elements, assemble_locked_frame_elements,
         dispatch_output_frame_callbacks_filtered,
     },
     edid::ParsedEdid,
@@ -2183,6 +2182,7 @@ fn render_single_drm_surface(
         )
     } else {
         let (base_scene_items, special_overlay) = state.collect_output_scene_items(&out_name);
+        let layer_tiers = state.output_layer_tiers(&out_ws_id);
         let blur_cfg = state.lua_sandbox.config_snapshot().appearance.blur;
         let any_window_needs_blur = blur_cfg.enabled
             && base_scene_items
@@ -2201,7 +2201,7 @@ fn render_single_drm_surface(
                 renderer.as_mut(),
                 &surface.output,
                 output_scale,
-                BACKGROUND_LAYER_TIERS,
+                layer_tiers.below_toplevels,
                 &mut gles_bg_elems,
             );
             state
@@ -2236,7 +2236,7 @@ fn render_single_drm_surface(
             &mut renderer,
             &surface.output,
             output_scale,
-            FOREGROUND_LAYER_TIERS,
+            layer_tiers.above_toplevels,
             &mut elements,
         );
 
@@ -2262,7 +2262,7 @@ fn render_single_drm_surface(
 
         if let Some(ws) = state.workspaces.get(&out_ws_id)
             && ws.layout_mode == koma_model::LayoutMode::Scrolling
-            && ws.fullscreen_window.is_none()
+            && ws.presented_window_id().is_none()
         {
             let cam_x = ws.scrolling.peek_camera_x(state.elapsed_ms());
             let tab_segs = ws.scrolling.tab_indicator_segments_at(viewport, cam_x);
@@ -2289,7 +2289,7 @@ fn render_single_drm_surface(
             &mut renderer,
             &surface.output,
             output_scale,
-            BACKGROUND_LAYER_TIERS,
+            layer_tiers.below_toplevels,
             &mut elements,
         );
 

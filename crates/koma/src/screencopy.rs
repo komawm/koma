@@ -52,10 +52,7 @@ use smithay::{
 use tracing::{debug, warn};
 
 use crate::{
-    backend_winit::{
-        BACKGROUND_LAYER_TIERS, FOREGROUND_LAYER_TIERS, append_ime_popup_elements,
-        append_layer_tier_elements,
-    },
+    backend_winit::{append_ime_popup_elements, append_layer_tier_elements},
     security_context::client_is_unrestricted,
     state::KomaState,
 };
@@ -922,6 +919,7 @@ fn build_screencopy_elements<'a>(
     now_ms: u64,
 ) -> Vec<KomaRenderElement<GlesRenderer>> {
     let output_scale = smithay::utils::Scale::from(output.current_scale().fractional_scale());
+    let layer_tiers = state.output_layer_tiers(ws_id);
     let mut elements = Vec::new();
 
     // Front-to-back order: human cursor -> agent cursor/trail -> overlay/top layers -> IME popups -> special overlay -> workspace -> bottom/background layers.
@@ -929,7 +927,7 @@ fn build_screencopy_elements<'a>(
         renderer,
         output,
         output_scale,
-        FOREGROUND_LAYER_TIERS,
+        layer_tiers.above_toplevels,
         &mut elements,
     );
     append_ime_popup_elements(renderer, state, output, output_scale, &mut elements);
@@ -951,7 +949,7 @@ fn build_screencopy_elements<'a>(
 
     if let Some(ws) = state.workspaces.get(ws_id)
         && ws.layout_mode == LayoutMode::Scrolling
-        && ws.fullscreen_window.is_none()
+        && ws.presented_window_id().is_none()
     {
         let cam_x = ws.scrolling.peek_camera_x(now_ms);
         let tab_segs = ws.scrolling.tab_indicator_segments_at(viewport, cam_x);
@@ -975,7 +973,7 @@ fn build_screencopy_elements<'a>(
         renderer,
         output,
         output_scale,
-        BACKGROUND_LAYER_TIERS,
+        layer_tiers.below_toplevels,
         &mut elements,
     );
 

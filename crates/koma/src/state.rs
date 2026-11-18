@@ -113,7 +113,7 @@ const TILED_TOPLEVEL_STATES: [xdg_toplevel::State; 4] = [
 #[cfg(feature = "smithay-tty")]
 use crate::backend_tty::TtyBackendState;
 use crate::{
-    backend_winit::WinitBackendState,
+    backend_winit::{BACKGROUND_LAYER_TIERS, FOREGROUND_LAYER_TIERS, WinitBackendState},
     config_watcher::{ConfigWatcherHandle, KomaConfigPath},
     cursor::CursorManager,
     desktop_protocols::{ActivationTokenPolicy, DeferredXdgActivation, StoredToplevelIcon},
@@ -597,13 +597,21 @@ pub struct MappedWindow {
     pub app_id: String,
     pub title: String,
     pub is_floating: bool,
-    pub is_maximized: bool,
     pub is_minimized: bool,
     pub is_sandboxed: bool,
     pub preferred_size: (u32, u32),
     pub rect: LogicalRect,
     pub decoration_mode: DecorationMode,
     pub icon: Option<StoredToplevelIcon>,
+}
+
+/// Layer-shell tiers composited for one output frame, split around the window scene.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutputLayerTiers {
+    /// Tiers drawn in front of every toplevel (empty while a window is fullscreen).
+    pub above_toplevels: &'static [Layer],
+    /// Tiers drawn behind every toplevel (always composited).
+    pub below_toplevels: &'static [Layer],
 }
 
 /// Per-workspace virtual/agent cursor runtime decoupled from physical human `pointer_location`.
@@ -2145,7 +2153,6 @@ impl KomaState {
             return;
         };
         let is_offscreen = matches!(ws.presentation, PresentationTarget::Offscreen { .. });
-        let fullscreen_win = ws.fullscreen_window;
         let visible = ws.compute_animation_target_geometries();
         let now_ms = self.elapsed_ms();
         let appearance = self.lua_sandbox.config_snapshot().appearance;
@@ -2173,8 +2180,8 @@ impl KomaState {
                         bypass,
                     );
                 }
-                let is_fs = fullscreen_win == Some(win_id);
-                let is_max = mapped.is_maximized;
+                let is_fs = ws.is_fullscreen(win_id);
+                let is_max = ws.is_maximized(win_id);
                 let dec_mode = mapped.decoration_mode;
                 let state_needs_configure = mapped.window.toplevel().is_some_and(|t| {
                     t.with_pending_state(|st| {
@@ -2349,7 +2356,6 @@ impl KomaState {
             app_id: app_id.clone(),
             title: title.clone(),
             is_floating,
-            is_maximized: false,
             is_minimized: false,
             is_sandboxed,
             preferred_size,
@@ -3083,10 +3089,12 @@ impl KomaState {
             .workspaces
             .get(&ws_id)
             .and_then(|ws| ws.active_window());
+        // The presentation model owns fullscreen/maximize, so a presenting window is never a
+        // frame-edge resize target (komawm/koma#30).
         let fullscreen = self
             .workspaces
             .get(&ws_id)
-            .and_then(|ws| ws.fullscreen_window);
+            .and_then(|ws| ws.fullscreen_window());
         // Focused window first, then the rest: shared tiled borders resize the focused tile.
         candidates.sort_by_key(|m| Some(m.win_id) != focused);
 
@@ -3222,7 +3230,7 @@ impl KomaState {
             };
         let now_ms = self.elapsed_ms();
         let tab_win_id = self.workspaces.get(&target_ws_id).and_then(|ws| {
-            if ws.layout_mode == LayoutMode::Scrolling && ws.fullscreen_window.is_none() {
+            if ws.layout_mode == LayoutMode::Scrolling && ws.presented_window_id().is_none() {
                 ws.scrolling.hit_test_tab_indicator(
                     LogicalPoint {
                         x: output_local.x,
@@ -3473,10 +3481,11 @@ impl KomaState {
             return Vec::new();
         };
         let focused_id = ws.active_window();
-        let fullscreen_id = ws.fullscreen_window;
+        let fullscreen_id = ws.fullscreen_window();
         let is_agent_ws = matches!(ws.presentation, PresentationTarget::Offscreen { .. });
         let now_ms = self.elapsed_ms();
-        let is_scrolling_strip = fullscreen_id.is_none() && ws.layout_mode == LayoutMode::Scrolling;
+        let is_scrolling_strip =
+            ws.presented_window_id().is_none() && ws.layout_mode == LayoutMode::Scrolling;
         let camera_shift_px = if is_scrolling_strip {
             if is_screencast_or_agent_capture || is_agent_ws {
                 ws.scrolling.camera_x.round() as i32
@@ -3654,6 +3663,28 @@ impl KomaState {
             None
         };
         (base_items, special_overlay)
+    }
+
+    /// Layer-shell tiers composited for one workspace's output frame.
+    ///
+    /// Front-to-back assembly draws `above_toplevels` before the window scene and `below_toplevels`
+    /// after it. While a window on `ws_id` is `Fullscreen` the `Top`/`Overlay` tiers (status bars,
+    /// launchers) are suppressed for that output so the fullscreen window stays front-most; a
+    /// `Maximized` window keeps them, because it only fills the non-exclusive work area.
+    #[must_use]
+    pub fn output_layer_tiers(&self, ws_id: &WorkspaceId) -> OutputLayerTiers {
+        let fullscreen = self
+            .workspaces
+            .get(ws_id)
+            .is_some_and(|ws| ws.fullscreen_window().is_some());
+        OutputLayerTiers {
+            above_toplevels: if fullscreen {
+                &[]
+            } else {
+                &FOREGROUND_LAYER_TIERS
+            },
+            below_toplevels: &BACKGROUND_LAYER_TIERS,
+        }
     }
 
     /// Returns visible toplevel `WlSurface` roots displayed on `output_name`.
@@ -3848,7 +3879,7 @@ impl KomaState {
             let is_fs = self
                 .workspaces
                 .get(&m.ws_id)
-                .is_some_and(|ws| ws.fullscreen_window == Some(m.win_id));
+                .is_some_and(|ws| ws.is_fullscreen(m.win_id));
             let border_w = if is_fs {
                 0
             } else {
@@ -4420,7 +4451,7 @@ impl KomaState {
                 },
                 workspace: ws.name.clone(),
                 floating: mapped.is_floating,
-                fullscreen: ws.fullscreen_window == Some(mapped.win_id),
+                fullscreen: ws.is_fullscreen(mapped.win_id),
                 focused: is_focused,
             };
             if is_focused {
@@ -4670,21 +4701,43 @@ impl KomaState {
         false
     }
 
+    /// Derives whether `win_id` is currently maximized from the owning workspace's
+    /// `WindowPresentation`, the single source of truth for maximize/fullscreen.
+    #[must_use]
+    pub fn is_window_maximized(&self, win_id: WindowId) -> bool {
+        self.mapped_windows
+            .iter()
+            .find(|m| m.win_id == win_id)
+            .and_then(|m| self.workspaces.get(&m.ws_id))
+            .is_some_and(|ws| ws.is_maximized(win_id))
+    }
+
     pub fn set_window_maximized(&mut self, win_id: WindowId, maximized: bool) {
-        let Some(mapped) = self.mapped_windows.iter_mut().find(|m| m.win_id == win_id) else {
+        let Some(mapped) = self.mapped_windows.iter().find(|m| m.win_id == win_id) else {
             return;
         };
-        if mapped.is_maximized == maximized {
+        let ws_id = mapped.ws_id.clone();
+        if self.is_window_maximized(win_id) == maximized {
+            // `xdg_toplevel` clients still expect an answer to a redundant request.
             if let Some(toplevel) = mapped.window.toplevel() {
                 toplevel.send_pending_configure();
             }
             return;
         }
-        mapped.is_maximized = maximized;
-        let ws_id = mapped.ws_id.clone();
+        let Some(ws) = self.workspaces.get_mut(&ws_id) else {
+            return;
+        };
+        ws.set_maximized(win_id, maximized);
         self.sync_workspace_geometries(&ws_id);
+        self.focus_active_deck_window();
         self.sync_foreign_toplevels();
         self.queue_redraw();
+    }
+
+    /// Toggles maximize for `win_id` (`Mod + M`), clearing a fullscreen state on this workspace.
+    pub fn toggle_window_maximized(&mut self, win_id: WindowId) {
+        let maximized = !self.is_window_maximized(win_id);
+        self.set_window_maximized(win_id, maximized);
     }
 
     pub fn set_window_minimized(&mut self, win_id: WindowId, minimized: bool) {
@@ -4725,10 +4778,7 @@ impl KomaState {
             return;
         };
         if let Some(ws) = self.workspaces.get_mut(&ws_id) {
-            let is_fs = ws.fullscreen_window == Some(win_id);
-            if is_fs != fullscreen {
-                ws.toggle_fullscreen(win_id);
-            }
+            ws.set_fullscreen(win_id, fullscreen);
         }
         self.sync_workspace_geometries(&ws_id);
         self.focus_active_deck_window();
