@@ -36,7 +36,7 @@ use smithay::{
         cursor::Cursor as WinitCursor, dpi::LogicalSize,
         platform::wayland::WindowAttributesWayland, window::WindowAttributes,
     },
-    utils::{IsAlive, Point, Rectangle, SERIAL_COUNTER},
+    utils::{IsAlive, Point, Rectangle, SERIAL_COUNTER, Transform},
     wayland::{
         dmabuf::{DmabufFeedbackBuilder, DmabufGlobal},
         shell::wlr_layer::Layer,
@@ -45,6 +45,28 @@ use smithay::{
 use tracing::{debug, info, warn};
 
 use crate::state::{ActiveBackend, KomaState};
+
+/// Render transform applied to the nested output's damage tracker.
+///
+/// A nested Koma presents its frame through an EGL *window* surface. Smithay composes with the
+/// same projection for every render target (element row `y = 0` lands in the lowest framebuffer
+/// rows), which is the row order `wl_buffer` consumers expect from texture/DMA-BUF targets such
+/// as KMS scanout and screencopy - but an EGL window surface hands the parent compositor a
+/// vertically mirrored buffer, so the whole nested desktop is displayed upside down (bar at the
+/// bottom, text mirrored, cursor at the mirrored position; komawm/koma#35).
+///
+/// Mirroring the compose step cancels that: the bytes the host receives are upright again, the
+/// damage-tracker geometry is unchanged (`Transform::Flipped180` keeps the transformed size),
+/// and input needs no remapping because the two mirrors cancel, so a host pointer row maps to
+/// the same scene row (`presented_row` in the tests pins this down).
+///
+/// The flip is a property of the winit/EGL presentation path, not of a driver: it reproduces
+/// identically with the NVIDIA EGL stack (620.70.06) and with Mesa `llvmpipe`, and a plain GL
+/// client (`mpv`) drawn directly in a nested Koma is upright, so the scene composition and the
+/// consumer path are not involved. The KMS backend and the screencopy path keep rendering with
+/// `Transform::Normal` and stay byte-identical. niri compensates the same mirror by forcing
+/// `Transform::Flipped180` on its winit output transform (`niri/src/niri.rs`).
+pub(crate) const NESTED_RENDER_TRANSFORM: Transform = Transform::Flipped180;
 
 pub struct WinitBackendState {
     pub output: Output,
@@ -100,7 +122,9 @@ impl WinitBackendState {
         );
         output.set_preferred(mode);
 
-        let damage_tracker = OutputDamageTracker::from_output(&output);
+        // See `NESTED_RENDER_TRANSFORM`: the EGL window surface mirrors what we compose.
+        let damage_tracker =
+            OutputDamageTracker::new(win_size, scale_factor, NESTED_RENDER_TRANSFORM);
 
         let logical_w = (f64::from(win_size.w) / scale_factor).round().max(64.0) as u32;
         let logical_h = (f64::from(win_size.h) / scale_factor).round().max(64.0) as u32;
@@ -119,6 +143,13 @@ impl WinitBackendState {
                                 None,
                                 Some(Scale::Fractional(scale_factor)),
                                 None,
+                            );
+                            // The tracker no longer follows the output (it carries the nested
+                            // render transform), so rebuild it for the new size/scale.
+                            winit_state.damage_tracker = OutputDamageTracker::new(
+                                size,
+                                scale_factor,
+                                NESTED_RENDER_TRANSFORM,
                             );
                             winit_state.output.clone()
                         }
@@ -745,6 +776,8 @@ where
             };
             let winit_out = winit_state.output.clone();
             let rect = state.output_logical_rect(&winit_out);
+            // No output-transform correction here: the compose mirror and the EGL window
+            // surface mirror cancel, so host rows map 1:1 onto scene rows (`presented_row`).
             let local_pos: Point<f64, _> = event.position_transformed(rect.size);
             state.handle_pointer_absolute_motion(local_pos + rect.loc.to_f64(), event.time());
         }
@@ -800,5 +833,55 @@ where
             state.handle_touch_cancel();
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use smithay::utils::{Logical, Size};
+
+    use super::*;
+
+    /// Row at which the parent compositor displays a scene row of the nested output.
+    ///
+    /// Models the two mirrors of the nested presentation path: the damage tracker compose step
+    /// (`NESTED_RENDER_TRANSFORM`) and the parent compositor's treatment of an EGL window-surface
+    /// buffer, which arrives y-mirrored.
+    pub(crate) fn presented_row(scene_y: f64, height: f64, render_transform: Transform) -> f64 {
+        let area: Size<f64, Logical> = (height, height).into();
+        let composed = render_transform.transform_point_in(Point::from((0.0, scene_y)), &area);
+        // EGL window surfaces reach the host mirrored (`komawm/koma#35`): flip the composed row.
+        area.h - composed.y
+    }
+
+    const HEIGHT: f64 = 480.0;
+
+    /// What the nested desktop composes must be what the host displays: every scene row has to
+    /// come back as the same host row. Regression guard for komawm/koma#35, where the nested
+    /// output was shown upside down.
+    #[test]
+    fn nested_presentation_is_wysiwyg() {
+        for scene_y in [0.0, 1.0, HEIGHT / 2.0, 47.25, HEIGHT - 1.0, HEIGHT] {
+            let host_y = presented_row(scene_y, HEIGHT, NESTED_RENDER_TRANSFORM);
+            assert!(
+                (host_y - scene_y).abs() < 1e-9,
+                "scene row {scene_y} is displayed at host row {host_y}"
+            );
+        }
+    }
+
+    /// Without the compose mirror the host would draw the nested desktop mirrored: this is the
+    /// exact bug from the issue, and it must keep failing so the constant above is understood as
+    /// a required compensation rather than a cosmetic preference.
+    #[test]
+    fn unmirrored_compose_is_shown_upside_down() {
+        for scene_y in [0.0, 1.0, HEIGHT / 2.0, HEIGHT - 1.0] {
+            let host_y = presented_row(scene_y, HEIGHT, Transform::Normal);
+            assert!(
+                (host_y - (HEIGHT - scene_y)).abs() < 1e-9,
+                "expected a mirror of row {scene_y}, got host row {host_y}"
+            );
+        }
+        assert_eq!(presented_row(0.0, HEIGHT, Transform::Normal), HEIGHT);
     }
 }
