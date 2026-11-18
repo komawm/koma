@@ -27,6 +27,19 @@
 //! The classifier is a pure function over parsed [`ThreadSnapshot`] values so it can be unit
 //! tested without reproducing a freeze.
 
+// The `/proc`-based capture path is Linux-only (`/proc/self/task`, `futex(2)`, `schedstat`,
+// `rustix::fs::RawDir`, `gettid`). The classifier and the `/proc` line parsers are portable, so
+// they stay compiled everywhere for tests and for a future non-`/proc` source; on other targets
+// they are simply unreferenced by the inert watchdog, hence the module-level allowance below.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
+
+#[cfg(target_os = "linux")]
+use std::time::Duration;
+
+#[cfg(not(target_os = "linux"))]
+use tracing::debug;
+
+#[cfg(target_os = "linux")]
 use std::{
     fs::File,
     io,
@@ -36,14 +49,17 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread::{self, JoinHandle},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(target_os = "linux")]
 use rustix::{
     fd::BorrowedFd,
     fs::{Mode, OFlags},
     io::Errno,
 };
+
+#[cfg(target_os = "linux")]
 use tracing::{error, warn};
 
 /// Environment variable holding the stall threshold in seconds (`0` disables the watchdog).
@@ -55,7 +71,8 @@ pub const STALL_BUDGET_ENV: &str = "KOMA_STALL_WATCHDOG_BUDGET_MS";
 pub const DEFAULT_STALL_SECS: u64 = 5;
 /// Default dump budget: 750 ms.
 pub const DEFAULT_BUDGET_MS: u64 = 750;
-/// How often the side thread re-reads the heartbeat.
+/// How often the side thread re-reads the heartbeat (Linux capture thread only).
+#[cfg(target_os = "linux")]
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// Upper bound on captured threads.
 const MAX_THREADS: usize = 256;
@@ -66,23 +83,33 @@ const WCHAN_CAP: usize = 48;
 /// `/proc/<pid>/syscall` is `nr` plus six arguments plus stack pointer and program counter.
 const SYSCALL_CAP: usize = 192;
 
-/// Futex syscall number for aarch64 and riscv64.
-#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+/// Futex syscall number for aarch64 and riscv64 Linux.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "aarch64", target_arch = "riscv64")
+))]
 const SYS_FUTEX_NR: i64 = 98;
-/// Futex syscall number for x86_64.
-#[cfg(target_arch = "x86_64")]
+/// Futex syscall number for x86_64 Linux.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 const SYS_FUTEX_NR: i64 = 202;
-/// Futex syscall number for i686.
-#[cfg(target_arch = "x86")]
+/// Futex syscall number for i686 Linux.
+#[cfg(all(target_os = "linux", target_arch = "x86"))]
 const SYS_FUTEX_NR: i64 = 240;
-/// Architectures without a known constant fall back to `wchan`-only detection.
-#[cfg(not(any(
-    target_arch = "aarch64",
-    target_arch = "riscv64",
-    target_arch = "x86_64",
-    target_arch = "x86"
-)))]
+/// Linux architectures without a known constant fall back to `wchan`-only detection.
+#[cfg(all(
+    target_os = "linux",
+    not(any(
+        target_arch = "aarch64",
+        target_arch = "riscv64",
+        target_arch = "x86_64",
+        target_arch = "x86"
+    ))
+))]
 const SYS_FUTEX_NR: i64 = -1;
+/// Off Linux there is no `futex(2)` number to match: `ThreadSnapshot::syscall` is only populated
+/// by the Linux capture path, so [`ThreadSnapshot::futex_address`] is always `None` there.
+#[cfg(not(target_os = "linux"))]
+const SYS_FUTEX_NR: i64 = i64::MIN;
 
 /// One thread's `/proc/self/task/<tid>/*` state, captured without heap allocation.
 #[derive(Clone, Copy)]
@@ -347,12 +374,14 @@ pub fn classify(threads: &[ThreadSnapshot], event_loop_tid: i32) -> Verdict {
     verdict
 }
 
+#[cfg(target_os = "linux")]
 /// Fixed-capacity, allocation-free text buffer used by the dump path.
 struct Line {
     buf: [u8; 4096],
     len: usize,
 }
 
+#[cfg(target_os = "linux")]
 impl Line {
     fn new() -> Self {
         Self {
@@ -426,6 +455,7 @@ impl Line {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn write_all(fd: BorrowedFd<'_>, mut bytes: &[u8]) -> io::Result<()> {
     while !bytes.is_empty() {
         match rustix::io::write(fd, bytes) {
@@ -438,6 +468,7 @@ fn write_all(fd: BorrowedFd<'_>, mut bytes: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 /// Reads a procfs file into `buf`, returning the trimmed slice length.
 fn read_small(fd: BorrowedFd<'_>, buf: &mut [u8]) -> io::Result<usize> {
     let mut total = 0_usize;
@@ -531,6 +562,7 @@ fn parse_schedstat(bytes: &[u8]) -> Option<(u64, u64)> {
     Some((run, wait))
 }
 
+#[cfg(target_os = "linux")]
 fn copy_proc_file(
     src_dir: BorrowedFd<'_>,
     name: &str,
@@ -579,6 +611,7 @@ fn copy_proc_file(
     }
 }
 
+#[cfg(target_os = "linux")]
 /// Pre-opened filesystem state so the dump path never allocates.
 struct Paths {
     root: OwnedFd,
@@ -587,6 +620,7 @@ struct Paths {
     event_loop_tid: i32,
 }
 
+#[cfg(target_os = "linux")]
 impl Paths {
     fn prepare() -> Option<Self> {
         let state_home = std::env::var_os("XDG_STATE_HOME")
@@ -618,6 +652,7 @@ impl Paths {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn current_tid() -> i32 {
     #[allow(unsafe_code)]
     // SAFETY: `gettid` is a side-effect-free syscall wrapper in libc that cannot fail.
@@ -627,6 +662,7 @@ fn current_tid() -> i32 {
 }
 
 /// Collects every thread of this process into `out`, returning the captured count.
+#[cfg(target_os = "linux")]
 fn read_task_file(
     task_dir: BorrowedFd<'_>,
     path: &mut Line,
@@ -647,6 +683,7 @@ fn read_task_file(
     read_small(fd.as_fd(), buf).ok()
 }
 
+#[cfg(target_os = "linux")]
 /// Collects every thread of this process into `out`, returning the captured count.
 fn capture_threads(
     paths: &Paths,
@@ -734,6 +771,7 @@ fn capture_threads(
     captured
 }
 
+#[cfg(target_os = "linux")]
 /// Writes evidence with stack buffers and pre-opened descriptors only.
 fn write_evidence(paths: &Paths, stalled_micros: u64, budget: Duration) -> Option<Verdict> {
     let deadline = Instant::now() + budget;
@@ -860,10 +898,18 @@ fn write_evidence(paths: &Paths, stalled_micros: u64, budget: Duration) -> Optio
 }
 
 /// Heartbeat plus side-thread lifecycle.
+///
+/// The public surface is platform-independent so `main.rs` needs no `#[cfg]`: off Linux the
+/// watchdog is inert (no thread, no timer, no allocation) because every piece of evidence this
+/// module collects is a Linux `/proc`/`futex` facility.
 pub struct StallWatchdog {
+    #[cfg(target_os = "linux")]
     started: Instant,
+    #[cfg(target_os = "linux")]
     heartbeat: Arc<AtomicU64>,
+    #[cfg(target_os = "linux")]
     stop: Arc<AtomicBool>,
+    #[cfg(target_os = "linux")]
     thread: Option<JoinHandle<()>>,
 }
 
@@ -871,92 +917,124 @@ impl StallWatchdog {
     /// Starts the watchdog unless it is disabled or the evidence directory is unusable.
     ///
     /// Must be called from the event-loop thread: that thread id is recorded so the classifier
-    /// can distinguish a self-reentrant wait from any other thread's wait.
+    /// can distinguish a self-reentrant wait from any other thread's wait. Off Linux this is a
+    /// no-op returning `None`: in-process stall capture reads `/proc/self/task/<tid>/syscall`,
+    /// `wchan`, `schedstat` and decodes `futex(2)`, none of which exist on the BSDs.
     #[must_use]
     pub fn start() -> Option<Self> {
-        let stall_secs = std::env::var(STALL_SECS_ENV)
-            .ok()
-            .and_then(|value| value.trim().parse::<u64>().ok())
-            .unwrap_or(DEFAULT_STALL_SECS);
-        if stall_secs == 0 {
-            return None;
+        #[cfg(not(target_os = "linux"))]
+        {
+            debug!(
+                "in-process stall capture is Linux-only (/proc/self/task + futex); watchdog inert"
+            );
+            None
         }
-        let budget_ms = std::env::var(STALL_BUDGET_ENV)
-            .ok()
-            .and_then(|value| value.trim().parse::<u64>().ok())
-            .unwrap_or(DEFAULT_BUDGET_MS)
-            .clamp(50, 10_000);
 
-        let Some(paths) = Paths::prepare() else {
-            warn!("stall watchdog disabled: no usable XDG state directory for evidence dumps");
-            return None;
-        };
-        let started = Instant::now();
-        let heartbeat = Arc::new(AtomicU64::new(0));
-        let stop = Arc::new(AtomicBool::new(false));
-
-        let thread_heartbeat = Arc::clone(&heartbeat);
-        let thread_stop = Arc::clone(&stop);
-        let thread_started = started;
-        let stall_micros = stall_secs.saturating_mul(1_000_000);
-        let budget = Duration::from_millis(budget_ms);
-        let root_display = paths.root_display.clone();
-
-        let thread = thread::Builder::new()
-            .name("koma-stall".into())
-            .spawn(move || {
-                let mut reported_heartbeat: Option<u64> = None;
-                loop {
-                    thread::sleep(POLL_INTERVAL);
-                    if thread_stop.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    let beat = thread_heartbeat.load(Ordering::Relaxed);
-                    let elapsed = thread_started
-                        .elapsed()
-                        .as_micros()
-                        .min(u128::from(u64::MAX)) as u64;
-                    let stalled_for = elapsed.saturating_sub(beat);
-                    if stalled_for >= stall_micros {
-                        // One dump per stall episode: the same heartbeat means the loop is still
-                        // wedged, so re-dumping would only burn the budget.
-                        if reported_heartbeat != Some(beat) {
-                            reported_heartbeat = Some(beat);
-                            let _ = write_evidence(&paths, stalled_for, budget);
-                        }
-                    } else {
-                        reported_heartbeat = None;
-                    }
-                }
-            })
-            .ok()?;
-
-        tracing::info!(
-            stall_seconds = stall_secs,
-            evidence_root = %root_display,
-            "stall watchdog armed (writes only when the event loop stops ticking)"
-        );
-
-        Some(Self {
-            started,
-            heartbeat,
-            stop,
-            thread: Some(thread),
-        })
+        #[cfg(target_os = "linux")]
+        {
+            start_linux()
+        }
     }
 
     /// Records one event-loop iteration. One relaxed store, no syscalls beyond the clock read.
     pub fn tick(&self) {
-        let micros = self.started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
-        self.heartbeat.store(micros, Ordering::Relaxed);
+        #[cfg(target_os = "linux")]
+        {
+            let micros = self.started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+            self.heartbeat.store(micros, Ordering::Relaxed);
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = self;
+        }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn start_linux() -> Option<StallWatchdog> {
+    let stall_secs = std::env::var(STALL_SECS_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_STALL_SECS);
+    if stall_secs == 0 {
+        return None;
+    }
+    let budget_ms = std::env::var(STALL_BUDGET_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_BUDGET_MS)
+        .clamp(50, 10_000);
+
+    let Some(paths) = Paths::prepare() else {
+        warn!("stall watchdog disabled: no usable XDG state directory for evidence dumps");
+        return None;
+    };
+    let started = Instant::now();
+    let heartbeat = Arc::new(AtomicU64::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+
+    let thread_heartbeat = Arc::clone(&heartbeat);
+    let thread_stop = Arc::clone(&stop);
+    let thread_started = started;
+    let stall_micros = stall_secs.saturating_mul(1_000_000);
+    let budget = Duration::from_millis(budget_ms);
+    let root_display = paths.root_display.clone();
+
+    let thread = thread::Builder::new()
+        .name("koma-stall".into())
+        .spawn(move || {
+            let mut reported_heartbeat: Option<u64> = None;
+            loop {
+                thread::sleep(POLL_INTERVAL);
+                if thread_stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                let beat = thread_heartbeat.load(Ordering::Relaxed);
+                let elapsed = thread_started
+                    .elapsed()
+                    .as_micros()
+                    .min(u128::from(u64::MAX)) as u64;
+                let stalled_for = elapsed.saturating_sub(beat);
+                if stalled_for >= stall_micros {
+                    // One dump per stall episode: the same heartbeat means the loop is still
+                    // wedged, so re-dumping would only burn the budget.
+                    if reported_heartbeat != Some(beat) {
+                        reported_heartbeat = Some(beat);
+                        let _ = write_evidence(&paths, stalled_for, budget);
+                    }
+                } else {
+                    reported_heartbeat = None;
+                }
+            }
+        })
+        .ok()?;
+
+    tracing::info!(
+        stall_seconds = stall_secs,
+        evidence_root = %root_display,
+        "stall watchdog armed (writes only when the event loop stops ticking)"
+    );
+
+    Some(StallWatchdog {
+        started,
+        heartbeat,
+        stop,
+        thread: Some(thread),
+    })
 }
 
 impl Drop for StallWatchdog {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+        #[cfg(target_os = "linux")]
+        {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = self;
         }
     }
 }
@@ -965,6 +1043,8 @@ impl Drop for StallWatchdog {
 mod tests {
     use super::*;
 
+    /// Synthetic thread record. The classifier is a pure function over these, so the tests below
+    /// that do not encode a Linux futex syscall number run on every target.
     fn thread(tid: i32, state: u8, wchan: &str, syscall: Option<(i64, u64)>) -> ThreadSnapshot {
         let mut snapshot = ThreadSnapshot {
             tid,
@@ -981,6 +1061,7 @@ mod tests {
         snapshot
     }
 
+    #[cfg(target_os = "linux")]
     fn futex_wait(tid: i32, address: u64) -> ThreadSnapshot {
         thread(
             tid,
@@ -991,6 +1072,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn lone_event_loop_waiter_is_a_self_reentrant_mutex() {
         let threads = [
             futex_wait(100, 0x7f00_dead_0000),
@@ -1006,6 +1088,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn two_waiters_on_one_address_are_a_thread_cycle() {
         let threads = [
             futex_wait(200, 0x55aa_0000),
@@ -1019,6 +1102,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn a_cycle_not_involving_the_event_loop_thread_is_still_reported() {
         let threads = [futex_wait(300, 0xabc0), futex_wait(301, 0xabc0)];
         let verdict = classify(&threads, 999);
@@ -1040,6 +1124,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn lone_non_loop_futex_waiter_is_not_blamed_on_the_loop() {
         let threads = [futex_wait(500, 0x1234), thread(501, b'R', "", None)];
         let verdict = classify(&threads, 501);
@@ -1048,6 +1133,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn distinct_futex_addresses_are_reported_as_scattered() {
         let threads = [
             futex_wait(600, 0x10),
@@ -1067,6 +1153,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn futex_address_requires_the_futex_syscall() {
         let snapshot = thread(700, b'S', "futex_wait", Some((35, 0xfeed)));
         assert!(snapshot.is_futex_wait());
