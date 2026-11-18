@@ -944,6 +944,7 @@ fn build_screencopy_elements<'a>(
             None,
             None,
             sp_items,
+            None,
         );
         elements.extend(sp_elems);
     }
@@ -954,7 +955,7 @@ fn build_screencopy_elements<'a>(
     {
         let cam_x = ws.scrolling.peek_camera_x(now_ms);
         let tab_segs = ws.scrolling.tab_indicator_segments_at(viewport, cam_x);
-        append_tab_indicator_elements(renderer, output_scale, &tab_segs, &mut elements);
+        append_tab_indicator_elements(renderer, output_scale, &tab_segs, None, &mut elements);
     }
 
     let ws_elems = assemble_workspace_elements(
@@ -967,6 +968,7 @@ fn build_screencopy_elements<'a>(
         None,
         None,
         base_items,
+        None,
     );
     elements.extend(ws_elems);
     // A screencast mirrors the physical output, so captured closing frames must appear here too.
@@ -988,7 +990,7 @@ fn build_screencopy_elements<'a>(
     );
 
     if state.config_error_banner.is_some() {
-        prepend_config_error_banner(viewport, &mut elements);
+        prepend_config_error_banner(viewport, None, &mut elements);
     }
     if state.keybind_overlay_is_open() {
         prepend_keybind_overlay_elements(
@@ -1006,6 +1008,7 @@ fn build_screencopy_elements<'a>(
         RenderTargetKind::ScreencastPreview,
         output_scale,
         agent_cursor,
+        None,
         &mut elements,
     );
     if let Some((cursor_manager, cursor_pos)) = cursor {

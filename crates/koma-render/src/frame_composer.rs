@@ -8,7 +8,7 @@ use koma_model::{
     AgentCursorFrameSnapshot, BlurConfig, BorderConfig, DimConfig, FocusRingConfig, LogicalRect,
     LogicalViewport, ShadowConfig, WorkspaceLeaseState, parse_hex_color,
 };
-use koma_proto::OverlayKind;
+use koma_proto::{OverlayKind, WindowId};
 use smithay::{
     backend::renderer::{
         Color32F, ImportAll, ImportMem, Renderer,
@@ -17,7 +17,7 @@ use smithay::{
             memory::{MemoryRenderBuffer, MemoryRenderBufferRenderElement},
             surface::{WaylandSurfaceRenderElement, render_elements_from_surface_tree},
         },
-        gles::{GlesRenderer, GlesTexture},
+        gles::{GlesPixelProgram, GlesRenderer, GlesTexProgram, GlesTexture},
     },
     desktop::{PopupManager, Window},
     utils::{Logical, Physical, Point, Rectangle, Scale, Size},
@@ -26,9 +26,11 @@ use smithay::{
 use crate::{
     RenderTargetKind,
     elements::{
-        KomaAgentCursorElement, KomaAgentTrailElement, KomaBlurredBackdropElement,
-        KomaClippedSurfaceElement, KomaDropShadowElement, KomaRenderElement,
-        KomaRoundedBorderElement, KomaSolidColorElement, to_smithay_logical_rect,
+        BorderRole, DecorationKey, DecorationSlot, FrameDecorationCache, KomaAgentCursorElement,
+        KomaAgentTrailElement, KomaBlurredBackdropElement, KomaClippedSurfaceElement,
+        KomaDropShadowElement, KomaRenderElement, KomaRoundedBorderElement, KomaSolidColorElement,
+        OverlaySolidKind, WindowSolidKind, split_drop_shadow_strips, split_rounded_border_strips,
+        to_smithay_logical_rect,
     },
     offscreen_fbo::capture_elements_to_memory,
     shaders::{KomaCompiledShaders, KomaGlesRenderer},
@@ -54,6 +56,7 @@ pub const COLOR_SHADOW_DEFAULT: [f32; 4] = [0.0, 0.0, 0.0, 0.451]; // #00000073
 
 /// Per-window descriptor passed into the scene assembler for a single frame.
 pub struct WindowSceneItem<'a> {
+    pub win_id: WindowId,
     pub window: &'a Window,
     pub rect: LogicalRect,
     pub is_floating: bool,
@@ -443,6 +446,143 @@ pub fn resolve_border_rgba(
 pub struct FrameBlurContext {
     pub texture: GlesTexture,
     pub config: BlurConfig,
+    /// True when `DualKawaseBlurEngine::execute_blur` already baked contrast/noise/brightness
+    /// into `texture` (so `BLUR_FINISH_ROUNDED_FRAG_BODY` skips per-frame re-toning).
+    pub pre_toned: bool,
+    /// Monotonic generation from `CachedBackdropBlur::blur_generation` for damage tracking.
+    pub generation: u64,
+}
+
+impl FrameBlurContext {
+    #[must_use]
+    pub const fn from_cached(texture: GlesTexture, config: BlurConfig, generation: u64) -> Self {
+        Self {
+            texture,
+            config,
+            pre_toned: true,
+            generation,
+        }
+    }
+}
+
+fn make_solid_element(
+    cache: Option<&mut FrameDecorationCache>,
+    key: DecorationKey,
+    rect: Rectangle<f64, Logical>,
+    rgba: [f32; 4],
+) -> KomaSolidColorElement {
+    match cache {
+        Some(c) => c.solid(key, rect, rgba),
+        None => KomaSolidColorElement::oneshot(rect, rgba),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_rounded_border_strips<R>(
+    mut cache: Option<&mut FrameDecorationCache>,
+    mut key_for_strip: impl FnMut(u8) -> DecorationKey,
+    full_geo: Rectangle<f64, Logical>,
+    outer_radius: [f32; 4],
+    border_width: f32,
+    border_color: [f32; 4],
+    border_color_end: [f32; 4],
+    gradient_angle_rad: f32,
+    opacity: f32,
+    output_scale: Scale<f64>,
+    white_tex: &GlesTexture,
+    border_prog: &GlesTexProgram,
+    elements: &mut Vec<KomaRenderElement<R>>,
+) where
+    R: Renderer + ImportAll,
+{
+    for (strip_idx, strip_geo) in
+        split_rounded_border_strips(full_geo, outer_radius, border_width, output_scale)
+    {
+        let key = key_for_strip(strip_idx);
+        let elem = match cache.as_deref_mut() {
+            Some(c) => c.rounded_border(
+                key,
+                strip_geo,
+                full_geo,
+                outer_radius,
+                border_width,
+                border_color,
+                border_color_end,
+                gradient_angle_rad,
+                opacity,
+                output_scale,
+                white_tex,
+                border_prog,
+            ),
+            None => KomaRoundedBorderElement::new(
+                strip_geo,
+                outer_radius,
+                border_width,
+                border_color,
+                opacity,
+                output_scale,
+                white_tex.clone(),
+                border_prog.clone(),
+            )
+            .with_gradient(border_color_end, gradient_angle_rad)
+            .with_full_geometry(full_geo),
+        };
+        elements.push(KomaRenderElement::RoundedBorder(elem));
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_drop_shadow_strips<R>(
+    mut cache: Option<&mut FrameDecorationCache>,
+    win_id: WindowId,
+    shadow_geom: DropShadowGeometry,
+    window_geo: Rectangle<f64, Logical>,
+    window_radii: [f32; 4],
+    opacity: f32,
+    output_scale: Scale<f64>,
+    shadow_prog: &GlesPixelProgram,
+    elements: &mut Vec<KomaRenderElement<R>>,
+) where
+    R: Renderer + ImportAll,
+{
+    for (strip_idx, strip_area) in
+        split_drop_shadow_strips(shadow_geom.area, window_geo, window_radii, output_scale)
+    {
+        let key = DecorationKey::Window {
+            win_id,
+            slot: DecorationSlot::DropShadowStrip(strip_idx),
+        };
+        let elem = match cache.as_deref_mut() {
+            Some(c) => c.drop_shadow(
+                key,
+                strip_area,
+                shadow_geom.shadow_box,
+                shadow_geom.shadow_radii,
+                shadow_geom.sigma,
+                shadow_geom.sharp,
+                shadow_geom.color,
+                window_geo,
+                window_radii,
+                opacity,
+                output_scale,
+                shadow_prog,
+            ),
+            None => KomaDropShadowElement::new(
+                strip_area,
+                shadow_geom.shadow_box,
+                shadow_geom.shadow_radii,
+                shadow_geom.sigma,
+                shadow_geom.sharp,
+                shadow_geom.color,
+                window_geo,
+                window_radii,
+                opacity,
+                output_scale,
+                shadow_prog.clone(),
+            ),
+        };
+        elements.push(KomaRenderElement::DropShadow(elem));
+    }
 }
 
 /// Builds the **front-to-back** `KomaRenderElement<R>` list consumed by `OutputDamageTracker::render_output`
@@ -462,6 +602,7 @@ pub fn assemble_workspace_elements<R>(
     blur_ctx: Option<&FrameBlurContext>,
     drop_preview_rect: Option<LogicalRect>,
     windows_top_to_bottom: &[WindowSceneItem<'_>],
+    mut decoration_cache: Option<&mut FrameDecorationCache>,
 ) -> Vec<KomaRenderElement<R>>
 where
     R: Renderer + ImportAll + ImportMem + KomaGlesRenderer,
@@ -472,7 +613,7 @@ where
 
     // 1. Optional topmost 15x15 `grid_225` decision grid overlay (`IPC_SPEC.md` §5.4)
     if target == RenderTargetKind::AgentCapture && overlay == OverlayKind::Grid225 {
-        append_grid_225_hairlines(viewport, &mut elements);
+        append_grid_225_hairlines(viewport, decoration_cache.as_deref_mut(), &mut elements);
     }
 
     let viewport_size =
@@ -494,6 +635,7 @@ where
                     default_preview_radius,
                     output_scale,
                     &shaders,
+                    decoration_cache.as_deref_mut(),
                     &mut elements,
                 );
             }
@@ -514,7 +656,12 @@ where
 
         // Protected Surface Blackout Invariant (`IPC_SPEC.md` §3.2)
         if item.is_protected_surface && target != RenderTargetKind::PhysicalOutput {
-            elements.push(KomaRenderElement::from(KomaSolidColorElement::oneshot(
+            elements.push(KomaRenderElement::from(make_solid_element(
+                decoration_cache.as_deref_mut(),
+                DecorationKey::Window {
+                    win_id: item.win_id,
+                    slot: DecorationSlot::Solid(WindowSolidKind::ProtectedBlackout),
+                },
                 outer_rect,
                 COLOR_PROTECTED_BLACKOUT,
             )));
@@ -570,18 +717,24 @@ where
                     shaders.white_1x1_tex.as_ref(),
                 )
             {
-                elements.push(KomaRenderElement::RoundedBorder(
-                    KomaRoundedBorderElement::new(
-                        ring_geom.ring_rect,
-                        ring_geom.outer_radii,
-                        ring_geom.width,
-                        ring_rgba,
-                        eff_opacity,
-                        output_scale,
-                        white_tex.clone(),
-                        border_prog.clone(),
-                    ),
-                ));
+                append_rounded_border_strips(
+                    decoration_cache.as_deref_mut(),
+                    |strip| DecorationKey::Window {
+                        win_id: item.win_id,
+                        slot: DecorationSlot::FocusRingStrip(strip),
+                    },
+                    ring_geom.ring_rect,
+                    ring_geom.outer_radii,
+                    ring_geom.width,
+                    ring_rgba,
+                    ring_rgba,
+                    0.0,
+                    eff_opacity,
+                    output_scale,
+                    white_tex,
+                    border_prog,
+                    &mut elements,
+                );
             }
         }
 
@@ -592,19 +745,24 @@ where
                 shaders.white_1x1_tex.as_ref(),
             )
         {
-            elements.push(KomaRenderElement::RoundedBorder(
-                KomaRoundedBorderElement::new(
-                    outer_rect,
-                    outer_radii,
-                    border_thickness as f32,
-                    border_rgba,
-                    eff_opacity,
-                    output_scale,
-                    white_tex.clone(),
-                    border_prog.clone(),
-                )
-                .with_gradient(border_rgba_end, border_angle_rad),
-            ));
+            append_rounded_border_strips(
+                decoration_cache.as_deref_mut(),
+                |strip| DecorationKey::Window {
+                    win_id: item.win_id,
+                    slot: DecorationSlot::BorderStrip(strip),
+                },
+                outer_rect,
+                outer_radii,
+                border_thickness as f32,
+                border_rgba,
+                border_rgba_end,
+                border_angle_rad,
+                eff_opacity,
+                output_scale,
+                white_tex,
+                border_prog,
+                &mut elements,
+            );
         }
 
         // 2c. Main toplevel surface tree (clipped to `inner_rect` + `inner_radii` when shader available)
@@ -651,8 +809,27 @@ where
         {
             let should_blur = b_ctx.config.ignore_opacity || eff_opacity < 0.999;
             if should_blur {
-                elements.push(KomaRenderElement::BlurredBackdrop(
-                    KomaBlurredBackdropElement::new(
+                let key = DecorationKey::Window {
+                    win_id: item.win_id,
+                    slot: DecorationSlot::BlurredBackdrop,
+                };
+                let elem = match decoration_cache.as_deref_mut() {
+                    Some(c) => c.blurred_backdrop(
+                        key,
+                        inner_rect,
+                        viewport_size,
+                        inner_radii,
+                        eff_opacity,
+                        output_scale,
+                        b_ctx.config.noise,
+                        b_ctx.config.contrast,
+                        b_ctx.config.brightness,
+                        b_ctx.pre_toned,
+                        b_ctx.generation,
+                        &b_ctx.texture,
+                        blur_prog,
+                    ),
+                    None => KomaBlurredBackdropElement::new(
                         inner_rect,
                         viewport_size,
                         inner_radii,
@@ -663,13 +840,20 @@ where
                         b_ctx.config.brightness,
                         b_ctx.texture.clone(),
                         blur_prog.clone(),
-                    ),
-                ));
+                    )
+                    .with_pre_toned(b_ctx.pre_toned),
+                };
+                elements.push(KomaRenderElement::BlurredBackdrop(elem));
             }
         }
 
         if item.border.enabled && border_thickness > 0.0 && shaders.rounded_border.is_none() {
-            elements.push(KomaRenderElement::from(KomaSolidColorElement::oneshot(
+            elements.push(KomaRenderElement::from(make_solid_element(
+                decoration_cache.as_deref_mut(),
+                DecorationKey::Window {
+                    win_id: item.win_id,
+                    slot: DecorationSlot::Solid(WindowSolidKind::BorderFallback),
+                },
                 outer_rect,
                 border_rgba,
             )));
@@ -681,7 +865,12 @@ where
         {
             let ring_rgba = resolve_focus_ring_rgba(&item.focus_ring, item.is_focused);
             if ring_rgba[3] > 0.0 {
-                elements.push(KomaRenderElement::from(KomaSolidColorElement::oneshot(
+                elements.push(KomaRenderElement::from(make_solid_element(
+                    decoration_cache.as_deref_mut(),
+                    DecorationKey::Window {
+                        win_id: item.win_id,
+                        slot: DecorationSlot::Solid(WindowSolidKind::FocusRingFallback),
+                    },
                     ring_geom.ring_rect,
                     ring_rgba,
                 )));
@@ -695,19 +884,17 @@ where
                 shaders.rounded_shadow.as_ref(),
             )
         {
-            elements.push(KomaRenderElement::DropShadow(KomaDropShadowElement::new(
-                shadow_geom.area,
-                shadow_geom.shadow_box,
-                shadow_geom.shadow_radii,
-                shadow_geom.sigma,
-                shadow_geom.sharp,
-                shadow_geom.color,
+            append_drop_shadow_strips(
+                decoration_cache.as_deref_mut(),
+                item.win_id,
+                shadow_geom,
                 outer_rect,
                 outer_radii,
                 eff_opacity,
                 output_scale,
-                shadow_prog.clone(),
-            )));
+                shadow_prog,
+                &mut elements,
+            );
         }
     }
 
@@ -719,6 +906,7 @@ where
             default_preview_radius,
             output_scale,
             &shaders,
+            decoration_cache,
             &mut elements,
         );
     }
@@ -772,28 +960,39 @@ fn push_drop_preview_elements<R>(
     corner_radius: f32,
     output_scale: Scale<f64>,
     shaders: &KomaCompiledShaders,
+    mut decoration_cache: Option<&mut FrameDecorationCache>,
     elements: &mut Vec<KomaRenderElement<R>>,
 ) where
     R: Renderer + ImportAll,
 {
+    let scope = decoration_cache
+        .as_deref_mut()
+        .map_or(0, FrameDecorationCache::next_drop_preview_scope);
     let outer = to_smithay_logical_rect(preview_rect);
     let radii = [corner_radius.max(0.0); 4];
     if let (Some(border_prog), Some(white_tex)) = (
         shaders.rounded_border.as_ref(),
         shaders.white_1x1_tex.as_ref(),
     ) {
-        elements.push(KomaRenderElement::RoundedBorder(
-            KomaRoundedBorderElement::new(
-                outer,
-                radii,
-                2.0,
-                COLOR_DROP_PREVIEW_BORDER,
-                1.0,
-                output_scale,
-                white_tex.clone(),
-                border_prog.clone(),
-            ),
-        ));
+        append_rounded_border_strips(
+            decoration_cache.as_deref_mut(),
+            |strip| DecorationKey::OverlayBorderStrip {
+                role: BorderRole::DropPreview,
+                scope,
+                strip,
+            },
+            outer,
+            radii,
+            2.0,
+            COLOR_DROP_PREVIEW_BORDER,
+            COLOR_DROP_PREVIEW_BORDER,
+            0.0,
+            1.0,
+            output_scale,
+            white_tex,
+            border_prog,
+            elements,
+        );
     }
     let inset = Rectangle::<f64, Logical>::new(
         Point::from((
@@ -805,7 +1004,9 @@ fn push_drop_preview_elements<R>(
             (f64::from(preview_rect.h) - 4.0).max(16.0),
         )),
     );
-    elements.push(KomaRenderElement::from(KomaSolidColorElement::oneshot(
+    elements.push(KomaRenderElement::from(make_solid_element(
+        decoration_cache,
+        DecorationKey::OverlaySolid(OverlaySolidKind::DropPreviewFill(scope)),
         inset,
         COLOR_DROP_PREVIEW_FILL,
     )));
@@ -814,6 +1015,7 @@ fn push_drop_preview_elements<R>(
 /// Appends a translucent dark backdrop scrim behind an open `special:<name>` Scratchpad overlay.
 pub fn append_scratchpad_dim_scrim<R>(
     viewport: LogicalViewport,
+    decoration_cache: Option<&mut FrameDecorationCache>,
     elements: &mut Vec<KomaRenderElement<R>>,
 ) where
     R: Renderer + ImportAll,
@@ -822,7 +1024,9 @@ pub fn append_scratchpad_dim_scrim<R>(
         Point::from((0.0, 0.0)),
         Size::from((f64::from(viewport.width), f64::from(viewport.height))),
     );
-    elements.push(KomaRenderElement::from(KomaSolidColorElement::oneshot(
+    elements.push(KomaRenderElement::from(make_solid_element(
+        decoration_cache,
+        DecorationKey::OverlaySolid(OverlaySolidKind::ScratchpadScrim),
         scrim,
         COLOR_SCRATCHPAD_DIM_SCRIM,
     )));
@@ -832,6 +1036,7 @@ pub fn append_scratchpad_dim_scrim<R>(
 /// `~/.config/koma/init.lua` failed its most recent hot-reload.
 pub fn prepend_config_error_banner<R>(
     viewport: LogicalViewport,
+    decoration_cache: Option<&mut FrameDecorationCache>,
     elements: &mut Vec<KomaRenderElement<R>>,
 ) where
     R: Renderer + ImportAll,
@@ -842,15 +1047,20 @@ pub fn prepend_config_error_banner<R>(
     );
     elements.insert(
         0,
-        KomaRenderElement::from(KomaSolidColorElement::oneshot(
+        KomaRenderElement::from(make_solid_element(
+            decoration_cache,
+            DecorationKey::OverlaySolid(OverlaySolidKind::ConfigErrorBanner),
             bar,
             COLOR_CONFIG_ERROR_BANNER,
         )),
     );
 }
 
-fn append_grid_225_hairlines<R>(viewport: LogicalViewport, elements: &mut Vec<KomaRenderElement<R>>)
-where
+fn append_grid_225_hairlines<R>(
+    viewport: LogicalViewport,
+    mut decoration_cache: Option<&mut FrameDecorationCache>,
+    elements: &mut Vec<KomaRenderElement<R>>,
+) where
     R: Renderer + ImportAll,
 {
     let w = f64::from(viewport.width);
@@ -858,14 +1068,24 @@ where
     for idx in 1..15 {
         let x = (w / 15.0) * f64::from(idx);
         let v_line = Rectangle::new(Point::from((x, 0.0)), Size::from((1.0, h)));
-        elements.push(KomaRenderElement::from(KomaSolidColorElement::oneshot(
+        elements.push(KomaRenderElement::from(make_solid_element(
+            decoration_cache.as_deref_mut(),
+            DecorationKey::OverlaySolid(OverlaySolidKind::Grid225Line {
+                is_vertical: true,
+                idx: idx as u8,
+            }),
             v_line,
             COLOR_GRID_HAIRLINE,
         )));
 
         let y = (h / 15.0) * f64::from(idx);
         let h_line = Rectangle::new(Point::from((0.0, y)), Size::from((w, 1.0)));
-        elements.push(KomaRenderElement::from(KomaSolidColorElement::oneshot(
+        elements.push(KomaRenderElement::from(make_solid_element(
+            decoration_cache.as_deref_mut(),
+            DecorationKey::OverlaySolid(OverlaySolidKind::Grid225Line {
+                is_vertical: false,
+                idx: idx as u8,
+            }),
             h_line,
             COLOR_GRID_HAIRLINE,
         )));
@@ -878,6 +1098,7 @@ pub fn append_tab_indicator_elements<R>(
     renderer: &mut R,
     output_scale: Scale<f64>,
     segments: &[koma_model::TabIndicatorSegment],
+    mut decoration_cache: Option<&mut FrameDecorationCache>,
     elements: &mut Vec<KomaRenderElement<R>>,
 ) where
     R: Renderer + ImportAll + ImportMem + KomaGlesRenderer,
@@ -903,8 +1124,26 @@ pub fn append_tab_indicator_elements<R>(
             )
         {
             // `border_width = 0.0` fills the entire rounded SDF pill cleanly
-            elements.push(KomaRenderElement::RoundedBorder(
-                KomaRoundedBorderElement::new(
+            let key = DecorationKey::Window {
+                win_id: seg.win_id,
+                slot: DecorationSlot::TabIndicatorBorder,
+            };
+            let elem = match decoration_cache.as_deref_mut() {
+                Some(c) => c.rounded_border(
+                    key,
+                    rect,
+                    rect,
+                    [radius; 4],
+                    0.0,
+                    rgba,
+                    rgba,
+                    0.0,
+                    1.0,
+                    output_scale,
+                    white_tex,
+                    border_prog,
+                ),
+                None => KomaRoundedBorderElement::new(
                     rect,
                     [radius; 4],
                     0.0,
@@ -914,11 +1153,18 @@ pub fn append_tab_indicator_elements<R>(
                     white_tex.clone(),
                     border_prog.clone(),
                 ),
-            ));
+            };
+            elements.push(KomaRenderElement::RoundedBorder(elem));
             continue;
         }
-        elements.push(KomaRenderElement::from(KomaSolidColorElement::oneshot(
-            rect, rgba,
+        elements.push(KomaRenderElement::from(make_solid_element(
+            decoration_cache.as_deref_mut(),
+            DecorationKey::Window {
+                win_id: seg.win_id,
+                slot: DecorationSlot::TabIndicatorSolid,
+            },
+            rect,
+            rgba,
         )));
     }
 }
@@ -939,6 +1185,7 @@ pub fn prepend_agent_cursor_elements<R>(
     target: RenderTargetKind,
     output_scale: Scale<f64>,
     snapshot: Option<&AgentCursorFrameSnapshot>,
+    mut decoration_cache: Option<&mut FrameDecorationCache>,
     elements: &mut Vec<KomaRenderElement<R>>,
 ) where
     R: Renderer + ImportAll + ImportMem + KomaGlesRenderer + crate::elements::KomaRenderTarget,
@@ -994,18 +1241,25 @@ pub fn prepend_agent_cursor_elements<R>(
             shaders.rounded_border.as_ref(),
             shaders.white_1x1_tex.as_ref(),
         ) {
-            overlay.push(KomaRenderElement::RoundedBorder(
-                KomaRoundedBorderElement::new(
-                    caret_f64,
-                    [4.0; 4],
-                    1.5,
-                    [r, g, b, 0.85 * alpha],
-                    alpha,
-                    output_scale,
-                    white_tex.clone(),
-                    border_prog.clone(),
-                ),
-            ));
+            append_rounded_border_strips(
+                decoration_cache.as_deref_mut(),
+                |strip| DecorationKey::OverlayBorderStrip {
+                    role: BorderRole::AgentCaret,
+                    scope: 0,
+                    strip,
+                },
+                caret_f64,
+                [4.0; 4],
+                1.5,
+                [r, g, b, 0.85 * alpha],
+                [r, g, b, 0.85 * alpha],
+                0.0,
+                alpha,
+                output_scale,
+                white_tex,
+                border_prog,
+                &mut overlay,
+            );
         } else {
             let stroke = 1.5_f64;
             let outline_rgba = [r, g, b, 0.85 * alpha];
@@ -1013,30 +1267,30 @@ pub fn prepend_agent_cursor_elements<R>(
             let y = caret_f64.loc.y;
             let w = caret_f64.size.w;
             let h = caret_f64.size.h;
-            overlay.push(KomaRenderElement::from(KomaSolidColorElement::oneshot(
+            let edges = [
                 Rectangle::new(Point::from((x, y)), Size::from((w, stroke))),
-                outline_rgba,
-            )));
-            overlay.push(KomaRenderElement::from(KomaSolidColorElement::oneshot(
                 Rectangle::new(
                     Point::from((x, (y + h - stroke).max(y))),
                     Size::from((w, stroke)),
                 ),
-                outline_rgba,
-            )));
-            overlay.push(KomaRenderElement::from(KomaSolidColorElement::oneshot(
                 Rectangle::new(Point::from((x, y)), Size::from((stroke, h))),
-                outline_rgba,
-            )));
-            overlay.push(KomaRenderElement::from(KomaSolidColorElement::oneshot(
                 Rectangle::new(
                     Point::from(((x + w - stroke).max(x), y)),
                     Size::from((stroke, h)),
                 ),
-                outline_rgba,
-            )));
+            ];
+            for (idx, edge_rect) in edges.into_iter().enumerate() {
+                overlay.push(KomaRenderElement::from(make_solid_element(
+                    decoration_cache.as_deref_mut(),
+                    DecorationKey::OverlaySolid(OverlaySolidKind::AgentCaretEdge(idx as u8)),
+                    edge_rect,
+                    outline_rgba,
+                )));
+            }
         }
-        overlay.push(KomaRenderElement::from(KomaSolidColorElement::oneshot(
+        overlay.push(KomaRenderElement::from(make_solid_element(
+            decoration_cache,
+            DecorationKey::OverlaySolid(OverlaySolidKind::AgentCaretFill),
             caret_f64,
             [r, g, b, 0.14 * alpha],
         )));
