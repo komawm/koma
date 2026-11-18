@@ -37,7 +37,9 @@ use smithay::{
 };
 use tracing::debug;
 
-use crate::state::{ClientState, KomaState};
+use crate::state::{ClientState, KomaState, PointerHitTarget};
+use koma_lua::FollowMouseMode;
+use koma_model::WorkspaceState;
 use koma_proto::WorkspaceId;
 
 pub const XDG_ACTIVATION_TOKEN_TTL: Duration = Duration::from_secs(10);
@@ -826,7 +828,11 @@ impl KomaState {
                 self.active_ws_id = self.active_workspace_for_output(&new_name);
             }
         }
-        let under = self.surface_under(clamped);
+        // Resolve the scene once: pointer dispatch and `follow_mouse` share this hit test, so the
+        // motion hot path performs no extra hit-testing or allocation for focus decisions.
+        let hit = self.hit_test_target(clamped);
+        self.follow_pointer_focus(hit.as_ref(), clamped);
+        let under = hit.map(|target| (target.surface().clone(), target.origin()));
         pointer.motion(
             self,
             under.clone(),
@@ -841,6 +847,68 @@ impl KomaState {
         self.refresh_frame_edge_hover(clamped);
         self.maybe_activate_pointer_constraint();
         self.queue_redraw();
+    }
+
+    /// Applies `koma.input({ pointer = { follow_mouse = ... } })` to a motion that landed on `hit`.
+    ///
+    /// Modes follow `Hyprland` `input:follow_mouse`: `off` is `0` (disabled: clicking is the only
+    /// way to move focus), `normal` is `1` (`full`: the window under the cursor is focused *and*
+    /// raised to the top of its workspace stack), and `focus_only` is `2` (the window under the
+    /// cursor gains keyboard focus without being raised, so the workspace keeps its active-window
+    /// stacking).
+    ///
+    /// Never acts over a gap or layer-shell surface, while locked/abandoned, while a
+    /// `MoveWindowGrab`/`ResizeWindowGrab` owns the pointer, or when an open `special:<name>`
+    /// overlay owns the visible stack and the hit window belongs to another workspace. Identity is
+    /// checked before any mutation, so motion inside the already-focused window is a no-op.
+    fn follow_pointer_focus(
+        &mut self,
+        hit: Option<&PointerHitTarget>,
+        global_pos: Point<f64, Logical>,
+    ) {
+        let mode = self.follow_mouse_mode;
+        if mode == FollowMouseMode::Off {
+            return;
+        }
+        let Some(PointerHitTarget::Window { win_id, ws_id, .. }) = hit else {
+            return;
+        };
+        if self.is_locked_or_abandoned() {
+            return;
+        }
+        let Some(pointer) = self.seat.get_pointer() else {
+            return;
+        };
+        if pointer.is_grabbed() {
+            return;
+        }
+        // A visible Scratchpad overlay stays authoritative: hovering the windows it covers is not a
+        // focus request (a click intentionally dismisses the overlay through `focus_window_at_point`).
+        if let Some(open_special) = &self.active_special_ws_id
+            && open_special != ws_id
+        {
+            return;
+        }
+        match mode {
+            FollowMouseMode::Normal => {
+                if self
+                    .workspaces
+                    .get(ws_id)
+                    .and_then(WorkspaceState::active_window)
+                    == Some(*win_id)
+                {
+                    return;
+                }
+                self.activate_window_hit(*win_id, ws_id, global_pos);
+            }
+            FollowMouseMode::FocusOnly => {
+                if self.focused_window_id() == Some(*win_id) {
+                    return;
+                }
+                self.focus_window_by_pointer(*win_id, ws_id, global_pos);
+            }
+            FollowMouseMode::Off => {}
+        }
     }
 
     #[must_use]

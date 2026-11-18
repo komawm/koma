@@ -318,14 +318,10 @@ pub fn sync_all_foreign_toplevels(state: &mut KomaState) {
         .retain(|m| m.is_alive());
 
     let locked = state.is_locked_or_abandoned();
-    let active_ws = state.effective_interactive_ws_id();
     let focused_win = if locked {
         None
     } else {
-        state
-            .workspaces
-            .get(&active_ws)
-            .and_then(|ws| ws.active_window())
+        state.focused_window_id()
     };
     let outputs = state.all_outputs();
     let snapshots = build_snapshots(state, focused_win, &outputs);

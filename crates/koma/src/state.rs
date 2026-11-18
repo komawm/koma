@@ -13,8 +13,8 @@ use std::{
 
 use calloop::{LoopHandle, LoopSignal, RegistrationToken};
 use koma_lua::{
-    ActionDescriptor, DesktopQuerySnapshot, LuaOutputInfo, LuaWindowInfo, LuaWorkspaceInfo,
-    TrampolineScheduler, phodopus_bridge::PhodopusSandbox,
+    ActionDescriptor, DesktopQuerySnapshot, FollowMouseMode, LuaOutputInfo, LuaWindowInfo,
+    LuaWorkspaceInfo, TrampolineScheduler, phodopus_bridge::PhodopusSandbox,
 };
 use koma_model::{
     AgentCursorConfig, AgentCursorFrameSnapshot, AgentCursorVisualDynamics, LayoutMode,
@@ -335,7 +335,31 @@ pub enum PointerHitTarget {
     Window {
         surface: WlSurface,
         origin: Point<f64, Logical>,
+        /// Mapped window the surface belongs to, resolved by the same hit test that found it.
+        win_id: WindowId,
+        /// Workspace the hit window lives on (`special:<name>` when the overlay owns the hit).
+        ws_id: WorkspaceId,
     },
+}
+
+impl PointerHitTarget {
+    #[must_use]
+    pub fn surface(&self) -> &WlSurface {
+        match self {
+            Self::LockSurface { surface, .. }
+            | Self::Layer { surface, .. }
+            | Self::Window { surface, .. } => surface,
+        }
+    }
+
+    #[must_use]
+    pub fn origin(&self) -> Point<f64, Logical> {
+        match self {
+            Self::LockSurface { origin, .. }
+            | Self::Layer { origin, .. }
+            | Self::Window { origin, .. } => *origin,
+        }
+    }
 }
 
 /// Front-to-back scene tiers ranked cleanly from lock surface down to background layers.
@@ -746,6 +770,10 @@ pub struct KomaState {
     pub applied_keyboard_repeat: (i32, i32),
     pub applied_startup_numlock: Option<bool>,
     pub virtual_keyboard_keymap_active: bool,
+    /// Resolved `koma.input({ pointer = { follow_mouse = ... } })` policy, refreshed on config apply.
+    pub follow_mouse_mode: FollowMouseMode,
+    /// Window that owns pointer-transferred keyboard focus in [`FollowMouseMode::FocusOnly`].
+    pub pointer_focus_window: Option<WindowId>,
 
     // Physical/nested host seat (`seat0` / `libseat`)
     pub seat: Seat<Self>,
@@ -989,6 +1017,8 @@ impl KomaState {
             ),
             applied_startup_numlock: None,
             virtual_keyboard_keymap_active: false,
+            follow_mouse_mode: FollowMouseMode::default(),
+            pointer_focus_window: None,
             seat,
             pointer_location: Point::from((
                 f64::from(initial_viewport.width) * 0.5,
@@ -2625,13 +2655,36 @@ impl KomaState {
         self.queue_redraw();
     }
 
+    /// Window that currently owns keyboard focus inside the interactive workspace.
+    ///
+    /// In [`FollowMouseMode::FocusOnly`] this is the pointer-focused window recorded by the
+    /// follow-mouse path; otherwise it is the workspace's active window. Keeping this a single
+    /// source of truth makes seat keyboard focus, `xdg_toplevel` `Activated`, foreign-toplevel
+    /// state and Lua/IPC snapshots agree without changing `WorkspaceState::active_window`.
+    #[must_use]
+    pub fn focused_window_id(&self) -> Option<WindowId> {
+        let ws_id = self.effective_interactive_ws_id();
+        if let Some(win_id) = self.pointer_focus_window
+            && self
+                .mapped_windows
+                .iter()
+                .any(|m| m.win_id == win_id && !m.is_minimized && m.ws_id == ws_id)
+        {
+            return Some(win_id);
+        }
+        self.workspaces
+            .get(&ws_id)
+            .and_then(WorkspaceState::active_window)
+            .filter(|id| {
+                self.mapped_windows
+                    .iter()
+                    .any(|m| m.win_id == *id && !m.is_minimized)
+            })
+    }
+
     #[must_use]
     fn active_deck_wl_surface(&self) -> Option<WlSurface> {
-        let target_ws_id = self.effective_interactive_ws_id();
-        let active_id = self
-            .workspaces
-            .get(&target_ws_id)
-            .and_then(WorkspaceState::active_window)?;
+        let active_id = self.focused_window_id()?;
         self.mapped_windows
             .iter()
             .find(|m| m.win_id == active_id && !m.is_minimized)
@@ -2756,15 +2809,7 @@ impl KomaState {
     /// seat keyboard focus without bypassing lock-screen or layer-shell priority.
     pub fn focus_active_deck_window(&mut self) {
         let target_ws_id = self.effective_interactive_ws_id();
-        let active_id = self
-            .workspaces
-            .get(&target_ws_id)
-            .and_then(WorkspaceState::active_window)
-            .filter(|id| {
-                self.mapped_windows
-                    .iter()
-                    .any(|m| m.win_id == *id && !m.is_minimized)
-            });
+        let active_id = self.focused_window_id();
         for mapped in &self.mapped_windows {
             if let Some(toplevel) = mapped.window.toplevel() {
                 let is_active = mapped.ws_id == target_ws_id
@@ -2910,8 +2955,13 @@ impl KomaState {
             return Some(hit);
         }
 
-        if let Some((_, _, surface, origin)) = self.hit_test_visible_surface(global_pos) {
-            return Some(PointerHitTarget::Window { surface, origin });
+        if let Some((win_id, ws_id, surface, origin)) = self.hit_test_visible_surface(global_pos) {
+            return Some(PointerHitTarget::Window {
+                surface,
+                origin,
+                win_id,
+                ws_id,
+            });
         }
 
         self.layer_surface_under_tiers(global_pos, [Layer::Bottom, Layer::Background])
@@ -2923,15 +2973,8 @@ impl KomaState {
         &self,
         global_pos: Point<f64, Logical>,
     ) -> Option<(WlSurface, Point<f64, Logical>)> {
-        self.hit_test_target(global_pos).map(|target| match target {
-            PointerHitTarget::LockSurface { surface, origin }
-            | PointerHitTarget::Layer {
-                surface, origin, ..
-            }
-            | PointerHitTarget::Window {
-                surface, origin, ..
-            } => (surface, origin),
-        })
+        self.hit_test_target(global_pos)
+            .map(|target| (target.surface().clone(), target.origin()))
     }
 
     #[must_use]
@@ -3342,6 +3385,8 @@ impl KomaState {
             self.reconcile_keyboard_focus();
             return;
         }
+        // An explicit click always wins over `focus_only` pointer-focus state.
+        self.pointer_focus_window = None;
 
         if let Some((target_ws_id, tab_win_id)) = self.tab_indicator_window_at(global_pos) {
             let now_ms = self.elapsed_ms();
@@ -3366,32 +3411,7 @@ impl KomaState {
         }
 
         if let Some((win_id, hit_ws_id, _, _)) = self.hit_test_visible_surface(global_pos) {
-            self.focused_ondemand_layer = None;
-            if self.active_special_ws_id.is_some()
-                && self.active_special_ws_id.as_ref() != Some(&hit_ws_id)
-            {
-                self.active_special_ws_id = None;
-            }
-            if let Some(hit_out) = self.output_at_point_strict(global_pos) {
-                let hit_out_name = hit_out.name();
-                self.focused_output_name = Some(hit_out_name.clone());
-                if !self
-                    .workspaces
-                    .get(&hit_ws_id)
-                    .is_some_and(|w| w.is_special)
-                {
-                    self.output_workspaces
-                        .insert(hit_out_name, hit_ws_id.clone());
-                    self.active_ws_id = hit_ws_id.clone();
-                }
-            }
-            let now_ms = self.elapsed_ms();
-            if let Some(ws) = self.workspaces.get_mut(&hit_ws_id) {
-                ws.activate_window(win_id, now_ms);
-            }
-            self.sync_workspace_geometries(&hit_ws_id);
-            self.focus_active_deck_window();
-            self.queue_redraw();
+            self.activate_window_hit(win_id, &hit_ws_id, global_pos);
         } else {
             self.focused_ondemand_layer = None;
             if let Some(hit_out) = self.output_at_point_strict(global_pos) {
@@ -3401,6 +3421,61 @@ impl KomaState {
             }
             self.focus_active_deck_window();
         }
+    }
+
+    /// Activates and raises the resolved `win_id` of `hit_ws_id` (click focus and
+    /// `follow_mouse = normal` share this path so both always agree).
+    pub(crate) fn activate_window_hit(
+        &mut self,
+        win_id: WindowId,
+        hit_ws_id: &WorkspaceId,
+        global_pos: Point<f64, Logical>,
+    ) {
+        let now_ms = self.elapsed_ms();
+        self.focused_ondemand_layer = None;
+        self.pointer_focus_window = None;
+        if self.active_special_ws_id.as_ref() != Some(hit_ws_id) {
+            self.active_special_ws_id = None;
+        }
+        if let Some(hit_out) = self.output_at_point_strict(global_pos) {
+            let hit_out_name = hit_out.name();
+            self.focused_output_name = Some(hit_out_name.clone());
+            if !self.workspaces.get(hit_ws_id).is_some_and(|w| w.is_special) {
+                self.output_workspaces
+                    .insert(hit_out_name, hit_ws_id.clone());
+                self.active_ws_id = hit_ws_id.clone();
+            }
+        }
+        if let Some(ws) = self.workspaces.get_mut(hit_ws_id) {
+            ws.activate_window(win_id, now_ms);
+        }
+        self.sync_workspace_geometries(hit_ws_id);
+        self.focus_active_deck_window();
+        self.queue_redraw();
+    }
+
+    /// `follow_mouse = focus_only`: transfers seat keyboard focus to `win_id` without raising it or
+    /// changing the workspace's active-window stacking, so the layout/tab order is untouched while
+    /// `Activated`, foreign-toplevel and Lua focus state follow the pointer.
+    pub(crate) fn focus_window_by_pointer(
+        &mut self,
+        win_id: WindowId,
+        hit_ws_id: &WorkspaceId,
+        global_pos: Point<f64, Logical>,
+    ) {
+        self.focused_ondemand_layer = None;
+        if let Some(hit_out) = self.output_at_point_strict(global_pos) {
+            let hit_out_name = hit_out.name();
+            self.focused_output_name = Some(hit_out_name.clone());
+            if !self.workspaces.get(hit_ws_id).is_some_and(|w| w.is_special) {
+                self.output_workspaces
+                    .insert(hit_out_name, hit_ws_id.clone());
+                self.active_ws_id = hit_ws_id.clone();
+            }
+        }
+        self.pointer_focus_window = Some(win_id);
+        self.focus_active_deck_window();
+        self.queue_redraw();
     }
 
     /// Collects **front-to-back** `WindowSceneItem`s for a single workspace (`ws_id`).
@@ -4470,6 +4545,19 @@ impl KomaState {
     pub fn apply_runtime_input_config(&mut self, registry: &KomaConfigRegistry) {
         self.apply_keyboard_spec_to_seat(&registry.input.keyboard, false);
         self.apply_backend_input_config(&registry.input, &registry.devices);
+        self.apply_follow_mouse_config(registry.input.pointer.follow_mouse.as_deref());
+    }
+
+    /// Caches the resolved [`FollowMouseMode`] so pointer motion never re-clones the config registry,
+    /// and drops any stale `focus_only` pointer-focus override when the policy stops allowing it.
+    fn apply_follow_mouse_config(&mut self, raw: Option<&str>) {
+        let mode = FollowMouseMode::from_config_value(raw);
+        self.follow_mouse_mode = mode;
+        // Only `focus_only` may keep keyboard focus on a window that is not the workspace's active
+        // window, so any other policy must drop the override and re-derive focus from the stack.
+        if mode != FollowMouseMode::FocusOnly && self.pointer_focus_window.take().is_some() {
+            self.focus_active_deck_window();
+        }
     }
 
     /// Restores the compositor's configured Lua XKB layout after a custom `zwp_virtual_keyboard_v1`
@@ -4660,10 +4748,7 @@ impl KomaState {
         scope_ws_id: Option<&WorkspaceId>,
     ) -> DesktopQuerySnapshot {
         let active_ws_id = self.effective_interactive_ws_id();
-        let active_focused_id = self
-            .workspaces
-            .get(&active_ws_id)
-            .and_then(WorkspaceState::active_window);
+        let active_focused_id = self.focused_window_id();
 
         let mut windows = Vec::new();
         let mut focused_window = None;
@@ -4930,6 +5015,7 @@ impl KomaState {
             ws.activate_window(win_id, now_ms);
         }
         self.focused_ondemand_layer = None;
+        self.pointer_focus_window = None;
         self.break_active_pointer_constraints();
         self.sync_workspace_geometries(&ws_id);
         self.focus_active_deck_window();

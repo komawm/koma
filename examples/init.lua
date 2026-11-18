@@ -102,6 +102,9 @@ koma.workspace({
 koma.input({
     mod_key = "Super",
     inherit_default_binds = true,
+    -- Pointer focus policy: "off" (Hyprland 0, click-to-focus),
+    -- "normal" (1, focus + raise) or "focus_only" (2, focus without raising).
+    pointer = { follow_mouse = "normal" },
     touchpad = { tap_to_click = true, natural_scroll = true },
     tablet = { map_to_output = "eDP-1" },
 })
