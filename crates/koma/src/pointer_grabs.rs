@@ -90,6 +90,9 @@ pub fn start_compositor_move_grab(state: &mut KomaState, button_code: u32, seria
     if state.is_locked_or_abandoned() {
         return false;
     }
+    // An interactive grab owns the pointer for the whole gesture: stop a pending keybind
+    // repeat so the held chord cannot keep moving windows behind the user's back.
+    state.cancel_keybind_repeat("pointer_grab");
     state.break_active_pointer_constraints();
     let Some(pointer) = state.ptr() else {
         return false;
@@ -111,6 +114,8 @@ pub fn start_compositor_move_grab(state: &mut KomaState, button_code: u32, seria
         ws.activate_window(win_id, now_ms);
     }
     state.focus_active_deck_window();
+    // Dragging a background window dismisses the Scratchpad overlay, which bars must see.
+    crate::ext_workspace::sync_ext_workspaces(state);
 
     let start_data = PointerGrabStartData {
         focus: None,
@@ -138,6 +143,9 @@ pub fn start_compositor_resize_grab(
     if state.is_locked_or_abandoned() {
         return false;
     }
+    // An interactive grab owns the pointer for the whole gesture: stop a pending keybind
+    // repeat so the held chord cannot keep moving windows behind the user's back.
+    state.cancel_keybind_repeat("pointer_grab");
     state.break_active_pointer_constraints();
     let Some(pointer) = state.ptr() else {
         return false;
@@ -159,6 +167,8 @@ pub fn start_compositor_resize_grab(
         ws.activate_window(win_id, now_ms);
     }
     state.focus_active_deck_window();
+    // Dragging a background window dismisses the Scratchpad overlay, which bars must see.
+    crate::ext_workspace::sync_ext_workspaces(state);
 
     let start_data = PointerGrabStartData {
         focus: None,
@@ -191,6 +201,9 @@ pub fn start_frame_edge_resize_grab(
     if state.is_locked_or_abandoned() {
         return false;
     }
+    // An interactive grab owns the pointer for the whole gesture: stop a pending keybind
+    // repeat so the held chord cannot keep moving windows behind the user's back.
+    state.cancel_keybind_repeat("pointer_grab");
     state.break_active_pointer_constraints();
     let Some(pointer) = state.ptr() else {
         return false;

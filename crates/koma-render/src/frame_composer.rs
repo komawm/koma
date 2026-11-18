@@ -238,22 +238,34 @@ pub fn effective_window_opacity(item: &WindowSceneItem<'_>, dim: &DimConfig) -> 
     effective_window_opacity_for(item.opacity, item.is_focused, dim)
 }
 
-/// Computes the physical origin of a toplevel's surface tree inside its frame.
+/// Computes the logical origin of a toplevel's surface tree inside its frame.
 ///
 /// Client-side-decorated clients keep their drop shadow (and any other decoration) inside the
-/// buffer and describe the visible area through `xdg_surface.set_window_geometry`. Compositing the
-/// surface tree at `inner_rect.loc` would therefore put the visible area at
-/// `inner_rect.loc + geometry.loc`, shifting the content down-right by the decoration inset and
-/// clipping its right/bottom edge. Subtracting the geometry origin makes the visible area start
-/// exactly at `inner_rect.loc`; server-side-decorated and XWayland windows report a `(0, 0)`
-/// geometry origin and are placed unchanged.
+/// buffer and describe the visible area through `xdg_surface.set_window_geometry`. The surface's
+/// own `(0, 0)` therefore lives at `inner_rect_loc - geometry.loc`, while the geometry rect
+/// (`inner_rect_loc`, size `inner_rect.size`) remains the visible/clip box.
+///
+/// This is the single definition of the surface origin: rendering, pointer hit-testing, pointer
+/// constraints and agent cursors all derive from it. Server-side-decorated and XWayland windows
+/// report a `(0, 0)` geometry origin and are placed unchanged.
+#[must_use]
+pub fn surface_origin(
+    inner_rect_loc: Point<f64, Logical>,
+    window_geometry_loc: Point<i32, Logical>,
+) -> Point<f64, Logical> {
+    inner_rect_loc - window_geometry_loc.to_f64()
+}
+
+/// Computes the physical origin of a toplevel's surface tree inside its frame.
+///
+/// See [`surface_origin`] for the logical definition; this only applies the output scale to it.
 #[must_use]
 pub fn toplevel_surface_origin(
     inner_rect_loc: Point<f64, Logical>,
     window_geometry_loc: Point<i32, Logical>,
     output_scale: Scale<f64>,
 ) -> Point<i32, Physical> {
-    (inner_rect_loc - window_geometry_loc.to_f64()).to_physical_precise_round(output_scale)
+    surface_origin(inner_rect_loc, window_geometry_loc).to_physical_precise_round(output_scale)
 }
 
 /// Window-local pixels prepared for offscreen capture: the logical window size plus the render
@@ -1068,6 +1080,11 @@ mod tests {
         assert_eq!(
             origin + Point::<i32, Physical>::from((12, 8)),
             Point::<i32, Physical>::from((100, 50))
+        );
+        // The logical helper used by hit-testing and constraints agrees with rendering.
+        assert_eq!(
+            surface_origin(inner_loc, geometry_loc),
+            Point::<f64, Logical>::from((88.0, 42.0))
         );
     }
 

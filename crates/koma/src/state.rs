@@ -31,7 +31,8 @@ use koma_render::{
     LazyFboPool,
     blur_pipeline::CachedBackdropBlur,
     frame_composer::{
-        ClosingWindowSceneItem, WindowSceneItem, capture_window_snapshot, window_snapshot_elements,
+        ClosingWindowSceneItem, WindowSceneItem, capture_window_snapshot, surface_origin,
+        window_snapshot_elements,
     },
     offscreen_fbo::{LazyOffscreenSurface, WindowFrameCache},
 };
@@ -131,6 +132,7 @@ use crate::{
     gesture_dispatcher::GestureTable,
     ipc_server::IpcClientConn,
     keybind_dispatcher::KeybindTable,
+    keybind_repeat::RepeatTiming,
     macro_runtime::{ActivePointerAnimation, WorkspaceDamageTracker},
     output_management::WlrOutputManagerState,
     output_power::{OutputPowerMode, OutputPowerState},
@@ -143,8 +145,9 @@ use crate::{
     },
     xwayland_satellite::SatelliteSlot,
 };
-use koma_lua::schema::{
-    DeviceOverrideSpec, InputConfigSpec, KeyboardInputSpec, KomaConfigRegistry,
+use koma_lua::{
+    BindHandleId,
+    schema::{DeviceOverrideSpec, InputConfigSpec, KeyboardInputSpec, KomaConfigRegistry},
 };
 use smithay::{
     backend::input::{Event as _, InputBackend, TouchEvent as _},
@@ -696,6 +699,8 @@ pub struct KomaState {
     pub loop_signal: LoopSignal,
     pub loop_handle: Option<LoopHandle<'static, Self>>,
     pub trampoline_timer_token: Option<RegistrationToken>,
+    /// One-shot timer driving repeat-while-held keybinds (`komawm/koma#76`).
+    pub keybind_repeat_timer_token: Option<RegistrationToken>,
     pub socket_name: OsString,
     pub instance_signature: Option<String>,
     pub primary_satellite: Option<SatelliteSlot>,
@@ -968,6 +973,7 @@ impl KomaState {
             loop_signal,
             loop_handle: Some(loop_handle),
             trampoline_timer_token: None,
+            keybind_repeat_timer_token: None,
             socket_name,
             instance_signature: None,
             primary_satellite: None,
@@ -1151,6 +1157,9 @@ impl KomaState {
         }
         ws.dwindle.config = d_cfg;
         ws.scrolling.update_config(s_cfg, viewport, now_ms);
+        // An empty `special:` overlay is hidden from bars unless it opts in, like any other
+        // workspace; scratchpads are created on first use and stay listed while they hold windows.
+        ws.persistent = matching_spec.is_some_and(|s| s.persistent);
 
         self.vseats
             .insert(vseat_id.clone(), VirtualSeatLedger::new(vseat_id));
@@ -1251,6 +1260,9 @@ impl KomaState {
         }
         ws.dwindle.config = d_cfg;
         ws.scrolling.update_config(s_cfg, viewport, now_ms);
+        // `persistent = true` is the opt-out from hiding empty workspaces in `ext-workspace-v1`
+        // bars; it must be applied at creation so a never-used workspace stays listed.
+        ws.persistent = matching_spec.is_some_and(|s| s.persistent);
 
         self.vseats
             .insert(vseat_id.clone(), VirtualSeatLedger::new(vseat_id));
@@ -1908,6 +1920,9 @@ impl KomaState {
         // Re-focusing the workspace that is already interactive (including re-opening the same
         // `special:` overlay) is not a transition: emit nothing, so hooks do not reset state.
         let prev_effective = self.effective_interactive_ws_id();
+        // An external workspace switch stops a pending repeat; a switch performed by the
+        // repeated action itself is exempt inside `cancel_keybind_repeat_for_external_change`.
+        self.cancel_keybind_repeat_for_external_change("workspace_change");
         self.break_active_pointer_constraints();
         if is_special {
             self.active_special_ws_id = Some(ws_id.clone());
@@ -2041,9 +2056,13 @@ impl KomaState {
         self.sync_workspace_geometries(dst_ws_id);
         self.sync_window_output_membership(dst_ws_id);
         if follow {
+            // `focus_workspace` republishes the workspace state at the end of the switch.
             self.focus_workspace(dst_ws_id);
         } else {
+            // A silent move never reaches `focus_workspace`, so the occupancy change on both
+            // workspaces has to be pushed here or the bar keeps a stale entry.
             self.focus_active_deck_window();
+            sync_ext_workspaces(self);
         }
         self.queue_redraw();
         true
@@ -2106,6 +2125,7 @@ impl KomaState {
         self.keybinds.suppressed_buttons.clear();
         self.keybinds.active_mode = None;
         self.keybinds.reset_scroll_trackers();
+        self.cancel_keybind_repeat("session_lock");
         self.gestures.reset_active_sessions();
 
         let now_input = smithay::backend::input::InputTime::now();
@@ -2528,6 +2548,8 @@ impl KomaState {
         self.mapped_windows.push(mapped);
         self.sync_workspace_geometries(&ws_id);
         self.sync_window_output_membership(&ws_id);
+        // A newly occupied workspace must leave the `hidden` set before the bar redraws.
+        sync_ext_workspaces(self);
         if let Some(final_rect) = self
             .mapped_windows
             .iter()
@@ -3138,12 +3160,17 @@ impl KomaState {
             if mapped.is_minimized {
                 continue;
             }
-            let local_origin = Point::from((f64::from(rect.x) + b_off, f64::from(rect.y) + b_off));
-            let local_pos = output_local - local_origin;
-            let global_origin = local_origin + out_origin;
+            // Frame space: the inner rect is the window geometry (border/border-fallback checks).
+            let inner_origin = Point::from((f64::from(rect.x) + b_off, f64::from(rect.y) + b_off));
+            let local_pos = output_local - inner_origin;
+            // Surface space: CSD surfaces extend above/left of the geometry rect, so hit-test the
+            // surface tree at its real `(0, 0)` and report that same origin for pointer focus.
+            let win_surface_origin = surface_origin(inner_origin, mapped.window.geometry().loc);
+            let surface_pos = output_local - win_surface_origin;
+            let global_origin = win_surface_origin + out_origin;
             if let Some((surf, surf_offset)) = mapped
                 .window
-                .surface_under(local_pos, WindowSurfaceType::ALL)
+                .surface_under(surface_pos, WindowSurfaceType::ALL)
             {
                 return Some((win_id, surf, surf_offset.to_f64() + global_origin));
             }
@@ -3473,6 +3500,8 @@ impl KomaState {
             }
             self.sync_workspace_geometries(&target_ws_id);
             self.focus_active_deck_window();
+            // A click can move the active workspace to another output; bars follow that here.
+            sync_ext_workspaces(self);
             self.queue_redraw();
             return;
         }
@@ -3487,6 +3516,7 @@ impl KomaState {
                 self.active_ws_id = self.active_workspace_for_output(&hit_out_name);
             }
             self.focus_active_deck_window();
+            sync_ext_workspaces(self);
         }
     }
 
@@ -3498,6 +3528,8 @@ impl KomaState {
         hit_ws_id: &WorkspaceId,
         global_pos: Point<f64, Logical>,
     ) {
+        // Pointer-driven focus is a user interaction outside the repeat: stop a pending repeat.
+        self.cancel_keybind_repeat_for_external_change("pointer_focus");
         let now_ms = self.elapsed_ms();
         self.focused_ondemand_layer = None;
         self.pointer_focus_window = None;
@@ -3518,6 +3550,8 @@ impl KomaState {
         }
         self.sync_workspace_geometries(hit_ws_id);
         self.focus_active_deck_window();
+        // Click/`follow_mouse = normal` focus can switch the displayed workspace.
+        sync_ext_workspaces(self);
         self.queue_redraw();
     }
 
@@ -3530,6 +3564,7 @@ impl KomaState {
         hit_ws_id: &WorkspaceId,
         global_pos: Point<f64, Logical>,
     ) {
+        self.cancel_keybind_repeat_for_external_change("pointer_focus");
         self.focused_ondemand_layer = None;
         if let Some(hit_out) = self.output_at_point_strict(global_pos) {
             let hit_out_name = hit_out.name();
@@ -3542,6 +3577,8 @@ impl KomaState {
         }
         self.pointer_focus_window = Some(win_id);
         self.focus_active_deck_window();
+        // Hovering a window on another output can switch the displayed workspace.
+        sync_ext_workspaces(self);
         self.queue_redraw();
     }
 
@@ -3993,7 +4030,11 @@ impl KomaState {
                 let mut eff_border = border_cfg.clone();
                 let mut eff_focus_ring = focus_ring_cfg.clone();
                 let mut eff_shadow = shadow_cfg.clone();
-                if is_click_through {
+                if is_click_through || is_fs {
+                    // A fullscreen window is the screen: Hyprland draws no border, no focus ring and
+                    // no shadow around it, and the owner reported the border ring surviving on
+                    // `Mod + Shift + F` (komawm/koma#30 follow-up). The corner radius is already 0
+                    // for fullscreen, and the shadow would otherwise bleed past the output edge.
                     eff_border.enabled = false;
                     eff_focus_ring.enabled = false;
                     eff_shadow.enabled = false;
@@ -4010,7 +4051,7 @@ impl KomaState {
                     corner_radius,
                     clip_to_geometry: eff_clip_to_geometry,
                     wants_blur: blur_enabled && !is_fs && !is_click_through && !eff_no_blur,
-                    no_shadow: is_click_through || dyn_rules.no_shadow.unwrap_or(false),
+                    no_shadow: is_fs || is_click_through || dyn_rules.no_shadow.unwrap_or(false),
                     border_color_override: if is_click_through {
                         None
                     } else {
@@ -4177,6 +4218,43 @@ impl KomaState {
         }) {
             self.cursor_anim_timer_token = Some(token);
         }
+    }
+
+    /// Repeat timing for `WhileHeld` binds, taken from the applied
+    /// `koma.input.keyboard.repeat_delay` / `repeat_rate` settings (`komawm/koma#76`).
+    #[must_use]
+    pub fn keybind_repeat_timing(&self) -> RepeatTiming {
+        RepeatTiming::from_input_settings(
+            self.applied_keyboard_repeat.0,
+            self.applied_keyboard_repeat.1,
+        )
+    }
+
+    /// Cancels a pending repeat-while-held keybind and its timer.
+    ///
+    /// Called on key release, modifier change, focus/workspace change, pointer grab, session
+    /// lock and configuration reload.
+    pub fn cancel_keybind_repeat(&mut self, reason: &'static str) {
+        if let Some(cancelled) = self.keybinds.repeat.cancel() {
+            self.drop_keybind_repeat_timer(reason, cancelled.bind_id);
+        }
+    }
+
+    /// Cancels a repeat because focus, workspace, grab or lock changed outside the repeated
+    /// action itself; a repeat that causes the change keeps running.
+    pub fn cancel_keybind_repeat_for_external_change(&mut self, reason: &'static str) {
+        if let Some(cancelled) = self.keybinds.repeat.cancel_for_external_change() {
+            self.drop_keybind_repeat_timer(reason, cancelled.bind_id);
+        }
+    }
+
+    fn drop_keybind_repeat_timer(&mut self, reason: &'static str, bind_id: BindHandleId) {
+        if let Some(token) = self.keybind_repeat_timer_token.take()
+            && let Some(handle) = &self.loop_handle
+        {
+            handle.remove(token);
+        }
+        tracing::debug!(reason, ?bind_id, "cancelled keybind repeat");
     }
 
     /// The client drag icon currently attached to the cursor, if a drag provided one.
@@ -4546,15 +4624,21 @@ impl KomaState {
             .find(|m| m.window.toplevel().is_some_and(|t| t.wl_surface() == &root));
 
         if let Some(m) = win_match {
-            let win_geo_loc = m.window.geometry().loc;
-            let ws_origin = self.workspace_output_origin(&m.ws_id).to_i32_round::<i32>();
-            return Rectangle::new(
-                Point::from((
-                    ws_origin.x + m.rect.x - win_geo_loc.x,
-                    ws_origin.y + m.rect.y - win_geo_loc.y,
-                )),
-                Size::from((m.rect.w.max(1) as i32, m.rect.h.max(1) as i32)),
-            );
+            let border = self.lua_sandbox.config_snapshot().appearance.border;
+            let b_off = if border.enabled {
+                f64::from(border.width.max(0.0))
+            } else {
+                0.0
+            };
+            let ws_origin = self.workspace_output_origin(&m.ws_id);
+            let inner_origin =
+                Point::from((f64::from(m.rect.x) + b_off, f64::from(m.rect.y) + b_off));
+            let win_surface_origin = surface_origin(inner_origin, m.window.geometry().loc);
+            let inner_size = Size::from((
+                (f64::from(m.rect.w) - 2.0 * b_off).max(1.0).round() as i32,
+                (f64::from(m.rect.h) - 2.0 * b_off).max(1.0).round() as i32,
+            ));
+            return Rectangle::new((ws_origin + win_surface_origin).to_i32_round(), inner_size);
         }
 
         for output in self.all_outputs() {
@@ -5235,6 +5319,9 @@ impl KomaState {
         self.sync_workspace_geometries(&ws_id);
         self.focus_active_deck_window();
         self.reconcile_idle_inhibitors();
+        // Restoring a minimized window makes its workspace occupied again and can switch the
+        // displayed workspace (IPC `win.activate`, foreign-toplevel activation).
+        sync_ext_workspaces(self);
         self.queue_redraw();
         true
     }
@@ -5316,6 +5403,9 @@ impl KomaState {
         self.focus_active_deck_window();
         self.reconcile_idle_inhibitors();
         self.sync_foreign_toplevels();
+        // A minimized window stops occupying its workspace, so minimize/restore changes bar
+        // visibility for that workspace.
+        sync_ext_workspaces(self);
         self.queue_redraw();
     }
 
@@ -5582,6 +5672,69 @@ pub(crate) mod tests {
             .get_mut(ws_id)
             .expect("workspace exists")
             .insert_window(win_id, false, None, None, None, None, false, true, now_ms);
+    }
+
+    fn arm_test_repeat(state: &mut KomaState) {
+        let now_ms = state.elapsed_ms();
+        assert!(state.keybinds.repeat.arm(
+            crate::keybind_repeat::RepeatRequest {
+                bind_id: koma_lua::BindHandleId(13),
+                keycode: 42,
+                mods: 1,
+                action: koma_lua::ActionDescriptor::FocusDirection("left".to_owned()),
+                allow_when_locked: false,
+            },
+            now_ms,
+        ));
+        assert!(state.keybinds.repeat.is_active());
+    }
+
+    #[test]
+    fn pending_keybind_repeat_is_cancelled_by_lock_workspace_change_and_pointer_grab() {
+        let (_el, _disp, mut state) = make_headless_test_state();
+
+        // Session lock: `clear_inputs_for_lock` runs from the lock handler.
+        arm_test_repeat(&mut state);
+        assert!(state.session_lock.try_lock(None));
+        state.clear_inputs_for_lock();
+        assert!(
+            !state.keybinds.repeat.is_active(),
+            "locking the session must cancel a pending repeat"
+        );
+        assert!(state.session_lock.unlock());
+
+        // External workspace switch cancels.
+        arm_test_repeat(&mut state);
+        let dst = state.ensure_workspace_by_name_or_id("2");
+        assert!(state.focus_workspace(&dst));
+        assert!(
+            !state.keybinds.repeat.is_active(),
+            "switching workspace must cancel a pending repeat"
+        );
+
+        // A pointer grab attempt cancels before the gesture owns the pointer.
+        arm_test_repeat(&mut state);
+        let serial = smithay::utils::SERIAL_COUNTER.next_serial();
+        let _ = crate::pointer_grabs::start_compositor_move_grab(
+            &mut state,
+            crate::pointer_grabs::BTN_LEFT,
+            serial,
+        );
+        assert!(
+            !state.keybinds.repeat.is_active(),
+            "starting a pointer grab must cancel a pending repeat"
+        );
+
+        // A repeat that switches workspace itself keeps running.
+        arm_test_repeat(&mut state);
+        state.keybinds.repeat.begin_dispatch();
+        let dst = state.ensure_workspace_by_name_or_id("3");
+        assert!(state.focus_workspace(&dst));
+        state.keybinds.repeat.end_dispatch();
+        assert!(
+            state.keybinds.repeat.is_active(),
+            "a workspace cycling bind must keep repeating after its own switch"
+        );
     }
 
     #[test]

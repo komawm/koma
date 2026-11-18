@@ -482,6 +482,16 @@ pub(crate) fn config_status_input_json(
     use koma_lua::schema::AccelProfileSpec;
 
     json!({
+        // XKB keymap inputs. `options` is the same knob as Hyprland's `kb_options`, so a
+        // Caps-to-Escape remap is `options = { "caps:escape" }` in either compositor.
+        "keyboard": {
+            "layout": input.keyboard.layout,
+            "variant": input.keyboard.variant,
+            "model": input.keyboard.model,
+            "options": input.keyboard.options,
+            "repeat_delay_ms": input.keyboard.repeat_delay,
+            "repeat_rate_hz": input.keyboard.repeat_rate,
+        },
         "pointer": {
             "accel_speed": input.pointer.accel_speed,
             "accel_profile": input.pointer.accel_profile.map(|p| match p {
@@ -2955,5 +2965,27 @@ mod tests {
         input.pointer.accel_profile = Some(AccelProfileSpec::Adaptive);
         let adaptive = config_status_input_json(&input);
         assert_eq!(adaptive["pointer"]["accel_profile"], "adaptive");
+    }
+
+    #[test]
+    fn config_status_reports_the_xkb_keyboard_options_that_remap_caps() {
+        use koma_lua::schema::InputConfigSpec;
+
+        let mut input = InputConfigSpec::default();
+        assert_eq!(
+            config_status_input_json(&input)["keyboard"]["options"],
+            serde_json::Value::Null,
+            "an unset keymap option list must stay null, not an empty string"
+        );
+
+        // The Hyprland-compatible Caps-to-Escape remap, plus the swap that pairs with it.
+        input.keyboard.layout = Some("us".to_owned());
+        input.keyboard.options = Some("caps:escape,altwin:swap_alt_win".to_owned());
+        let reported = config_status_input_json(&input);
+        assert_eq!(reported["keyboard"]["layout"], "us");
+        assert_eq!(
+            reported["keyboard"]["options"],
+            "caps:escape,altwin:swap_alt_win"
+        );
     }
 }

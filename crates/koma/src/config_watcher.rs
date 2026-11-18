@@ -52,7 +52,10 @@ use tracing::{debug, info, trace, warn};
 
 #[cfg(feature = "smithay-tty")]
 use crate::state::ActiveBackend;
-use crate::{gesture_dispatcher::GestureTable, keybind_dispatcher::KeybindTable, state::KomaState};
+use crate::{
+    ext_workspace::sync_ext_workspaces, gesture_dispatcher::GestureTable,
+    keybind_dispatcher::KeybindTable, state::KomaState,
+};
 
 const POLL_FALLBACK_MS: i32 = 350;
 #[cfg(target_os = "linux")]
@@ -661,6 +664,8 @@ pub fn reload_from_lua_source(
     {
         compiled_binds.active_mode = Some(cur_mode.clone());
     }
+    // A pending repeat belongs to the old bind table: cancel it before the atomic swap.
+    state.cancel_keybind_repeat("config_reload");
     state.keybinds = compiled_binds;
     state.gestures = compiled_gestures;
 
@@ -847,6 +852,9 @@ fn reconcile_declarative_workspaces(
             let vp = existing.viewport;
             existing.scrolling.update_config(s_cfg, vp, now_ms);
             existing.set_layout_mode(effective_layout, now_ms);
+            // The reload owns the opt-out flag, so flipping `persistent` in `init.lua` takes
+            // effect without restarting the compositor.
+            existing.persistent = spec.persistent;
             if !sync_ids.contains(existing_id) {
                 sync_ids.push(existing_id.clone());
             }
@@ -902,6 +910,7 @@ fn reconcile_declarative_workspaces(
         }
         ws.dwindle.config = d_cfg;
         ws.scrolling.update_config(s_cfg, spec.viewport, now_ms);
+        ws.persistent = spec.persistent;
 
         state
             .vseats
@@ -913,6 +922,9 @@ fn reconcile_declarative_workspaces(
     for id in sync_ids {
         state.sync_workspace_geometries(&id);
     }
+    // Declarative workspaces appear and change their `persistent` flag here; publishing once at
+    // the end keeps a bar from showing a half-applied workspace list.
+    sync_ext_workspaces(state);
 }
 
 fn record_reload_failure(
