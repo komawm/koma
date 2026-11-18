@@ -1000,7 +1000,15 @@ fn build_screencopy_elements<'a>(
     if let Some((cursor_manager, cursor_pos)) = cursor {
         let cursor_elems =
             cursor_manager.render_elements(renderer, cursor_pos, output_scale, now_ms);
+        let cursor_len = cursor_elems.len();
         elements.splice(0..0, cursor_elems);
+        // The drag icon sits with the cursor it follows, so a capture with the cursor overlay
+        // shows it too and a capture without the cursor omits both.
+        if let Some(icon) = state.dnd_icon() {
+            let icon_elems =
+                crate::dnd::icon_render_elements(icon, renderer, cursor_pos, output_scale);
+            elements.splice(cursor_len..cursor_len, icon_elems);
+        }
     }
 
     elements
