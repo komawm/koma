@@ -669,7 +669,7 @@ impl KomaState {
 
     #[must_use]
     pub fn has_active_locked_pointer_constraint(&self) -> bool {
-        let Some(pointer) = self.seat.get_pointer() else {
+        let Some(pointer) = self.ptr() else {
             return false;
         };
         let Some(focused) = pointer.current_focus() else {
@@ -689,7 +689,7 @@ impl KomaState {
 
     /// Activates any dormant pointer constraint whose surface holds focus and contains `global_pos`.
     pub fn maybe_activate_pointer_constraint_at(&self, global_pos: Point<f64, Logical>) {
-        let Some(pointer) = self.seat.get_pointer() else {
+        let Some(pointer) = self.ptr() else {
             return;
         };
         if let Some(focused) = pointer.current_focus() {
@@ -699,7 +699,7 @@ impl KomaState {
 
     /// Deactivates active pointer constraints (e.g. on lock-screen, focus change, or compositor grab).
     pub fn break_active_pointer_constraints(&mut self) {
-        let Some(pointer) = self.seat.get_pointer() else {
+        let Some(pointer) = self.ptr() else {
             return;
         };
         let Some(focused) = pointer.current_focus() else {
@@ -751,7 +751,9 @@ impl KomaState {
     ) {
         self.reconcile_session_lock();
         self.notify_user_activity();
-        let Some(pointer) = self.seat.get_pointer() else {
+        // Held across `follow_pointer_focus` and `maybe_activate_pointer_constraint`, both of which
+        // acquire the pointer themselves; Smithay releases its pointer mutex between calls.
+        let Some(pointer) = self.pointer_handle() else {
             return;
         };
         let serial = SERIAL_COUNTER.next_serial();
@@ -876,7 +878,7 @@ impl KomaState {
         if self.is_locked_or_abandoned() {
             return;
         }
-        let Some(pointer) = self.seat.get_pointer() else {
+        let Some(pointer) = self.ptr() else {
             return;
         };
         if pointer.is_grabbed() {

@@ -512,7 +512,7 @@ pub fn process_gesture_swipe_begin<B: InputBackend>(
     state.gestures.active_swipe = Some(ActiveSwipeSession::ClientForwarded);
     let time = event.time();
     refresh_pointer_hover_focus(state, time);
-    if let Some(pointer) = state.seat.get_pointer() {
+    if let Some(pointer) = state.ptr() {
         let serial = SERIAL_COUNTER.next_serial();
         pointer.gesture_swipe_begin(
             state,
@@ -680,7 +680,7 @@ pub fn process_gesture_swipe_update<B: InputBackend + 'static>(
     ) {
         let time = event.time();
         refresh_pointer_hover_focus(state, time);
-        if let Some(pointer) = state.seat.get_pointer() {
+        if let Some(pointer) = state.ptr() {
             pointer.gesture_swipe_update(
                 state,
                 &GestureSwipeUpdateEvent {
@@ -756,7 +756,7 @@ pub fn process_gesture_swipe_end<B: InputBackend>(
         Some(ActiveSwipeSession::ClientForwarded) => {
             let time = event.time();
             refresh_pointer_hover_focus(state, time);
-            if let Some(pointer) = state.seat.get_pointer() {
+            if let Some(pointer) = state.ptr() {
                 let serial = SERIAL_COUNTER.next_serial();
                 pointer.gesture_swipe_end(
                     state,
@@ -798,7 +798,7 @@ pub fn process_gesture_pinch_begin<B: InputBackend>(
     state.gestures.active_pinch = Some(ActivePinchSession::ClientForwarded);
     let time = event.time();
     refresh_pointer_hover_focus(state, time);
-    if let Some(pointer) = state.seat.get_pointer() {
+    if let Some(pointer) = state.ptr() {
         let serial = SERIAL_COUNTER.next_serial();
         pointer.gesture_pinch_begin(
             state,
@@ -855,7 +855,7 @@ pub fn process_gesture_pinch_update<B: InputBackend>(
                 .config_snapshot()
                 .input
                 .touchpad_pinch_sensitivity();
-            if let Some(pointer) = state.seat.get_pointer() {
+            if let Some(pointer) = state.ptr() {
                 pointer.gesture_pinch_update(
                     state,
                     &GesturePinchUpdateEvent {
@@ -880,7 +880,7 @@ pub fn process_gesture_pinch_end<B: InputBackend>(
     if matches!(prev, Some(ActivePinchSession::ClientForwarded)) {
         let time = event.time();
         refresh_pointer_hover_focus(state, time);
-        if let Some(pointer) = state.seat.get_pointer() {
+        if let Some(pointer) = state.ptr() {
             let serial = SERIAL_COUNTER.next_serial();
             pointer.gesture_pinch_end(
                 state,
@@ -902,7 +902,7 @@ pub fn process_gesture_hold_begin<B: InputBackend>(
     state.keybinds.pending_releases.clear();
     let time = event.time();
     refresh_pointer_hover_focus(state, time);
-    if let Some(pointer) = state.seat.get_pointer() {
+    if let Some(pointer) = state.ptr() {
         let serial = SERIAL_COUNTER.next_serial();
         pointer.gesture_hold_begin(
             state,
@@ -922,7 +922,7 @@ pub fn process_gesture_hold_end<B: InputBackend>(
     state.notify_user_activity();
     let time = event.time();
     refresh_pointer_hover_focus(state, time);
-    if let Some(pointer) = state.seat.get_pointer() {
+    if let Some(pointer) = state.ptr() {
         let serial = SERIAL_COUNTER.next_serial();
         pointer.gesture_hold_end(
             state,

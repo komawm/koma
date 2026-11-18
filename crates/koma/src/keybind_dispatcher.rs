@@ -933,7 +933,9 @@ pub fn process_pointer_button_event(
     state.reconcile_session_lock();
     state.notify_user_activity();
     let serial = SERIAL_COUNTER.next_serial();
-    let Some(pointer) = state.seat.get_pointer() else {
+    // Held across key-binding dispatch and `refresh_pointer_hover_focus`, which re-acquires the
+    // pointer; Smithay releases its pointer mutex between calls, so no scope is claimed here.
+    let Some(pointer) = state.pointer_handle() else {
         return;
     };
 
@@ -983,8 +985,7 @@ pub fn process_pointer_button_event(
     // 3. ButtonState::Pressed while ungrabbed: check mouse-button binds (`Mod + MouseLeft/Right/...`)
     if let Some(btn_trigger) = MouseButtonTrigger::from_button_code(button_code) {
         let held_mask = state
-            .seat
-            .get_keyboard()
+            .kb()
             .map(|kb| modifiers_mask_from_smithay(&kb.modifier_state()))
             .unwrap_or(0);
         let phys_mod = state.keybinds.effective_mod_key(is_bare_metal_tty);
@@ -1146,7 +1147,9 @@ pub fn process_keyboard_key_event(
         state.force_reapply_configured_xkb_config();
     }
     let serial = SERIAL_COUNTER.next_serial();
-    let Some(keyboard) = state.seat.get_keyboard() else {
+    // Held across the key-binding filter, which runs with Smithay's keyboard mutex released and
+    // may re-apply keyboard focus/configuration; no scope is claimed here.
+    let Some(keyboard) = state.keyboard_handle() else {
         return;
     };
 
@@ -1226,7 +1229,7 @@ pub fn process_keyboard_key_event(
             // Gate 0a2: Cancel active interactive Move/Resize grab on `Escape` (`niri/src/input/mod.rs` line 688)
             if !is_locked
                 && mod_raw == keysyms::KEY_Escape
-                && state.seat.get_pointer().is_some_and(|p| p.is_grabbed())
+                && state.ptr().is_some_and(|p| p.is_grabbed())
             {
                 return FilterResult::Intercept(InterceptOutcome::CancelPointerGrab);
             }
@@ -1402,7 +1405,7 @@ pub fn process_keyboard_key_event(
     match intercept {
         InterceptOutcome::SwitchVt(vt) => {
             state.keybinds.reset_scroll_trackers();
-            if let Some(kb) = state.seat.get_keyboard() {
+            if let Some(kb) = state.kb() {
                 kb.release_source(state, KeyboardSource::MAIN);
             }
             state.change_vt(vt);
@@ -1445,8 +1448,7 @@ pub fn process_pointer_axis_event<B: InputBackend>(
     let time = event.time();
 
     let held_mask = state
-        .seat
-        .get_keyboard()
+        .kb()
         .map(|kb| modifiers_mask_from_smithay(&kb.modifier_state()))
         .unwrap_or(0);
     let phys_mod = state.keybinds.effective_mod_key(is_bare_metal_tty);
@@ -1687,7 +1689,7 @@ pub fn process_pointer_axis_event<B: InputBackend>(
         frame = frame.stop(Axis::Vertical);
     }
 
-    if let Some(pointer) = state.seat.get_pointer() {
+    if let Some(pointer) = state.ptr() {
         pointer.axis(state, frame);
         pointer.frame(state);
     }
@@ -1762,7 +1764,7 @@ pub(crate) fn refresh_pointer_hover_focus(state: &mut KomaState, time: InputTime
     if state.has_active_locked_pointer_constraint() {
         return;
     }
-    let Some(pointer) = state.seat.get_pointer() else {
+    let Some(pointer) = state.ptr() else {
         return;
     };
     if pointer.is_grabbed() {

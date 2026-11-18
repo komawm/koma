@@ -171,7 +171,7 @@ impl WinitBackendState {
                     );
                     state.keybinds.reset_scroll_trackers();
                     state.gestures.reset_active_sessions();
-                    if let Some(keyboard) = state.seat.get_keyboard() {
+                    if let Some(keyboard) = state.kb() {
                         keyboard.release_source(state, KeyboardSource::MAIN);
                     }
                 }

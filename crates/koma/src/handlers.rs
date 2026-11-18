@@ -432,7 +432,7 @@ impl XdgShellHandler for KomaState {
             return;
         }
         if let Ok(mut grab) = self.popups.grab_popup(root, kind, &seat, serial) {
-            if let Some(keyboard) = seat.get_keyboard() {
+            if let Some(keyboard) = self.kb() {
                 if keyboard.is_grabbed()
                     && !(keyboard.has_grab(serial)
                         || keyboard.has_grab(grab.previous_serial().unwrap_or(serial)))
@@ -443,7 +443,7 @@ impl XdgShellHandler for KomaState {
                 keyboard.set_focus(self, grab.current_grab(), serial);
                 keyboard.set_grab(self, PopupKeyboardGrab::new(&grab), serial);
             }
-            if let Some(pointer) = seat.get_pointer() {
+            if let Some(pointer) = self.ptr() {
                 if pointer.is_grabbed()
                     && !(pointer.has_grab(serial)
                         || pointer
@@ -459,7 +459,9 @@ impl XdgShellHandler for KomaState {
 
     fn move_request(&mut self, surface: ToplevelSurface, _seat: WlSeat, serial: Serial) {
         let wl_surface = surface.wl_surface();
-        let Some(pointer) = self.seat.get_pointer() else {
+        // `start_csd_*_grab` re-acquires the pointer itself, so this clone must not hold the
+        // pointer scope across the call.
+        let Some(pointer) = self.pointer_handle() else {
             return;
         };
         if !pointer.has_grab(serial) {
@@ -498,7 +500,9 @@ impl XdgShellHandler for KomaState {
         edges: xdg_toplevel::ResizeEdge,
     ) {
         let wl_surface = surface.wl_surface();
-        let Some(pointer) = self.seat.get_pointer() else {
+        // `start_csd_*_grab` re-acquires the pointer itself, so this clone must not hold the
+        // pointer scope across the call.
+        let Some(pointer) = self.pointer_handle() else {
             return;
         };
         if !pointer.has_grab(serial) {
@@ -695,10 +699,15 @@ impl SeatHandler for KomaState {
     }
 
     fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
+        // Smithay delivers this from `PointerInnerHandle` while holding the pointer mutex.
+        let _held = crate::seat_guard::pointer_callback();
         self.set_cursor_status(image);
     }
 
     fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&WlSurface>) {
+        // Smithay calls this from `KeyboardGrab::set_focus` with the keyboard mutex held, so any
+        // `self.kb()` below would self-deadlock; the guard turns that into a logged soft failure.
+        let _held = crate::seat_guard::keyboard_callback();
         let dh = &self.display_handle;
         let client = focused.and_then(|s| dh.get_client(s.id()).ok());
 
@@ -735,7 +744,7 @@ impl SeatHandler for KomaState {
             self.queue_redraw();
         }
 
-        if let Some(pointer) = seat.get_pointer()
+        if let Some(pointer) = self.ptr()
             && let Some(ptr_surf) = pointer.current_focus()
         {
             let mut ptr_root = ptr_surf;
@@ -884,7 +893,6 @@ impl VirtualKeyboardHandler for KomaState {
     fn process_virtual_keyboard_event(&mut self, event: InputEvent<VirtualKeyboardBackend>) {
         use smithay::backend::input::{Event as _, KeyboardKeyEvent as _};
         use smithay::input::keyboard::FilterResult;
-        use smithay::wayland::input_method::InputMethodSeat as _;
         use smithay::wayland::virtual_keyboard::VirtualKeyboardSpecialEvent;
 
         self.reconcile_session_lock();
@@ -897,7 +905,9 @@ impl VirtualKeyboardHandler for KomaState {
             return;
         }
 
-        let Some(keyboard) = self.seat.get_keyboard() else {
+        // This handler re-applies XKB state through `force_reapply_configured_xkb_config`, which
+        // acquires the keyboard itself, so the handle is cloned without holding a scope.
+        let Some(keyboard) = self.keyboard_handle() else {
             return;
         };
 
@@ -926,7 +936,9 @@ impl VirtualKeyboardHandler for KomaState {
                 let device = event.device();
                 sync_vk_keymap(self, &device);
 
-                let grab_client = self.seat.input_method().keyboard_grab_client();
+                let grab_client = self
+                    .input_method()
+                    .and_then(|input_method| input_method.keyboard_grab_client());
                 let from_active_ime_grab = grab_client.is_some() && grab_client == device.client();
                 let serial = SERIAL_COUNTER.next_serial();
                 if from_active_ime_grab {
@@ -1080,6 +1092,9 @@ impl TabletSeatHandler for KomaState {
 // pinned Smithay rev `65aa86fa5236e41775c313408102a5d5c2d1e2ca`).
 impl smithay::wayland::input_method::InputMethodHandler for KomaState {
     fn new_popup(&mut self, surface: smithay::wayland::input_method::PopupSurface) {
+        // Reached from `InputMethodHandle::activate_input_method`, which holds the input-method
+        // mutex while calling us.
+        let _held = crate::seat_guard::input_method_callback();
         if self.is_locked_or_abandoned() {
             return;
         }
@@ -1091,11 +1106,14 @@ impl smithay::wayland::input_method::InputMethodHandler for KomaState {
     }
 
     fn dismiss_popup(&mut self, surface: smithay::wayland::input_method::PopupSurface) {
+        let _held = crate::seat_guard::input_method_callback();
         self.ime_popups.retain(|p| p != &surface);
         self.queue_redraw();
     }
 
     fn popup_repositioned(&mut self, surface: smithay::wayland::input_method::PopupSurface) {
+        // Reached from `InputMethodHandle::set_text_input_rectangle` with the mutex held.
+        let _held = crate::seat_guard::input_method_callback();
         if self.is_locked_or_abandoned() {
             self.clear_ime_state_for_lock();
             return;
@@ -1108,6 +1126,7 @@ impl smithay::wayland::input_method::InputMethodHandler for KomaState {
         &self,
         parent: &WlSurface,
     ) -> smithay::utils::Rectangle<i32, smithay::utils::Logical> {
+        let _held = crate::seat_guard::input_method_callback();
         self.ime_parent_geometry(parent)
     }
 }
