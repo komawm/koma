@@ -38,6 +38,19 @@ desktop, hardware support, or security guarantees.
   share one effective-keymap merge in `koma-lua`, so the CLI and the on-screen
   list cannot disagree.
 
+### Changed
+
+- `ext-workspace-v1`: an empty workspace now reports `hidden`, so a status bar
+  with `ignore-hidden: true` (waybar `ext/workspaces`) lists only the
+  workspaces that hold a mapped, non-minimized window instead of every
+  configured workspace. The protocol has no "occupied" state, so a
+  compositor-side rule is the only way to express it. A workspace keeps its
+  click target while it is occupied, and `koma.workspace({ persistent = true })`
+  keeps one empty workspace visible for owners who want the full strip back.
+  Workspace state is re-published when a window is mapped, unmapped or
+  destroyed, moved between workspaces or minimized/restored, and on workspace
+  switch and configuration reload, so the strip cannot go stale.
+
 ## [0.0.3] - 2026-11-18
 
 ### Added

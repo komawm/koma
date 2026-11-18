@@ -367,7 +367,7 @@ function MacroContext:dispatch(action) end
 ---@field spring fun(name: string, spec: { mass?: number, damping?: number, damping_ratio?: number, stiffness?: number, epsilon?: number })
 ---@field xwayland fun(spec: { enabled?: boolean, path?: string, isolate_agent_workspaces?: boolean })
 ---@field env fun(key: string, val: string)
----@field bind fun(chord: string, action: KomaAction|fun(ctx: KomaMacroContext), opts?: { desc?: string, repeat?: boolean, cooldown_ms?: integer, allow_when_locked?: boolean, pass_through?: boolean, edge?: "press"|"release"|"both", when_preempted?: "allow"|"ignore" }): KomaHandle
+---@field bind fun(chord: string, action: KomaAction|fun(ctx: KomaMacroContext), opts?: { desc?: string, repeat_while_held?: boolean, cooldown_ms?: integer, allow_when_locked?: boolean, pass_through?: boolean, edge?: "press"|"release"|"both", when_preempted?: "allow"|"ignore" }): KomaHandle
 ---@field unbind fun(chord: string)
 ---@field mode fun(name: string, spec: table)
 ---@field gesture fun(spec: { fingers: 2|3|4|5, direction: "left"|"right"|"up"|"down"|"horizontal"|"vertical"|"pinch_in"|"pinch_out", action: KomaAction|fun(ctx: KomaMacroContext), cooldown_ms?: integer, allow_when_locked?: boolean, when_preempted?: "allow"|"ignore", desc?: string }): KomaHandle

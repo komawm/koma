@@ -3171,7 +3171,7 @@ mod tests {
         let init_src = r##"
             koma.layout("scrolling")
             koma.workspace({ name = "1", gaps_in = 8, gaps_out = 16 })
-            koma.workspace({ name = "2", layout = "dwindle" })
+            koma.workspace({ name = "2", layout = "dwindle", persistent = true })
 
             koma.input({
                 mod_key = "Alt",
@@ -3230,6 +3230,14 @@ mod tests {
         assert_eq!(cfg.workspaces[0].effective_inner_gap(), 8);
         assert_eq!(cfg.workspaces[0].effective_outer_gap(), 16);
         assert_eq!(cfg.workspaces[1].layout, LayoutMode::Dwindle);
+        assert!(
+            !cfg.workspaces[0].persistent,
+            "empty workspaces are hidden from bars unless they opt in"
+        );
+        assert!(
+            cfg.workspaces[1].persistent,
+            "`persistent = true` keeps an empty workspace visible in `ext-workspace-v1` bars"
+        );
 
         assert_eq!(cfg.input.mod_key.as_deref(), Some("Alt"));
         assert!(!cfg.input.inherit_default_binds);

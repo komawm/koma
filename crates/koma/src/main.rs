@@ -102,6 +102,8 @@ mod ipc_server;
 mod keybind_dispatcher;
 mod keybind_overlay;
 #[cfg(feature = "smithay-winit")]
+mod keybind_repeat;
+#[cfg(feature = "smithay-winit")]
 mod macro_runtime;
 #[cfg(feature = "smithay-winit")]
 mod mcp;

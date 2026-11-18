@@ -25,7 +25,7 @@ pub use crate::{
         CONFIG_FUEL_BUDGET, DEFAULT_HEAP_LIMIT_BYTES, HostBridge, LAYOUT_HOOK_FUEL_BUDGET,
         MACRO_SLICE_FUEL_BUDGET, ParkedMacroTask, PendingHostOp, TrampolineScheduler,
     },
-    keybind_catalog::{KEYBIND_CATALOG, KEYBIND_GROUP_ORDER, KeybindCatalogEntry},
+    keybind_catalog::{BindRepeat, KEYBIND_CATALOG, KEYBIND_GROUP_ORDER, KeybindCatalogEntry},
     recorder::{RecordedStep, compile_recorded_macro},
     scaffold::{
         ConfigTemplateFile, ScaffoldError, TEMPLATE_MARKER, TEMPLATE_VERSION,

@@ -218,6 +218,8 @@ pub fn start_client_drag<S: Source>(
         source.cancel();
         return false;
     }
+    // The drag owns the pointer from here on, so a pending keybind repeat must stop.
+    state.cancel_keybind_repeat("pointer_grab");
 
     match type_ {
         GrabType::Pointer => {

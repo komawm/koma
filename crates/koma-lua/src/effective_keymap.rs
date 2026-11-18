@@ -13,8 +13,8 @@ use std::path::Path;
 use crate::{
     ActionDescriptor, BindHandleId, KomaConfigRegistry,
     keybind_catalog::{
-        GROUP_FOCUS, GROUP_LAYOUT, GROUP_POINTER, GROUP_SCRATCHPAD, GROUP_SESSION, GROUP_WINDOWS,
-        GROUP_WORKSPACES, KeybindCatalogEntry,
+        BindRepeat, GROUP_FOCUS, GROUP_LAYOUT, GROUP_POINTER, GROUP_SCRATCHPAD, GROUP_SESSION,
+        GROUP_WINDOWS, GROUP_WORKSPACES, KeybindCatalogEntry,
     },
     schema::TriggerEdge,
 };
@@ -69,6 +69,8 @@ pub struct EffectiveBind {
     pub kind: ChordKind,
     /// Presentation group (`Windows`, `Focus and movement`, ...).
     pub group: &'static str,
+    /// Whether the action repeats while the chord is held (komawm/koma#76).
+    pub repeat: bool,
 }
 
 const MODIFIER_ORDER: &[&str] = &["Mod", "Ctrl", "Shift", "Alt", "Super", "Mod5"];
@@ -534,6 +536,7 @@ fn builtin_row(entry: &KeybindCatalogEntry, mod_key: Option<&str>) -> EffectiveB
         synthetic: false,
         kind: chord_kind(&chord_identity(entry.chord, mod_key)),
         group: entry.group,
+        repeat: entry.repeat == crate::keybind_catalog::BindRepeat::WhileHeld,
     }
 }
 
@@ -554,6 +557,9 @@ fn config_row(spec: &crate::BindSpec, config_path: &Path, mod_key: Option<&str>)
         overridden_builtin: false,
         synthetic: false,
         kind,
+        // An explicit `repeat = true|false` wins; otherwise the action's own class decides, so a
+        // config-only `koma.act.focus.left()` repeats exactly like the built-in would.
+        repeat: spec.options.effective_repeat(&spec.action) == BindRepeat::WhileHeld,
         group: if kind.is_pointer() {
             GROUP_POINTER
         } else {
@@ -661,6 +667,7 @@ pub fn merge_binds(
             synthetic: true,
             kind: ChordKind::PointerButton,
             group: GROUP_POINTER,
+            repeat: false,
         });
     }
 

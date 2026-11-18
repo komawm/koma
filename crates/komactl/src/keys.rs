@@ -191,6 +191,7 @@ fn bind_rows_cells(rows: &[&BindRow]) -> Vec<Vec<String>> {
                 format!(" ({})", edge_label(row.edge))
             };
             let disabled = if row.enabled { "" } else { " [disabled]" };
+            let repeat = if row.repeat { " [repeat]" } else { "" };
             let description = if row.description.is_empty() {
                 String::from("-")
             } else {
@@ -198,7 +199,7 @@ fn bind_rows_cells(rows: &[&BindRow]) -> Vec<Vec<String>> {
             };
             vec![
                 format!("{}{mode}", row.chord),
-                format!("{}{edge}{disabled}", row.action),
+                format!("{}{edge}{disabled}{repeat}", row.action),
                 row.expression.clone(),
                 display_source(&row.source),
                 description,
@@ -326,6 +327,7 @@ pub(crate) fn render_json(listing: &KeyListing) -> Value {
             "mode": row.mode,
             "edge": edge_label(row.edge),
             "enabled": row.enabled,
+            "repeat": row.repeat,
         })
     };
     let binds: Vec<Value> = listing
@@ -388,8 +390,10 @@ chord (`Mod + Shift + 2`), the action, the Lua expression or action descriptor,
 the source (`builtin` or `config:<file>`), and the catalogue description.
 
 Overrides of a built-in chord keep the built-in description in parentheses so
-the original binding stays visible. Pointer and gesture binds are listed in
-their own sections. Nothing is hidden: binds the compositor cannot translate
+the original binding stays visible. Rows whose action keeps firing while the
+chord is held are marked `[repeat]` (movement, focus, resize, split-ratio,
+workspace and preset cycling); `repeat = true|false` overrides the default.
+Pointer and gesture binds are listed in their own sections. Nothing is hidden: binds the compositor cannot translate
 back into a catalogue entry are printed with their raw action descriptor.
 
 Works offline by default: the configuration is evaluated in the same jailed
@@ -807,6 +811,91 @@ mod tests {
                 .as_array()
                 .is_some_and(|rows| { rows.iter().all(|row| row["chord"].as_str().is_some()) })
         );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn repeat_rows_are_marked_in_the_human_and_json_listings() {
+        let (root, registry) = listing_for(
+            "koma.bind(\"Mod + D\", koma.act.focus.left())\n\
+             koma.bind(\"Mod + U\", koma.act.spawn({ \"bitty\" }))\n\
+             koma.bind(\"Mod + Y\", koma.act.focus.up(), { repeat_while_held = false })\n\
+             koma.bind(\"Mod + I\", koma.act.window.close(), { repeat_while_held = true })\n",
+            &[],
+        );
+        let rows = merge_binds(&registry, &root.join("init.lua"), KEYBIND_CATALOG);
+        let repeat_of = |chord: &str| {
+            rows.iter()
+                .find(|row| row.chord == chord)
+                .unwrap_or_else(|| panic!("`{chord}` is missing from the listing"))
+                .repeat
+        };
+
+        // Built-ins: movement/focus repeat, spawn/close/quit/reload do not.
+        assert!(repeat_of("Mod + Shift + H"), "window movement repeats");
+        assert!(repeat_of("Mod + H"), "directional focus repeats");
+        assert!(!repeat_of("Mod + Return"), "spawning must stay one-shot");
+        assert!(!repeat_of("Mod + Q"), "closing must stay one-shot");
+        assert!(!repeat_of("Mod + Shift + E"), "quitting must stay one-shot");
+        assert!(
+            !repeat_of("Mod + Shift + R"),
+            "reloading must stay one-shot"
+        );
+
+        // Config-only binds derive from the action, and the explicit option wins.
+        assert!(repeat_of("Mod + D"), "derived from the focus action");
+        assert!(!repeat_of("Mod + U"), "derived from the spawn action");
+        assert!(
+            !repeat_of("Mod + Y"),
+            "explicit `repeat_while_held = false` wins"
+        );
+        assert!(
+            repeat_of("Mod + I"),
+            "explicit `repeat_while_held = true` wins"
+        );
+
+        let listing = KeyListing {
+            rows,
+            gestures: Vec::new(),
+            config_path: root.join("init.lua"),
+            inherits_builtins: true,
+            config_error: None,
+            live: None,
+            live_error: None,
+        };
+        let human = render_human(&listing);
+        let movement_line = human
+            .lines()
+            .find(|line| line.starts_with("  Mod + Shift + H"))
+            .expect("movement row rendered");
+        assert!(
+            movement_line.contains("[repeat]"),
+            "repeat rows must be marked in the human table: {movement_line}"
+        );
+        let return_line = human
+            .lines()
+            .find(|line| line.starts_with("  Mod + Return"))
+            .expect("terminal row rendered");
+        assert!(
+            !return_line.contains("[repeat]"),
+            "one-shot rows must not be marked: {return_line}"
+        );
+
+        let json = render_json(&listing);
+        let binds = json["binds"].as_array().expect("binds array");
+        let json_repeat = |chord: &str| {
+            binds
+                .iter()
+                .find(|row| row["chord"] == chord)
+                .unwrap_or_else(|| panic!("`{chord}` missing from JSON"))
+                .get("repeat")
+                .and_then(Value::as_bool)
+        };
+        assert_eq!(json_repeat("Mod + Shift + H"), Some(true));
+        assert_eq!(json_repeat("Mod + Return"), Some(false));
+        assert_eq!(json_repeat("Mod + Y"), Some(false));
+        assert_eq!(json_repeat("Mod + I"), Some(true));
+
         let _ = fs::remove_dir_all(&root);
     }
 

@@ -60,6 +60,10 @@ pub struct WorkspaceState {
     pub window_presentation: Option<(WindowId, WindowPresentation)>,
     pub lease: WorkspaceLease,
     pub frame_clock: AdaptiveFrameClock,
+    /// Keeps this workspace visible in `ext-workspace-v1` status bars while it holds no window
+    /// (`koma.workspace({ persistent = true })`). Empty workspaces are hidden by default so a bar
+    /// lists only the workspaces actually in use instead of the whole configured strip.
+    pub persistent: bool,
     /// Per-window `xdg_toplevel` min/max size constraints, applied to every tiled geometry this
     /// workspace reports (see [`SizeHints`]). Floating windows keep their own placement.
     size_hints: BTreeMap<WindowId, SizeHints>,
@@ -120,6 +124,7 @@ impl WorkspaceState {
             window_presentation: None,
             lease: WorkspaceLease::default(),
             frame_clock: AdaptiveFrameClock::new(is_headed, FrameClockConfig::default(), now_ms),
+            persistent: false,
             size_hints: BTreeMap::new(),
         }
     }

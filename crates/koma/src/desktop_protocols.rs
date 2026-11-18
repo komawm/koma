@@ -41,6 +41,7 @@ use crate::state::{ClientState, KomaState, PointerHitTarget};
 use koma_lua::FollowMouseMode;
 use koma_model::WorkspaceState;
 use koma_proto::WorkspaceId;
+use koma_render::frame_composer::surface_origin;
 
 pub const XDG_ACTIVATION_TOKEN_TTL: Duration = Duration::from_secs(10);
 pub const MAX_DEFERRED_ACTIVATIONS: usize = 16;
@@ -974,24 +975,49 @@ impl KomaState {
         let root = root_surface_of(surface);
         if let Some(popup) = self.popups.find_popup(&root)
             && let Ok(popup_root) = smithay::desktop::find_popup_root_surface(&popup)
-            && let Some(root_origin) = self.surface_global_origin(&popup_root)
+            && let Some(root_surface_origin) = self.surface_global_origin(&popup_root)
         {
+            // `popups_for_surface` positions are relative to the root's *window geometry*, while
+            // this function returns the root's *surface* origin. Re-anchor by the root geometry
+            // inset so popups stay over their parent's visible area for CSD roots too.
+            let root_geometry_origin = root_surface_origin
+                + self
+                    .mapped_windows
+                    .iter()
+                    .find(|m| {
+                        m.window
+                            .toplevel()
+                            .is_some_and(|t| *t.wl_surface() == popup_root)
+                    })
+                    .map(|m| m.window.geometry().loc)
+                    .unwrap_or_default()
+                    .to_f64();
             for (candidate, offset) in
                 smithay::desktop::PopupManager::popups_for_surface(&popup_root)
             {
                 if *candidate.wl_surface() == root {
-                    return Some(root_origin + (offset - candidate.geometry().loc).to_f64());
+                    return Some(
+                        root_geometry_origin + (offset - candidate.geometry().loc).to_f64(),
+                    );
                 }
             }
             return Some(
-                root_origin + smithay::desktop::get_popup_toplevel_coords(&popup).to_f64(),
+                root_geometry_origin + smithay::desktop::get_popup_toplevel_coords(&popup).to_f64(),
             );
         }
         if let Some(m) = self.mapped_windows.iter().find(|m| {
             !m.is_minimized && m.window.toplevel().is_some_and(|t| *t.wl_surface() == root)
         }) {
             let ws_origin = self.workspace_output_origin(&m.ws_id);
-            return Some(ws_origin + Point::from((f64::from(m.rect.x), f64::from(m.rect.y))));
+            let border = self.lua_sandbox.config_snapshot().appearance.border;
+            let b_off = if border.enabled {
+                f64::from(border.width.max(0.0))
+            } else {
+                0.0
+            };
+            let inner_origin =
+                Point::from((f64::from(m.rect.x) + b_off, f64::from(m.rect.y) + b_off));
+            return Some(ws_origin + surface_origin(inner_origin, m.window.geometry().loc));
         }
         for out in self.all_outputs() {
             let map = layer_map_for_output(&out);
