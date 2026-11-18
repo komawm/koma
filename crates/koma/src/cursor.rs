@@ -519,7 +519,7 @@ impl CursorManager {
             None,
             Kind::Cursor,
         ) {
-            Ok(elem) => vec![KomaRenderElement::CursorBuffer(elem)],
+            Ok(elem) => vec![KomaRenderElement::MemoryBuffer(elem)],
             Err(err) => {
                 warn!("failed importing cursor memory buffer into renderer: {err}");
                 Vec::new()

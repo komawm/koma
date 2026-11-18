@@ -1954,6 +1954,33 @@ fn output_power_and_gamma_control_validation_and_transitions() {
 }
 
 #[test]
+fn toplevel_destroy_without_a_renderer_frees_window_state_synchronously() {
+    let mut env = ClientEnv::new();
+    let (surface, xdg_surface, toplevel) = env.spawn_window("Closing", "org.koma.closing");
+    assert_eq!(env.state.mapped_windows.len(), 1);
+    let win_id = env.state.mapped_windows[0].win_id;
+
+    toplevel.destroy();
+    xdg_surface.destroy();
+    surface.destroy();
+    env.pump();
+
+    assert!(
+        env.state.mapped_windows.is_empty(),
+        "a destroyed toplevel must leave layout, hit-testing and IPC immediately"
+    );
+    assert!(env.state.unmapped_windows.is_empty());
+    assert!(
+        !env.state.window_animations.borrow().is_closing(win_id),
+        "without a renderer no frame can be captured, so the close spring must not linger"
+    );
+    assert!(
+        env.state.closing_windows.is_empty(),
+        "no captured frame may outlive the toplevel when no snapshot was possible"
+    );
+}
+
+#[test]
 fn screencopy_copy_with_damage_waits_for_damage_and_minimizing_clears_focus() {
     let mut env = ClientEnv::new();
     let qh = env.queue.handle();

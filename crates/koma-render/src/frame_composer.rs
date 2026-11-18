@@ -3,6 +3,7 @@
 //! integrating SDF rounded-corner surface clipping, anti-aliased rounded borders,
 //! 4-quadrant `smart_split` drop-zone previews, and multi-pass `Dual Kawase Blur` backdrops.
 
+use anyhow::Context as _;
 use koma_model::{
     AgentCursorFrameSnapshot, BlurConfig, BorderConfig, DimConfig, FocusRingConfig, LogicalRect,
     LogicalViewport, ShadowConfig, WorkspaceLeaseState, parse_hex_color,
@@ -13,9 +14,10 @@ use smithay::{
         Color32F, ImportAll, ImportMem, Renderer,
         element::{
             Kind,
+            memory::{MemoryRenderBuffer, MemoryRenderBufferRenderElement},
             surface::{WaylandSurfaceRenderElement, render_elements_from_surface_tree},
         },
-        gles::GlesTexture,
+        gles::{GlesRenderer, GlesTexture},
     },
     desktop::{PopupManager, Window},
     utils::{Logical, Physical, Point, Rectangle, Scale, Size},
@@ -28,6 +30,7 @@ use crate::{
         KomaClippedSurfaceElement, KomaDropShadowElement, KomaRenderElement,
         KomaRoundedBorderElement, KomaSolidColorElement, to_smithay_logical_rect,
     },
+    offscreen_fbo::capture_elements_to_memory,
     shaders::{KomaCompiledShaders, KomaGlesRenderer},
 };
 
@@ -69,6 +72,18 @@ pub struct WindowSceneItem<'a> {
     pub focus_ring: FocusRingConfig,
     pub shadow: ShadowConfig,
     pub dim: DimConfig,
+}
+
+/// A captured closing window frame, still composited while `appearance.animations.windows_close`
+/// settles. The owning `wl_surface` is already gone, so the pixels come from the per-window frame
+/// cache (or [`capture_window_snapshot`]) rather than from the live surface tree.
+pub struct ClosingWindowSceneItem<'a> {
+    pub snapshot: &'a MemoryRenderBuffer,
+    /// Pixel size of the captured snapshot (its own `buffer_scale` is `1`, so this is also the
+    /// source rectangle in buffer coordinates).
+    pub snapshot_size: (i32, i32),
+    pub rect: LogicalRect,
+    pub opacity: f32,
 }
 
 /// Resolved logical geometry and shader parameters for a rounded drop shadow.
@@ -239,6 +254,97 @@ pub fn toplevel_surface_origin(
     output_scale: Scale<f64>,
 ) -> Point<i32, Physical> {
     (inner_rect_loc - window_geometry_loc.to_f64()).to_physical_precise_round(output_scale)
+}
+
+/// Window-local pixels prepared for offscreen capture: the logical window size plus the render
+/// elements that reproduce the toplevel's committed frame at the origin.
+pub struct WindowSnapshotElements {
+    pub size: Size<i32, Logical>,
+    pub elements: Vec<KomaRenderElement<GlesRenderer>>,
+}
+
+/// Builds the render elements that reproduce `window`'s committed frame inside a
+/// window-local `(0, 0, rect.w, rect.h)` box, clipped to the configured corner radius.
+///
+/// Shared by the on-commit frame cache and the one-shot close snapshot so both capture identical
+/// pixels.
+///
+/// # Errors
+///
+/// Fails when the window is not an xdg toplevel or has no committed buffer.
+pub fn window_snapshot_elements(
+    renderer: &mut GlesRenderer,
+    window: &Window,
+    rect: LogicalRect,
+    output_scale: Scale<f64>,
+    corner_radius: f32,
+) -> anyhow::Result<WindowSnapshotElements> {
+    let toplevel = window
+        .toplevel()
+        .context("only xdg toplevels can be snapshotted")?;
+    let size = Size::<i32, Logical>::from((rect.w.max(1) as i32, rect.h.max(1) as i32));
+    let surface_origin =
+        toplevel_surface_origin(Point::from((0.0, 0.0)), window.geometry().loc, output_scale);
+    let surface_elems: Vec<WaylandSurfaceRenderElement<GlesRenderer>> =
+        render_elements_from_surface_tree(
+            renderer,
+            toplevel.wl_surface(),
+            surface_origin,
+            output_scale,
+            1.0,
+            Kind::Unspecified,
+        );
+    if surface_elems.is_empty() {
+        anyhow::bail!("toplevel has no committed buffer to snapshot");
+    }
+
+    let shaders = KomaCompiledShaders::get_or_compile(renderer);
+    let inner_rect = Rectangle::<f64, Logical>::new(
+        Point::from((0.0, 0.0)),
+        Size::from((f64::from(size.w), f64::from(size.h))),
+    );
+    let radius = corner_radius.max(0.0);
+    let mut elements: Vec<KomaRenderElement<GlesRenderer>> = Vec::new();
+    if radius > 0.5
+        && let Some(clip_prog) = shaders.clipped_surface.as_ref()
+    {
+        for surf_el in surface_elems {
+            elements.push(KomaRenderElement::ClippedSurface(
+                KomaClippedSurfaceElement::new(
+                    surf_el,
+                    clip_prog.clone(),
+                    inner_rect,
+                    [radius; 4],
+                    1.0,
+                    output_scale,
+                ),
+            ));
+        }
+    } else {
+        elements.extend(surface_elems.into_iter().map(KomaRenderElement::from));
+    }
+    Ok(WindowSnapshotElements { size, elements })
+}
+
+/// Captures a toplevel's currently committed buffer into a CPU-side snapshot, clipped to the
+/// window rectangle with the configured corner radius.
+///
+/// The compositor normally reads the per-window frame cache instead; this one-shot path covers
+/// clients that still hold a buffer when their toplevel is destroyed.
+///
+/// # Errors
+///
+/// Fails when the window is not an xdg toplevel, when the surface has no committed buffer, or when
+/// the offscreen read-back fails.
+pub fn capture_window_snapshot(
+    renderer: &mut GlesRenderer,
+    window: &Window,
+    rect: LogicalRect,
+    output_scale: Scale<f64>,
+    corner_radius: f32,
+) -> anyhow::Result<(MemoryRenderBuffer, (i32, i32))> {
+    let snapshot = window_snapshot_elements(renderer, window, rect, output_scale, corner_radius)?;
+    capture_elements_to_memory(renderer, snapshot.size, output_scale, &snapshot.elements)
 }
 
 /// Resolves `(start_rgba, end_rgba, angle_rad)` for a gradient border interpolated smoothly by `focus_factor`.
@@ -606,6 +712,47 @@ where
     }
 
     elements
+}
+
+/// Appends captured closing-window frames on top of the already assembled workspace elements.
+///
+/// The rect is the `windows_close` spring's sampled output, so the frame shrinks towards its
+/// centre and fades out. The window is no longer part of the layout, hit-testing, focus or IPC
+/// inventory at this point; only these pixels linger.
+pub fn append_closing_window_elements<R>(
+    renderer: &mut R,
+    items: &[ClosingWindowSceneItem<'_>],
+    elements: &mut Vec<KomaRenderElement<R>>,
+) where
+    R: Renderer + ImportAll + ImportMem,
+    R::TextureId: Clone + Send + 'static,
+{
+    for item in items {
+        if item.rect.w == 0 || item.rect.h == 0 || item.opacity <= 0.001 {
+            continue;
+        }
+        let src = Rectangle::<f64, Logical>::from_size(Size::from((
+            f64::from(item.snapshot_size.0.max(1)),
+            f64::from(item.snapshot_size.1.max(1)),
+        )));
+        let logical_size = Size::<i32, Logical>::from((item.rect.w as i32, item.rect.h as i32));
+        let location =
+            Point::<f64, Physical>::from((f64::from(item.rect.x), f64::from(item.rect.y)));
+        match MemoryRenderBufferRenderElement::from_buffer(
+            renderer,
+            location,
+            item.snapshot,
+            Some(item.opacity.clamp(0.0, 1.0)),
+            Some(src),
+            Some(logical_size),
+            Kind::Unspecified,
+        ) {
+            Ok(elem) => elements.push(KomaRenderElement::MemoryBuffer(elem)),
+            Err(err) => {
+                tracing::warn!(?err, "failed to import closing window snapshot");
+            }
+        }
+    }
 }
 
 fn push_drop_preview_elements<R>(
