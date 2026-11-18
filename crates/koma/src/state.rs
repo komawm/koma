@@ -1152,6 +1152,9 @@ impl KomaState {
         }
         ws.dwindle.config = d_cfg;
         ws.scrolling.update_config(s_cfg, viewport, now_ms);
+        // An empty `special:` overlay is hidden from bars unless it opts in, like any other
+        // workspace; scratchpads are created on first use and stay listed while they hold windows.
+        ws.persistent = matching_spec.is_some_and(|s| s.persistent);
 
         self.vseats
             .insert(vseat_id.clone(), VirtualSeatLedger::new(vseat_id));
@@ -1252,6 +1255,9 @@ impl KomaState {
         }
         ws.dwindle.config = d_cfg;
         ws.scrolling.update_config(s_cfg, viewport, now_ms);
+        // `persistent = true` is the opt-out from hiding empty workspaces in `ext-workspace-v1`
+        // bars; it must be applied at creation so a never-used workspace stays listed.
+        ws.persistent = matching_spec.is_some_and(|s| s.persistent);
 
         self.vseats
             .insert(vseat_id.clone(), VirtualSeatLedger::new(vseat_id));
@@ -2042,9 +2048,13 @@ impl KomaState {
         self.sync_workspace_geometries(dst_ws_id);
         self.sync_window_output_membership(dst_ws_id);
         if follow {
+            // `focus_workspace` republishes the workspace state at the end of the switch.
             self.focus_workspace(dst_ws_id);
         } else {
+            // A silent move never reaches `focus_workspace`, so the occupancy change on both
+            // workspaces has to be pushed here or the bar keeps a stale entry.
             self.focus_active_deck_window();
+            sync_ext_workspaces(self);
         }
         self.queue_redraw();
         true
@@ -2529,6 +2539,8 @@ impl KomaState {
         self.mapped_windows.push(mapped);
         self.sync_workspace_geometries(&ws_id);
         self.sync_window_output_membership(&ws_id);
+        // A newly occupied workspace must leave the `hidden` set before the bar redraws.
+        sync_ext_workspaces(self);
         if let Some(final_rect) = self
             .mapped_windows
             .iter()
@@ -3479,6 +3491,8 @@ impl KomaState {
             }
             self.sync_workspace_geometries(&target_ws_id);
             self.focus_active_deck_window();
+            // A click can move the active workspace to another output; bars follow that here.
+            sync_ext_workspaces(self);
             self.queue_redraw();
             return;
         }
@@ -3493,6 +3507,7 @@ impl KomaState {
                 self.active_ws_id = self.active_workspace_for_output(&hit_out_name);
             }
             self.focus_active_deck_window();
+            sync_ext_workspaces(self);
         }
     }
 
@@ -3524,6 +3539,8 @@ impl KomaState {
         }
         self.sync_workspace_geometries(hit_ws_id);
         self.focus_active_deck_window();
+        // Click/`follow_mouse = normal` focus can switch the displayed workspace.
+        sync_ext_workspaces(self);
         self.queue_redraw();
     }
 
@@ -3548,6 +3565,8 @@ impl KomaState {
         }
         self.pointer_focus_window = Some(win_id);
         self.focus_active_deck_window();
+        // Hovering a window on another output can switch the displayed workspace.
+        sync_ext_workspaces(self);
         self.queue_redraw();
     }
 
@@ -5251,6 +5270,9 @@ impl KomaState {
         self.sync_workspace_geometries(&ws_id);
         self.focus_active_deck_window();
         self.reconcile_idle_inhibitors();
+        // Restoring a minimized window makes its workspace occupied again and can switch the
+        // displayed workspace (IPC `win.activate`, foreign-toplevel activation).
+        sync_ext_workspaces(self);
         self.queue_redraw();
         true
     }
@@ -5332,6 +5354,9 @@ impl KomaState {
         self.focus_active_deck_window();
         self.reconcile_idle_inhibitors();
         self.sync_foreign_toplevels();
+        // A minimized window stops occupying its workspace, so minimize/restore changes bar
+        // visibility for that workspace.
+        sync_ext_workspaces(self);
         self.queue_redraw();
     }
 

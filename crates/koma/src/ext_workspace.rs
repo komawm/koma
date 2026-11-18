@@ -20,13 +20,15 @@
 //!
 //! - `active` means "currently displayed": the workspace is assigned to an output, is the open
 //!   `special:` overlay, or is the active workspace.
-//! - `hidden` marks workspaces that have no on-screen representation at all: headless/agent
-//!   workspaces (an offscreen FBO entry or an `Offscreen` presentation target). It is **not** set
-//!   on ordinary inactive workspaces, because the protocol defines `hidden` as "clients attempting
-//!   to visualize the compositor workspace state should not display such workspaces" — hiding an
-//!   inactive workspace would remove the click target a status bar needs. Ordinary inactive
-//!   workspaces therefore carry an empty state, and `ignore-hidden: true` keeps them visible while
-//!   dropping agent/headless workspaces from the strip.
+//! - `hidden` marks workspaces a bar is expected to drop from its strip: workspaces with no
+//!   on-screen representation at all (headless/agent workspaces: an offscreen FBO entry or an
+//!   `Offscreen` presentation target) and empty workspaces. `ext-workspace-v1` has no "occupied"
+//!   state, so this compositor-side rule is the only way to express it: marking an empty
+//!   workspace `hidden` makes a spec-compliant bar with `ignore-hidden: true` list only the
+//!   workspaces in use instead of all ten configured ones. A workspace that holds a mapped,
+//!   non-minimized window stays visible with an empty state bitset, so it keeps its click target.
+//!   `koma.workspace({ persistent = true })` restores the old "always visible" behaviour for one
+//!   workspace.
 //! - `urgent` is never set: Koma has no window urgency notion yet, so no workspace can be urgent.
 //! - `deactivate`, `assign`, `remove`, `create_workspace` and the matching capabilities are not
 //!   advertised and are ignored when a client still sends them. Koma has no workspace destruction,
@@ -37,6 +39,9 @@
 //!   next workspace event. The exact `wl_output` resources reported to a client are retained, so a
 //!   later `output_leave` still reaches a client whose output was hot-unplugged and two bindings of
 //!   one physical output are tracked separately.
+//! - The snapshot is re-published on every occupancy change (window map, unmap, destroy, move
+//!   between workspaces, minimize/restore), workspace switch, workspace creation and config
+//!   reload, so the visible strip never lags behind the compositor's real state.
 
 use std::collections::HashMap;
 
@@ -157,17 +162,37 @@ impl ExtWorkspaceState {
 
 /// Protocol state bits for one workspace.
 ///
-/// `active` is the displayed workspace; `hidden` is reserved for workspaces that must not be
-/// visualized at all (headless/agent workspaces). Ordinary inactive workspaces stay empty so a
-/// status bar keeps their click targets.
-fn workspace_state_bits(displayed: bool, headless: bool) -> WorkspaceStateBit {
+/// `active` is the displayed workspace and wins over every other bit. `hidden` means "a bar must
+/// not list this workspace": headless/agent workspaces have no on-screen representation, and an
+/// empty workspace is hidden so the bar strip shows only the workspaces actually in use (the
+/// bar-noise problem: a fixed ten-workspace strip where at most three are used). A workspace that
+/// holds windows stays visible with no state bits so its click target survives `ignore-hidden`, and
+/// `persistent` keeps an empty workspace visible for owners who want the full strip back.
+fn workspace_state_bits(
+    displayed: bool,
+    headless: bool,
+    occupied: bool,
+    persistent: bool,
+) -> WorkspaceStateBit {
     if displayed {
         WorkspaceStateBit::Active
-    } else if headless {
+    } else if headless || (!occupied && !persistent) {
         WorkspaceStateBit::Hidden
     } else {
         WorkspaceStateBit::empty()
     }
+}
+
+/// Whether `ws_id` holds at least one mapped, non-minimized window.
+///
+/// A minimized window is mapped but not on screen, so it does not keep a workspace in the bar. A
+/// stashed (`Deck` background) window does count: it is a live, reachable window of that workspace,
+/// and hiding the workspace would remove the only bar entry that can bring it back.
+fn workspace_is_occupied(state: &KomaState, ws_id: &WorkspaceId) -> bool {
+    state
+        .mapped_windows
+        .iter()
+        .any(|mapped| &mapped.ws_id == ws_id && !mapped.is_minimized)
 }
 
 /// One entry of the authoritative workspace snapshot pushed to clients.
@@ -214,11 +239,12 @@ fn capture_snapshot(state: &KomaState) -> Vec<WorkspaceSnapshot> {
             // marks the workspace the human is actually looking at as active.
             let headless = state.offscreen_surfaces.contains_key(&ws_id)
                 || matches!(ws.presentation, PresentationTarget::Offscreen { .. });
+            let occupied = workspace_is_occupied(state, &ws_id);
             Some(WorkspaceSnapshot {
                 ws_id,
                 name: ws.name.clone(),
                 coordinates: vec![u32::try_from(index).unwrap_or(u32::MAX)],
-                state: workspace_state_bits(displayed, headless),
+                state: workspace_state_bits(displayed, headless, occupied, ws.persistent),
             })
         })
         .collect()
@@ -541,35 +567,45 @@ mod tests {
     use koma_render::offscreen_fbo::LazyOffscreenSurface;
 
     #[test]
-    fn workspace_state_bits_mark_only_displayed_and_headless_workspaces() {
+    fn workspace_state_bits_prefer_active_and_hide_only_headless_or_empty_workspaces() {
         assert_eq!(
-            workspace_state_bits(true, false),
+            workspace_state_bits(true, false, false, false),
             WorkspaceStateBit::Active,
-            "a displayed workspace is active"
-        );
-        assert!(
-            workspace_state_bits(false, false).is_empty(),
-            "an ordinary inactive workspace must carry no state bits, so bars keep its click target"
+            "a displayed workspace is active, even while it holds no window"
         );
         assert_eq!(
-            workspace_state_bits(false, true),
-            WorkspaceStateBit::Hidden,
-            "a headless/agent workspace has no on-screen representation"
-        );
-        assert_eq!(
-            workspace_state_bits(true, true),
+            workspace_state_bits(true, true, true, true),
             WorkspaceStateBit::Active,
             "displaying a formerly headless workspace wins over hiding it"
+        );
+        assert!(
+            workspace_state_bits(false, false, true, false).is_empty(),
+            "an occupied inactive workspace must carry no state bits, so bars keep its click target"
+        );
+        assert_eq!(
+            workspace_state_bits(false, false, false, false),
+            WorkspaceStateBit::Hidden,
+            "an empty inactive workspace is hidden so bars list only workspaces in use"
+        );
+        assert!(
+            workspace_state_bits(false, false, false, true).is_empty(),
+            "`persistent = true` keeps an empty workspace visible"
+        );
+        assert_eq!(
+            workspace_state_bits(false, true, true, true),
+            WorkspaceStateBit::Hidden,
+            "a headless/agent workspace has no on-screen representation, persistent or not"
         );
     }
 
     #[test]
-    fn snapshot_marks_displayed_active_headless_hidden_and_plain_inactive_empty() {
+    fn snapshot_hides_empty_and_headless_workspaces_and_keeps_persistent_ones_visible() {
         let (_event_loop, _display, mut state) = make_headless_test_state();
         let ws1 = state.active_ws_id.clone();
         let ws2 = state.ensure_workspace_by_name_or_id("2");
         let ws3 = state.ensure_workspace_by_name_or_id("3");
         let ws4 = state.ensure_workspace_by_name_or_id("4");
+        let ws5 = state.ensure_workspace_by_name_or_id("5");
 
         // Two independent headless markers: an offscreen presentation and an offscreen FBO entry.
         state.workspaces.get_mut(&ws3).expect("ws3").presentation =
@@ -577,6 +613,7 @@ mod tests {
         state
             .offscreen_surfaces
             .insert(ws4.clone(), LazyOffscreenSurface::new(1920, 1080, 1.0));
+        state.workspaces.get_mut(&ws5).expect("ws5").persistent = true;
 
         let state_of = |snapshot: &[WorkspaceSnapshot], ws_id: &WorkspaceId| {
             snapshot
@@ -588,9 +625,10 @@ mod tests {
 
         let snapshot = capture_snapshot(&state);
         assert_eq!(state_of(&snapshot, &ws1), WorkspaceStateBit::Active);
-        assert!(
-            state_of(&snapshot, &ws2).is_empty(),
-            "an ordinary inactive workspace is neither active nor hidden"
+        assert_eq!(
+            state_of(&snapshot, &ws2),
+            WorkspaceStateBit::Hidden,
+            "an empty inactive workspace is hidden so a bar stops listing it"
         );
         assert_eq!(
             state_of(&snapshot, &ws3),
@@ -601,6 +639,10 @@ mod tests {
             state_of(&snapshot, &ws4),
             WorkspaceStateBit::Hidden,
             "an offscreen FBO entry marks an agent/headless workspace"
+        );
+        assert!(
+            state_of(&snapshot, &ws5).is_empty(),
+            "`persistent = true` keeps an empty workspace visible in the bar"
         );
 
         // Displayed headless workspaces become active instead of hidden.

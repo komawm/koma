@@ -132,6 +132,12 @@ fn render_workspaces_lua() -> String {
 -- as they are when no rule matches.
 --
 -- Workspaces inherit the global layout unless they set one explicitly.
+--
+-- Koma publishes an empty workspace as `hidden` over `ext-workspace-v1`, so a
+-- status bar with `ignore-hidden: true` (waybar `ext/workspaces`) lists only the
+-- workspaces that hold a window instead of every configured one. Add
+-- `persistent = true` to keep one empty workspace visible, for example:
+-- koma.workspace({{ name = \"10\", persistent = true }})
 
 koma.layout(\"dwindle\")
 

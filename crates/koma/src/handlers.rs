@@ -280,6 +280,8 @@ impl CompositorHandler for KomaState {
                     ws.remove_window(removed.win_id, now_ms);
                 }
                 self.sync_workspace_geometries(&removed.ws_id);
+                // Losing a window can empty the workspace; a bar with `ignore-hidden` must drop it.
+                crate::ext_workspace::sync_ext_workspaces(self);
                 self.unmapped_windows.insert(
                     root_surface,
                     UnmappedToplevel {
@@ -656,6 +658,8 @@ impl XdgShellHandler for KomaState {
                 ws.remove_window(removed.win_id, now_ms);
             }
             self.sync_workspace_geometries(&removed.ws_id);
+            // A destroyed toplevel can leave its workspace empty and therefore hidden in bars.
+            crate::ext_workspace::sync_ext_workspaces(self);
             self.break_active_pointer_constraints();
             self.reconcile_idle_inhibitors();
             self.sync_foreign_toplevels();

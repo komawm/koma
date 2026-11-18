@@ -111,6 +111,8 @@ pub fn start_compositor_move_grab(state: &mut KomaState, button_code: u32, seria
         ws.activate_window(win_id, now_ms);
     }
     state.focus_active_deck_window();
+    // Dragging a background window dismisses the Scratchpad overlay, which bars must see.
+    crate::ext_workspace::sync_ext_workspaces(state);
 
     let start_data = PointerGrabStartData {
         focus: None,
@@ -159,6 +161,8 @@ pub fn start_compositor_resize_grab(
         ws.activate_window(win_id, now_ms);
     }
     state.focus_active_deck_window();
+    // Dragging a background window dismisses the Scratchpad overlay, which bars must see.
+    crate::ext_workspace::sync_ext_workspaces(state);
 
     let start_data = PointerGrabStartData {
         focus: None,

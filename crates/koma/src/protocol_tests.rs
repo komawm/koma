@@ -2770,10 +2770,9 @@ fn ext_workspace_global_publishes_every_workspace_and_activate_switches_composit
         "the focused workspace must be advertised as active"
     );
     assert_eq!(
-        env.client.ext_workspace_state("2"),
-        0,
-        "an ordinary unfocused workspace carries no state bits, so its click target survives \
-         `ignore-hidden: true`"
+        env.client.ext_workspace_state("2") & EXT_WORKSPACE_STATE_HIDDEN,
+        EXT_WORKSPACE_STATE_HIDDEN,
+        "an empty workspace is hidden, so a bar with `ignore-hidden` lists only workspaces in use"
     );
     assert_eq!(
         env.client.ext_workspace_state("agent") & EXT_WORKSPACE_STATE_HIDDEN,
@@ -2816,9 +2815,9 @@ fn ext_workspace_global_publishes_every_workspace_and_activate_switches_composit
         EXT_WORKSPACE_STATE_ACTIVE
     );
     assert_eq!(
-        env.client.ext_workspace_state("1"),
-        0,
-        "the switched-away workspace returns to an empty state, not hidden"
+        env.client.ext_workspace_state("1") & EXT_WORKSPACE_STATE_HIDDEN,
+        EXT_WORKSPACE_STATE_HIDDEN,
+        "the switched-away workspace is empty, so it becomes hidden instead of staying listed"
     );
 }
 
@@ -2834,7 +2833,11 @@ fn ext_workspace_states_track_compositor_initiated_workspace_switches() {
         env.client.ext_workspace_state("1") & EXT_WORKSPACE_STATE_ACTIVE,
         EXT_WORKSPACE_STATE_ACTIVE
     );
-    assert_eq!(env.client.ext_workspace_state("2"), 0);
+    assert_eq!(
+        env.client.ext_workspace_state("2") & EXT_WORKSPACE_STATE_HIDDEN,
+        EXT_WORKSPACE_STATE_HIDDEN,
+        "an empty inactive workspace is hidden"
+    );
 
     // Compositor-side switch (`ws.focus`/keybind path), not a bar request.
     assert!(env.state.focus_workspace(&ws2));
@@ -2845,9 +2848,9 @@ fn ext_workspace_states_track_compositor_initiated_workspace_switches() {
         "the compositor-side switch must publish active"
     );
     assert_eq!(
-        env.client.ext_workspace_state("1"),
-        0,
-        "the switched-away workspace must drop its active bit"
+        env.client.ext_workspace_state("1") & EXT_WORKSPACE_STATE_HIDDEN,
+        EXT_WORKSPACE_STATE_HIDDEN,
+        "the switched-away workspace must drop its active bit and be hidden while empty"
     );
 
     assert!(env.state.focus_workspace(&ws1));
@@ -2856,7 +2859,10 @@ fn ext_workspace_states_track_compositor_initiated_workspace_switches() {
         env.client.ext_workspace_state("1") & EXT_WORKSPACE_STATE_ACTIVE,
         EXT_WORKSPACE_STATE_ACTIVE
     );
-    assert_eq!(env.client.ext_workspace_state("2"), 0);
+    assert_eq!(
+        env.client.ext_workspace_state("2") & EXT_WORKSPACE_STATE_HIDDEN,
+        EXT_WORKSPACE_STATE_HIDDEN
+    );
 
     // Fail closed: a locked session must ignore a committed `activate`.
     assert!(env.state.session_lock.try_lock(None));
@@ -2869,6 +2875,79 @@ fn ext_workspace_states_track_compositor_initiated_workspace_switches() {
     assert_eq!(
         env.state.active_ws_id, ws1,
         "activate must be ignored while the session is locked"
+    );
+}
+
+#[test]
+fn ext_workspace_visibility_follows_workspace_occupancy() {
+    let mut env = ClientEnv::new();
+    let ws1 = env.state.active_ws_id.clone();
+    let ws2 = env.state.ensure_workspace_by_name_or_id("2");
+    let _manager = env.bind_ext_workspace_manager();
+    env.pump();
+
+    assert_eq!(
+        env.client.ext_workspace_state("2") & EXT_WORKSPACE_STATE_HIDDEN,
+        EXT_WORKSPACE_STATE_HIDDEN,
+        "a workspace that never held a window is hidden, so the bar does not list it"
+    );
+
+    // Opening the first window on a workspace must publish it as visible before the next frame.
+    let (surface, xdg_surface, toplevel) = env.spawn_window("Occupant", "org.koma.occupant");
+    env.pump();
+    assert_eq!(
+        env.client.ext_workspace_state("1") & EXT_WORKSPACE_STATE_ACTIVE,
+        EXT_WORKSPACE_STATE_ACTIVE
+    );
+    assert_eq!(
+        env.client.ext_workspace_state("2") & EXT_WORKSPACE_STATE_HIDDEN,
+        EXT_WORKSPACE_STATE_HIDDEN,
+        "an unrelated empty workspace stays hidden while another one is used"
+    );
+    assert_eq!(env.state.mapped_windows.len(), 1);
+
+    // A silent move (`follow = false`) never reaches `focus_workspace`, so the occupancy re-sync
+    // inside the move path is what republishes both workspaces.
+    assert!(
+        env.state
+            .move_active_window_between_workspaces_with_follow(&ws1, &ws2, false)
+    );
+    env.pump();
+    assert_eq!(
+        env.client.ext_workspace_state("2"),
+        0,
+        "the destination now holds a window: visible with no state bits so its click target \
+         survives `ignore-hidden: true`"
+    );
+    assert_eq!(
+        env.client.ext_workspace_state("1") & EXT_WORKSPACE_STATE_ACTIVE,
+        EXT_WORKSPACE_STATE_ACTIVE,
+        "a silent move keeps the source workspace displayed"
+    );
+
+    // Closing the last window of a workspace hides it again in the same dispatch as the unmap.
+    toplevel.destroy();
+    xdg_surface.destroy();
+    surface.destroy();
+    env.pump();
+    assert_eq!(
+        env.client.ext_workspace_state("2") & EXT_WORKSPACE_STATE_HIDDEN,
+        EXT_WORKSPACE_STATE_HIDDEN,
+        "closing the last window must re-hide the workspace instead of leaving a stale bar entry"
+    );
+
+    // `persistent = true` is the per-workspace opt-out from hiding empty workspaces.
+    env.state
+        .lua_sandbox
+        .eval_init_lua(r#"koma.workspace({ name = "3", persistent = true })"#)
+        .expect("persistent workspace spec must evaluate");
+    let ws3 = env.state.ensure_workspace_by_name_or_id("3");
+    env.pump();
+    assert!(env.state.workspaces[&ws3].persistent);
+    assert_eq!(
+        env.client.ext_workspace_state("3"),
+        0,
+        "a persistent empty workspace stays in the bar with no state bits"
     );
 }
 
@@ -3038,9 +3117,14 @@ fn ext_workspace_cycle_focus_keeps_bar_state_in_sync() {
         "`WorkspaceFocusNext` must publish the new active workspace"
     );
     assert_eq!(
-        env.client.ext_workspace_state("1"),
+        env.client.ext_workspace_state("1") & EXT_WORKSPACE_STATE_ACTIVE,
         0,
         "the bar must stop reporting the previous workspace as active"
+    );
+    assert_eq!(
+        env.client.ext_workspace_state("1") & EXT_WORKSPACE_STATE_HIDDEN,
+        EXT_WORKSPACE_STATE_HIDDEN,
+        "the switched-away workspace holds no window in this test, so it is hidden"
     );
     assert_eq!(
         env.state.workspaces[&ws2].layout_mode,
