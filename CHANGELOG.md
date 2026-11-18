@@ -8,6 +8,32 @@ desktop, hardware support, or security guarantees.
 
 ## [Unreleased]
 
+### Added
+
+- `win.move_to_workspace` (alias `win.move`) on `koma-admin.sock`: moves the
+  focused workspace's active window to an existing workspace, mirroring
+  `ActionDescriptor::WindowMoveToWorkspace`, with `follow` deciding whether the
+  destination is focused (`movetoworkspace` vs `movetoworkspacesilent`). Rejects
+  unknown workspaces and empty sources with `ErrNotFound`, applies the session
+  lock gate, and is exposed as `komactl win move-to-workspace <ws_id|name>
+  [--follow]`.
+- `ext-workspace-v1` (staging) server support: one workspace group owning every
+  output, one workspace handle per Koma workspace with its id, name, 1D
+  coordinates and `active` / `hidden` state, plus `output_enter` /
+  `workspace_enter` bookkeeping and `done` batches. `workspace.activate` routes
+  through `KomaState::focus_workspace`, so `waybar` `ext/workspaces` with
+  `on-click: activate` switches workspaces; the request is ignored while the
+  session is locked. Documented subset: `urgent`, `deactivate`, `assign`,
+  `remove` and `create_workspace` are not advertised.
+- `focused` in each `scene.inventory` workspace entry, true for exactly one
+  workspace (`active_ws_id`), replacing the runtime-file bridge for status bars.
+
+### Fixed
+
+- `workspace.focused` now fires for every activation path, including special
+  (`special:<name>`) workspaces, output switches and output-less switches, and
+  never twice for a no-op re-focus.
+
 ## [0.0.2] - 2026-11-17
 
 ### Added

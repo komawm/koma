@@ -956,7 +956,11 @@ impl VirtualKeyboardHandler for KomaState {
 }
 
 impl OutputHandler for KomaState {
-    fn output_bound(&mut self, _output: Output, _wl_output: WlOutput) {}
+    fn output_bound(&mut self, _output: Output, _wl_output: WlOutput) {
+        // A bar that binds `wl_output` after `ext_workspace_manager_v1` still needs its
+        // `workspace_group.output_enter`; the sync is a no-op while no manager is bound.
+        crate::ext_workspace::sync_ext_workspaces(self);
+    }
 }
 
 impl FractionalScaleHandler for KomaState {
