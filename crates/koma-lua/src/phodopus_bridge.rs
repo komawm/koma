@@ -1711,6 +1711,11 @@ fn build_act_namespace<'gc>(ctx: Context<'gc>) -> Result<Table<'gc>, LuaError<'g
     );
     win.set_field(
         ctx,
+        "maximize_toggle",
+        unit_act(ctx, ActionDescriptor::WindowMaximizeToggle),
+    );
+    win.set_field(
+        ctx,
         "float_toggle",
         unit_act(ctx, ActionDescriptor::WindowFloatToggle),
     );

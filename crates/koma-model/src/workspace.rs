@@ -24,6 +24,21 @@ pub enum PresentationTarget {
     Offscreen { lazy_fbo_slot: u32 },
 }
 
+/// Per-window presentation override owned by a `WorkspaceState`.
+///
+/// This is the single source of truth for both special window modes: it decides the geometry of
+/// the window and every consumer (xdg `Maximized`/`Fullscreen` state bits, foreign-toplevel and IPC
+/// surfaces, the layer-shell visibility policy) derives its answer from it. The two modes are
+/// mutually exclusive by construction because only one window can hold at most one mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowPresentation {
+    /// Covers `viewport.full_rect()` (gaps and exclusive zones included) and hides the
+    /// `Top`/`Overlay` layer tiers on the hosting output.
+    Fullscreen,
+    /// Covers `viewport.work_area_rect()` inset by the active layout's outer gap; panels stay.
+    Maximized,
+}
+
 /// Symmetrical workspace container owning both a tiled layout engine (`DwindleTree`,
 /// `ScrollingStrip`, or `DeckStashStack`) and a Z-ordered `FloatingStack` (`CSpace`).
 #[derive(Debug)]
@@ -41,7 +56,8 @@ pub struct WorkspaceState {
     pub scrolling: ScrollingStrip,
     pub floating: FloatingStack,
     pub focused_window: Option<WindowId>,
-    pub fullscreen_window: Option<WindowId>,
+    /// Single source of truth for `Fullscreen` / `Maximized` presentation of at most one window.
+    pub window_presentation: Option<(WindowId, WindowPresentation)>,
     pub lease: WorkspaceLease,
     pub frame_clock: AdaptiveFrameClock,
     /// Per-window `xdg_toplevel` min/max size constraints, applied to every tiled geometry this
@@ -101,7 +117,7 @@ impl WorkspaceState {
             scrolling: ScrollingStrip::new(scrolling_cfg, !is_headed),
             floating: FloatingStack::default(),
             focused_window: None,
-            fullscreen_window: None,
+            window_presentation: None,
             lease: WorkspaceLease::default(),
             frame_clock: AdaptiveFrameClock::new(is_headed, FrameClockConfig::default(), now_ms),
             size_hints: BTreeMap::new(),
@@ -131,12 +147,15 @@ impl WorkspaceState {
         self.size_hints.get(&win_id).copied()
     }
 
-    /// Clamps every tiled geometry to the owning client's advertised size constraints.
+    /// Clamps every presented/tiled geometry to the owning client's advertised size constraints.
     ///
     /// A layout box narrower/shorter than a client's minimum cannot be honoured by that client: it
     /// keeps its minimum content size and commits a cropped buffer, which the compositor then masks
     /// to the smaller tile ("clipped instead of resized"). Growing the reported tile to the minimum
     /// makes the layout honest again.
+    ///
+    /// Fullscreen/maximize presentation rects go through the same clamp, so a presentation never
+    /// hands a client a size below its `xdg_toplevel` minimum.
     ///
     /// When the workspace genuinely cannot fit both neighbours' minimums the clamped tile overlaps
     /// its sibling (the focused window stays complete and usable). Propagating minimums through the
@@ -245,8 +264,8 @@ impl WorkspaceState {
 
     /// Removes `win_id` from whichever layer (`FloatingStack` or Tiled) owns it and updates focus.
     pub fn remove_window(&mut self, win_id: WindowId, now_ms: u64) -> Option<WindowId> {
-        if self.fullscreen_window == Some(win_id) {
-            self.fullscreen_window = None;
+        if self.presented_window_id() == Some(win_id) {
+            self.window_presentation = None;
         }
         let _ = self.deck.remove(win_id);
         self.size_hints.remove(&win_id);
@@ -285,8 +304,8 @@ impl WorkspaceState {
         cursor_pos: Option<LogicalPoint>,
         now_ms: u64,
     ) -> Option<bool> {
-        if self.fullscreen_window == Some(win_id) {
-            self.fullscreen_window = None;
+        if self.presented_window_id() == Some(win_id) {
+            self.window_presentation = None;
         }
         if self.floating.remove(win_id).is_some() {
             let is_float = self.insert_window(
@@ -320,16 +339,124 @@ impl WorkspaceState {
         }
     }
 
-    /// Toggles workspace fullscreen state for `win_id`, preserving underlying tiled/floating rects.
-    pub fn toggle_fullscreen(&mut self, win_id: WindowId) -> bool {
-        if self.fullscreen_window == Some(win_id) {
-            self.fullscreen_window = None;
-            false
-        } else {
-            self.fullscreen_window = Some(win_id);
-            self.focused_window = Some(win_id);
-            true
+    /// `WindowId` currently presented `Fullscreen` or `Maximized` on this workspace.
+    #[must_use]
+    pub fn presented_window_id(&self) -> Option<WindowId> {
+        self.window_presentation.map(|(win_id, _)| win_id)
+    }
+
+    /// Presentation mode currently applied to `win_id`, if any.
+    #[must_use]
+    pub fn presentation_of(&self, win_id: WindowId) -> Option<WindowPresentation> {
+        self.window_presentation
+            .filter(|(presented, _)| *presented == win_id)
+            .map(|(_, mode)| mode)
+    }
+
+    /// `WindowId` currently presented `Fullscreen` on this workspace, if any.
+    #[must_use]
+    pub fn fullscreen_window(&self) -> Option<WindowId> {
+        self.window_presentation
+            .filter(|(_, mode)| *mode == WindowPresentation::Fullscreen)
+            .map(|(win_id, _)| win_id)
+    }
+
+    /// `WindowId` currently presented `Maximized` on this workspace, if any.
+    #[must_use]
+    pub fn maximized_window(&self) -> Option<WindowId> {
+        self.window_presentation
+            .filter(|(_, mode)| *mode == WindowPresentation::Maximized)
+            .map(|(win_id, _)| win_id)
+    }
+
+    /// Whether `win_id` is the workspace's `Fullscreen` window.
+    #[must_use]
+    pub fn is_fullscreen(&self, win_id: WindowId) -> bool {
+        self.presentation_of(win_id) == Some(WindowPresentation::Fullscreen)
+    }
+
+    /// Whether `win_id` is the workspace's `Maximized` window.
+    #[must_use]
+    pub fn is_maximized(&self, win_id: WindowId) -> bool {
+        self.presentation_of(win_id) == Some(WindowPresentation::Maximized)
+    }
+
+    /// Sets or clears `Fullscreen` on `win_id`, clearing any other presentation mode on this
+    /// workspace (the two modes are mutually exclusive). Returns the resulting state.
+    pub fn set_fullscreen(&mut self, win_id: WindowId, fullscreen: bool) -> bool {
+        if self.is_fullscreen(win_id) == fullscreen {
+            return fullscreen;
         }
+        if fullscreen {
+            self.window_presentation = Some((win_id, WindowPresentation::Fullscreen));
+            self.focused_window = Some(win_id);
+        } else {
+            self.window_presentation = None;
+        }
+        fullscreen
+    }
+
+    /// Sets or clears `Maximized` on `win_id`, clearing any other presentation mode on this
+    /// workspace. Returns the resulting state.
+    pub fn set_maximized(&mut self, win_id: WindowId, maximized: bool) -> bool {
+        if self.is_maximized(win_id) == maximized {
+            return maximized;
+        }
+        if maximized {
+            self.window_presentation = Some((win_id, WindowPresentation::Maximized));
+            self.focused_window = Some(win_id);
+        } else {
+            self.window_presentation = None;
+        }
+        maximized
+    }
+
+    /// Toggles workspace fullscreen state for `win_id`, preserving underlying tiled/floating rects.
+    /// An active `Maximized` state on any window is cleared.
+    pub fn toggle_fullscreen(&mut self, win_id: WindowId) -> bool {
+        self.set_fullscreen(win_id, !self.is_fullscreen(win_id))
+    }
+
+    /// Toggles workspace maximize state for `win_id`. An active `Fullscreen` state is cleared.
+    pub fn toggle_maximized(&mut self, win_id: WindowId) -> bool {
+        self.set_maximized(win_id, !self.is_maximized(win_id))
+    }
+
+    /// The active layout's outer gap, used by `maximized_rect`.
+    #[must_use]
+    pub fn outer_gap(&self) -> u32 {
+        match self.layout_mode {
+            LayoutMode::Dwindle | LayoutMode::Deck => self.dwindle.config.outer_gap,
+            LayoutMode::Scrolling => self.scrolling.config.outer_gap,
+        }
+    }
+
+    /// Rect used by `WindowPresentation::Maximized`: the non-exclusive work area inset by the
+    /// active layout's outer gap, so the bar stays visible while tiling gaps stay uniform.
+    #[must_use]
+    pub fn maximized_rect(&self) -> LogicalRect {
+        let wa = self.viewport.work_area_rect();
+        let gap = self.outer_gap();
+        let w = wa.w.saturating_sub(gap.saturating_mul(2)).max(1);
+        let h = wa.h.saturating_sub(gap.saturating_mul(2)).max(1);
+        LogicalRect::new(
+            wa.x.saturating_add(gap as i32),
+            wa.y.saturating_add(gap as i32),
+            w,
+            h,
+        )
+    }
+
+    /// Geometry of the presenting window (`Fullscreen` or `Maximized`), if any.
+    #[must_use]
+    pub fn presentation_geometry(&self) -> Option<(WindowId, LogicalRect)> {
+        self.window_presentation.map(|(win_id, mode)| {
+            let rect = match mode {
+                WindowPresentation::Fullscreen => self.viewport.full_rect(),
+                WindowPresentation::Maximized => self.maximized_rect(),
+            };
+            (win_id, rect)
+        })
     }
 
     /// Toggles `pseudotile` on `win_id` inside `DwindleTree`.
@@ -497,8 +624,10 @@ impl WorkspaceState {
     /// subtracting `camera_x`) so column width/swap animations stay orthogonal to `camera_spring`!
     #[must_use]
     pub fn compute_animation_target_geometries(&self) -> Vec<(WindowId, LogicalRect, bool)> {
-        if let Some(fs_win) = self.fullscreen_window {
-            return vec![(fs_win, self.viewport.full_rect(), false)];
+        if let Some((win_id, rect)) = self.presentation_geometry() {
+            let mut out = vec![(win_id, rect, false)];
+            self.clamp_tiled_size_hints(&mut out);
+            return out;
         }
 
         let mut out: Vec<(WindowId, LogicalRect, bool)> = match self.layout_mode {
@@ -534,8 +663,10 @@ impl WorkspaceState {
     /// Z-order at `now_ms` (`Scrolling` columns shifted by the live `camera_spring` position!).
     #[must_use]
     pub fn compute_visible_geometries_at(&self, now_ms: u64) -> Vec<(WindowId, LogicalRect, bool)> {
-        if let Some(fs_win) = self.fullscreen_window {
-            return vec![(fs_win, self.viewport.full_rect(), false)];
+        if let Some((win_id, rect)) = self.presentation_geometry() {
+            let mut out = vec![(win_id, rect, false)];
+            self.clamp_tiled_size_hints(&mut out);
+            return out;
         }
 
         let mut out: Vec<(WindowId, LogicalRect, bool)> = match self.layout_mode {
@@ -572,8 +703,10 @@ impl WorkspaceState {
     /// Returns visible `(WindowId, LogicalRect, is_floating)` items at the settled target camera.
     #[must_use]
     pub fn compute_visible_geometries(&self) -> Vec<(WindowId, LogicalRect, bool)> {
-        if let Some(fs_win) = self.fullscreen_window {
-            return vec![(fs_win, self.viewport.full_rect(), false)];
+        if let Some((win_id, rect)) = self.presentation_geometry() {
+            let mut out = vec![(win_id, rect, false)];
+            self.clamp_tiled_size_hints(&mut out);
+            return out;
         }
 
         let mut out: Vec<(WindowId, LogicalRect, bool)> = match self.layout_mode {
@@ -656,7 +789,7 @@ mod tests {
         assert!(scroll_geos[0].1.x + scroll_geos[0].1.w as i32 <= 60 + 1820);
 
         // Fullscreen spans full physical output bounds regardless of panels
-        ws.fullscreen_window = Some(w1);
+        ws.set_fullscreen(w1, true);
         assert_eq!(
             ws.compute_visible_geometries(),
             vec![(w1, LogicalRect::new(0, 0, 1920, 1080), false)]
@@ -739,5 +872,71 @@ mod tests {
             .expect("dialog geometry");
         assert!(float);
         assert!(float_rect.w < 900, "floating rect keeps its own size");
+    }
+
+    #[test]
+    fn maximized_window_uses_gapped_work_area_and_excludes_siblings_from_the_frame() {
+        let base_vp = LogicalViewport::new(1920, 1080, 1.0);
+        // 1820x1000 work area at (60, 36): 60 px left, 36 px top, 60 px right, 44 px bottom edges.
+        let wa = base_vp.work_area_from_edges(36, 44, 60, 40);
+        let vp_with_bars = base_vp.with_work_area_zone(wa.x, wa.y, wa.w as i32, wa.h as i32);
+
+        let mut ws = WorkspaceState::new(
+            WorkspaceId::new("main"),
+            "main",
+            SeatId::new("seat0"),
+            vp_with_bars,
+            PresentationTarget::Physical(OutputId::new("eDP-1")),
+            LayoutMode::Dwindle,
+            0,
+        );
+        ws.dwindle.config.outer_gap = 10;
+        ws.dwindle.config.inner_gap = 6;
+        let w1 = WindowId::new(1, 1);
+        let w2 = WindowId::new(2, 1);
+        ws.insert_window(w1, false, None, None, None, None, false, true, 0);
+        ws.insert_window(w2, false, None, None, None, None, false, true, 0);
+        assert_eq!(ws.compute_animation_target_geometries().len(), 2);
+
+        assert!(ws.toggle_maximized(w1));
+        assert_eq!(ws.presentation_of(w1), Some(WindowPresentation::Maximized));
+        assert!(ws.is_maximized(w1));
+        assert!(!ws.is_maximized(w2));
+        assert!(ws.fullscreen_window().is_none());
+
+        let maximized = ws.maximized_rect();
+        // 1820x1000 work area inset by the 10 px outer gap on every side.
+        assert_eq!(maximized, LogicalRect::new(70, 46, 1800, 980));
+        assert_eq!(
+            ws.compute_animation_target_geometries(),
+            vec![(w1, maximized, false)],
+            "maximize presents only the maximized window, front-most, with no siblings",
+        );
+
+        // Maximize is not fullscreen: the bar inset and gaps stay reserved.
+        let fullscreen = ws.viewport.full_rect();
+        assert_eq!(fullscreen, LogicalRect::new(0, 0, 1920, 1080));
+        assert_ne!(maximized, fullscreen);
+        assert_eq!(maximized.y - fullscreen.y, 46);
+        assert_eq!(fullscreen.h - maximized.h, 100);
+        assert_eq!(maximized.x, 70);
+        assert_eq!(maximized.w + 120, 1920);
+
+        // Fullscreen supersedes maximize; toggling maximize off restores the dwindle tiles.
+        assert!(ws.toggle_fullscreen(w1));
+        assert_eq!(
+            ws.compute_animation_target_geometries(),
+            vec![(w1, fullscreen, false)]
+        );
+        assert!(!ws.is_maximized(w1));
+        assert!(!ws.toggle_fullscreen(w1));
+        assert_eq!(ws.window_presentation, None);
+        let restored = ws.compute_animation_target_geometries();
+        assert_eq!(restored.len(), 2, "both dwindle tiles return after exiting");
+        assert!(
+            restored
+                .iter()
+                .any(|(id, rect, _)| *id == w1 && *rect != maximized)
+        );
     }
 }
