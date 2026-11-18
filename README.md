@@ -16,16 +16,16 @@ Koma avoids hardcoded behavior in favor of sensible defaults that can be overrid
 
 ## Repository structure
 
-| Crate                                                                          | Target  | Source responsibility                                                                                                    |
-| ------------------------------------------------------------------------------ | ------- | ------------------------------------------------------------------------------------------------------------------------ |
-| [koma-proto](https://github.com/komawm/koma/tree/main/crates/koma-proto)       | Library | IPC schemas and framing, ancillary FD transport, capability tokens, epoch identifiers, event buffers.                    |
-| [koma-model](https://github.com/komawm/koma/tree/main/crates/koma-model)       | Library | Dwindle, scrolling/tabbed columns, deck/stash and floating workspaces, leases, rules, springs, frame clocks.             |
-| [koma-lua](https://github.com/komawm/koma/tree/main/crates/koma-lua)           | Library | Configuration schema, Phodopus bridge, host operations, coroutine scheduling, macro recording, LuaLS type generation.    |
-| [koma-render](https://github.com/komawm/koma/tree/main/crates/koma-render)     | Library | Smithay scene composition, shaders, blur, offscreen pools, capture overlays and protected-surface handling.              |
-| [koma-seat](https://github.com/komawm/koma/tree/main/crates/koma-seat)         | Library | Virtual-seat held-input ledger and text-injection interface.                                                             |
-| [koma](https://github.com/komawm/koma/tree/main/crates/koma)                   | Binary  | Winit and TTY backend integration, Wayland handlers, IPC server, input dispatch, config reload and Xwayland integration. |
-| [komactl](https://github.com/komawm/koma/tree/main/crates/komactl)             | Binary  | Configuration validation and reload, type generation, admin IPC, sandbox launcher.                                       |
-| [koma-overview](https://github.com/komawm/koma/tree/main/crates/koma-overview) | Binary  | Layer-shell companion, thumbnail/overview layout and daemon control.                                                     |
+| Crate                                                                          | Target  | Source responsibility                                                                                                               |
+| ------------------------------------------------------------------------------ | ------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| [koma-proto](https://github.com/komawm/koma/tree/main/crates/koma-proto)       | Library | IPC schemas and framing, ancillary FD transport, capability tokens, epoch identifiers, event buffers.                               |
+| [koma-model](https://github.com/komawm/koma/tree/main/crates/koma-model)       | Library | Dwindle, scrolling/tabbed columns, deck/stash and floating workspaces, leases, rules, springs, frame clocks.                        |
+| [koma-lua](https://github.com/komawm/koma/tree/main/crates/koma-lua)           | Library | Configuration schema, Phodopus bridge, host operations, coroutine scheduling, macro recording, LuaLS type generation.               |
+| [koma-render](https://github.com/komawm/koma/tree/main/crates/koma-render)     | Library | Smithay scene composition, shaders, blur, offscreen pools, capture overlays and protected-surface handling.                         |
+| [koma-seat](https://github.com/komawm/koma/tree/main/crates/koma-seat)         | Library | Virtual-seat held-input ledger and text-injection interface.                                                                        |
+| [koma](https://github.com/komawm/koma/tree/main/crates/koma)                   | Binary  | Winit and TTY backend integration, Wayland handlers, IPC server, input dispatch, config reload and Xwayland integration.            |
+| [komactl](https://github.com/komawm/koma/tree/main/crates/komactl)             | Binary  | Configuration validation, diagnostics (`doctor`) and keymap listing (`keys`), reload, type generation, admin IPC, sandbox launcher. |
+| [koma-overview](https://github.com/komawm/koma/tree/main/crates/koma-overview) | Binary  | Layer-shell companion, thumbnail/overview layout and daemon control.                                                                |
 
 These eight crates belong to this Git repository. The stdio MCP adapter (agent IPC client, epoch handling and PNG encoding) is the `koma mcp` subcommand of the `koma` binary. The [organization workspace](https://github.com/komawm/.github) also routes independent checkouts for canonical documentation, Jiku, Lua types and packaging. It uses no Git submodules. Phodopus is the existing shared upstream checkout, with its own identity and history.
 
