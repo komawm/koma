@@ -2470,53 +2470,11 @@ fn cycle_workspace_focus(state: &mut KomaState, forward: bool) {
     } else {
         (cur_pos + ids.len() - 1) % ids.len()
     };
+    // Route through the single workspace-switch path: it performs the output mapping, geometry
+    // resync, transition, `workspace.focused` event and `ext-workspace-v1` sync, so a bar that
+    // drives `ext/workspaces` stays in step with the keybind.
     let next_ws = ids[next_pos].clone();
-    if let Some(hosting_out) = state
-        .output_workspaces
-        .iter()
-        .find(|(_, id)| *id == &next_ws)
-        .map(|(name, _)| name.clone())
-        && state.focused_output_name().as_deref() != Some(hosting_out.as_str())
-    {
-        let _ = state.focus_output(&hosting_out);
-        return;
-    }
-    state.break_active_pointer_constraints();
-    state.active_special_ws_id = None;
-    let prev_ws_id = state.active_ws_id.clone();
-    state.active_ws_id = next_ws.clone();
-    let mut switched_out: Option<String> = None;
-    if let Some(focused_out) = state.focused_output() {
-        let out_name = focused_out.name();
-        state
-            .output_workspaces
-            .insert(out_name.clone(), next_ws.clone());
-        let vp = state.viewport_for_output(&focused_out);
-        let now_ms = state.elapsed_ms();
-        if let Some(ws) = state.workspaces.get_mut(&next_ws) {
-            ws.presentation =
-                koma_model::PresentationTarget::Physical(koma_proto::OutputId::new(&out_name));
-            if ws.viewport != vp {
-                ws.viewport = vp;
-                ws.recalculate(now_ms);
-            }
-        }
-        state.sync_workspace_geometries(&next_ws);
-        state.sync_window_output_membership(&next_ws);
-        switched_out = Some(out_name);
-    }
-    state.focus_active_deck_window();
-    if let Some(out_name) = switched_out {
-        state.trigger_workspace_transition(
-            &out_name,
-            &prev_ws_id,
-            &next_ws,
-            if forward { 1 } else { -1 },
-        );
-    }
-    state.reconcile_idle_inhibitors();
-    state.sync_foreign_toplevels();
-    state.queue_redraw();
+    state.focus_workspace_with_direction(&next_ws, if forward { 1 } else { -1 });
 }
 
 #[cfg(test)]

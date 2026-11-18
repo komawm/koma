@@ -189,6 +189,15 @@ struct CapturedExtWorkspace {
 }
 
 #[derive(Debug, Clone, Default)]
+struct CapturedExtWorkspaceManager {
+    groups: Vec<u32>,
+    workspaces: Vec<u32>,
+    /// Number of `ext_workspace_manager_v1.workspace` events seen, including re-created handles.
+    workspaces_created: usize,
+    done: usize,
+}
+
+#[derive(Debug, Clone, Default)]
 struct CapturedExtWorkspaceGroup {
     capabilities: Option<u32>,
     outputs: Vec<u32>,
@@ -240,6 +249,8 @@ struct ClientHarness {
     fractional_scales: Vec<u32>,
     layer_configures: usize,
     ext_workspace_manager: Option<ext_workspace_manager_v1::ExtWorkspaceManagerV1>,
+    ext_workspace_manager_proxies: BTreeMap<u32, ext_workspace_manager_v1::ExtWorkspaceManagerV1>,
+    ext_workspace_managers: BTreeMap<u32, CapturedExtWorkspaceManager>,
     ext_workspace_done: usize,
     ext_workspace_finished: usize,
     ext_workspace_groups: BTreeMap<u32, CapturedExtWorkspaceGroup>,
@@ -306,6 +317,28 @@ impl ClientHarness {
                 (ws.name == name).then_some(ws.state)
             })
             .unwrap_or_default()
+    }
+
+    fn ext_workspace_handles_of_manager(&self, manager_id: u32) -> Vec<u32> {
+        self.ext_workspace_managers
+            .get(&manager_id)
+            .map(|captured| captured.workspaces.clone())
+            .unwrap_or_default()
+    }
+
+    fn ext_workspace_handle_for_manager(
+        &self,
+        manager_id: u32,
+        name: &str,
+    ) -> Option<&ext_workspace_handle_v1::ExtWorkspaceHandleV1> {
+        self.ext_workspace_managers
+            .get(&manager_id)?
+            .workspaces
+            .iter()
+            .find_map(|id| {
+                let ws = self.ext_workspaces.get(id)?;
+                (ws.name == name).then(|| self.ext_workspace_proxies.get(id))?
+            })
     }
 
     fn ext_workspace_id(&self, name: &str) -> Option<String> {
@@ -414,6 +447,9 @@ impl ClientEnv {
                 "ext_workspace_manager_v1",
             );
         self.client.ext_workspace_manager = Some(manager.clone());
+        self.client
+            .ext_workspace_manager_proxies
+            .insert(manager.id().protocol_id(), manager.clone());
         self.pump();
         manager
     }
@@ -556,15 +592,21 @@ impl Dispatch<ext_session_lock_surface_v1::ExtSessionLockSurfaceV1, ()> for Clie
 impl Dispatch<ext_workspace_manager_v1::ExtWorkspaceManagerV1, ()> for ClientHarness {
     fn event(
         state: &mut Self,
-        _manager: &ext_workspace_manager_v1::ExtWorkspaceManagerV1,
+        manager: &ext_workspace_manager_v1::ExtWorkspaceManagerV1,
         event: ext_workspace_manager_v1::Event,
         _: &(),
         _: &Connection,
         _: &wayland_client::QueueHandle<Self>,
     ) {
+        let manager_id = manager.id().protocol_id();
+        state
+            .ext_workspace_manager_proxies
+            .insert(manager_id, manager.clone());
+        let captured = state.ext_workspace_managers.entry(manager_id).or_default();
         match event {
             ext_workspace_manager_v1::Event::WorkspaceGroup { workspace_group } => {
                 let id = workspace_group.id().protocol_id();
+                captured.groups.push(id);
                 state
                     .ext_workspace_groups
                     .insert(id, CapturedExtWorkspaceGroup::default());
@@ -574,12 +616,17 @@ impl Dispatch<ext_workspace_manager_v1::ExtWorkspaceManagerV1, ()> for ClientHar
             }
             ext_workspace_manager_v1::Event::Workspace { workspace } => {
                 let id = workspace.id().protocol_id();
+                captured.workspaces.push(id);
+                captured.workspaces_created += 1;
                 state
                     .ext_workspaces
                     .insert(id, CapturedExtWorkspace::default());
                 state.ext_workspace_proxies.insert(id, workspace);
             }
-            ext_workspace_manager_v1::Event::Done => state.ext_workspace_done += 1,
+            ext_workspace_manager_v1::Event::Done => {
+                captured.done += 1;
+                state.ext_workspace_done += 1;
+            }
             ext_workspace_manager_v1::Event::Finished => state.ext_workspace_finished += 1,
             _ => {}
         }
@@ -2279,6 +2326,13 @@ fn ext_workspace_global_publishes_every_workspace_and_activate_switches_composit
     let mut env = ClientEnv::new();
     let ws1 = env.state.active_ws_id.clone();
     let ws2 = env.state.ensure_workspace_by_name_or_id("2");
+    // A headless/agent workspace has no on-screen representation and must only be `hidden`.
+    let headless = env.state.ensure_workspace_by_name_or_id("agent");
+    env.state
+        .workspaces
+        .get_mut(&headless)
+        .expect("headless workspace")
+        .presentation = koma_model::PresentationTarget::Offscreen { lazy_fbo_slot: 0 };
     let manager = env.bind_ext_workspace_manager();
     env.pump();
 
@@ -2303,13 +2357,13 @@ fn ext_workspace_global_publishes_every_workspace_and_activate_switches_composit
         1,
         "the bar's bound wl_output must be reported through output_enter"
     );
-    assert_eq!(group.workspaces.len(), 2, "every workspace joins the group");
+    assert_eq!(group.workspaces.len(), 3, "every workspace joins the group");
     assert!(
         env.client.ext_workspace_done >= 1,
         "sync must end with done"
     );
 
-    assert_eq!(env.client.ext_workspaces.len(), 2);
+    assert_eq!(env.client.ext_workspaces.len(), 3);
     assert_eq!(
         env.client.ext_workspace_id("1"),
         Some(ws1.as_str().to_owned())
@@ -2324,9 +2378,15 @@ fn ext_workspace_global_publishes_every_workspace_and_activate_switches_composit
         "the focused workspace must be advertised as active"
     );
     assert_eq!(
-        env.client.ext_workspace_state("2") & EXT_WORKSPACE_STATE_HIDDEN,
+        env.client.ext_workspace_state("2"),
+        0,
+        "an ordinary unfocused workspace carries no state bits, so its click target survives \
+         `ignore-hidden: true`"
+    );
+    assert_eq!(
+        env.client.ext_workspace_state("agent") & EXT_WORKSPACE_STATE_HIDDEN,
         EXT_WORKSPACE_STATE_HIDDEN,
-        "an unfocused workspace must be advertised as hidden"
+        "a headless/agent workspace must be advertised as hidden"
     );
     let coordinates: Vec<u32> = env
         .client
@@ -2334,7 +2394,11 @@ fn ext_workspace_global_publishes_every_workspace_and_activate_switches_composit
         .values()
         .flat_map(|ws| ws.coordinates.clone())
         .collect();
-    assert_eq!(coordinates, vec![0, 1], "coordinates must be unique and 1D");
+    assert_eq!(
+        coordinates,
+        vec![0, 1, 2],
+        "coordinates must be unique and 1D"
+    );
     assert!(
         env.client
             .ext_workspaces
@@ -2360,8 +2424,9 @@ fn ext_workspace_global_publishes_every_workspace_and_activate_switches_composit
         EXT_WORKSPACE_STATE_ACTIVE
     );
     assert_eq!(
-        env.client.ext_workspace_state("1") & EXT_WORKSPACE_STATE_HIDDEN,
-        EXT_WORKSPACE_STATE_HIDDEN
+        env.client.ext_workspace_state("1"),
+        0,
+        "the switched-away workspace returns to an empty state, not hidden"
     );
 }
 
@@ -2370,17 +2435,14 @@ fn ext_workspace_states_track_compositor_initiated_workspace_switches() {
     let mut env = ClientEnv::new();
     let ws1 = env.state.active_ws_id.clone();
     let ws2 = env.state.ensure_workspace_by_name_or_id("2");
-    let _manager = env.bind_ext_workspace_manager();
+    let manager = env.bind_ext_workspace_manager();
     env.pump();
 
     assert_eq!(
         env.client.ext_workspace_state("1") & EXT_WORKSPACE_STATE_ACTIVE,
         EXT_WORKSPACE_STATE_ACTIVE
     );
-    assert_eq!(
-        env.client.ext_workspace_state("2") & EXT_WORKSPACE_STATE_HIDDEN,
-        EXT_WORKSPACE_STATE_HIDDEN
-    );
+    assert_eq!(env.client.ext_workspace_state("2"), 0);
 
     // Compositor-side switch (`ws.focus`/keybind path), not a bar request.
     assert!(env.state.focus_workspace(&ws2));
@@ -2391,9 +2453,9 @@ fn ext_workspace_states_track_compositor_initiated_workspace_switches() {
         "the compositor-side switch must publish active"
     );
     assert_eq!(
-        env.client.ext_workspace_state("1") & EXT_WORKSPACE_STATE_HIDDEN,
-        EXT_WORKSPACE_STATE_HIDDEN,
-        "the switched-away workspace must publish hidden"
+        env.client.ext_workspace_state("1"),
+        0,
+        "the switched-away workspace must drop its active bit"
     );
 
     assert!(env.state.focus_workspace(&ws1));
@@ -2402,13 +2464,42 @@ fn ext_workspace_states_track_compositor_initiated_workspace_switches() {
         env.client.ext_workspace_state("1") & EXT_WORKSPACE_STATE_ACTIVE,
         EXT_WORKSPACE_STATE_ACTIVE
     );
-    assert_eq!(
-        env.client.ext_workspace_state("2") & EXT_WORKSPACE_STATE_HIDDEN,
-        EXT_WORKSPACE_STATE_HIDDEN
-    );
+    assert_eq!(env.client.ext_workspace_state("2"), 0);
 
-    // Fail closed: a locked session must ignore `activate`.
+    // Fail closed: a locked session must ignore a committed `activate`.
     assert!(env.state.session_lock.try_lock(None));
+    env.client
+        .ext_workspace_by_name("2")
+        .expect("workspace 2 handle")
+        .activate();
+    manager.commit();
+    env.pump();
+    assert_eq!(
+        env.state.active_ws_id, ws1,
+        "activate must be ignored while the session is locked"
+    );
+}
+
+#[test]
+fn ext_workspace_activate_waits_for_commit_and_keeps_only_the_last_request() {
+    let mut env = ClientEnv::new();
+    env.state
+        .lua_sandbox
+        .eval_init_lua(
+            r##"
+            koma.on("workspace.focused", function(ctx, ev)
+                ctx:dispatch(koma.act.workspace.set_layout("deck", ev.name))
+            end)
+            "##,
+        )
+        .expect("workspace.focused hook must evaluate");
+    let ws1 = env.state.active_ws_id.clone();
+    let ws2 = env.state.ensure_workspace_by_name_or_id("2");
+    let ws3 = env.state.ensure_workspace_by_name_or_id("3");
+    let manager = env.bind_ext_workspace_manager();
+    env.pump();
+
+    // An activation that is never committed must not switch.
     env.client
         .ext_workspace_by_name("2")
         .expect("workspace 2 handle")
@@ -2416,7 +2507,192 @@ fn ext_workspace_states_track_compositor_initiated_workspace_switches() {
     env.pump();
     assert_eq!(
         env.state.active_ws_id, ws1,
-        "activate must be ignored while the session is locked"
+        "activate must not take effect before commit"
+    );
+
+    // Two activations in one batch: only the last one applies, and no intermediate workspace
+    // reaches `workspace.focused` (the hook would have set its layout to `Deck`).
+    env.client
+        .ext_workspace_by_name("2")
+        .expect("workspace 2 handle")
+        .activate();
+    env.client
+        .ext_workspace_by_name("3")
+        .expect("workspace 3 handle")
+        .activate();
+    manager.commit();
+    env.pump();
+    assert_eq!(env.state.active_ws_id, ws3);
+    assert_eq!(
+        env.state.workspaces[&ws3].layout_mode,
+        koma_model::LayoutMode::Deck,
+        "the committed workspace must emit `workspace.focused`"
+    );
+    assert_ne!(
+        env.state.workspaces[&ws2].layout_mode,
+        koma_model::LayoutMode::Deck,
+        "an intermediate activation in the same batch must never run"
+    );
+
+    // A pending request is dropped when the manager stops instead of committing.
+    env.client
+        .ext_workspace_by_name("2")
+        .expect("workspace 2 handle")
+        .activate();
+    manager.stop();
+    env.pump();
+    assert_eq!(
+        env.state.active_ws_id, ws3,
+        "an uncommitted activation must be dropped on stop"
+    );
+    assert_ne!(
+        env.state.workspaces[&ws2].layout_mode,
+        koma_model::LayoutMode::Deck
+    );
+}
+
+#[test]
+fn ext_workspace_handle_destroy_is_scoped_to_one_manager() {
+    let mut env = ClientEnv::new();
+    let _ = env.state.ensure_workspace_by_name_or_id("2");
+    let manager_a = env.bind_ext_workspace_manager();
+    let manager_b = env.bind_ext_workspace_manager();
+    env.pump();
+
+    let manager_a_id = manager_a.id().protocol_id();
+    let manager_b_id = manager_b.id().protocol_id();
+    let handles_named = |harness: &ClientHarness, manager_id: u32, name: &str| -> Vec<u32> {
+        harness
+            .ext_workspace_handles_of_manager(manager_id)
+            .into_iter()
+            .filter(|id| harness.ext_workspaces.get(id).map(|ws| ws.name.as_str()) == Some(name))
+            .collect()
+    };
+    assert_eq!(
+        env.client
+            .ext_workspace_handles_of_manager(manager_a_id)
+            .len(),
+        2,
+        "each manager instance gets its own handles"
+    );
+    let manager_b_handles = env.client.ext_workspace_handles_of_manager(manager_b_id);
+    assert_eq!(manager_b_handles.len(), 2);
+    let created_a = env.client.ext_workspace_managers[&manager_a_id].workspaces_created;
+    let created_b = env.client.ext_workspace_managers[&manager_b_id].workspaces_created;
+    assert_eq!((created_a, created_b), (2, 2));
+
+    let destroyed = env
+        .client
+        .ext_workspace_handle_for_manager(manager_a_id, "2")
+        .expect("manager A workspace 2 handle")
+        .clone();
+    destroyed.destroy();
+    env.pump();
+
+    // A later sync recreates only the destroyed manager's handle; the other manager keeps its
+    // original object instead of receiving a duplicate for the same workspace.
+    crate::ext_workspace::sync_ext_workspaces(&mut env.state);
+    env.pump();
+
+    assert_eq!(
+        env.client.ext_workspace_handles_of_manager(manager_b_id),
+        manager_b_handles,
+        "destroying one manager's handle must not touch another manager's objects"
+    );
+    assert_eq!(
+        handles_named(&env.client, manager_b_id, "2").len(),
+        1,
+        "the surviving manager must keep exactly one handle per workspace"
+    );
+    assert_eq!(
+        env.client.ext_workspace_managers[&manager_a_id].workspaces_created,
+        created_a + 1,
+        "the owning manager must get one fresh resource for the destroyed handle"
+    );
+    assert_eq!(
+        env.client.ext_workspace_managers[&manager_b_id].workspaces_created, created_b,
+        "no handle may be re-created for the untouched manager"
+    );
+}
+
+#[test]
+fn ext_workspace_cycle_focus_keeps_bar_state_in_sync() {
+    let mut env = ClientEnv::new();
+    env.state
+        .lua_sandbox
+        .eval_init_lua(
+            r##"
+            koma.on("workspace.focused", function(ctx, ev)
+                ctx:dispatch(koma.act.workspace.set_layout("deck", ev.name))
+            end)
+            "##,
+        )
+        .expect("workspace.focused hook must evaluate");
+    let ws2 = env.state.ensure_workspace_by_name_or_id("2");
+    let _manager = env.bind_ext_workspace_manager();
+    env.pump();
+    assert_eq!(
+        env.client.ext_workspace_state("1") & EXT_WORKSPACE_STATE_ACTIVE,
+        EXT_WORKSPACE_STATE_ACTIVE
+    );
+
+    execute_action_descriptor(&mut env.state, ActionDescriptor::WorkspaceFocusNext, false);
+    env.pump();
+
+    assert_eq!(env.state.active_ws_id, ws2);
+    assert_eq!(
+        env.client.ext_workspace_state("2") & EXT_WORKSPACE_STATE_ACTIVE,
+        EXT_WORKSPACE_STATE_ACTIVE,
+        "`WorkspaceFocusNext` must publish the new active workspace"
+    );
+    assert_eq!(
+        env.client.ext_workspace_state("1"),
+        0,
+        "the bar must stop reporting the previous workspace as active"
+    );
+    assert_eq!(
+        env.state.workspaces[&ws2].layout_mode,
+        koma_model::LayoutMode::Deck,
+        "`WorkspaceFocusNext` must emit `workspace.focused` like every other switch"
+    );
+}
+
+#[test]
+fn ext_workspace_group_delivers_output_leave_after_output_removal() {
+    let mut env = ClientEnv::new();
+    let _manager = env.bind_ext_workspace_manager();
+    env.pump();
+    let group_outputs = |env: &ClientEnv| -> Vec<u32> {
+        env.client
+            .ext_workspace_groups
+            .values()
+            .next()
+            .map(|group| group.outputs.clone())
+            .unwrap_or_default()
+    };
+    assert_eq!(group_outputs(&env).len(), 1);
+
+    // A second binding of the same physical output must be tracked separately.
+    let (global_name, version) = env.client.globals["wl_output"];
+    let qh = env.queue.handle();
+    let _second_binding =
+        env.registry
+            .bind::<wl_output::WlOutput, (), ClientHarness>(global_name, version, &qh, ());
+    env.pump();
+    assert_eq!(
+        group_outputs(&env).len(),
+        2,
+        "two bindings of one physical output are two group memberships"
+    );
+
+    // Hot-unplug: the retained `wl_output` resources still receive `output_leave`, even though
+    // `all_outputs()` no longer resolves the output.
+    env.state.test_outputs.clear();
+    crate::ext_workspace::sync_ext_workspaces(&mut env.state);
+    env.pump();
+    assert!(
+        group_outputs(&env).is_empty(),
+        "output_leave must reach the client after the output is gone"
     );
 }
 

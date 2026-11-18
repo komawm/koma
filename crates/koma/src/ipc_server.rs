@@ -872,12 +872,9 @@ pub(crate) fn dispatch_rpc(
                 .to_owned();
 
             // Resolve existing workspaces only: a bar click must not silently create
-            // one. The keybind path keeps its create-on-demand behaviour.
-            let known = state
-                .workspaces
-                .iter()
-                .any(|(id, ws)| id.as_str() == query || ws.name == query);
-            if !known {
+            // one. The keybind path keeps its create-on-demand behaviour. Exact ids win over
+            // names, so a workspace merely *named* `ws_01` cannot shadow workspace id `ws_01`.
+            if state.find_workspace_by_id_or_name(&query).is_none() {
                 return Err(IpcError::new(
                     ErrorSymbol::ErrNotFound,
                     format!("unknown workspace {query}"),
@@ -922,13 +919,9 @@ pub(crate) fn dispatch_rpc(
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
 
-            // Existing workspaces only: a bar click must not create one.
-            let Some(dst_ws_id) = state
-                .workspaces
-                .iter()
-                .find(|(id, ws)| id.as_str() == target || ws.name == target)
-                .map(|(id, _)| id.clone())
-            else {
+            // Existing workspaces only: a bar click must not create one. Exact ids win over
+            // names, matching `ws.focus`.
+            let Some(dst_ws_id) = state.find_workspace_by_id_or_name(&target) else {
                 return Err(IpcError::new(
                     ErrorSymbol::ErrNotFound,
                     format!("unknown workspace {target}"),
@@ -2663,6 +2656,81 @@ mod tests {
         )
         .expect_err("win.move_to_workspace is admin-only");
         assert_eq!(denied.symbol, ErrorSymbol::ErrCapabilityDenied);
+    }
+
+    #[test]
+    fn workspace_lookup_prefers_exact_ids_over_names() {
+        let (_event_loop, _display, mut state) = crate::state::tests::make_headless_test_state();
+        let ws1 = state.active_ws_id.clone();
+        assert_eq!(ws1.as_str(), "ws_01");
+
+        // A workspace deliberately *named* like the real id of another workspace.
+        let decoy_id = WorkspaceId::new("ws_09");
+        let now_ms = state.elapsed_ms();
+        state.workspaces.insert(
+            decoy_id.clone(),
+            WorkspaceState::new(
+                decoy_id.clone(),
+                ws1.as_str(),
+                SeatId::new("vseat_09"),
+                LogicalViewport::new(1920, 1080, 1.0),
+                PresentationTarget::Physical(koma_proto::OutputId::new("primary")),
+                LayoutMode::Dwindle,
+                now_ms,
+            ),
+        );
+        let src = state.ensure_workspace_by_name_or_id("2");
+        let win_id = insert_window(&mut state, &src);
+        let conn_id = 75_u64;
+        insert_admin_conn(&mut state, conn_id);
+
+        assert_eq!(
+            state.find_workspace_by_id_or_name("ws_01"),
+            Some(ws1.clone()),
+            "an exact workspace id must win over a workspace merely named `ws_01`"
+        );
+
+        let (_, _) = dispatch_rpc(
+            &mut state,
+            conn_id,
+            IpcRequest {
+                id: 1,
+                method: "ws.focus".to_owned(),
+                params: json!({ "ws_id": "ws_01" }),
+            },
+            Vec::new(),
+        )
+        .expect("ws.focus must resolve the exact id");
+        assert_eq!(state.active_ws_id, ws1, "ws.focus landed on the decoy name");
+
+        // Return to the window's workspace so the move has a source.
+        let (_, _) = dispatch_rpc(
+            &mut state,
+            conn_id,
+            IpcRequest {
+                id: 2,
+                method: "ws.focus".to_owned(),
+                params: json!({ "ws_id": "2" }),
+            },
+            Vec::new(),
+        )
+        .expect("ws.focus must switch back by name");
+        assert_eq!(state.active_ws_id, src);
+
+        let (moved, _) = dispatch_rpc(
+            &mut state,
+            conn_id,
+            IpcRequest {
+                id: 3,
+                method: "win.move_to_workspace".to_owned(),
+                params: json!({ "workspace": "ws_01" }),
+            },
+            Vec::new(),
+        )
+        .expect("win.move_to_workspace must resolve the exact id");
+        assert_eq!(moved["to_ws_id"], json!(ws1.as_str()));
+        assert_eq!(state.workspaces[&ws1].active_window(), Some(win_id));
+        assert_ne!(state.workspaces[&decoy_id].active_window(), Some(win_id));
     }
 
     #[test]

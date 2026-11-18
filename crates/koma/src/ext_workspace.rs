@@ -10,26 +10,37 @@
 //! - one `ext_workspace_handle_v1` per live workspace, carrying its door id ([`WorkspaceId`]) as
 //!   the protocol `id`, its human name, 1D coordinates in strip order, and the `active` /
 //!   `hidden` state bits;
-//! - the `activate` request routed through [`KomaState::focus_workspace`], the same single
-//!   switch path used by keybinds, `ws.focus` and followed window moves.
+//! - the `activate` request queued per manager and applied on
+//!   `ext_workspace_manager_v1.commit` (protocol v1 treats the requests preceding a commit as one
+//!   atomic batch, so two activations before a commit activate only the last one), then routed
+//!   through [`KomaState::focus_workspace`], the same single switch path used by keybinds,
+//!   `ws.focus` and followed window moves.
 //!
-//! Deliberate, documented subset (see the `komawm/docs` `IPC_SPEC.md` follow-up):
+//! State bits and the deliberate, documented subset (see the `komawm/docs` `IPC_SPEC.md` follow-up):
 //!
+//! - `active` means "currently displayed": the workspace is assigned to an output, is the open
+//!   `special:` overlay, or is the active workspace.
+//! - `hidden` marks workspaces that have no on-screen representation at all: headless/agent
+//!   workspaces (an offscreen FBO entry or an `Offscreen` presentation target). It is **not** set
+//!   on ordinary inactive workspaces, because the protocol defines `hidden` as "clients attempting
+//!   to visualize the compositor workspace state should not display such workspaces" — hiding an
+//!   inactive workspace would remove the click target a status bar needs. Ordinary inactive
+//!   workspaces therefore carry an empty state, and `ignore-hidden: true` keeps them visible while
+//!   dropping agent/headless workspaces from the strip.
 //! - `urgent` is never set: Koma has no window urgency notion yet, so no workspace can be urgent.
 //! - `deactivate`, `assign`, `remove`, `create_workspace` and the matching capabilities are not
 //!   advertised and are ignored when a client still sends them. Koma has no workspace destruction,
 //!   no output reassignment and no group re-parenting; a request that cannot be honoured must not
 //!   be advertised as supported.
-//! - `active` means "currently displayed": the workspace is assigned to an output, is the open
-//!   `special:` overlay, or is the active workspace. Everything else is `hidden`, matching the
-//!   protocol definition ("not visible in its workspace group"). Bars that do not want
-//!   agent/headless workspaces in the strip set `ignore-hidden: true`.
 //! - Group output membership is refreshed when a manager binds, when a `wl_output` is bound and on
 //!   every workspace state change, so a bar that binds outputs after the manager converges on the
-//!   next workspace event.
+//!   next workspace event. The exact `wl_output` resources reported to a client are retained, so a
+//!   later `output_leave` still reaches a client whose output was hot-unplugged and two bindings of
+//!   one physical output are tracked separately.
 
 use std::collections::HashMap;
 
+use koma_model::PresentationTarget;
 use koma_proto::WorkspaceId;
 use smithay::{
     output::Output,
@@ -65,6 +76,9 @@ pub struct ExtWorkspaceGroupUserData;
 #[derive(Debug)]
 pub struct ExtWorkspaceHandleUserData {
     pub ws_id: WorkspaceId,
+    /// Manager instance that owns this handle. A handle is destroyed only from its own
+    /// manager's bookkeeping, never from another client's manager.
+    pub manager: ExtWorkspaceManagerV1,
 }
 
 /// Property snapshot last sent to one client handle, so sync only emits changed properties.
@@ -87,8 +101,12 @@ struct WorkspaceRecord {
 struct GroupRecord {
     handle: ExtWorkspaceGroupHandleV1,
     capabilities_sent: bool,
-    /// `wl_output` protocol ids already reported through `output_enter`, with their output name.
-    outputs: HashMap<u32, String>,
+    /// Exact `wl_output` resources reported through `output_enter`, keyed by protocol id.
+    ///
+    /// Keeping the resources (instead of resolving outputs from `all_outputs()` later) lets
+    /// `output_leave` reach a client after the output was hot-unplugged, and keeps two bindings of
+    /// one physical output distinct.
+    outputs: HashMap<u32, WlOutput>,
 }
 
 #[derive(Debug)]
@@ -96,6 +114,12 @@ struct ManagerRecord {
     manager: ExtWorkspaceManagerV1,
     group: Option<GroupRecord>,
     workspaces: HashMap<WorkspaceId, WorkspaceRecord>,
+    /// Last `activate` requested since this manager's previous `commit`, applied on commit.
+    ///
+    /// `ext_workspace_manager_v1` defines the requests preceding a commit as one atomic batch, so
+    /// an activation that is never committed has no effect and two activations in one batch land
+    /// on the last workspace only.
+    pending_activation: Option<WorkspaceId>,
 }
 
 /// Per-client `ext-workspace-v1` object bookkeeping.
@@ -124,18 +148,25 @@ impl ExtWorkspaceState {
             .retain(|record| record.manager.id() != manager.id());
     }
 
-    fn remove_workspace_handle(&mut self, ws_id: &WorkspaceId) {
-        for record in &mut self.managers {
-            record.workspaces.remove(ws_id);
-        }
+    fn manager_mut(&mut self, manager: &ExtWorkspaceManagerV1) -> Option<&mut ManagerRecord> {
+        self.managers
+            .iter_mut()
+            .find(|record| record.manager.id() == manager.id())
     }
 }
 
-fn workspace_state_bits(is_visible: bool) -> WorkspaceStateBit {
-    if is_visible {
+/// Protocol state bits for one workspace.
+///
+/// `active` is the displayed workspace; `hidden` is reserved for workspaces that must not be
+/// visualized at all (headless/agent workspaces). Ordinary inactive workspaces stay empty so a
+/// status bar keeps their click targets.
+fn workspace_state_bits(displayed: bool, headless: bool) -> WorkspaceStateBit {
+    if displayed {
         WorkspaceStateBit::Active
-    } else {
+    } else if headless {
         WorkspaceStateBit::Hidden
+    } else {
+        WorkspaceStateBit::empty()
     }
 }
 
@@ -175,14 +206,19 @@ fn capture_snapshot(state: &KomaState) -> Vec<WorkspaceSnapshot> {
         .enumerate()
         .filter_map(|(index, ws_id)| {
             let ws = state.workspaces.get(&ws_id)?;
-            let visible = state.output_workspaces.values().any(|id| *id == ws_id)
+            let displayed = state.output_workspaces.values().any(|id| *id == ws_id)
                 || visible_special == Some(&ws_id)
                 || ws_id == state.active_ws_id;
+            // Headless/agent workspaces have no on-screen representation. A focused headless
+            // workspace keeps its offscreen FBO entry, but `displayed` wins so the bar still
+            // marks the workspace the human is actually looking at as active.
+            let headless = state.offscreen_surfaces.contains_key(&ws_id)
+                || matches!(ws.presentation, PresentationTarget::Offscreen { .. });
             Some(WorkspaceSnapshot {
                 ws_id,
                 name: ws.name.clone(),
                 coordinates: vec![u32::try_from(index).unwrap_or(u32::MAX)],
-                state: workspace_state_bits(visible),
+                state: workspace_state_bits(displayed, headless),
             })
         })
         .collect()
@@ -267,6 +303,7 @@ pub fn sync_ext_workspaces(state: &mut KomaState) {
                     version,
                     ExtWorkspaceHandleUserData {
                         ws_id: entry.ws_id.clone(),
+                        manager: record.manager.clone(),
                     },
                 ) else {
                     continue;
@@ -338,15 +375,14 @@ pub fn sync_ext_workspaces(state: &mut KomaState) {
 }
 
 /// Emits `output_enter` / `output_leave` so the single group tracks the client's live outputs.
+///
+/// The `wl_output` resources are retained per group so a leave can still be delivered after the
+/// compositor dropped the output, and so multiple bindings of one physical output stay distinct.
 fn sync_group_outputs(group: &mut GroupRecord, client: &Client, outputs: &[Output]) {
-    let mut desired: HashMap<u32, String> = HashMap::new();
+    let mut desired: HashMap<u32, WlOutput> = HashMap::new();
     for output in outputs {
-        // `Output::client_outputs` keeps the output mutex locked for the iterator's lifetime, so
-        // the name must be read before the iterator starts (a nested `output.name()` would
-        // self-deadlock on the non-reentrant `std::sync::Mutex`).
-        let name = output.name();
         for wl_output in output.client_outputs(client) {
-            desired.insert(wl_output.id().protocol_id(), name.clone());
+            desired.insert(wl_output.id().protocol_id(), wl_output);
         }
     }
 
@@ -357,29 +393,21 @@ fn sync_group_outputs(group: &mut GroupRecord, client: &Client, outputs: &[Outpu
         .copied()
         .collect();
     for protocol_id in stale {
-        let Some(name) = group.outputs.remove(&protocol_id) else {
+        let Some(wl_output) = group.outputs.remove(&protocol_id) else {
             continue;
         };
-        if let Some(wl_output) = find_client_output(client, outputs, &name) {
+        if wl_output.is_alive() {
             group.handle.output_leave(&wl_output);
         }
     }
 
-    for (protocol_id, name) in &desired {
-        if group.outputs.contains_key(protocol_id) {
+    for (protocol_id, wl_output) in desired {
+        if group.outputs.contains_key(&protocol_id) {
             continue;
         }
-        let Some(wl_output) = find_client_output(client, outputs, name) else {
-            continue;
-        };
         group.handle.output_enter(&wl_output);
-        group.outputs.insert(*protocol_id, name.clone());
+        group.outputs.insert(protocol_id, wl_output);
     }
-}
-
-fn find_client_output(client: &Client, outputs: &[Output], name: &str) -> Option<WlOutput> {
-    let output = outputs.iter().find(|output| output.name() == name)?.clone();
-    output.client_outputs(client).next()
 }
 
 impl GlobalDispatch2<ExtWorkspaceManagerV1, KomaState> for ExtWorkspaceGlobalData {
@@ -400,6 +428,7 @@ impl GlobalDispatch2<ExtWorkspaceManagerV1, KomaState> for ExtWorkspaceGlobalDat
             manager,
             group: None,
             workspaces: HashMap::new(),
+            pending_activation: None,
         });
         // Child objects must not be created from inside a `bind` dispatch: `DataInit` still
         // holds the client's object-map borrow, so `Client::create_resource` would self-deadlock.
@@ -421,8 +450,22 @@ impl Dispatch2<ExtWorkspaceManagerV1, KomaState> for ExtWorkspaceManagerUserData
         _data_init: &mut DataInit<'_, KomaState>,
     ) {
         match request {
-            // Requests are applied as they arrive, so a commit has nothing left to batch.
-            ext_workspace_manager_v1::Request::Commit => {}
+            ext_workspace_manager_v1::Request::Commit => {
+                // Protocol v1: the requests preceding a commit form one atomic batch. Apply the
+                // last activation only, so intermediate workspaces never become visible or reach
+                // `workspace.focused` hooks.
+                let pending = state
+                    .ext_workspace_state
+                    .manager_mut(manager)
+                    .and_then(|record| record.pending_activation.take());
+                let Some(ws_id) = pending else {
+                    return;
+                };
+                if state.is_locked_or_abandoned() || !state.workspaces.contains_key(&ws_id) {
+                    return;
+                }
+                state.focus_workspace(&ws_id);
+            }
             ext_workspace_manager_v1::Request::Stop => {
                 manager.finished();
                 state.ext_workspace_state.remove_manager(manager);
@@ -467,13 +510,10 @@ impl Dispatch2<ExtWorkspaceHandleV1, KomaState> for ExtWorkspaceHandleUserData {
     ) {
         match request {
             ext_workspace_handle_v1::Request::Activate => {
-                // Fail closed while the session is locked: a bar must not surface another
-                // workspace over the lock screen.
-                if state.is_locked_or_abandoned() {
-                    return;
-                }
-                if state.workspaces.contains_key(&self.ws_id) {
-                    state.focus_workspace(&self.ws_id);
+                // Queued until the owning manager commits; the commit applies it atomically and
+                // re-checks the lock gate, so an uncommitted or locked request never switches.
+                if let Some(record) = state.ext_workspace_state.manager_mut(&self.manager) {
+                    record.pending_activation = Some(self.ws_id.clone());
                 }
             }
             // Unadvertised capabilities: the protocol requires the compositor to ignore them.
@@ -486,9 +526,11 @@ impl Dispatch2<ExtWorkspaceHandleV1, KomaState> for ExtWorkspaceHandleUserData {
     }
 
     fn destroyed(&self, state: &mut KomaState, _client: ClientId, _handle: &ExtWorkspaceHandleV1) {
-        state
-            .ext_workspace_state
-            .remove_workspace_handle(&self.ws_id);
+        // Remove only this manager instance's handle: another attached manager (or another
+        // client) keeps its own object for the same workspace.
+        if let Some(record) = state.ext_workspace_state.manager_mut(&self.manager) {
+            record.workspaces.remove(&self.ws_id);
+        }
     }
 }
 
@@ -496,14 +538,80 @@ impl Dispatch2<ExtWorkspaceHandleV1, KomaState> for ExtWorkspaceHandleUserData {
 mod tests {
     use super::*;
     use crate::state::tests::make_headless_test_state;
+    use koma_render::offscreen_fbo::LazyOffscreenSurface;
 
     #[test]
-    fn workspace_state_bits_mark_visible_workspaces_active_and_others_hidden() {
-        assert_eq!(workspace_state_bits(true), WorkspaceStateBit::Active);
-        assert_eq!(workspace_state_bits(false), WorkspaceStateBit::Hidden);
+    fn workspace_state_bits_mark_only_displayed_and_headless_workspaces() {
+        assert_eq!(
+            workspace_state_bits(true, false),
+            WorkspaceStateBit::Active,
+            "a displayed workspace is active"
+        );
         assert!(
-            !workspace_state_bits(true).contains(WorkspaceStateBit::Hidden),
-            "active and hidden are mutually exclusive state bits"
+            workspace_state_bits(false, false).is_empty(),
+            "an ordinary inactive workspace must carry no state bits, so bars keep its click target"
+        );
+        assert_eq!(
+            workspace_state_bits(false, true),
+            WorkspaceStateBit::Hidden,
+            "a headless/agent workspace has no on-screen representation"
+        );
+        assert_eq!(
+            workspace_state_bits(true, true),
+            WorkspaceStateBit::Active,
+            "displaying a formerly headless workspace wins over hiding it"
+        );
+    }
+
+    #[test]
+    fn snapshot_marks_displayed_active_headless_hidden_and_plain_inactive_empty() {
+        let (_event_loop, _display, mut state) = make_headless_test_state();
+        let ws1 = state.active_ws_id.clone();
+        let ws2 = state.ensure_workspace_by_name_or_id("2");
+        let ws3 = state.ensure_workspace_by_name_or_id("3");
+        let ws4 = state.ensure_workspace_by_name_or_id("4");
+
+        // Two independent headless markers: an offscreen presentation and an offscreen FBO entry.
+        state.workspaces.get_mut(&ws3).expect("ws3").presentation =
+            PresentationTarget::Offscreen { lazy_fbo_slot: 0 };
+        state
+            .offscreen_surfaces
+            .insert(ws4.clone(), LazyOffscreenSurface::new(1920, 1080, 1.0));
+
+        let state_of = |snapshot: &[WorkspaceSnapshot], ws_id: &WorkspaceId| {
+            snapshot
+                .iter()
+                .find(|entry| &entry.ws_id == ws_id)
+                .map(|entry| entry.state)
+                .expect("workspace in snapshot")
+        };
+
+        let snapshot = capture_snapshot(&state);
+        assert_eq!(state_of(&snapshot, &ws1), WorkspaceStateBit::Active);
+        assert!(
+            state_of(&snapshot, &ws2).is_empty(),
+            "an ordinary inactive workspace is neither active nor hidden"
+        );
+        assert_eq!(
+            state_of(&snapshot, &ws3),
+            WorkspaceStateBit::Hidden,
+            "an offscreen presentation marks a headless workspace"
+        );
+        assert_eq!(
+            state_of(&snapshot, &ws4),
+            WorkspaceStateBit::Hidden,
+            "an offscreen FBO entry marks an agent/headless workspace"
+        );
+
+        // Displayed headless workspaces become active instead of hidden.
+        state
+            .output_workspaces
+            .insert("DP-1".to_owned(), ws4.clone());
+        let snapshot = capture_snapshot(&state);
+        assert_eq!(
+            state_of(&snapshot, &ws4),
+            WorkspaceStateBit::Active,
+            "display wins over the headless marker"
         );
     }
 

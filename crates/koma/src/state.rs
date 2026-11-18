@@ -1152,18 +1152,30 @@ impl KomaState {
         ws_id
     }
 
+    /// Resolves `query` to an existing workspace, matching exact workspace ids before names.
+    ///
+    /// A workspace may be *named* `ws_01` while the real workspace with id `ws_01` is a different
+    /// workspace, so id precedence must be explicit: a single `id == query || name == query` scan
+    /// over a `HashMap` would pick whichever entry iterated first.
+    #[must_use]
+    pub fn find_workspace_by_id_or_name(&self, query: &str) -> Option<WorkspaceId> {
+        if let Some((id, _)) = self.workspaces.iter().find(|(id, _)| id.as_str() == query) {
+            return Some(id.clone());
+        }
+        self.workspaces
+            .iter()
+            .find(|(_, ws)| ws.name == query)
+            .map(|(id, _)| id.clone())
+    }
+
     /// Resolves an existing workspace by `WorkspaceId` or `name`, or lazily creates a new workspace
     /// applying `registry.default_layout` and any matching `WorkspaceSpec` (`layout`, `gaps`).
     pub fn ensure_workspace_by_name_or_id(&mut self, query: &str) -> WorkspaceId {
         if query.starts_with(koma_model::SPECIAL_WORKSPACE_PREFIX) {
             return self.ensure_special_workspace(Some(query));
         }
-        if let Some((existing_id, _)) = self
-            .workspaces
-            .iter()
-            .find(|(id, ws)| id.as_str() == query || ws.name == query)
-        {
-            return existing_id.clone();
+        if let Some(existing_id) = self.find_workspace_by_id_or_name(query) {
+            return existing_id;
         }
 
         let next_idx = self.workspaces.len() + 1;
@@ -1812,8 +1824,9 @@ impl KomaState {
             return false;
         }
         self.break_active_pointer_constraints();
-        let prev_ws = self.active_ws_id.clone();
-        let prev_output = self.focused_output_name.clone();
+        // Compare the *effective interactive* workspace, so dismissing a `special:` overlay over
+        // the target workspace still emits its activation event.
+        let prev_effective = self.effective_interactive_ws_id();
         self.active_special_ws_id = None;
         self.focused_output_name = Some(target_name.to_owned());
         let ws_id = self.ensure_initial_workspace_for_output(&target_out);
@@ -1853,7 +1866,7 @@ impl KomaState {
         self.sync_foreign_toplevels();
         self.queue_redraw();
         sync_ext_workspaces(self);
-        if prev_ws != ws_id || prev_output.as_deref() != Some(target_name) {
+        if self.effective_interactive_ws_id() != prev_effective {
             let presentation = match self.workspaces.get(&ws_id).map(|ws| &ws.presentation) {
                 Some(PresentationTarget::Offscreen { .. }) => "headless",
                 _ => "physical",
@@ -1865,13 +1878,29 @@ impl KomaState {
 
     /// Makes `ws_id` the focused workspace, switching the output that owns it when needed.
     ///
-    /// This is the single workspace-switch path shared by `workspace.focus`, `ws.focus` and
-    /// window moves that follow the window (`Hyprland` `movetoworkspace`), so a followed move
-    /// lands in exactly the same state as an explicit workspace focus.
+    /// This is the single workspace-switch path shared by `workspace.focus`, `ws.focus`,
+    /// `WorkspaceFocusNext`/`Prev`, `ext-workspace-v1.activate` and window moves that follow the
+    /// window (`Hyprland` `movetoworkspace`), so every one of them lands in exactly the same state
+    /// and publishes the same activation event.
     pub fn focus_workspace(&mut self, ws_id: &WorkspaceId) -> bool {
+        self.focus_workspace_with_direction(ws_id, 0)
+    }
+
+    /// [`Self::focus_workspace`] with an explicit slide direction for the workspace transition.
+    ///
+    /// `direction_hint` is `0` for an implicit direction derived from the workspace names and
+    /// `1` / `-1` for `WorkspaceFocusNext` / `WorkspaceFocusPrev`.
+    pub fn focus_workspace_with_direction(
+        &mut self,
+        ws_id: &WorkspaceId,
+        direction_hint: i32,
+    ) -> bool {
         let Some(is_special) = self.workspaces.get(ws_id).map(|ws| ws.is_special) else {
             return false;
         };
+        // Re-focusing the workspace that is already interactive (including re-opening the same
+        // `special:` overlay) is not a transition: emit nothing, so hooks do not reset state.
+        let prev_effective = self.effective_interactive_ws_id();
         self.break_active_pointer_constraints();
         if is_special {
             self.active_special_ws_id = Some(ws_id.clone());
@@ -1880,8 +1909,10 @@ impl KomaState {
             self.sync_foreign_toplevels();
             self.queue_redraw();
             sync_ext_workspaces(self);
-            let out_name = self.focused_output_name.clone();
-            self.emit_workspace_activated(ws_id, out_name.as_deref(), "special");
+            if self.effective_interactive_ws_id() != prev_effective {
+                let out_name = self.focused_output_name.clone();
+                self.emit_workspace_activated(ws_id, out_name.as_deref(), "special");
+            }
             return true;
         }
 
@@ -1917,19 +1948,18 @@ impl KomaState {
         }
         self.focus_active_deck_window();
         if let Some(out_name) = switched_out.as_deref() {
-            self.trigger_workspace_transition(out_name, &prev_ws_id, ws_id, 0);
+            self.trigger_workspace_transition(out_name, &prev_ws_id, ws_id, direction_hint);
         }
         self.reconcile_idle_inhibitors();
         self.sync_foreign_toplevels();
         self.queue_redraw();
         sync_ext_workspaces(self);
-        if switched_out.is_none() && prev_ws_id != *ws_id {
-            // Output-less switch (no backend output yet): still a real transition.
+        if self.effective_interactive_ws_id() != prev_effective {
             let presentation = match self.workspaces.get(ws_id).map(|ws| &ws.presentation) {
                 Some(PresentationTarget::Offscreen { .. }) => "headless",
                 _ => "physical",
             };
-            self.emit_workspace_activated(ws_id, None, presentation);
+            self.emit_workspace_activated(ws_id, switched_out.as_deref(), presentation);
         }
         true
     }
@@ -4920,7 +4950,11 @@ impl KomaState {
         crate::macro_runtime::rearm_trampoline_timer(self);
     }
 
-    /// Triggers a per-output headed workspace slide/fade transition and emits `"workspace.focused"`.
+    /// Triggers the per-output headed workspace slide/fade transition for a workspace switch.
+    ///
+    /// Animation only: the `"workspace.focused"` hook is emitted by the switch path itself
+    /// (`focus_workspace` / `focus_output`) after the effective interactive workspace changed, so
+    /// an animation retrigger can never double-emit or fire for a no-op switch.
     pub fn trigger_workspace_transition(
         &mut self,
         output_name: &str,
@@ -4960,8 +4994,6 @@ impl KomaState {
             &anim_cfg,
             is_offscreen,
         );
-        let presentation = if is_offscreen { "headless" } else { "physical" };
-        self.emit_workspace_activated(new_ws, Some(output_name), presentation);
     }
 
     /// Emits the `workspace.focused` Lua hook for a completed workspace activation.
@@ -5903,6 +5935,79 @@ pub(crate) mod tests {
             state.workspaces[&ws_move].layout_mode,
             LayoutMode::Deck,
             "a followed window move must emit `workspace.focused` for the destination"
+        );
+    }
+
+    #[test]
+    fn special_overlay_switches_emit_exactly_once_per_real_transition() {
+        use smithay::output::{Mode, PhysicalProperties, Subpixel};
+
+        let (_el, _disp, mut state) = make_headless_test_state();
+        state
+            .lua_sandbox
+            .eval_init_lua(
+                r##"
+                koma.on("workspace.focused", function(ctx, ev)
+                    ctx:dispatch(koma.act.workspace.set_layout("deck", ev.name))
+                end)
+                "##,
+            )
+            .expect("Lua event hooks must evaluate");
+
+        let output = Output::new(
+            "eDP-1".to_owned(),
+            PhysicalProperties {
+                size: (800, 340).into(),
+                subpixel: Subpixel::Unknown,
+                make: "Test".to_owned(),
+                model: "Panel".to_owned(),
+                serial_number: "edp-1".to_owned(),
+            },
+        );
+        output.change_current_state(
+            Some(Mode {
+                size: (1920, 1080).into(),
+                refresh: 60_000,
+            }),
+            None,
+            Some(Scale::Integer(1)),
+            None,
+        );
+        state.test_outputs = vec![output.clone()];
+        state.register_or_update_output(&output, Some((0, 0)), SafeAreaInsets::default(), true);
+
+        let underlying = state.active_workspace_for_output("eDP-1");
+        let special = state.ensure_special_workspace(Some("magic"));
+        assert!(state.focus_workspace(&special));
+        assert_eq!(state.workspaces[&special].layout_mode, LayoutMode::Deck);
+
+        // Re-opening the already focused special workspace is not a transition: the hook must not
+        // run again, so the sentinel layout survives.
+        state
+            .workspaces
+            .get_mut(&special)
+            .expect("special workspace")
+            .layout_mode = LayoutMode::Dwindle;
+        assert!(state.focus_workspace(&special));
+        assert_eq!(
+            state.workspaces[&special].layout_mode,
+            LayoutMode::Dwindle,
+            "re-focusing the open special workspace must not emit `workspace.focused` again"
+        );
+
+        // Dismissing the overlay with an output focus lands on the underlying workspace, which is
+        // a real transition even though `active_ws_id` never changed.
+        state
+            .workspaces
+            .get_mut(&underlying)
+            .expect("underlying workspace")
+            .layout_mode = LayoutMode::Dwindle;
+        assert!(state.focus_output("eDP-1"));
+        assert_eq!(state.active_ws_id, underlying);
+        assert_eq!(
+            state.workspaces[&underlying].layout_mode,
+            LayoutMode::Deck,
+            "dismissing a special overlay must emit the underlying workspace activation"
         );
     }
 
