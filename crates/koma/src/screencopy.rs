@@ -53,6 +53,7 @@ use tracing::{debug, warn};
 
 use crate::{
     backend_winit::{append_ime_popup_elements, append_layer_tier_elements},
+    keybind_overlay::prepend_keybind_overlay_elements,
     security_context::client_is_unrestricted,
     state::KomaState,
 };
@@ -988,6 +989,16 @@ fn build_screencopy_elements<'a>(
 
     if state.config_error_banner.is_some() {
         prepend_config_error_banner(viewport, &mut elements);
+    }
+    if state.keybind_overlay_is_open() {
+        prepend_keybind_overlay_elements(
+            renderer,
+            state,
+            &output.name(),
+            viewport,
+            output_scale,
+            &mut elements,
+        );
     }
 
     prepend_agent_cursor_elements(

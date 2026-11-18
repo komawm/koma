@@ -758,6 +758,16 @@ impl KomaState {
             return;
         };
         let serial = SERIAL_COUNTER.next_serial();
+
+        // The keybind overview owns the pointer too: track the cursor for its own frame but never
+        // forward motion or focus changes to the clients behind the scrim.
+        if self.keybind_overlay_is_open() && !self.is_locked_or_abandoned() {
+            self.pointer_location = self.clamp_pointer_to_outputs(candidate_pos);
+            pointer.frame(self);
+            self.queue_redraw();
+            return;
+        }
+
         let rel_event = RelativeMotionEvent {
             delta,
             delta_unaccel,
