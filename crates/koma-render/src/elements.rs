@@ -945,7 +945,7 @@ render_elements! {
     DropShadow = KomaDropShadowElement,
     AgentCursor = KomaAgentCursorElement,
     AgentTrail = KomaAgentTrailElement,
-    CursorBuffer = MemoryRenderBufferRenderElement<R>,
+    MemoryBuffer = MemoryRenderBufferRenderElement<R>,
     Solid = KomaSolidColorElement,
 }
 
@@ -1178,7 +1178,7 @@ pub fn rasterize_label_pill_argb8888(
     (pixels, w, h)
 }
 
-/// Builds a Smithay `CursorBuffer` render element displaying a rasterized [`LabelPillSnapshot`].
+/// Builds a Smithay `MemoryBuffer` render element displaying a rasterized [`LabelPillSnapshot`].
 #[must_use]
 pub fn build_label_pill_element<R>(
     renderer: &mut R,
@@ -1217,7 +1217,7 @@ where
         Kind::Unspecified,
     )
     .ok()
-    .map(KomaRenderElement::CursorBuffer)
+    .map(KomaRenderElement::MemoryBuffer)
 }
 
 #[cfg(test)]

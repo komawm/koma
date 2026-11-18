@@ -30,9 +30,9 @@ use koma_render::{
     RenderTargetKind,
     elements::KomaRenderElement,
     frame_composer::{
-        DEFAULT_BACKDROP_CLEAR, FrameBlurContext, append_scratchpad_dim_scrim,
-        append_tab_indicator_elements, assemble_workspace_elements, prepend_agent_cursor_elements,
-        prepend_config_error_banner,
+        DEFAULT_BACKDROP_CLEAR, FrameBlurContext, append_closing_window_elements,
+        append_scratchpad_dim_scrim, append_tab_indicator_elements, assemble_workspace_elements,
+        prepend_agent_cursor_elements, prepend_config_error_banner,
     },
 };
 use libc::dev_t;
@@ -2281,6 +2281,14 @@ fn render_single_drm_surface(
             &base_scene_items,
         );
         elements.extend(ws_elements);
+        // Captured closing frames linger above the window layers while `windows_close` settles.
+        let mut closing_items = state.closing_window_scene_items(&out_ws_id);
+        if let Some(sp_id) = state.active_special_ws_id.as_ref()
+            && sp_id != &out_ws_id
+        {
+            closing_items.extend(state.closing_window_scene_items(sp_id));
+        }
+        append_closing_window_elements(&mut renderer, &closing_items, &mut elements);
         if state.config_error_banner.is_some() {
             prepend_config_error_banner(viewport, &mut elements);
         }

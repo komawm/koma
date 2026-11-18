@@ -19,8 +19,8 @@ use koma_render::{
     RenderTargetKind,
     elements::KomaRenderElement,
     frame_composer::{
-        append_tab_indicator_elements, assemble_workspace_elements, prepend_agent_cursor_elements,
-        prepend_config_error_banner,
+        append_closing_window_elements, append_tab_indicator_elements, assemble_workspace_elements,
+        prepend_agent_cursor_elements, prepend_config_error_banner,
     },
     offscreen_fbo::LazyOffscreenSurface,
 };
@@ -970,6 +970,15 @@ fn build_screencopy_elements<'a>(
         base_items,
     );
     elements.extend(ws_elems);
+    // A screencast mirrors the physical output, so captured closing frames must appear here too.
+    let mut closing_items = state.closing_window_scene_items(ws_id);
+    // Special-overlay items are assembled above; keep their closing frames in the same layer.
+    if let Some(sp_id) = state.active_special_ws_id.as_ref()
+        && sp_id != ws_id
+    {
+        closing_items.extend(state.closing_window_scene_items(sp_id));
+    }
+    append_closing_window_elements(renderer, &closing_items, &mut elements);
 
     append_layer_tier_elements(
         renderer,
