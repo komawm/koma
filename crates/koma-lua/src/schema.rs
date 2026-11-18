@@ -88,6 +88,8 @@ pub enum ActionDescriptor {
     OverviewToggle,
     OverviewOpen,
     ScrollStripSwipe,
+    /// Toggles the compositor-rendered keybind overview overlay.
+    OverlayKeybindsToggle,
     WorkspaceFocus(String),
     WorkspaceFocusNext,
     WorkspaceFocusPrev,

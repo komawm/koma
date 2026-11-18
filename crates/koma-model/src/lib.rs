@@ -13,6 +13,7 @@ pub mod clock;
 pub mod cursor_path;
 pub mod dwindle;
 pub mod geometry;
+pub mod keybind_overlay;
 pub mod kinematics;
 pub mod layout;
 pub mod lease;
@@ -44,6 +45,10 @@ pub use crate::{
     },
     geometry::{
         Anchor9, AnchorPoint, LogicalPoint, LogicalRect, LogicalViewport, SafeAreaInsets, SizeHints,
+    },
+    keybind_overlay::{
+        KeybindOverlayLayout, KeybindOverlayRow, KeybindOverlayText, KeybindOverlayTextRole,
+        compact_chord, layout_keybind_overlay,
     },
     kinematics::{
         BezierPointerSolver, MAX_POINTER_SPRING_MS, MinimumJerkSolver, PointerSpring2D,
