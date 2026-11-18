@@ -260,13 +260,16 @@ pub(crate) fn layer_entry_location(
 /// tree has committed a buffer yet (the first frame of a layer client is buffer-less by protocol).
 /// Buffer-backed layers are always returned, so a `Background` wallpaper can never be dropped from
 /// the element list for lack of a cached geometry (komawm/koma#31).
+///
+/// `tiers` is a slice so the fullscreen policy can suppress the foreground tiers entirely
+/// (`KomaState::output_layer_tiers`) while every tier literal still lives in the two constants above.
 pub(crate) fn layer_tier_entries(
     map: &LayerMap,
-    tiers: [Layer; 2],
+    tiers: &[Layer],
 ) -> Vec<(LayerSurface, Point<i32, smithay::utils::Logical>)> {
     let mut entries = Vec::new();
     for tier in tiers {
-        for layer in map.layers_on(tier).rev() {
+        for layer in map.layers_on(*tier).rev() {
             if !layer.alive() {
                 continue;
             }
@@ -285,7 +288,7 @@ pub(crate) fn append_layer_tier_elements<R>(
     renderer: &mut R,
     output: &Output,
     output_scale: smithay::utils::Scale<f64>,
-    tiers: [Layer; 2],
+    tiers: &[Layer],
     elements: &mut Vec<koma_render::elements::KomaRenderElement<R>>,
 ) where
     R: smithay::backend::renderer::Renderer + smithay::backend::renderer::ImportAll,
@@ -538,18 +541,19 @@ pub fn render_winit_frame(state: &mut KomaState) -> anyhow::Result<()> {
                 output_scale,
                 &mut elements,
             );
+            let layer_tiers = state.output_layer_tiers(&out_ws_id);
             append_layer_tier_elements(
                 winit_state.backend.renderer(),
                 &winit_state.output,
                 output_scale,
-                FOREGROUND_LAYER_TIERS,
+                layer_tiers.above_toplevels,
                 &mut elements,
             );
             append_layer_tier_elements(
                 winit_state.backend.renderer(),
                 &winit_state.output,
                 output_scale,
-                BACKGROUND_LAYER_TIERS,
+                layer_tiers.below_toplevels,
                 &mut bg_layer_elements,
             );
 
@@ -596,7 +600,7 @@ pub fn render_winit_frame(state: &mut KomaState) -> anyhow::Result<()> {
 
             if let Some(ws) = state.workspaces.get(&out_ws_id)
                 && ws.layout_mode == koma_model::LayoutMode::Scrolling
-                && ws.fullscreen_window.is_none()
+                && ws.presented_window_id().is_none()
             {
                 let cam_x = ws.scrolling.peek_camera_x(state.elapsed_ms());
                 let tab_segs = ws.scrolling.tab_indicator_segments_at(viewport, cam_x);

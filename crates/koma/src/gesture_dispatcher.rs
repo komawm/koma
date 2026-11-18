@@ -604,7 +604,7 @@ pub fn process_gesture_swipe_update<B: InputBackend + 'static>(
     let is_preempted = active_ws_is_preempted(state);
     let interactive_ws_id = state.effective_interactive_ws_id();
     let interactive_is_scrolling = state.workspaces.get(&interactive_ws_id).is_some_and(|ws| {
-        ws.layout_mode == LayoutMode::Scrolling && ws.fullscreen_window.is_none()
+        ws.layout_mode == LayoutMode::Scrolling && ws.presented_window_id().is_none()
     });
 
     let mut next_step = PostSwipeStep::None;

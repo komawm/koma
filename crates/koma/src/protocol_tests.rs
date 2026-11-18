@@ -19,6 +19,9 @@ use smithay::reexports::wayland_protocols::ext::foreign_toplevel_list::v1::clien
 use smithay::reexports::wayland_protocols::ext::idle_notify::v1::client::{
     ext_idle_notification_v1, ext_idle_notifier_v1,
 };
+use smithay::reexports::wayland_protocols::ext::session_lock::v1::client::{
+    ext_session_lock_manager_v1, ext_session_lock_surface_v1, ext_session_lock_v1,
+};
 use smithay::reexports::wayland_protocols::wp::fractional_scale::v1::client::{
     wp_fractional_scale_manager_v1, wp_fractional_scale_v1,
 };
@@ -195,6 +198,9 @@ struct ClientHarness {
     gamma_sizes: Vec<u32>,
     gamma_failed: usize,
     locked_events: Vec<&'static str>,
+    session_lock_locked: usize,
+    session_lock_finished: usize,
+    session_lock_configures: Vec<(u32, u32, u32)>,
     confined_events: Vec<&'static str>,
     relative_motions: Vec<(f64, f64, f64, f64)>,
     icon_sizes: Vec<i32>,
@@ -418,6 +424,55 @@ impl Dispatch<wl_registry::WlRegistry, ()> for ClientHarness {
                 _ => {}
             }
             state.globals.insert(interface, (name, version));
+        }
+    }
+}
+
+impl Dispatch<ext_session_lock_manager_v1::ExtSessionLockManagerV1, ()> for ClientHarness {
+    fn event(
+        _: &mut Self,
+        _: &ext_session_lock_manager_v1::ExtSessionLockManagerV1,
+        _: ext_session_lock_manager_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &wayland_client::QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<ext_session_lock_v1::ExtSessionLockV1, ()> for ClientHarness {
+    fn event(
+        state: &mut Self,
+        _: &ext_session_lock_v1::ExtSessionLockV1,
+        event: ext_session_lock_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &wayland_client::QueueHandle<Self>,
+    ) {
+        match event {
+            ext_session_lock_v1::Event::Locked => state.session_lock_locked += 1,
+            ext_session_lock_v1::Event::Finished => state.session_lock_finished += 1,
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<ext_session_lock_surface_v1::ExtSessionLockSurfaceV1, ()> for ClientHarness {
+    fn event(
+        state: &mut Self,
+        _: &ext_session_lock_surface_v1::ExtSessionLockSurfaceV1,
+        event: ext_session_lock_surface_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &wayland_client::QueueHandle<Self>,
+    ) {
+        if let ext_session_lock_surface_v1::Event::Configure {
+            serial,
+            width,
+            height,
+        } = event
+        {
+            state.session_lock_configures.push((serial, width, height));
         }
     }
 }
@@ -1593,8 +1648,6 @@ fn foreign_toplevel_wlr_and_ext_list_lifecycle_and_lock_guard() {
 
     editor_handle.set_maximized();
     editor_handle.set_minimized();
-    editor_handle.set_fullscreen(None);
-    editor_handle.set_rectangle(&surf1, 10, 20, 300, 200);
     env.pump();
     let m1 = env
         .state
@@ -1602,9 +1655,23 @@ fn foreign_toplevel_wlr_and_ext_list_lifecycle_and_lock_guard() {
         .iter()
         .find(|m| m.win_id == win1)
         .expect("win1");
-    assert!(m1.is_maximized);
+    assert!(env.state.is_window_maximized(win1));
     assert!(m1.is_minimized);
-    assert_eq!(env.state.workspaces[&ws1].fullscreen_window, Some(win1));
+    assert_eq!(env.state.workspaces[&ws1].fullscreen_window(), None);
+    assert_eq!(
+        m1.rect,
+        env.state.workspaces[&ws1].maximized_rect(),
+        "maximize must apply real work-area geometry, not the dwindle tile"
+    );
+
+    editor_handle.set_fullscreen(None);
+    editor_handle.set_rectangle(&surf1, 10, 20, 300, 200);
+    env.pump();
+    assert_eq!(env.state.workspaces[&ws1].fullscreen_window(), Some(win1));
+    assert!(
+        !env.state.is_window_maximized(win1),
+        "fullscreen and maximize are mutually exclusive"
+    );
 
     editor_handle.unset_maximized();
     editor_handle.unset_minimized();
@@ -1616,9 +1683,9 @@ fn foreign_toplevel_wlr_and_ext_list_lifecycle_and_lock_guard() {
         .iter()
         .find(|m| m.win_id == win1)
         .expect("win1");
-    assert!(!m1.is_maximized);
+    assert!(!env.state.is_window_maximized(win1));
     assert!(!m1.is_minimized);
-    assert_eq!(env.state.workspaces[&ws1].fullscreen_window, None);
+    assert_eq!(env.state.workspaces[&ws1].fullscreen_window(), None);
 
     // Locked session blocks foreign activation.
     assert!(env.state.session_lock.try_lock(None));
@@ -2000,6 +2067,86 @@ fn screencopy_copy_with_damage_waits_for_damage_and_minimizing_clears_focus() {
 }
 
 #[test]
+fn move_to_workspace_follow_and_silent_variants_move_keyboard_focus() {
+    let mut env = ClientEnv::new();
+    let ws1 = env.state.active_ws_id.clone();
+    let _surf_a = env.spawn_window("Stay", "org.koma.stay").0;
+    let (_surf_b, _xs_b, _tl_b) = env.spawn_window("Moved", "org.koma.moved");
+    let moved_win = env.state.mapped_windows[1].win_id;
+    let moved_server_surface = mapped_surface(&env.state, moved_win);
+    env.state.focus_active_deck_window();
+    assert_eq!(
+        env.state.seat.get_keyboard().unwrap().current_focus(),
+        Some(moved_server_surface.clone()),
+        "the newest window must start keyed"
+    );
+
+    execute_action_descriptor(
+        &mut env.state,
+        ActionDescriptor::WindowMoveToWorkspace {
+            workspace: "2".to_owned(),
+            follow: true,
+        },
+        false,
+    );
+    let ws2 = env.state.active_ws_id.clone();
+    assert_ne!(ws1, ws2, "follow must switch the active workspace");
+    assert_eq!(env.state.workspaces[&ws2].active_window(), Some(moved_win));
+    assert_eq!(
+        env.state.seat.get_keyboard().unwrap().current_focus(),
+        Some(moved_server_surface),
+        "the moved window must hold keyboard focus after a followed move"
+    );
+
+    // A new window on the destination becomes active; the silent move of that window
+    // must keep the destination workspace and the previous window focused.
+    let (_surf_c, _xs_c, _tl_c) = env.spawn_window("Silent", "org.koma.silent");
+    let silent_win = env.state.mapped_windows[2].win_id;
+    let silent_server_surface = mapped_surface(&env.state, silent_win);
+    env.state.focus_active_deck_window();
+    assert_eq!(
+        env.state.seat.get_keyboard().unwrap().current_focus(),
+        Some(silent_server_surface.clone())
+    );
+
+    execute_action_descriptor(
+        &mut env.state,
+        ActionDescriptor::WindowMoveToWorkspace {
+            workspace: "3".to_owned(),
+            follow: false,
+        },
+        false,
+    );
+    assert_eq!(
+        env.state.active_ws_id, ws2,
+        "silent move must keep the source workspace focused"
+    );
+    assert_eq!(env.state.workspaces[&ws2].active_window(), Some(moved_win));
+    assert_eq!(
+        env.state.seat.get_keyboard().unwrap().current_focus(),
+        Some(mapped_surface(&env.state, moved_win))
+    );
+    assert_ne!(
+        env.state.seat.get_keyboard().unwrap().current_focus(),
+        Some(silent_server_surface),
+        "the silently moved window must not keep keyboard focus"
+    );
+}
+
+fn mapped_surface(
+    state: &KomaState,
+    win_id: koma_proto::WindowId,
+) -> smithay::reexports::wayland_server::protocol::wl_surface::WlSurface {
+    state
+        .mapped_windows
+        .iter()
+        .find(|m| m.win_id == win_id)
+        .and_then(|m| m.window.toplevel())
+        .map(|t| t.wl_surface().clone())
+        .expect("mapped toplevel")
+}
+
+#[test]
 fn wlr_output_manager_head_advertisement_test_apply_cancel_and_sandbox() {
     use koma_model::SafeAreaInsets;
     use smithay::{
@@ -2344,6 +2491,171 @@ fn multi_monitor_window_move_fractional_scale_and_notch_layer_shell_composition(
 }
 
 #[test]
+fn fullscreen_window_suppresses_top_and_overlay_layer_tiers_but_keeps_background() {
+    use smithay::desktop::layer_map_for_output;
+    use smithay::wayland::shell::wlr_layer::Layer;
+
+    let mut env = ClientEnv::new();
+    let qh = env.queue.handle();
+    let compositor =
+        env.client
+            .bind::<wl_compositor::WlCompositor>(&env.registry, &qh, "wl_compositor");
+    let layer_shell = env.client.bind::<zwlr_layer_shell_v1::ZwlrLayerShellV1>(
+        &env.registry,
+        &qh,
+        "zwlr_layer_shell_v1",
+    );
+    let shm = env
+        .client
+        .bind::<wl_shm::WlShm>(&env.registry, &qh, "wl_shm");
+    env.client.compositor = Some(compositor.clone());
+    env.client.shm = Some(shm.clone());
+
+    // Real Waybar-shaped client: `Top` tier, anchored top edge with a 24 px exclusive zone.
+    let bar_surf = compositor.create_surface(&qh, ());
+    let wl_out = env.client.outputs[0].clone();
+    let bar_layer = layer_shell.get_layer_surface(
+        &bar_surf,
+        Some(&wl_out),
+        zwlr_layer_shell_v1::Layer::Top,
+        "koma-bar".to_owned(),
+        &qh,
+        (),
+    );
+    bar_layer.set_size(1920, 24);
+    bar_layer.set_anchor(zwlr_layer_surface_v1::Anchor::Top);
+    bar_layer.set_exclusive_zone(24);
+    bar_surf.commit();
+    env.pump();
+    let bar_fd = create_portable_shm_fd(1920 * 24 * 4, None);
+    let bar_pool = shm.create_pool(bar_fd.as_fd(), 1920 * 24 * 4, &qh, ());
+    let bar_buf = bar_pool.create_buffer(0, 1920, 24, 1920 * 4, wl_shm::Format::Argb8888, &qh, ());
+    bar_surf.attach(Some(&bar_buf), 0, 0);
+    bar_surf.commit();
+    env.pump();
+
+    let (_surf1, _xs1, _tl1) = env.spawn_window("Editor", "org.koma.editor");
+    let (_surf2, _xs2, _tl2) = env.spawn_window("Browser", "org.koma.browser");
+
+    let ws_id = env.state.active_workspace_for_output("DP-1");
+    let win1 = env.state.mapped_windows[0].win_id;
+    assert_eq!(env.state.mapped_windows.len(), 2);
+
+    // Panels are composited above toplevels and the desktop background stays behind them.
+    let tiers = env.state.output_layer_tiers(&ws_id);
+    assert_eq!(
+        tiers.above_toplevels,
+        [Layer::Overlay, Layer::Top].as_slice(),
+        "Top/Overlay tiers composite above tiled windows while nothing is fullscreen"
+    );
+    assert_eq!(
+        tiers.below_toplevels,
+        [Layer::Bottom, Layer::Background].as_slice()
+    );
+
+    let ws = env
+        .state
+        .workspaces
+        .get_mut(&ws_id)
+        .expect("DP-1 workspace");
+    let work_area = ws.viewport.work_area_rect();
+    assert_eq!(
+        work_area.y, 24,
+        "the 24 px bar must reserve work area before fullscreen"
+    );
+    ws.set_fullscreen(win1, true);
+    env.state.sync_workspace_geometries(&ws_id);
+
+    // Fullscreen: the bar tier is skipped for this output, background tier survives.
+    let tiers = env.state.output_layer_tiers(&ws_id);
+    assert!(
+        tiers.above_toplevels.is_empty(),
+        "Top/Overlay tiers must not composite over a fullscreen window"
+    );
+    assert_eq!(
+        tiers.below_toplevels,
+        [Layer::Bottom, Layer::Background].as_slice(),
+        "background layers must stay composited behind a fullscreen window"
+    );
+
+    // The policy is render-time only: the bar stays mapped and reclaims the output afterwards.
+    let map = layer_map_for_output(&env._output);
+    assert_eq!(
+        map.layers_on(Layer::Top).count(),
+        1,
+        "the layer surface must remain mapped, only its tier is skipped"
+    );
+    drop(map);
+
+    // The fullscreen toplevel is the only window element, hence front-most, and covers the
+    // physical output rect including the reserved bar strip.
+    let ws = env.state.workspaces.get(&ws_id).expect("DP-1 workspace");
+    assert_eq!(
+        ws.compute_visible_geometries(),
+        vec![(win1, koma_model::LogicalRect::new(0, 0, 1920, 1080), false)]
+    );
+    let items = env.state.collect_workspace_scene_items(&ws_id, false);
+    assert_eq!(items.len(), 1, "sibling windows are not composited");
+    let expected_root = env
+        .state
+        .mapped_windows
+        .iter()
+        .find(|m| m.win_id == win1)
+        .and_then(|m| m.window.toplevel().map(|t| t.wl_surface().clone()))
+        .expect("fullscreen toplevel surface");
+    assert!(
+        items[0]
+            .window
+            .toplevel()
+            .is_some_and(|t| *t.wl_surface() == expected_root),
+        "the fullscreen toplevel must be the front-most window element"
+    );
+
+    // Leaving fullscreen restores the bar tier.
+    env.state
+        .workspaces
+        .get_mut(&ws_id)
+        .expect("DP-1 workspace")
+        .set_fullscreen(win1, false);
+    let tiers = env.state.output_layer_tiers(&ws_id);
+    assert_eq!(
+        tiers.above_toplevels,
+        [Layer::Overlay, Layer::Top].as_slice()
+    );
+
+    // Maximize is distinct from fullscreen: the bar stays composited and the window fills only
+    // the gapped work area.
+    let maximized = {
+        let ws = env
+            .state
+            .workspaces
+            .get_mut(&ws_id)
+            .expect("DP-1 workspace");
+        ws.set_maximized(win1, true);
+        let maximized = ws.maximized_rect();
+        assert_eq!(maximized.y, work_area.y + ws.outer_gap() as i32);
+        assert_ne!(maximized, ws.viewport.full_rect());
+        maximized
+    };
+    env.state.sync_workspace_geometries(&ws_id);
+    let tiers = env.state.output_layer_tiers(&ws_id);
+    assert_eq!(
+        tiers.above_toplevels,
+        [Layer::Overlay, Layer::Top].as_slice(),
+        "maximize must not hide the bar"
+    );
+    let ws = env.state.workspaces.get(&ws_id).expect("DP-1 workspace");
+    assert_eq!(
+        ws.compute_visible_geometries(),
+        vec![(win1, maximized, false)]
+    );
+
+    bar_layer.destroy();
+    bar_buf.destroy();
+    bar_pool.destroy();
+}
+
+#[test]
 fn screencopy_v1_emits_single_buffer_event_and_ready() {
     let mut env = ClientEnv::new();
     let qh = env.queue.handle();
@@ -2466,7 +2778,7 @@ fn background_layer_surface_enters_frame_list_below_toplevels() {
     let map = layer_map_for_output(&env._output);
     assert_eq!(map.layers_on(Layer::Background).count(), 1);
     assert!(
-        layer_tier_entries(&map, BACKGROUND_LAYER_TIERS).is_empty(),
+        layer_tier_entries(&map, &BACKGROUND_LAYER_TIERS).is_empty(),
         "a buffer-less Background surface must be skipped instead of emitting a 0x0 element"
     );
     drop(map);
@@ -2482,7 +2794,7 @@ fn background_layer_surface_enters_frame_list_below_toplevels() {
     env.pump();
 
     let map = layer_map_for_output(&env._output);
-    let background = layer_tier_entries(&map, BACKGROUND_LAYER_TIERS);
+    let background = layer_tier_entries(&map, &BACKGROUND_LAYER_TIERS);
     assert_eq!(
         background.len(),
         1,
@@ -2498,7 +2810,7 @@ fn background_layer_surface_enters_frame_list_below_toplevels() {
     assert_eq!(bg_geometry.size, Size::from((1920, 1080)));
     // A Background surface must never be collected as a foreground layer (no double draw).
     assert!(
-        layer_tier_entries(&map, FOREGROUND_LAYER_TIERS).is_empty(),
+        layer_tier_entries(&map, &FOREGROUND_LAYER_TIERS).is_empty(),
         "Background tier must not leak into the Overlay/Top list"
     );
     drop(map);
@@ -2528,14 +2840,14 @@ fn background_layer_surface_enters_frame_list_below_toplevels() {
     env.pump();
 
     let map = layer_map_for_output(&env._output);
-    let foreground = layer_tier_entries(&map, FOREGROUND_LAYER_TIERS);
+    let foreground = layer_tier_entries(&map, &FOREGROUND_LAYER_TIERS);
     assert_eq!(
         foreground.len(),
         1,
         "the Top bar must stay in the foreground list"
     );
     assert_eq!(
-        layer_tier_entries(&map, BACKGROUND_LAYER_TIERS).len(),
+        layer_tier_entries(&map, &BACKGROUND_LAYER_TIERS).len(),
         1,
         "the wallpaper must survive a Top-tier commit"
     );
@@ -4218,6 +4530,132 @@ mod kom_0024_compat_tests {
             Some(koma_proto::DeliverySemantics::not_delivered_safe())
         );
     }
+}
+
+/// Drives the real `ext-session-lock-v1` wire protocol (`Locked` -> `Confirm` -> `Unlock`) against
+/// the headless seat and asserts every phase reaches a render pass (komawm/koma#37).
+///
+/// Reproduces the KOM-0043 hang: `SessionLockHandler::new_surface` reconciles keyboard focus while
+/// the session is locked, Smithay calls `SeatHandler::focus_changed` while holding the keyboard
+/// mutex, and the locked branch re-entered `KeyboardHandle::current_focus()` -> self-deadlock.
+#[test]
+fn session_lock_acquire_confirm_unlock_cycles_schedule_rendering() {
+    use crate::state::{SessionLockPhase, is_surface_mapped, output_logical_viewport};
+
+    let mut env = ClientEnv::new();
+    let qh = env.queue.handle();
+    let manager = env
+        .client
+        .bind::<ext_session_lock_manager_v1::ExtSessionLockManagerV1>(
+            &env.registry,
+            &qh,
+            "ext_session_lock_manager_v1",
+        );
+    let compositor =
+        env.client
+            .bind::<wl_compositor::WlCompositor>(&env.registry, &qh, "wl_compositor");
+    let shm = env
+        .client
+        .bind::<wl_shm::WlShm>(&env.registry, &qh, "wl_shm");
+    let wl_out = env.client.outputs[0].clone();
+
+    let out = env.state.test_outputs[0].clone();
+    let (width, height, scale) = output_logical_viewport(&out);
+    assert_eq!(scale, 1.0, "test output must be integer-scaled");
+    let stride = width * 4;
+    let shm_fd = create_portable_shm_fd((stride * height) as usize, None);
+    let pool = shm.create_pool(shm_fd.as_fd(), (stride * height) as i32, &qh, ());
+    let buffer = pool.create_buffer(
+        0,
+        width as i32,
+        height as i32,
+        stride as i32,
+        wl_shm::Format::Argb8888,
+        &qh,
+        (),
+    );
+
+    for cycle in 0..3 {
+        // --- Acquire ------------------------------------------------------------
+        env.state.redraw_queued = false;
+        let lock = manager.lock(&qh, ());
+        env.pump();
+        assert_eq!(
+            env.client.session_lock_locked,
+            cycle + 1,
+            "client got Locked"
+        );
+        assert!(
+            matches!(env.state.session_lock.phase, SessionLockPhase::Locked(_)),
+            "compositor must transition to Locked"
+        );
+        assert!(
+            env.state.redraw_queued,
+            "acquire must schedule a blackout render pass"
+        );
+
+        // --- Confirm: lock surface create + configure + first commit ------------
+        let surface = compositor.create_surface(&qh, ());
+        let lock_surface = lock.get_lock_surface(&surface, &wl_out, &qh, ());
+        env.state.redraw_queued = false;
+        env.pump();
+        assert_eq!(
+            env.state.session_lock.surfaces.len(),
+            1,
+            "LockSurface must be registered for the output"
+        );
+        let configure = *env
+            .client
+            .session_lock_configures
+            .last()
+            .expect("lock surface must receive a configure");
+        assert_eq!((configure.1, configure.2), (width, height));
+
+        lock_surface.ack_configure(configure.0);
+        surface.attach(Some(&buffer), 0, 0);
+        env.state.redraw_queued = false;
+        surface.commit();
+        env.pump();
+        let lock_surface_ref = env
+            .state
+            .session_lock
+            .active_lock_surface_for_output(&out)
+            .cloned()
+            .expect("lock surface stays active");
+        assert!(
+            is_surface_mapped(lock_surface_ref.wl_surface()),
+            "committed lock surface must be mapped so the locked frame draws it"
+        );
+        assert!(
+            env.state.redraw_queued,
+            "LockSurface commit must schedule a render pass while locked"
+        );
+
+        // --- Unlock -------------------------------------------------------------
+        env.state.redraw_queued = false;
+        lock.unlock_and_destroy();
+        env.pump();
+        assert_eq!(
+            env.state.session_lock.phase,
+            SessionLockPhase::Unlocked,
+            "unlock must return to Unlocked"
+        );
+        assert!(
+            env.state.session_lock.surfaces.is_empty(),
+            "unlock must not leak LockSurface handles"
+        );
+        assert!(
+            env.state.redraw_queued,
+            "unlock must schedule a render pass of the unlocked scene"
+        );
+
+        surface.destroy();
+        env.pump();
+    }
+
+    assert_eq!(env.client.session_lock_finished, 0);
+    buffer.destroy();
+    pool.destroy();
 }
 
 /// `komawm/koma#33`: a split must never configure a client below the `xdg_toplevel.set_min_size`

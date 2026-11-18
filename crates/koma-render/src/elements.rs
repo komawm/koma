@@ -507,11 +507,25 @@ impl<R: KomaRenderTarget> RenderElement<R> for KomaBlurredBackdropElement {
 // 4. `KomaSolidColorElement` & Unified `KomaRenderElement<R>`
 // ==============================================================================
 
+/// Converts a straight-alpha `RGBA` color into the premultiplied form the GLES frame expects.
+///
+/// Every Koma color constant and pixel-shader uniform is authored in straight (non-premultiplied)
+/// alpha; the pixel shaders multiply `rgb * a` themselves (see `shaders.rs`). Smithay's
+/// `Frame::draw_solid` does *not* premultiply, and its blend function is
+/// `ONE, ONE_MINUS_SRC_ALPHA` (premultiplied), so a straight-alpha solid color has to be
+/// premultiplied here or it blends in at `1 / alpha` times its intended intensity.
+#[must_use]
+pub fn premultiplied_rgba(rgba: [f32; 4]) -> [f32; 4] {
+    let a = rgba[3].clamp(0.0, 1.0);
+    [rgba[0] * a, rgba[1] * a, rgba[2] * a, a]
+}
+
 #[derive(Debug, Clone)]
 pub struct KomaSolidColorElement {
     id: Id,
     geometry: Rectangle<f64, Logical>,
     commit: CommitCounter,
+    /// Straight-alpha color as authored by callers; premultiplied only at draw time.
     color: Color32F,
     kind: Kind,
 }
@@ -591,7 +605,13 @@ impl<R: Renderer> RenderElement<R> for KomaSolidColorElement {
         _opaque_regions: &[Rectangle<i32, Physical>],
         _cache: Option<&UserDataMap>,
     ) -> Result<(), R::Error> {
-        frame.draw_solid(dst, damage, self.color)
+        let [r, g, b, a] = premultiplied_rgba([
+            self.color.r(),
+            self.color.g(),
+            self.color.b(),
+            self.color.a(),
+        ]);
+        frame.draw_solid(dst, damage, Color32F::new(r, g, b, a))
     }
 
     fn underlying_storage(&self, _renderer: &mut R) -> Option<UnderlyingStorage<'_>> {
@@ -1225,6 +1245,44 @@ mod tests {
     use koma_model::{LogicalRect, place_label_pill};
 
     use super::*;
+
+    #[test]
+    fn solid_color_premultiplies_straight_alpha_for_premultiplied_blending() {
+        // The drop-zone preview fill is authored as straight `#58a6ff` at 18 % alpha. Under
+        // `BlendFunc(ONE, ONE_MINUS_SRC_ALPHA)` a straight-alpha value would land at ~5x its
+        // intended intensity (a bright blue wash over the whole drop rect), so the element has to
+        // premultiply before handing the color to `draw_solid`.
+        let straight = [0.345, 0.651, 1.0, 0.18];
+        let premul = premultiplied_rgba(straight);
+        assert!((premul[0] - 0.0621).abs() < 1e-4, "r {}", premul[0]);
+        assert!((premul[1] - 0.11718).abs() < 1e-4, "g {}", premul[1]);
+        assert!((premul[2] - 0.18).abs() < 1e-4, "b {}", premul[2]);
+        assert!((premul[3] - 0.18).abs() < 1e-6, "a {}", premul[3]);
+        for (i, channel) in premul[..3].iter().enumerate() {
+            assert!(
+                *channel <= premul[3] + 1e-6,
+                "premultiplied channel {i} exceeds alpha"
+            );
+        }
+
+        // Opaque colors must pass through unchanged, otherwise every blackout rect would tint.
+        let opaque = [0.0, 0.0, 0.0, 1.0];
+        assert_eq!(premultiplied_rgba(opaque), opaque);
+        let accent = [0.345, 0.651, 1.0, 1.0];
+        assert_eq!(premultiplied_rgba(accent), accent);
+    }
+
+    #[test]
+    fn solid_color_element_keeps_authored_color_and_alpha() {
+        // Callers keep using straight-alpha constants; only the draw path premultiplies.
+        let rect = Rectangle::from_size(Size::from((16.0, 16.0)));
+        let element = KomaSolidColorElement::oneshot(rect, [0.345, 0.651, 1.0, 0.18]);
+        assert!((element.alpha() - 0.18).abs() < 1e-6);
+        assert_eq!(element.color.r(), 0.345);
+        assert_eq!(element.color.g(), 0.651);
+        assert_eq!(element.color.b(), 1.0);
+        assert!(!element.color.is_opaque());
+    }
 
     #[test]
     fn label_pill_rasterizer_draws_backdrop_accent_bar_and_visible_glyphs() {

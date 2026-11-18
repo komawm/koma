@@ -10,9 +10,7 @@ use std::{
 };
 
 use koma_lua::{ActionDescriptor, BindHandleId, BindOptions, BindSpec, schema::TriggerEdge};
-use koma_model::{
-    CardinalDir, LogicalPoint, PresentationTarget, SPECIAL_WORKSPACE_PREFIX, WorkspaceState,
-};
+use koma_model::{CardinalDir, LogicalPoint, PresentationTarget, WorkspaceState};
 use koma_proto::WorkspaceId;
 use smithay::{
     backend::input::{
@@ -32,7 +30,7 @@ use crate::{
     macro_runtime::{execute_queued_host_actions, rearm_trampoline_timer},
     pointer_grabs::{
         BTN_EXTRA, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, BTN_SIDE, cancel_active_pointer_grab,
-        start_compositor_move_grab, start_compositor_resize_grab,
+        start_compositor_move_grab, start_compositor_resize_grab, start_frame_edge_resize_grab,
     },
     state::KomaState,
 };
@@ -343,9 +341,10 @@ impl KeybindTable {
                 None,
             ),
             (30, "Mod + C", ActionDescriptor::ScrollingCenterColumn, None),
+            (31, "Mod + M", ActionDescriptor::WindowMaximizeToggle, None),
             (
-                31,
-                "Mod + M",
+                36,
+                "Mod + Shift + M",
                 ActionDescriptor::ScrollingMaximizeColumn,
                 None,
             ),
@@ -533,7 +532,10 @@ impl KeybindTable {
                     enabled: true,
                     raw_chord: move_chord_str,
                     chord,
-                    press_action: Some(ActionDescriptor::WindowMoveToWorkspace(ws_name)),
+                    press_action: Some(ActionDescriptor::WindowMoveToWorkspace {
+                        workspace: ws_name,
+                        follow: true,
+                    }),
                     release_action: None,
                     options: BindOptions::default(),
                 });
@@ -1065,7 +1067,26 @@ pub fn process_pointer_button_event(
         }
     }
 
-    // 4. Normal unintercepted click: clear any stale suppression, apply layer/window focus, and forward!
+    // 4. Frame edge/corner drag starts an interactive resize with no modifier
+    //    (`Hyprland` border-drag parity, komawm/koma#42).
+    if button_code == BTN_LEFT
+        && let Some(edge) = state.frame_edge_under_pointer(state.pointer_location)
+        && start_frame_edge_resize_grab(state, button_code, serial, edge)
+    {
+        pointer.button(
+            state,
+            &ButtonEvent {
+                button: button_code,
+                state: btn_state,
+                serial,
+                time,
+            },
+        );
+        pointer.frame(state);
+        return;
+    }
+
+    // 5. Normal unintercepted click: clear any stale suppression, apply layer/window focus, and forward!
     state.keybinds.suppressed_buttons.remove(&button_code);
     let cursor_pos = state.pointer_location;
     state.handle_pointer_button_focus(cursor_pos);
@@ -1885,14 +1906,27 @@ pub fn execute_action_descriptor(
                     ws.toggle_fullscreen(id);
                 }
                 state.sync_workspace_geometries(&ws_id);
+                state.sync_foreign_toplevels();
                 state.queue_redraw();
             }
         }
 
-        ActionDescriptor::WindowMoveToWorkspace(target_name) => {
-            let dst_ws_id = state.ensure_workspace_by_name_or_id(&target_name);
+        ActionDescriptor::WindowMaximizeToggle => {
+            let ws_id = state.effective_interactive_ws_id();
+            let active_id = state
+                .workspaces
+                .get(&ws_id)
+                .and_then(WorkspaceState::active_window);
+            if let Some(id) = active_id {
+                state.toggle_window_maximized(id);
+            }
+        }
+
+        ActionDescriptor::WindowMoveToWorkspace { workspace, follow } => {
+            let dst_ws_id = state.ensure_workspace_by_name_or_id(&workspace);
             let src_ws_id = state.effective_interactive_ws_id();
-            let _ = state.move_active_window_between_workspaces(&src_ws_id, &dst_ws_id);
+            let _ = state
+                .move_active_window_between_workspaces_with_follow(&src_ws_id, &dst_ws_id, follow);
         }
 
         ActionDescriptor::WindowMoveToMonitor(target_monitor) => {
@@ -2199,9 +2233,11 @@ pub fn execute_action_descriptor(
             let src_ws_id = state.effective_interactive_ws_id();
             if src_ws_id == sp_id {
                 let dst_ws_id = state.active_ws_id.clone();
-                let _ = state.move_active_window_between_workspaces(&sp_id, &dst_ws_id);
+                let _ = state
+                    .move_active_window_between_workspaces_with_follow(&sp_id, &dst_ws_id, false);
             } else {
-                let _ = state.move_active_window_between_workspaces(&src_ws_id, &sp_id);
+                let _ = state
+                    .move_active_window_between_workspaces_with_follow(&src_ws_id, &sp_id, false);
                 if !silent {
                     state.active_special_ws_id = Some(sp_id);
                 }
@@ -2262,57 +2298,8 @@ pub fn execute_action_descriptor(
         }
 
         ActionDescriptor::WorkspaceFocus(target) | ActionDescriptor::WorkspacePeek(target) => {
-            state.break_active_pointer_constraints();
-            if target.starts_with(SPECIAL_WORKSPACE_PREFIX) {
-                let sp_id = state.ensure_special_workspace(Some(&target));
-                state.active_special_ws_id = Some(sp_id);
-                state.focus_active_deck_window();
-                state.reconcile_idle_inhibitors();
-                state.sync_foreign_toplevels();
-                state.queue_redraw();
-            } else {
-                let ws_id = state.ensure_workspace_by_name_or_id(&target);
-                if let Some(hosting_out) = state
-                    .output_workspaces
-                    .iter()
-                    .find(|(_, id)| *id == &ws_id)
-                    .map(|(name, _)| name.clone())
-                {
-                    let _ = state.focus_output(&hosting_out);
-                    return;
-                }
-                state.active_special_ws_id = None;
-                let prev_ws_id = state.active_ws_id.clone();
-                state.active_ws_id = ws_id.clone();
-                let mut switched_out: Option<String> = None;
-                if let Some(focused_out) = state.focused_output() {
-                    let out_name = focused_out.name();
-                    state
-                        .output_workspaces
-                        .insert(out_name.clone(), ws_id.clone());
-                    let vp = state.viewport_for_output(&focused_out);
-                    let now_ms = state.elapsed_ms();
-                    if let Some(ws) = state.workspaces.get_mut(&ws_id) {
-                        ws.presentation = koma_model::PresentationTarget::Physical(
-                            koma_proto::OutputId::new(&out_name),
-                        );
-                        if ws.viewport != vp {
-                            ws.viewport = vp;
-                            ws.recalculate(now_ms);
-                        }
-                    }
-                    state.sync_workspace_geometries(&ws_id);
-                    state.sync_window_output_membership(&ws_id);
-                    switched_out = Some(out_name);
-                }
-                state.focus_active_deck_window();
-                if let Some(out_name) = switched_out {
-                    state.trigger_workspace_transition(&out_name, &prev_ws_id, &ws_id, 0);
-                }
-                state.reconcile_idle_inhibitors();
-                state.sync_foreign_toplevels();
-                state.queue_redraw();
-            }
+            let ws_id = state.ensure_workspace_by_name_or_id(&target);
+            let _ = state.focus_workspace(&ws_id);
         }
 
         ActionDescriptor::WorkspaceFocusNext => {
@@ -2595,6 +2582,35 @@ mod tests {
     }
 
     #[test]
+    fn builtin_mod_m_maximizes_and_mod_f_stays_fullscreen() {
+        let defaults = KeybindTable::with_builtin_defaults();
+        let action_for = |spec: &str| {
+            let chord = parse_chord_spec(spec).expect("valid chord");
+            defaults
+                .binds
+                .iter()
+                .find(|b| b.chord == chord)
+                .and_then(|b| b.press_action.clone())
+        };
+
+        assert_eq!(
+            action_for("Mod + M"),
+            Some(ActionDescriptor::WindowMaximizeToggle),
+            "Mod + M must toggle the maximize presentation state"
+        );
+        assert_eq!(
+            action_for("Mod + F"),
+            Some(ActionDescriptor::WindowFullscreenToggle),
+            "Mod + F must stay fullscreen"
+        );
+        assert_eq!(
+            action_for("Mod + Shift + M"),
+            Some(ActionDescriptor::ScrollingMaximizeColumn),
+            "the scrolling-only maximize column action must remain reachable"
+        );
+    }
+
+    #[test]
     fn builtin_defaults_include_hyprland_workspace_1_to_9_and_compile_with_options_overrides_and_unbinds()
      {
         let defaults = KeybindTable::with_builtin_defaults();
@@ -2608,7 +2624,11 @@ mod tests {
             }));
             assert!(defaults.binds.iter().any(|b| {
                 b.chord == move_chord
-                    && b.press_action == Some(ActionDescriptor::WindowMoveToWorkspace(ws.clone()))
+                    && b.press_action
+                        == Some(ActionDescriptor::WindowMoveToWorkspace {
+                            workspace: ws.clone(),
+                            follow: true,
+                        })
             }));
         }
 

@@ -102,6 +102,63 @@ impl ResizeCorner {
     pub const fn has_bottom(self) -> bool {
         matches!(self, Self::BottomLeft | Self::BottomRight | Self::Bottom)
     }
+
+    /// Resolves the grab edge/corner for a pointer at `cursor` within `threshold` logical pixels of
+    /// the outer frame `rect`, or `None` when the pointer is not on the frame.
+    ///
+    /// Corners win over edges, so a 6x6 corner still resizes diagonally. When the frame is thinner
+    /// than twice the threshold the nearer edge wins instead of an ambiguous two-edge match. A point
+    /// outside the frame by more than `threshold` is never a resize target, so the client area and
+    /// the surrounding gaps stay click-through.
+    #[must_use]
+    pub fn frame_edge_at(rect: LogicalRect, cursor: LogicalPoint, threshold: f64) -> Option<Self> {
+        if rect.w == 0 || rect.h == 0 {
+            return None;
+        }
+        let t = threshold.max(1.0);
+        let left = f64::from(rect.x);
+        let top = f64::from(rect.y);
+        let right = left + f64::from(rect.w);
+        let bottom = top + f64::from(rect.h);
+        if cursor.x < left - t
+            || cursor.x > right + t
+            || cursor.y < top - t
+            || cursor.y > bottom + t
+        {
+            return None;
+        }
+
+        let d_left = (cursor.x - left).abs();
+        let d_right = (cursor.x - right).abs();
+        let d_top = (cursor.y - top).abs();
+        let d_bottom = (cursor.y - bottom).abs();
+        let horizontal = match (d_left <= t, d_right <= t) {
+            (true, true) if d_left <= d_right => Some(true),
+            (true, true) => Some(false),
+            (true, false) => Some(true),
+            (false, true) => Some(false),
+            (false, false) => None,
+        };
+        let vertical = match (d_top <= t, d_bottom <= t) {
+            (true, true) if d_top <= d_bottom => Some(true),
+            (true, true) => Some(false),
+            (true, false) => Some(true),
+            (false, true) => Some(false),
+            (false, false) => None,
+        };
+
+        match (horizontal, vertical) {
+            (Some(true), Some(true)) => Some(Self::TopLeft),
+            (Some(false), Some(true)) => Some(Self::TopRight),
+            (Some(true), Some(false)) => Some(Self::BottomLeft),
+            (Some(false), Some(false)) => Some(Self::BottomRight),
+            (Some(true), None) => Some(Self::Left),
+            (Some(false), None) => Some(Self::Right),
+            (None, Some(true)) => Some(Self::Top),
+            (None, Some(false)) => Some(Self::Bottom),
+            (None, None) => None,
+        }
+    }
 }
 
 /// Live 4-quadrant `smart_split` drop zone computed while hovering `DwindleTree` tiles during
@@ -1608,5 +1665,68 @@ mod tests {
         assert_eq!(tree.rect_of(w2).unwrap().h, 440);
         assert_eq!(tree.rect_of(w3).unwrap().y, 440);
         assert_eq!(tree.rect_of(w3).unwrap().h, 640);
+    }
+
+    #[test]
+    fn frame_edge_at_maps_all_eight_directions_and_rejects_interior_and_far_points() {
+        let rect = LogicalRect::new(100, 100, 400, 300);
+        let t = 8.0;
+        let cases = [
+            (LogicalPoint { x: 101.0, y: 102.0 }, ResizeCorner::TopLeft),
+            (LogicalPoint { x: 499.0, y: 102.0 }, ResizeCorner::TopRight),
+            (
+                LogicalPoint { x: 101.0, y: 399.0 },
+                ResizeCorner::BottomLeft,
+            ),
+            (
+                LogicalPoint { x: 499.0, y: 399.0 },
+                ResizeCorner::BottomRight,
+            ),
+            (LogicalPoint { x: 100.0, y: 250.0 }, ResizeCorner::Left),
+            (LogicalPoint { x: 500.0, y: 250.0 }, ResizeCorner::Right),
+            (LogicalPoint { x: 300.0, y: 100.0 }, ResizeCorner::Top),
+            (LogicalPoint { x: 300.0, y: 400.0 }, ResizeCorner::Bottom),
+            // Just outside the frame, still inside the threshold, is still a grab.
+            (LogicalPoint { x: 296.0, y: 405.0 }, ResizeCorner::Bottom),
+            // Interior of the frame is client area, never a grab.
+            (LogicalPoint { x: 300.0, y: 250.0 }, ResizeCorner::None),
+            // Beyond the threshold on one axis only.
+            (LogicalPoint { x: 300.0, y: 412.0 }, ResizeCorner::None),
+            (
+                LogicalPoint {
+                    x: 300.0,
+                    y: 100.0 - 12.0,
+                },
+                ResizeCorner::None,
+            ),
+        ];
+        for (cursor, expected) in cases {
+            let got = ResizeCorner::frame_edge_at(rect, cursor, t).unwrap_or(ResizeCorner::None);
+            assert_eq!(got, expected, "cursor {cursor:?}");
+        }
+    }
+
+    #[test]
+    fn frame_edge_at_prefers_the_nearer_edge_when_the_frame_is_thinner_than_two_thresholds() {
+        // A 10px wide tile with an 8px threshold: both vertical edges are within reach of the
+        // centre, so the nearer one must win instead of reporting a corner.
+        let rect = LogicalRect::new(0, 0, 10, 200);
+        assert_eq!(
+            ResizeCorner::frame_edge_at(rect, LogicalPoint { x: 1.0, y: 100.0 }, 8.0),
+            Some(ResizeCorner::Left)
+        );
+        assert_eq!(
+            ResizeCorner::frame_edge_at(rect, LogicalPoint { x: 9.0, y: 100.0 }, 8.0),
+            Some(ResizeCorner::Right)
+        );
+        // A degenerate frame can never be a resize target.
+        assert_eq!(
+            ResizeCorner::frame_edge_at(
+                LogicalRect::new(0, 0, 0, 0),
+                LogicalPoint { x: 0.0, y: 0.0 },
+                8.0
+            ),
+            None
+        );
     }
 }
