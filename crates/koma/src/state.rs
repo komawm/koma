@@ -3993,7 +3993,11 @@ impl KomaState {
                 let mut eff_border = border_cfg.clone();
                 let mut eff_focus_ring = focus_ring_cfg.clone();
                 let mut eff_shadow = shadow_cfg.clone();
-                if is_click_through {
+                if is_click_through || is_fs {
+                    // A fullscreen window is the screen: Hyprland draws no border, no focus ring and
+                    // no shadow around it, and the owner reported the border ring surviving on
+                    // `Mod + Shift + F` (komawm/koma#30 follow-up). The corner radius is already 0
+                    // for fullscreen, and the shadow would otherwise bleed past the output edge.
                     eff_border.enabled = false;
                     eff_focus_ring.enabled = false;
                     eff_shadow.enabled = false;
@@ -4010,7 +4014,7 @@ impl KomaState {
                     corner_radius,
                     clip_to_geometry: eff_clip_to_geometry,
                     wants_blur: blur_enabled && !is_fs && !is_click_through && !eff_no_blur,
-                    no_shadow: is_click_through || dyn_rules.no_shadow.unwrap_or(false),
+                    no_shadow: is_fs || is_click_through || dyn_rules.no_shadow.unwrap_or(false),
                     border_color_override: if is_click_through {
                         None
                     } else {

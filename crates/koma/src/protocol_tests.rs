@@ -3606,12 +3606,46 @@ fn fullscreen_window_suppresses_top_and_overlay_layer_tiers_but_keeps_background
         .find(|m| m.win_id == win1)
         .and_then(|m| m.window.toplevel().map(|t| t.wl_surface().clone()))
         .expect("fullscreen toplevel surface");
+
+    // A fullscreen window is the screen: no border ring, no focus ring, no shadow. The owner
+    // reported the border outline surviving on `Mod + Shift + F` (komawm/koma#30 follow-up).
+    let item = &items[0];
     assert!(
-        items[0]
-            .window
-            .toplevel()
-            .is_some_and(|t| *t.wl_surface() == expected_root),
-        "the fullscreen toplevel must be the front-most window element"
+        !item.border.enabled,
+        "a fullscreen window must not paint its border ring"
+    );
+    assert!(
+        !item.focus_ring.enabled,
+        "a fullscreen window must not paint its focus ring"
+    );
+    assert!(
+        !item.shadow.enabled && item.no_shadow,
+        "a fullscreen window must not paint a drop shadow"
+    );
+    assert_eq!(
+        item.corner_radius, 0.0,
+        "a fullscreen window must not be clipped to rounded corners"
+    );
+
+    // Leaving fullscreen restores the decorated presentation.
+    env.state
+        .workspaces
+        .get_mut(&ws_id)
+        .expect("DP-1 workspace")
+        .set_fullscreen(win1, false);
+    env.state.sync_workspace_geometries(&ws_id);
+    let restored = env.state.collect_workspace_scene_items(&ws_id, false);
+    let restored_item = restored
+        .iter()
+        .find(|i| {
+            i.window
+                .toplevel()
+                .is_some_and(|t| *t.wl_surface() == expected_root)
+        })
+        .expect("tiled window is composited again");
+    assert!(
+        restored_item.border.enabled,
+        "the border ring comes back once the window is tiled again"
     );
 
     // Leaving fullscreen restores the bar tier.
