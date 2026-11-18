@@ -492,7 +492,7 @@ pub(crate) fn dispatch_single_host_action(state: &mut KomaState, action: QueuedH
             if !verify_action_epoch_and_protection(state, &ws_id, expected_epoch) {
                 return;
             }
-            if let Some(pointer) = state.seat.get_pointer() {
+            if let Some(pointer) = state.ptr() {
                 let mut frame = AxisFrame::new(InputTime::now()).source(AxisSource::Wheel);
                 if dx.abs() > f64::EPSILON {
                     frame = frame
@@ -1155,7 +1155,6 @@ fn active_window_in_ws<'a>(
 
 fn try_commit_via_text_input_v3(state: &KomaState, ws_id: &WorkspaceId, utf8: &str) -> bool {
     use smithay::reexports::wayland_server::Resource as _;
-    use smithay::wayland::text_input::TextInputSeat as _;
 
     let Some(target_wl) = active_window_in_ws(state, ws_id)
         .and_then(|m| m.window.toplevel().map(|t| t.wl_surface().clone()))
@@ -1163,20 +1162,27 @@ fn try_commit_via_text_input_v3(state: &KomaState, ws_id: &WorkspaceId, utf8: &s
         return false;
     };
 
-    let text_input = state.seat.text_input();
+    let Some(text_input) = state.text_input() else {
+        return false;
+    };
     let mut committed = false;
-    text_input.with_active_text_input(|ti, surface| {
-        if !committed {
-            let mut root = surface.clone();
-            while let Some(parent) = smithay::wayland::compositor::get_parent(&root) {
-                root = parent;
+    {
+        // The closure runs with the text-input mutex held: any nested text-input acquisition
+        // inside it would self-deadlock, so the scope is marked for its whole duration.
+        let _held = crate::seat_guard::text_input_callback();
+        text_input.with_active_text_input(|ti, surface| {
+            if !committed {
+                let mut root = surface.clone();
+                while let Some(parent) = smithay::wayland::compositor::get_parent(&root) {
+                    root = parent;
+                }
+                if root.id() == target_wl.id() {
+                    ti.commit_string(Some(utf8.to_owned()));
+                    committed = true;
+                }
             }
-            if root.id() == target_wl.id() {
-                ti.commit_string(Some(utf8.to_owned()));
-                committed = true;
-            }
-        }
-    });
+        });
+    }
     if committed {
         text_input.done(false);
     }
@@ -1250,7 +1256,7 @@ fn dispatch_vseat_pointer_motion_inner(
         time,
     };
 
-    if let Some(pointer) = state.seat.get_pointer()
+    if let Some(pointer) = state.ptr()
         && !pointer.is_grabbed()
         && let Some(focused) = pointer.current_focus()
     {
@@ -1318,7 +1324,7 @@ fn dispatch_vseat_pointer_motion_inner(
     let under = state
         .surface_under_in_workspace(ws_id, ws_local)
         .map(|(_, surf, origin)| (surf, origin));
-    if let Some(pointer) = state.seat.get_pointer() {
+    if let Some(pointer) = state.ptr() {
         pointer.motion(
             state,
             under.clone(),
@@ -1444,7 +1450,7 @@ pub(crate) fn apply_vseat_wheel(
     }
 
     let held = press_vseat_modifiers(state, ws_id, modifiers);
-    if let Some(pointer) = state.seat.get_pointer() {
+    if let Some(pointer) = state.ptr() {
         let mut frame = AxisFrame::new(InputTime::now()).source(AxisSource::Wheel);
         let mut has_axis = false;
         if discrete_x != 0 || dx.abs() > f64::EPSILON {
@@ -1647,7 +1653,7 @@ fn apply_vseat_pointer_button(
         ac.visual.trigger_click(ws_local_pt, now_ms, &ac_cfg);
     }
 
-    if let Some(pointer) = state.seat.get_pointer() {
+    if let Some(pointer) = state.ptr() {
         let serial = SERIAL_COUNTER.next_serial();
         let time = InputTime::now();
         pointer.button(
@@ -1703,10 +1709,7 @@ fn paste_chord_for_workspace(state: &KomaState, ws_id: &WorkspaceId) -> &'static
 
 /// Restores keyboard focus to the active window when targeting the interactive workspace without focus.
 fn ensure_workspace_keyboard_focus(state: &mut KomaState, ws_id: &WorkspaceId) {
-    let needs_focus = state
-        .seat
-        .get_keyboard()
-        .is_some_and(|kb| kb.current_focus().is_none());
+    let needs_focus = state.kb().is_some_and(|kb| kb.current_focus().is_none());
     if needs_focus && *ws_id == state.effective_interactive_ws_id() {
         state.focus_active_deck_window();
     }
@@ -1801,7 +1804,7 @@ fn can_type_via_ascii_xkb(utf8: &str) -> bool {
 }
 
 fn synthesize_xkb_keycode_edge(state: &mut KomaState, xkb_keycode: u32, edge: KeyState) {
-    if let Some(keyboard) = state.seat.get_keyboard() {
+    if let Some(keyboard) = state.kb() {
         let serial = SERIAL_COUNTER.next_serial();
         let time = InputTime::now();
         let _ = keyboard.input::<(), _>(

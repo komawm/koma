@@ -91,7 +91,7 @@ pub fn start_compositor_move_grab(state: &mut KomaState, button_code: u32, seria
         return false;
     }
     state.break_active_pointer_constraints();
-    let Some(pointer) = state.seat.get_pointer() else {
+    let Some(pointer) = state.ptr() else {
         return false;
     };
     if pointer.is_grabbed() {
@@ -139,7 +139,7 @@ pub fn start_compositor_resize_grab(
         return false;
     }
     state.break_active_pointer_constraints();
-    let Some(pointer) = state.seat.get_pointer() else {
+    let Some(pointer) = state.ptr() else {
         return false;
     };
     if pointer.is_grabbed() {
@@ -192,7 +192,7 @@ pub fn start_frame_edge_resize_grab(
         return false;
     }
     state.break_active_pointer_constraints();
-    let Some(pointer) = state.seat.get_pointer() else {
+    let Some(pointer) = state.ptr() else {
         return false;
     };
     if pointer.is_grabbed() {
@@ -248,7 +248,7 @@ pub fn start_csd_move_grab(
         return false;
     }
     state.break_active_pointer_constraints();
-    let Some(pointer) = state.seat.get_pointer() else {
+    let Some(pointer) = state.ptr() else {
         return false;
     };
     let interactive_ws = state.effective_interactive_ws_id();
@@ -295,7 +295,7 @@ pub fn start_csd_resize_grab(
     let Some(explicit_corner) = resize_corner_from_xdg_edge(edges) else {
         return false;
     };
-    let Some(pointer) = state.seat.get_pointer() else {
+    let Some(pointer) = state.ptr() else {
         return false;
     };
     let interactive_ws = state.effective_interactive_ws_id();
@@ -329,7 +329,7 @@ pub fn start_csd_resize_grab(
 
 /// Cancels any active pointer grab on `Escape` press (`niri/src/input/mod.rs` lines 688-699).
 pub fn cancel_active_pointer_grab(state: &mut KomaState, serial: Serial, time: InputTime) -> bool {
-    let Some(pointer) = state.seat.get_pointer() else {
+    let Some(pointer) = state.ptr() else {
         return false;
     };
     if !pointer.is_grabbed() {
@@ -513,6 +513,8 @@ impl MoveWindowGrab {
     }
 
     fn on_toggle_floating_mid_drag(&mut self, state: &mut KomaState) -> bool {
+        // Smithay runs grab callbacks with the pointer mutex held.
+        let _held = crate::seat_guard::pointer_callback();
         if !state.mapped_windows.iter().any(|m| m.win_id == self.win_id) {
             return false;
         }
@@ -535,6 +537,8 @@ impl MoveWindowGrab {
     }
 
     fn on_frame(&mut self, state: &mut KomaState) -> bool {
+        // Smithay runs grab callbacks with the pointer mutex held.
+        let _held = crate::seat_guard::pointer_callback();
         if !state.mapped_windows.iter().any(|m| m.win_id == self.win_id)
             || !state.workspaces.contains_key(&self.ws_id)
         {
@@ -572,6 +576,9 @@ impl MoveWindowGrab {
     }
 
     fn on_ungrab(&mut self, state: &mut KomaState) {
+        // `PointerHandle::{set_grab,unset_grab}` call this with the pointer mutex held, so the
+        // `focus_active_deck_window` below must not re-enter `PointerHandle::current_focus`.
+        let _held = crate::seat_guard::pointer_callback();
         state.active_drop_preview = None;
         state.active_drag_edge_scroll = None;
         state.edge_scroll_keep_alive = false;
@@ -875,6 +882,8 @@ impl ResizeWindowGrab {
     }
 
     fn on_frame(&mut self, state: &mut KomaState) -> bool {
+        // Smithay runs grab callbacks with the pointer mutex held.
+        let _held = crate::seat_guard::pointer_callback();
         if !state.mapped_windows.iter().any(|m| m.win_id == self.win_id)
             || !state.workspaces.contains_key(&self.ws_id)
         {
@@ -978,6 +987,8 @@ impl ResizeWindowGrab {
     }
 
     fn on_ungrab(&mut self, state: &mut KomaState) {
+        // Smithay runs grab callbacks with the pointer mutex held.
+        let _held = crate::seat_guard::pointer_callback();
         state.set_cursor_status(CursorImageStatus::default_named());
     }
 }

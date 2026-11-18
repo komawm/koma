@@ -1945,7 +1945,7 @@ fn on_session_event_callback(state: &mut KomaState, event: SessionEvent) {
             info!("pausing Koma TTY session (VT switch away)");
             // Release physical & virtual held keys immediately because release scancodes will land
             // on the destination VT (`niri/src/backend/tty.rs` lines 622-638).
-            if let Some(keyboard) = state.seat.get_keyboard() {
+            if let Some(keyboard) = state.kb() {
                 keyboard.release_source(state, KeyboardSource::MAIN);
             }
             crate::macro_runtime::release_all_vseat_held_inputs_everywhere(state);
@@ -1977,7 +1977,7 @@ fn on_session_event_callback(state: &mut KomaState, event: SessionEvent) {
             }
             let reg = state.lua_sandbox.config_snapshot();
             tty.apply_libinput_config_to_all(&reg.input, &reg.devices);
-            if let Some(keyboard) = state.seat.get_keyboard() {
+            if let Some(keyboard) = state.kb() {
                 tty.sync_keyboard_leds(keyboard.led_state());
             }
 
@@ -2500,7 +2500,7 @@ fn handle_libinput_device_event(state: &mut KomaState, event: &InputEvent<Libinp
             let reg = state.lua_sandbox.config_snapshot();
             configure_libinput_device(&mut dev, &reg.input, &reg.devices);
             if dev.has_capability(DeviceCapability::Keyboard)
-                && let Some(keyboard) = state.seat.get_keyboard()
+                && let Some(keyboard) = state.kb()
             {
                 dev.led_update(keyboard.led_state().into());
             }

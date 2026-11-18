@@ -113,10 +113,14 @@ mod protocol_tests;
 #[cfg(feature = "smithay-winit")]
 mod screencopy;
 #[cfg(feature = "smithay-winit")]
+mod seat_guard;
+#[cfg(feature = "smithay-winit")]
 mod security_context;
 mod session_env;
 #[cfg(feature = "smithay-winit")]
 mod signals;
+#[cfg(feature = "smithay-winit")]
+mod stall;
 #[cfg(feature = "smithay-winit")]
 mod state;
 #[cfg(feature = "smithay-winit")]
@@ -352,6 +356,8 @@ fn run_nested_winit(
         "Koma nested Winit compositor initialized (Alt+Return=terminal, Alt+[ / ]=Deck cycle, Alt+G=Preempt)"
     );
 
+    let stall_watchdog = crate::stall::StallWatchdog::start();
+
     render_winit_frame(&mut state)?;
     state.queue_redraw();
 
@@ -368,6 +374,9 @@ fn run_nested_winit(
 
     event_loop
         .run(Some(Duration::from_millis(16)), &mut state, |state| {
+            if let Some(watchdog) = stall_watchdog.as_ref() {
+                watchdog.tick();
+            }
             crate::screencopy::flush_pending_screencopy_frames(state);
             state.popups.cleanup();
             state.cleanup_ime_popups();
@@ -449,6 +458,8 @@ fn run_bare_metal_tty(
         "Koma bare-metal KMS/DRM compositor initialized (Super+Return=terminal, Super+G=Preempt, Ctrl+Alt+F1..F12=VT)"
     );
 
+    let stall_watchdog = crate::stall::StallWatchdog::start();
+
     // Submit Frame 1 (`#111216` backdrop) to active KMS CRTCs
     render_pending_tty_outputs(&mut state);
 
@@ -465,6 +476,9 @@ fn run_bare_metal_tty(
 
     event_loop
         .run(Some(Duration::from_millis(16)), &mut state, |state| {
+            if let Some(watchdog) = stall_watchdog.as_ref() {
+                watchdog.tick();
+            }
             if state.redraw_queued {
                 render_pending_tty_outputs(state);
             }

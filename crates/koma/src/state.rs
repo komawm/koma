@@ -134,6 +134,7 @@ use crate::{
     output_management::WlrOutputManagerState,
     output_power::{OutputPowerMode, OutputPowerState},
     screencopy::ScreencopyState,
+    seat_guard::{SeatHandle, SeatHandleGuard},
     security_context::{
         JailedWaylandSocket, NewClient, PeerSocketCredentials, client_can_view_primary_selection,
         client_is_unrestricted, is_surface_from_restricted_client, query_peer_credentials,
@@ -150,7 +151,9 @@ use smithay::{
         DownEvent as TouchDownPayload, MotionEvent as TouchMotionPayload, UpEvent as TouchUpPayload,
     },
     wayland::{
-        input_method::{InputMethodManagerState, PopupSurface as ImePopupSurface},
+        input_method::{
+            InputMethodManagerState, InputMethodSeat as _, PopupSurface as ImePopupSurface,
+        },
         text_input::{TextInputManagerState, TextInputSeat as _},
     },
 };
@@ -1844,7 +1847,7 @@ impl KomaState {
                 f64::from(rect.loc.y) + f64::from(rect.size.h) * 0.5,
             ));
             self.pointer_location = center;
-            if let Some(pointer) = self.seat.get_pointer()
+            if let Some(pointer) = self.ptr()
                 && !pointer.is_grabbed()
             {
                 let under = self.surface_under(center);
@@ -2108,7 +2111,7 @@ impl KomaState {
             SERIAL_COUNTER.next_serial(),
             now_input,
         );
-        if let Some(pointer) = self.seat.get_pointer() {
+        if let Some(pointer) = self.ptr() {
             let serial = SERIAL_COUNTER.next_serial();
             pointer.motion(
                 self,
@@ -2122,10 +2125,10 @@ impl KomaState {
             pointer.frame(self);
         }
         self.clear_ime_state_for_lock();
-        if let Some(touch) = self.seat.get_touch() {
+        if let Some(touch) = self.touch() {
             touch.cancel(self);
         }
-        if let Some(keyboard) = self.seat.get_keyboard() {
+        if let Some(keyboard) = self.kb() {
             let serial = SERIAL_COUNTER.next_serial();
             keyboard.set_focus(self, None, serial);
         }
@@ -2857,7 +2860,7 @@ impl KomaState {
             KeyboardFocusSource::ActiveWindow => self.active_deck_wl_surface(),
         };
 
-        if let Some(keyboard) = self.seat.get_keyboard()
+        if let Some(keyboard) = self.kb()
             && keyboard.current_focus() != target_surface
         {
             let serial = SERIAL_COUNTER.next_serial();
@@ -4174,6 +4177,83 @@ impl KomaState {
 }
 
 impl KomaState {
+    /// Acquires the seat keyboard for the duration of the returned guard.
+    ///
+    /// Returns `None` when this thread already owns a keyboard scope: Smithay's
+    /// `KeyboardHandle` mutex is not reentrant, so the nested acquisition would wedge the
+    /// event loop forever (komawm/koma#37, #54, #64). Callers must skip the work instead.
+    #[must_use]
+    #[track_caller]
+    pub fn kb(&self) -> Option<SeatHandleGuard<smithay::input::keyboard::KeyboardHandle<Self>>> {
+        let scope = crate::seat_guard::acquire(SeatHandle::Keyboard)?;
+        let handle = self.seat.get_keyboard()?;
+        Some(SeatHandleGuard::new(handle, scope))
+    }
+
+    /// Acquires the seat pointer for the duration of the returned guard.
+    ///
+    /// Returns `None` on a nested acquisition; see [`Self::kb`].
+    #[must_use]
+    #[track_caller]
+    pub fn ptr(&self) -> Option<SeatHandleGuard<smithay::input::pointer::PointerHandle<Self>>> {
+        let scope = crate::seat_guard::acquire(SeatHandle::Pointer)?;
+        let handle = self.seat.get_pointer()?;
+        Some(SeatHandleGuard::new(handle, scope))
+    }
+
+    /// Acquires the seat touch handle for the duration of the returned guard.
+    ///
+    /// Returns `None` on a nested acquisition; see [`Self::kb`].
+    #[must_use]
+    #[track_caller]
+    pub fn touch(&self) -> Option<SeatHandleGuard<smithay::input::touch::TouchHandle<Self>>> {
+        let scope = crate::seat_guard::acquire(SeatHandle::Touch)?;
+        let handle = self.seat.get_touch()?;
+        Some(SeatHandleGuard::new(handle, scope))
+    }
+
+    /// Acquires the seat text-input handle for the duration of the returned guard.
+    ///
+    /// Returns `None` on a nested acquisition; see [`Self::kb`].
+    #[must_use]
+    #[track_caller]
+    pub fn text_input(
+        &self,
+    ) -> Option<SeatHandleGuard<&smithay::wayland::text_input::TextInputHandle>> {
+        let scope = crate::seat_guard::acquire(SeatHandle::TextInput)?;
+        Some(SeatHandleGuard::new(self.seat.text_input(), scope))
+    }
+
+    /// Acquires the seat input-method handle for the duration of the returned guard.
+    ///
+    /// Returns `None` on a nested acquisition; see [`Self::kb`].
+    #[must_use]
+    #[track_caller]
+    pub fn input_method(
+        &self,
+    ) -> Option<SeatHandleGuard<&smithay::wayland::input_method::InputMethodHandle>> {
+        let scope = crate::seat_guard::acquire(SeatHandle::InputMethod)?;
+        Some(SeatHandleGuard::new(self.seat.input_method(), scope))
+    }
+
+    /// Clones the seat keyboard without claiming a scope.
+    ///
+    /// Only for *input entry points* that keep the handle across compositor dispatch
+    /// (key-binding filters, virtual-keyboard forwarding). Smithay releases its keyboard mutex
+    /// between those calls, so a scope here would reject legitimate re-application of keyboard
+    /// configuration. Re-entry protection on those paths comes from the callback scopes that
+    /// Smithay-held callbacks mark themselves ([`crate::seat_guard::callback`]).
+    #[must_use]
+    pub fn keyboard_handle(&self) -> Option<smithay::input::keyboard::KeyboardHandle<Self>> {
+        self.seat.get_keyboard()
+    }
+
+    /// Clones the seat pointer without claiming a scope; see [`Self::keyboard_handle`].
+    #[must_use]
+    pub fn pointer_handle(&self) -> Option<smithay::input::pointer::PointerHandle<Self>> {
+        self.seat.get_pointer()
+    }
+
     /// Fail-closed IME barrier enforced whenever `SessionLockPhase != Unlocked`:
     /// drops active `zwp_text_input_v3` focus/enter and discards all IME popup surfaces.
     ///
@@ -4181,10 +4261,17 @@ impl KomaState {
     /// Callers that are *not* running inside [`crate::state::KomaState::focus_changed`] should
     /// also reconcile keyboard-shortcut inhibitors ([`Self::clear_ime_state_for_lock`] does).
     pub fn clear_ime_focus_for_lock(&mut self) {
-        let text_input = self.seat.text_input();
-        if text_input.focus().is_some() {
-            text_input.leave();
-            text_input.set_focus(None);
+        {
+            let Some(text_input) = self.text_input() else {
+                // Nested acquisition (the caller already owns the text-input handle): popping the
+                // popups below is still safe and is the fail-closed behaviour we want.
+                self.ime_popups.clear();
+                return;
+            };
+            if text_input.focus().is_some() {
+                text_input.leave();
+                text_input.set_focus(None);
+            }
         }
         self.ime_popups.clear();
     }
@@ -4312,7 +4399,7 @@ impl KomaState {
 
     /// Reconciles active `zwp_keyboard_shortcuts_inhibitor_v1` instances against lock/preempt/focus.
     pub fn reconcile_keyboard_shortcuts_inhibitors(&mut self) {
-        let focused = self.seat.get_keyboard().and_then(|kb| kb.current_focus());
+        let focused = self.kb().and_then(|kb| kb.current_focus());
         self.reconcile_keyboard_shortcuts_inhibitors_with_focus(focused.as_ref());
     }
 
@@ -4359,7 +4446,7 @@ impl KomaState {
         {
             return false;
         }
-        let Some(focused) = self.seat.get_keyboard().and_then(|kb| kb.current_focus()) else {
+        let Some(focused) = self.kb().and_then(|kb| kb.current_focus()) else {
             return false;
         };
         if is_surface_from_restricted_client(self, &focused) {
@@ -4547,7 +4634,7 @@ impl KomaState {
     }
 
     fn apply_keyboard_spec_to_seat(&mut self, kb_spec: &KeyboardInputSpec, force_xkb: bool) {
-        let Some(keyboard) = self.seat.get_keyboard() else {
+        let Some(keyboard) = self.kb() else {
             return;
         };
 
@@ -4685,7 +4772,7 @@ impl KomaState {
         let Some(pos) = self.resolve_touch_position::<B, _>(&event) else {
             return;
         };
-        let Some(touch) = self.seat.get_touch() else {
+        let Some(touch) = self.touch() else {
             return;
         };
         if !self.is_locked_or_abandoned() && !touch.is_grabbed() {
@@ -4713,7 +4800,7 @@ impl KomaState {
         let Some(pos) = self.resolve_touch_position::<B, _>(&event) else {
             return;
         };
-        let Some(touch) = self.seat.get_touch() else {
+        let Some(touch) = self.touch() else {
             return;
         };
         let under = self.surface_under(pos);
@@ -4730,7 +4817,7 @@ impl KomaState {
 
     pub fn handle_touch_up<B: InputBackend>(&mut self, event: B::TouchUpEvent) {
         self.notify_user_activity();
-        let Some(touch) = self.seat.get_touch() else {
+        let Some(touch) = self.touch() else {
             return;
         };
         let serial = SERIAL_COUNTER.next_serial();
@@ -4745,13 +4832,13 @@ impl KomaState {
     }
 
     pub fn handle_touch_frame(&mut self) {
-        if let Some(touch) = self.seat.get_touch() {
+        if let Some(touch) = self.touch() {
             touch.frame(self);
         }
     }
 
     pub fn handle_touch_cancel(&mut self) {
-        if let Some(touch) = self.seat.get_touch() {
+        if let Some(touch) = self.touch() {
             touch.cancel(self);
         }
     }
