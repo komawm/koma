@@ -21,6 +21,16 @@ desktop, hardware support, or security guarantees.
   scripting, and `--strict` turns warnings into exit code `1`. Without
   `--strict`, a configuration error is reported but never changes the exit code,
   because the compositor keeps running on its last valid configuration.
+- `komactl doctor` gained `bind.spawn-target` and `bind.spawn-target-deep`: every
+  effective spawn bind (built-in catalogue, config overrides and `koma.unbind`,
+  merged through `merge_binds`) resolves its program the way `execve` would — an
+  absolute path must exist and be executable, a bare name is searched on `PATH` —
+  and reports `warn` naming the chord and the target when the program is missing.
+  `sh -c` / `fish -c` command strings are followed one level to their first
+  program word. Nothing is executed: `$VAR`, globs, relative paths, shell
+  keywords, built-ins, wrappers and pipelines are `skip`, and a fish function or
+  alias is never resolved by running a shell. This surfaces dead binds such as
+  `Mod + R` → `/usr/bin/hyprpicker` on a machine without `hyprpicker`.
 - `komactl keys`: lists every effective keybind by merging the built-in
   catalogue with the user configuration (`inherit_default_binds`, `koma.unbind`,
   chord overrides), rendering chords as `Mod + Shift + 2`, marking user
