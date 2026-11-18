@@ -661,6 +661,8 @@ pub fn reload_from_lua_source(
     {
         compiled_binds.active_mode = Some(cur_mode.clone());
     }
+    // A pending repeat belongs to the old bind table: cancel it before the atomic swap.
+    state.cancel_keybind_repeat("config_reload");
     state.keybinds = compiled_binds;
     state.gestures = compiled_gestures;
 

@@ -131,6 +131,7 @@ use crate::{
     gesture_dispatcher::GestureTable,
     ipc_server::IpcClientConn,
     keybind_dispatcher::KeybindTable,
+    keybind_repeat::RepeatTiming,
     macro_runtime::{ActivePointerAnimation, WorkspaceDamageTracker},
     output_management::WlrOutputManagerState,
     output_power::{OutputPowerMode, OutputPowerState},
@@ -143,8 +144,9 @@ use crate::{
     },
     xwayland_satellite::SatelliteSlot,
 };
-use koma_lua::schema::{
-    DeviceOverrideSpec, InputConfigSpec, KeyboardInputSpec, KomaConfigRegistry,
+use koma_lua::{
+    BindHandleId,
+    schema::{DeviceOverrideSpec, InputConfigSpec, KeyboardInputSpec, KomaConfigRegistry},
 };
 use smithay::{
     backend::input::{Event as _, InputBackend, TouchEvent as _},
@@ -696,6 +698,8 @@ pub struct KomaState {
     pub loop_signal: LoopSignal,
     pub loop_handle: Option<LoopHandle<'static, Self>>,
     pub trampoline_timer_token: Option<RegistrationToken>,
+    /// One-shot timer driving repeat-while-held keybinds (`komawm/koma#76`).
+    pub keybind_repeat_timer_token: Option<RegistrationToken>,
     pub socket_name: OsString,
     pub instance_signature: Option<String>,
     pub primary_satellite: Option<SatelliteSlot>,
@@ -968,6 +972,7 @@ impl KomaState {
             loop_signal,
             loop_handle: Some(loop_handle),
             trampoline_timer_token: None,
+            keybind_repeat_timer_token: None,
             socket_name,
             instance_signature: None,
             primary_satellite: None,
@@ -1908,6 +1913,9 @@ impl KomaState {
         // Re-focusing the workspace that is already interactive (including re-opening the same
         // `special:` overlay) is not a transition: emit nothing, so hooks do not reset state.
         let prev_effective = self.effective_interactive_ws_id();
+        // An external workspace switch stops a pending repeat; a switch performed by the
+        // repeated action itself is exempt inside `cancel_keybind_repeat_for_external_change`.
+        self.cancel_keybind_repeat_for_external_change("workspace_change");
         self.break_active_pointer_constraints();
         if is_special {
             self.active_special_ws_id = Some(ws_id.clone());
@@ -2106,6 +2114,7 @@ impl KomaState {
         self.keybinds.suppressed_buttons.clear();
         self.keybinds.active_mode = None;
         self.keybinds.reset_scroll_trackers();
+        self.cancel_keybind_repeat("session_lock");
         self.gestures.reset_active_sessions();
 
         let now_input = smithay::backend::input::InputTime::now();
@@ -3498,6 +3507,8 @@ impl KomaState {
         hit_ws_id: &WorkspaceId,
         global_pos: Point<f64, Logical>,
     ) {
+        // Pointer-driven focus is a user interaction outside the repeat: stop a pending repeat.
+        self.cancel_keybind_repeat_for_external_change("pointer_focus");
         let now_ms = self.elapsed_ms();
         self.focused_ondemand_layer = None;
         self.pointer_focus_window = None;
@@ -3530,6 +3541,7 @@ impl KomaState {
         hit_ws_id: &WorkspaceId,
         global_pos: Point<f64, Logical>,
     ) {
+        self.cancel_keybind_repeat_for_external_change("pointer_focus");
         self.focused_ondemand_layer = None;
         if let Some(hit_out) = self.output_at_point_strict(global_pos) {
             let hit_out_name = hit_out.name();
@@ -4177,6 +4189,43 @@ impl KomaState {
         }) {
             self.cursor_anim_timer_token = Some(token);
         }
+    }
+
+    /// Repeat timing for `WhileHeld` binds, taken from the applied
+    /// `koma.input.keyboard.repeat_delay` / `repeat_rate` settings (`komawm/koma#76`).
+    #[must_use]
+    pub fn keybind_repeat_timing(&self) -> RepeatTiming {
+        RepeatTiming::from_input_settings(
+            self.applied_keyboard_repeat.0,
+            self.applied_keyboard_repeat.1,
+        )
+    }
+
+    /// Cancels a pending repeat-while-held keybind and its timer.
+    ///
+    /// Called on key release, modifier change, focus/workspace change, pointer grab, session
+    /// lock and configuration reload.
+    pub fn cancel_keybind_repeat(&mut self, reason: &'static str) {
+        if let Some(cancelled) = self.keybinds.repeat.cancel() {
+            self.drop_keybind_repeat_timer(reason, cancelled.bind_id);
+        }
+    }
+
+    /// Cancels a repeat because focus, workspace, grab or lock changed outside the repeated
+    /// action itself; a repeat that causes the change keeps running.
+    pub fn cancel_keybind_repeat_for_external_change(&mut self, reason: &'static str) {
+        if let Some(cancelled) = self.keybinds.repeat.cancel_for_external_change() {
+            self.drop_keybind_repeat_timer(reason, cancelled.bind_id);
+        }
+    }
+
+    fn drop_keybind_repeat_timer(&mut self, reason: &'static str, bind_id: BindHandleId) {
+        if let Some(token) = self.keybind_repeat_timer_token.take()
+            && let Some(handle) = &self.loop_handle
+        {
+            handle.remove(token);
+        }
+        tracing::debug!(reason, ?bind_id, "cancelled keybind repeat");
     }
 
     /// The client drag icon currently attached to the cursor, if a drag provided one.
@@ -5582,6 +5631,69 @@ pub(crate) mod tests {
             .get_mut(ws_id)
             .expect("workspace exists")
             .insert_window(win_id, false, None, None, None, None, false, true, now_ms);
+    }
+
+    fn arm_test_repeat(state: &mut KomaState) {
+        let now_ms = state.elapsed_ms();
+        assert!(state.keybinds.repeat.arm(
+            crate::keybind_repeat::RepeatRequest {
+                bind_id: koma_lua::BindHandleId(13),
+                keycode: 42,
+                mods: 1,
+                action: koma_lua::ActionDescriptor::FocusDirection("left".to_owned()),
+                allow_when_locked: false,
+            },
+            now_ms,
+        ));
+        assert!(state.keybinds.repeat.is_active());
+    }
+
+    #[test]
+    fn pending_keybind_repeat_is_cancelled_by_lock_workspace_change_and_pointer_grab() {
+        let (_el, _disp, mut state) = make_headless_test_state();
+
+        // Session lock: `clear_inputs_for_lock` runs from the lock handler.
+        arm_test_repeat(&mut state);
+        assert!(state.session_lock.try_lock(None));
+        state.clear_inputs_for_lock();
+        assert!(
+            !state.keybinds.repeat.is_active(),
+            "locking the session must cancel a pending repeat"
+        );
+        assert!(state.session_lock.unlock());
+
+        // External workspace switch cancels.
+        arm_test_repeat(&mut state);
+        let dst = state.ensure_workspace_by_name_or_id("2");
+        assert!(state.focus_workspace(&dst));
+        assert!(
+            !state.keybinds.repeat.is_active(),
+            "switching workspace must cancel a pending repeat"
+        );
+
+        // A pointer grab attempt cancels before the gesture owns the pointer.
+        arm_test_repeat(&mut state);
+        let serial = smithay::utils::SERIAL_COUNTER.next_serial();
+        let _ = crate::pointer_grabs::start_compositor_move_grab(
+            &mut state,
+            crate::pointer_grabs::BTN_LEFT,
+            serial,
+        );
+        assert!(
+            !state.keybinds.repeat.is_active(),
+            "starting a pointer grab must cancel a pending repeat"
+        );
+
+        // A repeat that switches workspace itself keeps running.
+        arm_test_repeat(&mut state);
+        state.keybinds.repeat.begin_dispatch();
+        let dst = state.ensure_workspace_by_name_or_id("3");
+        assert!(state.focus_workspace(&dst));
+        state.keybinds.repeat.end_dispatch();
+        assert!(
+            state.keybinds.repeat.is_active(),
+            "a workspace cycling bind must keep repeating after its own switch"
+        );
     }
 
     #[test]
