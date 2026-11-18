@@ -4041,6 +4041,7 @@ impl KomaState {
                 }
 
                 items.push(WindowSceneItem {
+                    win_id,
                     window: &mapped.window,
                     rect: render_rect,
                     is_floating,

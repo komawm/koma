@@ -28,7 +28,7 @@ use koma_model::{LogicalViewport, OutputTransform, closest_representable_scale};
 use koma_proto::OverlayKind;
 use koma_render::{
     RenderTargetKind,
-    elements::KomaRenderElement,
+    elements::{FrameDecorationCache, KomaRenderElement},
     frame_composer::{
         DEFAULT_BACKDROP_CLEAR, FrameBlurContext, append_closing_window_elements,
         append_scratchpad_dim_scrim, append_tab_indicator_elements, assemble_workspace_elements,
@@ -143,6 +143,7 @@ pub struct DrmOutputSurface {
     pub output: Output,
     pub wl_global: Option<GlobalId>,
     pub compositor: GbmDrmCompositor,
+    pub decoration_cache: FrameDecorationCache,
     // RAII per-surface DMA-BUF feedback handle kept alive for the surface lifetime.
     #[allow(dead_code)]
     pub dmabuf_feedback: Option<DmabufFeedback>,
@@ -1387,6 +1388,7 @@ impl TtyBackendState {
                     output: output.clone(),
                     wl_global,
                     compositor,
+                    decoration_cache: FrameDecorationCache::default(),
                     dmabuf_feedback,
                     redraw_state: SurfaceRedrawState::Queued,
                     refresh_mhz: wl_mode.refresh,
@@ -2172,6 +2174,7 @@ fn render_single_drm_surface(
         .then(|| state.step_agent_cursor_for_output(&out_name, &out_ws_id))
         .flatten();
 
+    surface.decoration_cache.begin_frame();
     let (elements, clear_color): (Vec<KomaRenderElement<TtyRenderer<'_>>>, Color32F) = if locked {
         (
             assemble_locked_frame_elements(
@@ -2207,21 +2210,17 @@ fn render_single_drm_surface(
                 layer_tiers.below_toplevels,
                 &mut gles_bg_elems,
             );
-            state
-                .backdrop_blur_cache
-                .borrow_mut()
-                .update_and_blur(
-                    renderer.as_mut(),
-                    phys_sz,
-                    output_scale,
-                    DEFAULT_BACKDROP_CLEAR,
-                    &gles_bg_elems,
-                    blur_cfg,
-                )
-                .map(|texture| FrameBlurContext {
-                    texture,
-                    config: blur_cfg,
-                })
+            let mut blur_cache = state.backdrop_blur_cache.borrow_mut();
+            let tex = blur_cache.update_and_blur(
+                renderer.as_mut(),
+                phys_sz,
+                output_scale,
+                DEFAULT_BACKDROP_CLEAR,
+                &gles_bg_elems,
+                blur_cfg,
+            );
+            let blur_gen = blur_cache.blur_generation();
+            tex.map(|texture| FrameBlurContext::from_cached(texture, blur_cfg, blur_gen))
         } else {
             None
         };
@@ -2258,9 +2257,14 @@ fn render_single_drm_surface(
                 frame_blur_ctx.as_ref(),
                 sp_drop,
                 sp_items,
+                Some(&mut surface.decoration_cache),
             );
             elements.extend(sp_elems);
-            append_scratchpad_dim_scrim(viewport, &mut elements);
+            append_scratchpad_dim_scrim(
+                viewport,
+                Some(&mut surface.decoration_cache),
+                &mut elements,
+            );
         }
 
         if let Some(ws) = state.workspaces.get(&out_ws_id)
@@ -2269,7 +2273,13 @@ fn render_single_drm_surface(
         {
             let cam_x = ws.scrolling.peek_camera_x(state.elapsed_ms());
             let tab_segs = ws.scrolling.tab_indicator_segments_at(viewport, cam_x);
-            append_tab_indicator_elements(&mut renderer, output_scale, &tab_segs, &mut elements);
+            append_tab_indicator_elements(
+                &mut renderer,
+                output_scale,
+                &tab_segs,
+                Some(&mut surface.decoration_cache),
+                &mut elements,
+            );
         }
         let base_drop = state.drop_preview_for_workspace(&out_ws_id);
         let ws_elements = assemble_workspace_elements(
@@ -2282,6 +2292,7 @@ fn render_single_drm_surface(
             frame_blur_ctx.as_ref(),
             base_drop,
             &base_scene_items,
+            Some(&mut surface.decoration_cache),
         );
         elements.extend(ws_elements);
         // Captured closing frames linger above the window layers while `windows_close` settles.
@@ -2293,7 +2304,11 @@ fn render_single_drm_surface(
         }
         append_closing_window_elements(&mut renderer, &closing_items, &mut elements);
         if state.config_error_banner.is_some() {
-            prepend_config_error_banner(viewport, &mut elements);
+            prepend_config_error_banner(
+                viewport,
+                Some(&mut surface.decoration_cache),
+                &mut elements,
+            );
         }
 
         append_layer_tier_elements(
@@ -2309,6 +2324,7 @@ fn render_single_drm_surface(
             RenderTargetKind::PhysicalOutput,
             output_scale,
             agent_cursor_snap.as_ref(),
+            Some(&mut surface.decoration_cache),
             &mut elements,
         );
         let cursor_len = cursor_elems.len();
@@ -2316,6 +2332,7 @@ fn render_single_drm_surface(
         elements.splice(cursor_len..cursor_len, dnd_icon_elems);
         (elements, DEFAULT_BACKDROP_CLEAR)
     };
+    surface.decoration_cache.end_frame();
 
     let scanout_flags =
         FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY | FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT;

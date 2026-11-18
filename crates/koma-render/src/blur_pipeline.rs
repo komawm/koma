@@ -119,7 +119,8 @@ void main() {
 }
 "#;
 
-/// 8-tap Dual Kawase tent upsample pass (`Hyprland/src/render/shaders/glsl/blur2.glsl`).
+/// 8-tap Dual Kawase tent upsample pass (`Hyprland/src/render/shaders/glsl/blur2.glsl`) with
+/// optional baked contrast, dithering noise, and brightness finish on the final `mip_textures[0]` pass.
 const KAWASE_UP_FRAG: &str = r#"#version 100
 precision highp float;
 
@@ -127,6 +128,17 @@ varying vec2 v_coords;
 uniform sampler2D tex;
 uniform vec2 half_pixel;
 uniform float offset;
+uniform float apply_finish;
+uniform vec2 tex_size;
+uniform float blur_noise;
+uniform float blur_contrast;
+uniform float blur_brightness;
+
+float hypr_hash(vec2 p) {
+    vec3 p3 = fract(vec3(p.xyx) * 1689.1984);
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
+}
 
 void main() {
     vec2 o = half_pixel * offset;
@@ -142,7 +154,14 @@ void main() {
     sum += texture2D(tex, v_coords + vec2(-o.x, -o.y)) * 2.0;
     sum += texture2D(tex, v_coords + vec2( o.x, -o.y)) * 2.0;
 
-    gl_FragColor = sum / 12.0;
+    vec4 pix = sum / 12.0;
+    if (apply_finish > 0.5) {
+        pix.rgb = clamp((pix.rgb - 0.5) * blur_contrast + 0.5, 0.0, 1.0);
+        float n = (hypr_hash(v_coords * tex_size) - 0.5) * blur_noise;
+        pix.rgb = clamp((pix.rgb + n * pix.a) * blur_brightness, 0.0, 1.0);
+    }
+
+    gl_FragColor = pix;
 }
 "#;
 
@@ -153,6 +172,11 @@ struct KawasePassLocations {
     uniform_half_pixel: ffi::types::GLint,
     uniform_offset: ffi::types::GLint,
     uniform_vibrancy: ffi::types::GLint,
+    uniform_apply_finish: ffi::types::GLint,
+    uniform_tex_size: ffi::types::GLint,
+    uniform_blur_noise: ffi::types::GLint,
+    uniform_blur_contrast: ffi::types::GLint,
+    uniform_blur_brightness: ffi::types::GLint,
     attrib_vert: ffi::types::GLint,
 }
 
@@ -179,6 +203,11 @@ unsafe fn compile_kawase_pass(
     let half_pixel = c"half_pixel";
     let offset = c"offset";
     let vibrancy = c"vibrancy";
+    let apply_finish = c"apply_finish";
+    let tex_size = c"tex_size";
+    let blur_noise = c"blur_noise";
+    let blur_contrast = c"blur_contrast";
+    let blur_brightness = c"blur_brightness";
 
     Ok(KawasePassLocations {
         program,
@@ -190,6 +219,18 @@ unsafe fn compile_kawase_pass(
         uniform_offset: unsafe { gl.GetUniformLocation(program, offset.as_ptr()) },
         // SAFETY: Same active GLES2 context and NUL-terminated uniform name.
         uniform_vibrancy: unsafe { gl.GetUniformLocation(program, vibrancy.as_ptr()) },
+        // SAFETY: Same active GLES2 context and NUL-terminated uniform name.
+        uniform_apply_finish: unsafe { gl.GetUniformLocation(program, apply_finish.as_ptr()) },
+        // SAFETY: Same active GLES2 context and NUL-terminated uniform name.
+        uniform_tex_size: unsafe { gl.GetUniformLocation(program, tex_size.as_ptr()) },
+        // SAFETY: Same active GLES2 context and NUL-terminated uniform name.
+        uniform_blur_noise: unsafe { gl.GetUniformLocation(program, blur_noise.as_ptr()) },
+        // SAFETY: Same active GLES2 context and NUL-terminated uniform name.
+        uniform_blur_contrast: unsafe { gl.GetUniformLocation(program, blur_contrast.as_ptr()) },
+        // SAFETY: Same active GLES2 context and NUL-terminated uniform name.
+        uniform_blur_brightness: unsafe {
+            gl.GetUniformLocation(program, blur_brightness.as_ptr())
+        },
         // SAFETY: Same active GLES2 context and NUL-terminated attribute name.
         attrib_vert: unsafe { gl.GetAttribLocation(program, vert.as_ptr()) },
     })
@@ -367,18 +408,43 @@ impl DualKawaseBlurEngine {
                     quad_verts.as_ptr().cast(),
                 );
 
-                for (src_tex, dst_tex) in zip(
+                let total_up = self.mip_textures.len().saturating_sub(1);
+                for (step_idx, (src_tex, dst_tex)) in zip(
                     self.mip_textures.iter().rev(),
                     self.mip_textures.iter().rev().skip(1),
-                ) {
+                )
+                .enumerate()
+                {
                     let dst_sz = dst_tex.size();
                     let src_sz = src_tex.size();
+                    let is_final = step_idx + 1 == total_up;
                     gl.Viewport(0, 0, dst_sz.w, dst_sz.h);
                     gl.Uniform2f(
                         up.uniform_half_pixel,
                         0.5 / (src_sz.w.max(1) as f32),
                         0.5 / (src_sz.h.max(1) as f32),
                     );
+                    if up.uniform_apply_finish >= 0 {
+                        gl.Uniform1f(up.uniform_apply_finish, if is_final { 1.0 } else { 0.0 });
+                    }
+                    if is_final {
+                        if up.uniform_tex_size >= 0 {
+                            gl.Uniform2f(
+                                up.uniform_tex_size,
+                                dst_sz.w.max(1) as f32,
+                                dst_sz.h.max(1) as f32,
+                            );
+                        }
+                        if up.uniform_blur_noise >= 0 {
+                            gl.Uniform1f(up.uniform_blur_noise, cfg.noise.max(0.0));
+                        }
+                        if up.uniform_blur_contrast >= 0 {
+                            gl.Uniform1f(up.uniform_blur_contrast, cfg.contrast);
+                        }
+                        if up.uniform_blur_brightness >= 0 {
+                            gl.Uniform1f(up.uniform_blur_brightness, cfg.brightness);
+                        }
+                    }
                     gl.FramebufferTexture2D(
                         ffi::FRAMEBUFFER,
                         ffi::COLOR_ATTACHMENT0,
@@ -425,9 +491,29 @@ pub struct CachedBackdropBlur {
     last_size: Size<i32, Buffer>,
     last_scale: f64,
     last_cfg: Option<BlurConfig>,
+    blur_generation: u64,
 }
 
 impl CachedBackdropBlur {
+    /// Monotonic generation bumped each time `DualKawaseBlurEngine::execute_blur` refreshes
+    /// `mip_textures[0]` (allowing downstream element caches to track backdrop texture updates).
+    #[must_use]
+    pub const fn blur_generation(&self) -> u64 {
+        self.blur_generation
+    }
+
+    /// Clears `cached_blurred` and updates `last_cfg` whenever `BlurConfig` (including baked
+    /// `contrast`, `brightness`, or `noise`) changes, returning `true` when invalidated.
+    pub(crate) fn invalidate_if_config_changed(&mut self, cfg: BlurConfig) -> bool {
+        if self.last_cfg != Some(cfg) {
+            self.cached_blurred = None;
+            self.last_cfg = Some(cfg);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Updates the offscreen backdrop from `backdrop_elements` (e.g. `swww` wallpaper / bottom layers)
     /// and returns a ready-to-sample blurred `GlesTexture` when `cfg.enabled` is true.
     pub fn update_and_blur(
@@ -463,10 +549,7 @@ impl CachedBackdropBlur {
             self.last_scale = scale.x;
         }
 
-        if self.last_cfg != Some(cfg) {
-            self.cached_blurred = None;
-            self.last_cfg = Some(cfg);
-        }
+        self.invalidate_if_config_changed(cfg);
 
         let src_tex = self.source_tex.as_mut()?;
         let tracker = self.damage_tracker.as_mut()?;
@@ -487,8 +570,62 @@ impl CachedBackdropBlur {
             let engine = self.engine.as_mut()?;
             let src_ref = self.source_tex.as_ref()?;
             self.cached_blurred = engine.execute_blur(renderer, src_ref, cfg).ok();
+            if self.cached_blurred.is_some() {
+                self.blur_generation = self.blur_generation.wrapping_add(1);
+            }
         }
 
         self.cached_blurred.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kawase_up_shader_bakes_finish_toning_on_final_pass() {
+        for req in [
+            "uniform float apply_finish;",
+            "uniform vec2 tex_size;",
+            "uniform float blur_noise;",
+            "uniform float blur_contrast;",
+            "uniform float blur_brightness;",
+            "float hypr_hash(",
+            "if (apply_finish > 0.5)",
+        ] {
+            assert!(
+                KAWASE_UP_FRAG.contains(req),
+                "KAWASE_UP_FRAG missing expected symbol `{req}`"
+            );
+        }
+    }
+
+    #[test]
+    fn cached_backdrop_blur_invalidates_when_baked_toning_config_changes() {
+        let mut cache = CachedBackdropBlur::default();
+        let base = BlurConfig::default();
+
+        assert!(cache.invalidate_if_config_changed(base));
+        assert!(!cache.invalidate_if_config_changed(base));
+
+        let diff_contrast = BlurConfig {
+            contrast: base.contrast + 0.1,
+            ..base
+        };
+        assert!(cache.invalidate_if_config_changed(diff_contrast));
+        assert!(!cache.invalidate_if_config_changed(diff_contrast));
+
+        let diff_brightness = BlurConfig {
+            brightness: base.brightness - 0.1,
+            ..diff_contrast
+        };
+        assert!(cache.invalidate_if_config_changed(diff_brightness));
+
+        let diff_noise = BlurConfig {
+            noise: base.noise + 0.02,
+            ..diff_brightness
+        };
+        assert!(cache.invalidate_if_config_changed(diff_noise));
     }
 }

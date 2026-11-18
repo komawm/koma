@@ -189,15 +189,17 @@ uniform float border_width;
 uniform vec4 border_color;
 uniform vec4 border_color_end;
 uniform float gradient_angle_rad;
+uniform mat3 input_to_geo;
 
 float koma_rounding_alpha(vec2 coords, vec2 size, vec4 corner_radius, float scale);
 
 void main() {
     vec4 dummy_sample = texture2D(tex, v_coords);
-    vec2 coords = v_coords * geo_size;
+    vec2 geo_uv = (input_to_geo * vec3(v_coords, 1.0)).xy;
+    vec2 coords = geo_uv * geo_size;
 
     vec2 grad_dir = vec2(cos(gradient_angle_rad), sin(gradient_angle_rad));
-    float grad_t = clamp(dot(v_coords - vec2(0.5), grad_dir) + 0.5, 0.0, 1.0);
+    float grad_t = clamp(dot(geo_uv - vec2(0.5), grad_dir) + 0.5, 0.0, 1.0);
     vec4 grad_rgba = mix(border_color, border_color_end, grad_t);
 
     // Premultiply RGB by alpha
@@ -250,6 +252,7 @@ uniform vec2 local_uv_scale;
 uniform float blur_noise;
 uniform float blur_contrast;
 uniform float blur_brightness;
+uniform float blur_pre_toned;
 
 float koma_rounding_alpha(vec2 coords, vec2 size, vec4 corner_radius, float scale);
 
@@ -262,12 +265,14 @@ float hypr_hash(vec2 p) {
 void main() {
     vec4 pix = texture2D(tex, v_coords);
 
-    // Contrast around mid-gray (Hyprland blurprepare)
-    pix.rgb = clamp((pix.rgb - 0.5) * blur_contrast + 0.5, 0.0, 1.0);
+    if (blur_pre_toned < 0.5) {
+        // Contrast around mid-gray (Hyprland blurprepare)
+        pix.rgb = clamp((pix.rgb - 0.5) * blur_contrast + 0.5, 0.0, 1.0);
 
-    // Anti-banding hash dithering noise + brightness (Hyprland blurFinish.glsl)
-    float n = (hypr_hash(v_coords * geo_size) - 0.5) * blur_noise;
-    pix.rgb = clamp((pix.rgb + n * pix.a) * blur_brightness, 0.0, 1.0);
+        // Anti-banding hash dithering noise + brightness (Hyprland blurFinish.glsl)
+        float n = (hypr_hash(v_coords * geo_size) - 0.5) * blur_noise;
+        pix.rgb = clamp((pix.rgb + n * pix.a) * blur_brightness, 0.0, 1.0);
+    }
 
     vec2 local_norm = (v_coords - local_uv_origin) * local_uv_scale;
     float mask = koma_rounding_alpha(local_norm * geo_size, geo_size, corner_radius, koma_scale);
@@ -395,6 +400,18 @@ void main() {
     gl_FragColor = color;
 }
 "#;
+
+/// Returns the combined GLSL fragment source for `KomaRoundedBorderElement`.
+#[must_use]
+pub fn rounded_border_fragment_source() -> String {
+    format!("{ROUNDED_BORDER_FRAG_BODY}\n{GLSL_ROUNDING_ALPHA_FN}")
+}
+
+/// Returns the combined GLSL fragment source for `KomaBlurredBackdropElement`.
+#[must_use]
+pub fn blur_finish_rounded_fragment_source() -> String {
+    format!("{BLUR_FINISH_ROUNDED_FRAG_BODY}\n{GLSL_ROUNDING_ALPHA_FN}")
+}
 
 /// Returns the combined GLSL fragment source passed to `GlesRenderer::compile_custom_pixel_shader`.
 #[must_use]
@@ -662,7 +679,7 @@ impl KomaCompiledShaders {
             .map_err(|e| warn!("failed compiling clipped_surface GLSL shader: {e:?}"))
             .ok();
 
-        let border_src = format!("{ROUNDED_BORDER_FRAG_BODY}\n{GLSL_ROUNDING_ALPHA_FN}");
+        let border_src = rounded_border_fragment_source();
         let rounded_border = renderer
             .compile_custom_texture_shader(
                 &border_src,
@@ -674,12 +691,13 @@ impl KomaCompiledShaders {
                     UniformName::new("border_color", UniformType::_4f),
                     UniformName::new("border_color_end", UniformType::_4f),
                     UniformName::new("gradient_angle_rad", UniformType::_1f),
+                    UniformName::new("input_to_geo", UniformType::Matrix3x3),
                 ],
             )
             .map_err(|e| warn!("failed compiling rounded_border GLSL shader: {e:?}"))
             .ok();
 
-        let blur_finish_src = format!("{BLUR_FINISH_ROUNDED_FRAG_BODY}\n{GLSL_ROUNDING_ALPHA_FN}");
+        let blur_finish_src = blur_finish_rounded_fragment_source();
         let blur_finish_rounded = renderer
             .compile_custom_texture_shader(
                 &blur_finish_src,
@@ -692,6 +710,7 @@ impl KomaCompiledShaders {
                     UniformName::new("blur_noise", UniformType::_1f),
                     UniformName::new("blur_contrast", UniformType::_1f),
                     UniformName::new("blur_brightness", UniformType::_1f),
+                    UniformName::new("blur_pre_toned", UniformType::_1f),
                 ],
             )
             .map_err(|e| warn!("failed compiling blur_finish_rounded GLSL shader: {e:?}"))
@@ -904,6 +923,33 @@ mod tests {
             "uniform vec4 trail_p7;",
         ] {
             assert!(trail_src.contains(req), "missing trail shader decl `{req}`");
+        }
+    }
+
+    #[test]
+    fn rounded_border_and_blur_finish_shaders_expose_strip_and_pretone_uniforms() {
+        let border_src = rounded_border_fragment_source();
+        for req in [
+            "uniform mat3 input_to_geo;",
+            "vec2 geo_uv = (input_to_geo * vec3(v_coords, 1.0)).xy;",
+            "float koma_rounding_alpha(",
+        ] {
+            assert!(
+                border_src.contains(req),
+                "border shader missing expected symbol `{req}`"
+            );
+        }
+
+        let blur_src = blur_finish_rounded_fragment_source();
+        for req in [
+            "uniform float blur_pre_toned;",
+            "if (blur_pre_toned < 0.5)",
+            "float koma_rounding_alpha(",
+        ] {
+            assert!(
+                blur_src.contains(req),
+                "blur finish shader missing expected symbol `{req}`"
+            );
         }
     }
 }
