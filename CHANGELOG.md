@@ -6,6 +6,28 @@ incubation versions; `v0.1.0` will be the first independently accepted product
 release. A `0.0.x` tag is a development prerelease and does not claim a working
 desktop, hardware support, or security guarantees.
 
+## [0.0.5] - 2026-11-19
+
+### Added
+
+- Lightweight compositor frame-time histogram (`komawm/koma#100`): zero-allocation
+  `FrameTimeHistogram` on `KomaState` recording `[<1ms, 1-2ms, 2-4ms, 4-8ms, 8-16ms, >=16ms]`
+  buckets, `rendered_frames`, `skipped_frames`, `avg_us`, `max_us`, `last_us`, and
+  `p50_bucket` / `p95_bucket` across both DRM/TTY and Winit backends. Emits periodic
+  `tracing::debug!` summaries every 1,000 rendered frames and exposes `frame_perf` in the
+  `config.status` IPC response.
+
+### Changed
+
+- Aligned the `workspaces.lua` scaffold comment example to workspace `"9"` (`komawm/koma#102`),
+  matching the `1..9` default numbered workspace seeding and `Mod + 1..=9` keybinds.
+
+### Fixed
+
+- Floating window `default_floating_pos` anchor alignment (`komawm/koma#99`):
+  `resolve_floating_rect` now offsets the window by its size/half-size according to the
+  configured `Anchor9` instead of placing the window's top-left corner at the anchor point.
+
 ## [0.0.4] - 2026-11-19
 
 ### Added
