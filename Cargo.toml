@@ -19,7 +19,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.0.2"
+version = "0.0.3"
 edition = "2024"
 rust-version = "1.100"
 license = "GPL-3.0-or-later"
@@ -27,11 +27,11 @@ repository = "https://github.com/komawm/koma"
 
 [workspace.dependencies]
 # Internal workspace crates
-koma-proto = { path = "crates/koma-proto", version = "0.0.2" }
-koma-model = { path = "crates/koma-model", version = "0.0.2" }
-koma-lua = { path = "crates/koma-lua", version = "0.0.2" }
-koma-render = { path = "crates/koma-render", version = "0.0.2" }
-koma-seat = { path = "crates/koma-seat", version = "0.0.2" }
+koma-proto = { path = "crates/koma-proto", version = "0.0.3" }
+koma-model = { path = "crates/koma-model", version = "0.0.3" }
+koma-lua = { path = "crates/koma-lua", version = "0.0.3" }
+koma-render = { path = "crates/koma-render", version = "0.0.3" }
+koma-seat = { path = "crates/koma-seat", version = "0.0.3" }
 
 # Pure-Rust stackless Lua 5.4 sandbox (Piccolo fork), v0.2.0 tag's commit.
 phodopus = { git = "https://github.com/Xuepoo/phodopus", rev = "f3d6a9b8ecdf829629daa688a4adbe08259b1b81", version = "0.2.0" }

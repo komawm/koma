@@ -6,7 +6,7 @@ incubation versions; `v0.1.0` will be the first independently accepted product
 release. A `0.0.x` tag is a development prerelease and does not claim a working
 desktop, hardware support, or security guarantees.
 
-## [Unreleased]
+## [0.0.3] - 2026-11-18
 
 ### Added
 
@@ -55,6 +55,24 @@ desktop, hardware support, or security guarantees.
 - `move_to_workspace` follows the moved window to the destination workspace;
   `koma.act.window.move_to_workspace(ws, { follow = false })` keeps the source
   workspace focused (Hyprland `movetoworkspacesilent`).
+
+- The compositor can no longer deadlock on its own seat handles. Smithay holds
+  a non-reentrant mutex while it calls back into the compositor, so re-acquiring
+  the same handle from inside a callback parked the only event-loop thread in
+  `futex_wait` forever — no frames, no input, and no TTY, because the compositor
+  still holds DRM master. A thread-local guard now turns any such re-entry into
+  an `error!` naming both call sites and a soft failure instead of a hang.
+  Dropping a tiled window reached exactly that chain
+  (`PointerHandle::set_grab/unset_grab` → `on_ungrab` → focus change →
+  `pointer.current_focus()`), the same class as the session-lock freeze.
+- A stall watchdog dumps evidence from inside the compositor when the event loop
+  stops ticking for `KOMA_STALL_WATCHDOG_SECS` (default 5; `0` disables): every
+  thread's `comm`/`state`/`wchan`/`schedstat` plus the verbatim
+  `/proc/self/task/<tid>/syscall` line with its futex address, and a
+  classification (`self-reentrant-mutex`, `cross-thread-futex-cycle`,
+  `kernel-blocked`, …) under `$XDG_STATE_HOME/koma/stalls/<timestamp>/`. Bounded,
+  allocation-free before the files exist, and silent while healthy. Linux only;
+  other targets run an inert stub.
 
 ### Fixed
 - `workspace.focused` now fires for every activation path, including special
