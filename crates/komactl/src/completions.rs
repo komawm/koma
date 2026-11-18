@@ -225,6 +225,22 @@ const ROOT_SUBS: &[Cmd] = &[
         }],
     },
     Cmd {
+        name: "win",
+        desc: "Window actions (move to workspace)",
+        opts: &[],
+        subs: &[Cmd {
+            name: "move-to-workspace",
+            desc: "Move the focused workspace's active window to another workspace",
+            opts: &[Opt {
+                long: "follow",
+                short: None,
+                takes_value: false,
+                desc: "Follow the window to the destination workspace",
+            }],
+            subs: &[],
+        }],
+    },
+    Cmd {
         name: "capture",
         desc: "Capture a workspace frame to a raw file",
         opts: &[],

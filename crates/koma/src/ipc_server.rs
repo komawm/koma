@@ -872,12 +872,9 @@ pub(crate) fn dispatch_rpc(
                 .to_owned();
 
             // Resolve existing workspaces only: a bar click must not silently create
-            // one. The keybind path keeps its create-on-demand behaviour.
-            let known = state
-                .workspaces
-                .iter()
-                .any(|(id, ws)| id.as_str() == query || ws.name == query);
-            if !known {
+            // one. The keybind path keeps its create-on-demand behaviour. Exact ids win over
+            // names, so a workspace merely *named* `ws_01` cannot shadow workspace id `ws_01`.
+            if state.find_workspace_by_id_or_name(&query).is_none() {
                 return Err(IpcError::new(
                     ErrorSymbol::ErrNotFound,
                     format!("unknown workspace {query}"),
@@ -893,6 +890,65 @@ pub(crate) fn dispatch_rpc(
             Ok((
                 json!({
                     "focused": query,
+                    "active_ws_id": state.active_ws_id.as_str(),
+                }),
+                Vec::new(),
+            ))
+        }
+
+        "win.move_to_workspace" | "win.move" => {
+            // Mirrors `ActionDescriptor::WindowMoveToWorkspace` for status bars: `lua.exec_tx` is
+            // lease gated, so a bar cannot run the keybind action itself. Same door as `ws.focus`
+            // (admin socket, peer credentials, plus the session lock gate applied above).
+            if channel != SocketChannel::Admin {
+                return Err(IpcError::new(
+                    ErrorSymbol::ErrCapabilityDenied,
+                    "win.move_to_workspace is restricted to koma-admin.sock",
+                ));
+            }
+            let target = req
+                .params
+                .get("workspace")
+                .and_then(Value::as_str)
+                .or_else(|| req.params.get("ws_id").and_then(Value::as_str))
+                .ok_or_else(|| IpcError::new(ErrorSymbol::ErrInvalidParams, "missing workspace"))?
+                .to_owned();
+            let follow = req
+                .params
+                .get("follow")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+
+            // Existing workspaces only: a bar click must not create one. Exact ids win over
+            // names, matching `ws.focus`.
+            let Some(dst_ws_id) = state.find_workspace_by_id_or_name(&target) else {
+                return Err(IpcError::new(
+                    ErrorSymbol::ErrNotFound,
+                    format!("unknown workspace {target}"),
+                ));
+            };
+
+            let src_ws_id = state.effective_interactive_ws_id();
+            let active_win = state
+                .workspaces
+                .get(&src_ws_id)
+                .and_then(WorkspaceState::active_window);
+            let Some(win_id) = active_win else {
+                return Err(IpcError::new(
+                    ErrorSymbol::ErrNotFound,
+                    format!("workspace {} has no active window", src_ws_id.as_str()),
+                ));
+            };
+
+            let moved = state
+                .move_active_window_between_workspaces_with_follow(&src_ws_id, &dst_ws_id, follow);
+            Ok((
+                json!({
+                    "win_id": win_id.to_string(),
+                    "from_ws_id": src_ws_id.as_str(),
+                    "to_ws_id": dst_ws_id.as_str(),
+                    "followed": follow && moved,
+                    "moved": moved,
                     "active_ws_id": state.active_ws_id.as_str(),
                 }),
                 Vec::new(),
@@ -942,6 +998,7 @@ pub(crate) fn dispatch_rpc(
                 list.push(json!({
                     "ws_id": ws_id,
                     "name": ws.name,
+                    "focused": *ws_id == state.active_ws_id,
                     "is_special": ws.is_special,
                     "layout_mode": ws.layout_mode,
                     "frame_tier": ws.frame_clock.current_tier(now_ms),
@@ -2311,49 +2368,13 @@ fn generate_ephemeral_capability_token() -> Result<CapabilityToken, IpcError> {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::net::UnixStream;
+
     use super::*;
 
-    #[test]
-    fn ipc_lock_gate_denies_capture_and_sensitive_methods_when_locked_or_abandoned() {
-        assert!(check_ipc_lock_gate(false, "capture.frame").is_ok());
-        assert!(check_ipc_lock_gate(false, "scene.inventory").is_ok());
-        assert!(check_ipc_lock_gate(true, "config.status").is_ok());
-
-        for blocked_method in [
-            "capture.frame",
-            "scene.inventory",
-            "win.activate",
-            "win.close",
-            "ws.focus",
-            "ws.create",
-            "lease.acquire",
-            "macro.run",
-            "events.subscribe",
-            "vseat.key",
-            "vseat.path",
-            "vseat.stroke",
-            "vseat.cursor_settle",
-            "lua.exec_tx",
-            "config.reload",
-        ] {
-            let err = check_ipc_lock_gate(true, blocked_method)
-                .expect_err("sensitive IPC method must fail closed when locked");
-            assert_eq!(err.symbol, ErrorSymbol::ErrCapabilityDenied);
-            assert_eq!(err.message, "session is locked");
-        }
-    }
-
-    #[test]
-    fn ws_focus_switches_the_active_workspace_and_rejects_unknown_names() {
-        use std::os::unix::net::UnixStream;
-
-        let (_event_loop, _display, mut state) = crate::state::tests::make_headless_test_state();
-        let start = state.active_ws_id.clone();
-        let target = state.ensure_workspace_by_name_or_id("2");
-        assert_ne!(start, target, "test needs a second workspace");
-
+    /// Registers an admin-socket connection so RPC tests exercise the real authorization path.
+    fn insert_admin_conn(state: &mut KomaState, conn_id: u64) {
         let (client_stream, _peer) = UnixStream::pair().expect("unix stream pair");
-        let conn_id = 77_u64;
         state.ipc_clients.insert(
             conn_id,
             IpcClientConn {
@@ -2374,6 +2395,58 @@ mod tests {
                 armed_writable: false,
             },
         );
+    }
+
+    /// Inserts a tiled window as the active window of `ws_id` without a Wayland surface.
+    fn insert_window(state: &mut KomaState, ws_id: &WorkspaceId) -> koma_proto::WindowId {
+        let win_id = koma_proto::WindowId::new(1, 1);
+        let now_ms = state.elapsed_ms();
+        state
+            .workspaces
+            .get_mut(ws_id)
+            .expect("workspace exists")
+            .insert_window(win_id, false, None, None, None, None, false, true, now_ms);
+        win_id
+    }
+
+    #[test]
+    fn ipc_lock_gate_denies_capture_and_sensitive_methods_when_locked_or_abandoned() {
+        assert!(check_ipc_lock_gate(false, "capture.frame").is_ok());
+        assert!(check_ipc_lock_gate(false, "scene.inventory").is_ok());
+        assert!(check_ipc_lock_gate(true, "config.status").is_ok());
+
+        for blocked_method in [
+            "capture.frame",
+            "scene.inventory",
+            "win.activate",
+            "win.close",
+            "ws.create",
+            "lease.acquire",
+            "macro.run",
+            "events.subscribe",
+            "vseat.key",
+            "vseat.path",
+            "vseat.stroke",
+            "vseat.cursor_settle",
+            "lua.exec_tx",
+            "config.reload",
+        ] {
+            let err = check_ipc_lock_gate(true, blocked_method)
+                .expect_err("sensitive IPC method must fail closed when locked");
+            assert_eq!(err.symbol, ErrorSymbol::ErrCapabilityDenied);
+            assert_eq!(err.message, "session is locked");
+        }
+    }
+
+    #[test]
+    fn ws_focus_switches_the_active_workspace_and_rejects_unknown_names() {
+        let (_event_loop, _display, mut state) = crate::state::tests::make_headless_test_state();
+        let start = state.active_ws_id.clone();
+        let target = state.ensure_workspace_by_name_or_id("2");
+        assert_ne!(start, target, "test needs a second workspace");
+
+        let conn_id = 77_u64;
+        insert_admin_conn(&mut state, conn_id);
 
         let (res, _) = dispatch_rpc(
             &mut state,
@@ -2406,6 +2479,304 @@ mod tests {
         assert_eq!(err.symbol, ErrorSymbol::ErrNotFound);
         assert_eq!(state.workspaces.len(), before);
         assert_eq!(state.active_ws_id, target);
+    }
+
+    #[test]
+    fn lock_gate_refuses_workspace_switch_rpcs_without_mutating_state() {
+        let (_event_loop, _display, mut state) = crate::state::tests::make_headless_test_state();
+        let start = state.active_ws_id.clone();
+        let target = state.ensure_workspace_by_name_or_id("2");
+        let win_id = insert_window(&mut state, &start);
+        let conn_id = 71_u64;
+        insert_admin_conn(&mut state, conn_id);
+        assert!(
+            state.session_lock.try_lock(None),
+            "test must lock the session"
+        );
+
+        let focus_err = dispatch_rpc(
+            &mut state,
+            conn_id,
+            IpcRequest {
+                id: 1,
+                method: "ws.focus".to_owned(),
+                params: json!({ "ws_id": "2" }),
+            },
+            Vec::new(),
+        )
+        .expect_err("ws.focus must fail closed while the session is locked");
+        assert_eq!(focus_err.symbol, ErrorSymbol::ErrCapabilityDenied);
+        assert_eq!(focus_err.message, "session is locked");
+
+        let move_err = dispatch_rpc(
+            &mut state,
+            conn_id,
+            IpcRequest {
+                id: 2,
+                method: "win.move_to_workspace".to_owned(),
+                params: json!({ "workspace": "2", "follow": true }),
+            },
+            Vec::new(),
+        )
+        .expect_err("win.move_to_workspace must fail closed while the session is locked");
+        assert_eq!(move_err.symbol, ErrorSymbol::ErrCapabilityDenied);
+        assert_eq!(move_err.message, "session is locked");
+
+        assert_eq!(state.active_ws_id, start, "locked RPCs must not switch");
+        assert_eq!(
+            state.workspaces[&start].active_window(),
+            Some(win_id),
+            "locked RPCs must not move the window"
+        );
+        assert_eq!(state.workspaces[&target].active_window(), None);
+    }
+
+    #[test]
+    fn win_move_to_workspace_moves_the_active_window_following_or_silently() {
+        let (_event_loop, _display, mut state) = crate::state::tests::make_headless_test_state();
+        let src = state.active_ws_id.clone();
+        let follow_target = state.ensure_workspace_by_name_or_id("2");
+        let silent_target = state.ensure_workspace_by_name_or_id("3");
+        let win_id = insert_window(&mut state, &src);
+        let conn_id = 72_u64;
+        insert_admin_conn(&mut state, conn_id);
+
+        let (followed, _) = dispatch_rpc(
+            &mut state,
+            conn_id,
+            IpcRequest {
+                id: 1,
+                method: "win.move_to_workspace".to_owned(),
+                params: json!({ "workspace": "2", "follow": true }),
+            },
+            Vec::new(),
+        )
+        .expect("followed move must succeed");
+        assert_eq!(followed["win_id"], json!(win_id.to_string()));
+        assert_eq!(followed["from_ws_id"], json!(src.as_str()));
+        assert_eq!(followed["to_ws_id"], json!(follow_target.as_str()));
+        assert_eq!(followed["moved"], json!(true));
+        assert_eq!(followed["followed"], json!(true));
+        assert_eq!(state.active_ws_id, follow_target);
+        assert_eq!(
+            state.workspaces[&follow_target].active_window(),
+            Some(win_id)
+        );
+
+        // `win.move` is the documented alias and never follows unless asked to.
+        let (silent, _) = dispatch_rpc(
+            &mut state,
+            conn_id,
+            IpcRequest {
+                id: 2,
+                method: "win.move".to_owned(),
+                params: json!({ "workspace": "3" }),
+            },
+            Vec::new(),
+        )
+        .expect("silent move must succeed");
+        assert_eq!(silent["to_ws_id"], json!(silent_target.as_str()));
+        assert_eq!(silent["followed"], json!(false));
+        assert_eq!(
+            state.active_ws_id, follow_target,
+            "a silent move keeps the source workspace focused"
+        );
+        assert_eq!(
+            state.workspaces[&silent_target].active_window(),
+            Some(win_id)
+        );
+        assert_eq!(state.workspaces[&follow_target].active_window(), None);
+
+        // Existing destinations only, and an empty source is an explicit `ErrNotFound`.
+        let before = state.workspaces.len();
+        let unknown = dispatch_rpc(
+            &mut state,
+            conn_id,
+            IpcRequest {
+                id: 3,
+                method: "win.move_to_workspace".to_owned(),
+                params: json!({ "workspace": "no-such-workspace" }),
+            },
+            Vec::new(),
+        )
+        .expect_err("unknown destination workspace must be rejected");
+        assert_eq!(unknown.symbol, ErrorSymbol::ErrNotFound);
+        assert_eq!(
+            state.workspaces.len(),
+            before,
+            "no workspace may be created"
+        );
+
+        let empty_source = dispatch_rpc(
+            &mut state,
+            conn_id,
+            IpcRequest {
+                id: 4,
+                method: "win.move_to_workspace".to_owned(),
+                params: json!({ "workspace": "1" }),
+            },
+            Vec::new(),
+        )
+        .expect_err("a workspace without an active window has nothing to move");
+        assert_eq!(empty_source.symbol, ErrorSymbol::ErrNotFound);
+
+        // The agent socket cannot borrow a bar's admin privilege.
+        let agent_conn = 73_u64;
+        let (agent_stream, _agent_peer) = UnixStream::pair().expect("unix stream pair");
+        state.ipc_clients.insert(
+            agent_conn,
+            IpcClientConn {
+                conn_id: agent_conn,
+                stream: agent_stream,
+                channel: SocketChannel::Agent,
+                auth: PeerAuthState::AgentAuthenticated {
+                    session_id: SessionId("agent".to_owned()),
+                    token: CapabilityToken(
+                        "koma_cap_test_token_for_admin_only_assertions".to_owned(),
+                    ),
+                },
+                reg_token: None,
+                inbox: FrameInbox::default(),
+                outbox: FrameOutbox::default(),
+                event_ring: EventRingBuffer::default(),
+                subscribed_workspaces: BTreeSet::new(),
+                subscribed_topics: HashSet::new(),
+                armed_writable: false,
+            },
+        );
+        let denied = dispatch_rpc(
+            &mut state,
+            agent_conn,
+            IpcRequest {
+                id: 5,
+                method: "win.move_to_workspace".to_owned(),
+                params: json!({ "workspace": "1" }),
+            },
+            Vec::new(),
+        )
+        .expect_err("win.move_to_workspace is admin-only");
+        assert_eq!(denied.symbol, ErrorSymbol::ErrCapabilityDenied);
+    }
+
+    #[test]
+    fn workspace_lookup_prefers_exact_ids_over_names() {
+        let (_event_loop, _display, mut state) = crate::state::tests::make_headless_test_state();
+        let ws1 = state.active_ws_id.clone();
+        assert_eq!(ws1.as_str(), "ws_01");
+
+        // A workspace deliberately *named* like the real id of another workspace.
+        let decoy_id = WorkspaceId::new("ws_09");
+        let now_ms = state.elapsed_ms();
+        state.workspaces.insert(
+            decoy_id.clone(),
+            WorkspaceState::new(
+                decoy_id.clone(),
+                ws1.as_str(),
+                SeatId::new("vseat_09"),
+                LogicalViewport::new(1920, 1080, 1.0),
+                PresentationTarget::Physical(koma_proto::OutputId::new("primary")),
+                LayoutMode::Dwindle,
+                now_ms,
+            ),
+        );
+        let src = state.ensure_workspace_by_name_or_id("2");
+        let win_id = insert_window(&mut state, &src);
+        let conn_id = 75_u64;
+        insert_admin_conn(&mut state, conn_id);
+
+        assert_eq!(
+            state.find_workspace_by_id_or_name("ws_01"),
+            Some(ws1.clone()),
+            "an exact workspace id must win over a workspace merely named `ws_01`"
+        );
+
+        let (_, _) = dispatch_rpc(
+            &mut state,
+            conn_id,
+            IpcRequest {
+                id: 1,
+                method: "ws.focus".to_owned(),
+                params: json!({ "ws_id": "ws_01" }),
+            },
+            Vec::new(),
+        )
+        .expect("ws.focus must resolve the exact id");
+        assert_eq!(state.active_ws_id, ws1, "ws.focus landed on the decoy name");
+
+        // Return to the window's workspace so the move has a source.
+        let (_, _) = dispatch_rpc(
+            &mut state,
+            conn_id,
+            IpcRequest {
+                id: 2,
+                method: "ws.focus".to_owned(),
+                params: json!({ "ws_id": "2" }),
+            },
+            Vec::new(),
+        )
+        .expect("ws.focus must switch back by name");
+        assert_eq!(state.active_ws_id, src);
+
+        let (moved, _) = dispatch_rpc(
+            &mut state,
+            conn_id,
+            IpcRequest {
+                id: 3,
+                method: "win.move_to_workspace".to_owned(),
+                params: json!({ "workspace": "ws_01" }),
+            },
+            Vec::new(),
+        )
+        .expect("win.move_to_workspace must resolve the exact id");
+        assert_eq!(moved["to_ws_id"], json!(ws1.as_str()));
+        assert_eq!(state.workspaces[&ws1].active_window(), Some(win_id));
+        assert_ne!(state.workspaces[&decoy_id].active_window(), Some(win_id));
+    }
+
+    #[test]
+    fn scene_inventory_marks_exactly_one_workspace_focused() {
+        let (_event_loop, _display, mut state) = crate::state::tests::make_headless_test_state();
+        let ws1 = state.active_ws_id.clone();
+        let ws2 = state.ensure_workspace_by_name_or_id("2");
+        state.ensure_workspace_by_name_or_id("scratch");
+        let conn_id = 74_u64;
+        insert_admin_conn(&mut state, conn_id);
+
+        let focused_ids = |state: &mut KomaState| -> Vec<String> {
+            let (inventory, _) = dispatch_rpc(
+                state,
+                conn_id,
+                IpcRequest {
+                    id: 9,
+                    method: "scene.inventory".to_owned(),
+                    params: json!({}),
+                },
+                Vec::new(),
+            )
+            .expect("scene.inventory must succeed on koma-admin.sock");
+            inventory["workspaces"]
+                .as_array()
+                .expect("workspaces array")
+                .iter()
+                .filter(|ws| ws["focused"] == json!(true))
+                .map(|ws| ws["ws_id"].as_str().unwrap_or_default().to_owned())
+                .collect()
+        };
+
+        assert_eq!(focused_ids(&mut state), vec![ws1.as_str().to_owned()]);
+
+        let (_, _) = dispatch_rpc(
+            &mut state,
+            conn_id,
+            IpcRequest {
+                id: 10,
+                method: "ws.focus".to_owned(),
+                params: json!({ "ws_id": ws2.as_str() }),
+            },
+            Vec::new(),
+        )
+        .expect("ws.focus must switch");
+        assert_eq!(focused_ids(&mut state), vec![ws2.as_str().to_owned()]);
     }
 
     #[test]

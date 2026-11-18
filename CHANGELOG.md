@@ -10,6 +10,29 @@ desktop, hardware support, or security guarantees.
 
 ### Added
 
+- `win.move_to_workspace` (alias `win.move`) on `koma-admin.sock`: moves the
+  focused workspace's active window to an existing workspace, mirroring
+  `ActionDescriptor::WindowMoveToWorkspace`, with `follow` deciding whether the
+  destination is focused (`movetoworkspace` vs `movetoworkspacesilent`). Rejects
+  unknown workspaces and empty sources with `ErrNotFound`, applies the session
+  lock gate, and is exposed as `komactl win move-to-workspace <ws_id|name>
+  [--follow]`.
+- `ext-workspace-v1` (staging) server support: one workspace group owning every
+  output, one workspace handle per Koma workspace with its id, name, 1D
+  coordinates and `active` / `hidden` state, plus `output_enter` /
+  `workspace_enter` bookkeeping and `done` batches. `active` marks the displayed
+  workspace; `hidden` is reserved for headless/agent workspaces that have no
+  on-screen representation, so ordinary inactive workspaces keep their click
+  targets under `ignore-hidden: true`. `workspace.activate` is queued per
+  manager and applied on `ext_workspace_manager_v1.commit` (one atomic batch,
+  last request wins), routes through `KomaState::focus_workspace`, and is
+  ignored while the session is locked. Group output membership retains the exact
+  `wl_output` resources, so `output_leave` survives a hot-unplug and two
+  bindings of one output are tracked separately. Documented subset: `urgent`,
+  `deactivate`, `assign`, `remove` and `create_workspace` are not advertised.
+- `focused` in each `scene.inventory` workspace entry, true for exactly one
+  workspace (`active_ws_id`), replacing the runtime-file bridge for status bars.
+
 - `Mod + M` toggles **maximize**: the focused window fills the work area minus
   gaps and exclusive zones, so the bar stays visible. `Mod + F` is true
   fullscreen: it covers the whole monitor including gaps and suppresses
@@ -34,6 +57,18 @@ desktop, hardware support, or security guarantees.
   workspace focused (Hyprland `movetoworkspacesilent`).
 
 ### Fixed
+- `workspace.focused` now fires for every activation path, including special
+  (`special:<name>`) workspaces, output switches, output-less switches and
+  `WorkspaceFocusNext` / `Prev` (cycling is a real activation and emits once),
+  and never fires for a no-op re-focus or for re-opening the already focused
+  special workspace. Dismissing a `special:` overlay now emits the activation of
+  the underlying workspace.
+- `WorkspaceFocusNext` / `Prev` route through the single workspace-switch path,
+  so `ext-workspace-v1` state and `workspace.focused` stay in sync with the
+  keybind instead of leaving the bar on the previous workspace.
+- Workspace lookups resolve exact workspace ids before names in `ws.focus`,
+  `win.move_to_workspace` and the keybind/layout path, so a workspace merely
+  named `ws_01` cannot shadow workspace id `ws_01`.
 
 - Tiled clients are no longer configured below the `xdg_toplevel` minimum size
   they advertise. Chromium and Firefox refused to shrink past their minimum and

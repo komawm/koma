@@ -144,6 +144,7 @@ fn usage_text() -> &'static str {
   komactl gen-types
   komactl inventory
   komactl ws focus <ws_id|name>
+  komactl win move-to-workspace <ws_id|name> [--follow]
   komactl token mint [label]
   komactl capture [ws_id] [out.rgba]
   komactl sandbox <run|create-jail|revoke-jail> [OPTIONS]
@@ -291,6 +292,28 @@ fn main() -> io::Result<()> {
             other => {
                 eprintln!(
                     "komactl ws: unknown subcommand {:?} (expected: focus <ws_id|name>)",
+                    other.unwrap_or("")
+                );
+                process::exit(2);
+            }
+        },
+        Some("win") => match args.get(1).map(String::as_str) {
+            Some("move-to-workspace") => {
+                let Some(target) = args.get(2).cloned() else {
+                    eprintln!("komactl win move-to-workspace: missing <ws_id|name>");
+                    process::exit(2);
+                };
+                let follow = args.iter().skip(3).any(|arg| arg == "--follow");
+                let mut client = AdminClient::connect()?;
+                let (val, _) = client.call_raw(
+                    "win.move_to_workspace",
+                    json!({ "workspace": target, "follow": follow }),
+                )?;
+                println!("{}", serde_json::to_string_pretty(&val).unwrap());
+            }
+            other => {
+                eprintln!(
+                    "komactl win: unknown subcommand {:?} (expected: move-to-workspace <ws_id|name> [--follow])",
                     other.unwrap_or("")
                 );
                 process::exit(2);
