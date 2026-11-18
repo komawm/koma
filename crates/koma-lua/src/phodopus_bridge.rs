@@ -1986,6 +1986,15 @@ fn build_act_namespace<'gc>(ctx: Context<'gc>) -> Result<Table<'gc>, LuaError<'g
     overview.set_field(ctx, "open", unit_act(ctx, ActionDescriptor::OverviewOpen));
     act.set_field(ctx, "overview", overview);
 
+    // koma.act.overlay.* (compositor-rendered keybind overview)
+    let overlay = Table::new(&ctx);
+    overlay.set_field(
+        ctx,
+        "keybinds_toggle",
+        unit_act(ctx, ActionDescriptor::OverlayKeybindsToggle),
+    );
+    act.set_field(ctx, "overlay", overlay);
+
     let strip = Table::new(&ctx);
     populate_scrolling_ns(ctx, &strip);
     act.set_field(ctx, "scroll_strip", strip);

@@ -1240,11 +1240,226 @@ where
     .map(KomaRenderElement::MemoryBuffer)
 }
 
+/// One text run inside a [`TextPanelSpec`], positioned in logical pixels.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextPanelLine {
+    pub x: u32,
+    pub y: u32,
+    pub text: String,
+    /// Straight-alpha RGB plus alpha (`#f0f6fc` -> `[240, 246, 252, 255]`).
+    pub color: [u8; 4],
+}
+
+/// A rounded panel of bitmap text, used by the compositor keybind overview.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TextPanelSpec {
+    pub width: u32,
+    pub height: u32,
+    pub corner_radius: u32,
+    /// Straight-alpha panel fill.
+    pub background: [f32; 4],
+    /// Straight-alpha one-pixel border.
+    pub border: [f32; 4],
+    pub lines: Vec<TextPanelLine>,
+}
+
+impl TextPanelSpec {
+    #[must_use]
+    pub fn new(width: u32, height: u32, corner_radius: u32) -> Self {
+        Self {
+            width,
+            height,
+            corner_radius,
+            background: [0.067, 0.086, 0.114, 0.97],
+            border: [0.188, 0.212, 0.239, 1.0],
+            lines: Vec::new(),
+        }
+    }
+}
+
+/// Rasterizes a rounded [`TextPanelSpec`] into premultiplied `Fourcc::Argb8888` (`[B, G, R, A]`).
+///
+/// Text is drawn with the same built-in 5x7 glyphs as the agent label pill, at a 2x logical
+/// scale (`12 px` advance, `14 px` cap height). Positions in `spec.lines` are logical; the
+/// returned buffer is `width * scale` by `height * scale`.
+///
+/// Complexity: $O(W \cdot H + \text{glyph pixels})$ in panel area.
+#[must_use]
+pub fn rasterize_text_panel_argb8888(
+    spec: &TextPanelSpec,
+    pixel_scale: i32,
+) -> (Vec<u8>, u32, u32) {
+    let s = pixel_scale.clamp(1, 4) as u32;
+    let w = spec.width.max(1) * s;
+    let h = spec.height.max(1) * s;
+    let mut pixels = vec![0_u8; (w * h * 4) as usize];
+
+    let bg = [
+        f32_to_u8(spec.background[0]),
+        f32_to_u8(spec.background[1]),
+        f32_to_u8(spec.background[2]),
+        f32_to_u8(spec.background[3]),
+    ];
+    let border = [
+        f32_to_u8(spec.border[0]),
+        f32_to_u8(spec.border[1]),
+        f32_to_u8(spec.border[2]),
+        f32_to_u8(spec.border[3]),
+    ];
+    let half_w = w as f32 * 0.5;
+    let half_h = h as f32 * 0.5;
+    let radius = (spec.corner_radius as f32 * s as f32).min(half_w.min(half_h));
+    let inner_rx = (half_w - radius).max(0.0);
+    let inner_ry = (half_h - radius).max(0.0);
+
+    for py in 0..h {
+        let qy = (py as f32 + 0.5 - half_h).abs() - inner_ry;
+        for px in 0..w {
+            let qx = (px as f32 + 0.5 - half_w).abs() - inner_rx;
+            let dist = qx.max(0.0).hypot(qy.max(0.0)) + qx.max(qy).min(0.0) - radius;
+            let cov = (0.5 - dist).clamp(0.0, 1.0);
+            if cov <= 0.001 {
+                continue;
+            }
+            let in_border = dist > -(1.5 * s as f32);
+            let rgba = if in_border {
+                premul_bgra(
+                    border[0],
+                    border[1],
+                    border[2],
+                    (f32::from(border[3]) * cov).round() as u8,
+                )
+            } else {
+                premul_bgra(bg[0], bg[1], bg[2], (f32::from(bg[3]) * cov).round() as u8)
+            };
+            let idx = ((py * w + px) * 4) as usize;
+            pixels[idx..idx + 4].copy_from_slice(&rgba);
+        }
+    }
+
+    let glyph_scale = 2 * s;
+    // 5 glyph columns + one column of spacing at the 2x logical glyph scale.
+    let advance = 6 * glyph_scale;
+    for line in &spec.lines {
+        let base_y = line.y * s;
+        let base_x = line.x * s;
+        let color = premul_bgra(line.color[0], line.color[1], line.color[2], line.color[3]);
+        for (char_idx, ch) in line.text.chars().enumerate() {
+            let glyph_x = base_x + char_idx as u32 * advance;
+            if glyph_x + 5 * glyph_scale > w {
+                break;
+            }
+            for (ry, bits) in glyph_5x7(ch).into_iter().enumerate() {
+                for rx in 0..5_u32 {
+                    if ((bits >> (4 - rx)) & 1) == 0 {
+                        continue;
+                    }
+                    for dy in 0..glyph_scale {
+                        let py = base_y + ry as u32 * glyph_scale + dy;
+                        if py >= h {
+                            continue;
+                        }
+                        for dx in 0..glyph_scale {
+                            let px = glyph_x + rx * glyph_scale + dx;
+                            if px >= w {
+                                continue;
+                            }
+                            let idx = ((py * w + px) * 4) as usize;
+                            pixels[idx..idx + 4].copy_from_slice(&color);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    (pixels, w, h)
+}
+
+/// Builds a Smithay `MemoryBuffer` element for a [`TextPanelSpec`] at `location`.
+#[must_use]
+pub fn build_text_panel_element<R>(
+    renderer: &mut R,
+    spec: &TextPanelSpec,
+    location: LogicalPoint,
+    output_scale: Scale<f64>,
+) -> Option<KomaRenderElement<R>>
+where
+    R: KomaRenderTarget,
+    R::TextureId: Send + Clone + 'static,
+{
+    if spec.width == 0 || spec.height == 0 {
+        return None;
+    }
+    let int_scale = output_scale.x.ceil().clamp(1.0, 4.0) as i32;
+    let (pixels, px_w, px_h) = rasterize_text_panel_argb8888(spec, int_scale);
+    let buffer = MemoryRenderBuffer::from_slice(
+        &pixels,
+        Fourcc::Argb8888,
+        (px_w as i32, px_h as i32),
+        int_scale,
+        Transform::Normal,
+        None,
+    );
+    let loc_phys: Point<i32, Physical> =
+        Point::from((location.x, location.y)).to_physical_precise_round(output_scale);
+    MemoryRenderBufferRenderElement::from_buffer(
+        renderer,
+        loc_phys.to_f64(),
+        &buffer,
+        None,
+        None,
+        None,
+        Kind::Unspecified,
+    )
+    .ok()
+    .map(KomaRenderElement::MemoryBuffer)
+}
+
 #[cfg(test)]
 mod tests {
     use koma_model::{LogicalRect, place_label_pill};
 
     use super::*;
+
+    #[test]
+    fn text_panel_rasterizer_draws_rounded_background_border_and_glyphs() {
+        let mut spec = TextPanelSpec::new(240, 80, 10);
+        spec.lines.push(TextPanelLine {
+            x: 12,
+            y: 12,
+            text: "AB".to_owned(),
+            color: [240, 246, 252, 255],
+        });
+        let (pixels, w, h) = rasterize_text_panel_argb8888(&spec, 1);
+        assert_eq!((w, h), (240, 80));
+        assert_eq!(pixels.len(), (w * h * 4) as usize);
+
+        // Rounded corner stays transparent.
+        assert_eq!(&pixels[0..4], &[0, 0, 0, 0]);
+
+        // Panel centre is opaque background (#11161d -> BGRA with alpha 247).
+        let centre = (((h / 2) * w + w / 2) * 4) as usize;
+        assert!(pixels[centre + 3] > 240);
+        assert!(
+            pixels[centre] > pixels[centre + 2],
+            "background stays blue-ish (BGRA)"
+        );
+
+        // Glyph pixels use the requested near-white colour.
+        let white = pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|px| px[0] == 252 && px[1] == 246 && px[2] == 240 && px[3] == 255)
+            .count();
+        assert!(white > 20, "expected readable glyphs, found {white} pixels");
+
+        // Scaled rasterization keeps logical geometry.
+        let (scaled, sw, sh) = rasterize_text_panel_argb8888(&spec, 2);
+        assert_eq!((sw, sh), (480, 160));
+        assert_eq!(scaled.len(), (sw * sh * 4) as usize);
+    }
 
     #[test]
     fn solid_color_premultiplies_straight_alpha_for_premultiplied_blending() {

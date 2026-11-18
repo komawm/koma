@@ -187,6 +187,7 @@ koma.bind("Mod + Shift + J", koma.act.window.move_direction("down"),  { desc = "
 koma.bind("Mod + Shift + K", koma.act.window.move_direction("up"),    { desc = "Move window up" })
 koma.bind("Mod + Shift + L", koma.act.window.move_direction("right"), { desc = "Move window right" })
 koma.bind("Mod + Tab",       koma.act.overview.toggle(),          { desc = "Toggle workspace overview" })
+koma.bind("Mod + Shift + Slash", koma.act.overlay.keybinds_toggle(), { desc = "Show the keybind overview" })
 
 for i = 1, 5 do
     local ws = tostring(i)

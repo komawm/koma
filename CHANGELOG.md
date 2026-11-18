@@ -28,6 +28,15 @@ desktop, hardware support, or security guarantees.
   drag/scroll binds and touchpad gestures in their own sections. Supports
   `--json` and `--grep <pattern>`, works offline, and merges the live
   configuration path, generation, and lock state when a socket is reachable.
+- Built-in keybind overview: `Mod + Shift + Slash` (and
+  `koma.act.overlay.keybinds_toggle()`) opens a compositor-rendered overlay
+  listing every effective binding, grouped by the catalogue groups and laid out
+  in output-sized columns with a final `+N more` row when the viewport cannot
+  fit them all. `Escape`, a click, or the same chord closes it; while open it
+  holds a keyboard grab, suppresses pointer delivery to clients, and never
+  draws over a locked or abandoned session. `komactl keys` and the overlay now
+  share one effective-keymap merge in `koma-lua`, so the CLI and the on-screen
+  list cannot disagree.
 
 ## [0.0.3] - 2026-11-18
 

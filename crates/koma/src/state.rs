@@ -798,6 +798,8 @@ pub struct KomaState {
     pub vseats: HashMap<SeatId, VirtualSeatLedger>,
     pub rules: WindowRuleEngine,
     pub keybinds: KeybindTable,
+    /// Open compositor-rendered keybind overview, if any.
+    pub keybind_overlay: Option<crate::keybind_overlay::KeybindOverlay>,
     pub gestures: GestureTable,
     pub pending_passthrough_actions: Vec<ActionDescriptor>,
     pub lua_scheduler: TrampolineScheduler,
@@ -1043,6 +1045,7 @@ impl KomaState {
             vseats,
             rules: WindowRuleEngine::new(),
             keybinds: KeybindTable::default(),
+            keybind_overlay: None,
             gestures: GestureTable::default(),
             pending_passthrough_actions: Vec::new(),
             lua_scheduler: TrampolineScheduler::default(),
@@ -2103,6 +2106,8 @@ impl KomaState {
         self.keybinds.active_mode = None;
         self.keybinds.reset_scroll_trackers();
         self.gestures.reset_active_sessions();
+        // Never leave the keybind overview visible above a locked session.
+        self.keybind_overlay = None;
 
         let now_input = smithay::backend::input::InputTime::now();
         self.break_active_pointer_constraints();
@@ -4769,6 +4774,10 @@ impl KomaState {
     {
         self.reconcile_session_lock();
         self.notify_user_activity();
+        if self.keybind_overlay_is_open() && !self.is_locked_or_abandoned() {
+            self.dismiss_keybind_overlay();
+            return;
+        }
         let Some(pos) = self.resolve_touch_position::<B, _>(&event) else {
             return;
         };
@@ -4797,6 +4806,9 @@ impl KomaState {
         B::Device: smithay::backend::input::Device,
     {
         self.notify_user_activity();
+        if self.keybind_overlay_is_open() && !self.is_locked_or_abandoned() {
+            return;
+        }
         let Some(pos) = self.resolve_touch_position::<B, _>(&event) else {
             return;
         };
@@ -4817,6 +4829,9 @@ impl KomaState {
 
     pub fn handle_touch_up<B: InputBackend>(&mut self, event: B::TouchUpEvent) {
         self.notify_user_activity();
+        if self.keybind_overlay_is_open() && !self.is_locked_or_abandoned() {
+            return;
+        }
         let Some(touch) = self.touch() else {
             return;
         };

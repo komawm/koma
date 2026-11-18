@@ -44,7 +44,10 @@ use smithay::{
 };
 use tracing::{debug, info, warn};
 
-use crate::state::{ActiveBackend, KomaState};
+use crate::{
+    keybind_overlay::prepend_keybind_overlay_elements,
+    state::{ActiveBackend, KomaState},
+};
 
 /// Render transform applied to the nested output's damage tracker.
 ///
@@ -670,6 +673,16 @@ pub fn render_winit_frame(state: &mut KomaState) -> anyhow::Result<()> {
             elements.extend(bg_layer_elements);
             if state.config_error_banner.is_some() {
                 prepend_config_error_banner(viewport, &mut elements);
+            }
+            if state.keybind_overlay_is_open() {
+                prepend_keybind_overlay_elements(
+                    winit_state.backend.renderer(),
+                    state,
+                    &out_name,
+                    viewport,
+                    output_scale,
+                    &mut elements,
+                );
             }
             prepend_agent_cursor_elements(
                 winit_state.backend.renderer(),

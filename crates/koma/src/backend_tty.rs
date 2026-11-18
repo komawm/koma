@@ -87,6 +87,7 @@ use crate::{
         dispatch_output_frame_callbacks_filtered,
     },
     edid::ParsedEdid,
+    keybind_overlay::prepend_keybind_overlay_elements,
     state::{ActiveBackend, KomaState, koma_transform_to_smithay},
 };
 
@@ -2291,6 +2292,16 @@ fn render_single_drm_surface(
         append_closing_window_elements(&mut renderer, &closing_items, &mut elements);
         if state.config_error_banner.is_some() {
             prepend_config_error_banner(viewport, &mut elements);
+        }
+        if state.keybind_overlay_is_open() {
+            prepend_keybind_overlay_elements(
+                &mut renderer,
+                state,
+                &out_name,
+                viewport,
+                output_scale,
+                &mut elements,
+            );
         }
 
         append_layer_tier_elements(

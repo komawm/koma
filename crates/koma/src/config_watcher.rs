@@ -662,6 +662,9 @@ pub fn reload_from_lua_source(
         compiled_binds.active_mode = Some(cur_mode.clone());
     }
     state.keybinds = compiled_binds;
+    // The open overview snapshots the previous effective keymap; close it on reload so it can
+    // never show bindings the compositor no longer accepts.
+    state.keybind_overlay = None;
     state.gestures = compiled_gestures;
 
     // 2. Reconcile declarative `koma.workspace(...)` specs losslessly (never dropping existing
