@@ -625,8 +625,8 @@ impl TtyBackendState {
         }
     }
 
-    /// Live-updates scale, transform, 2D position, and `safe_area` on connected KMS outputs during
-    /// `init.lua` hot-reload without dropping client surfaces or resetting DRM devices.
+    /// Live-updates scale, transform, mode, 2D position, and `safe_area` on connected KMS outputs
+    /// during `init.lua` hot-reload without dropping client surfaces or resetting DRM devices.
     pub fn apply_hot_reloaded_monitors(
         &mut self,
         registry: &koma_lua::KomaConfigRegistry,
@@ -643,7 +643,49 @@ impl TtyBackendState {
                 if spec.is_some_and(|s| s.off) {
                     continue;
                 }
-                let wl_mode = surface.output.current_mode().unwrap_or(Mode {
+                let cur_mode = surface.output.current_mode();
+                // A `koma.monitor` rule owns its output's mode; without a rule the live mode is
+                // left untouched so output-management changes survive unrelated reloads.
+                let target_mode = spec.and_then(|spec| {
+                    let advertised: Vec<AdvertisedMode> = surface
+                        .drm_modes
+                        .iter()
+                        .copied()
+                        .map(AdvertisedMode::from_drm_mode)
+                        .collect();
+                    resolve_reload_mode(
+                        &surface.connector_name,
+                        Some(spec.mode.as_str()),
+                        &advertised,
+                        &surface.drm_modes,
+                    )
+                });
+                // Only modeset when the resolved mode actually differs from the live one.
+                let applied_mode = match mode_change_required(cur_mode, target_mode) {
+                    Some(mode) => match apply_surface_mode(surface, mode) {
+                        Ok(applied) => {
+                            info!(
+                                connector = %surface.connector_name,
+                                old_mode = %describe_mode(cur_mode),
+                                new_mode = %describe_mode(Some(applied)),
+                                "applying hot-reloaded output mode"
+                            );
+                            Some(applied)
+                        }
+                        Err(err) => {
+                            warn!(
+                                connector = %surface.connector_name,
+                                requested = %describe_mode(Some(mode)),
+                                error = %err,
+                                "hot-reloaded output modeset failed; keeping the current mode"
+                            );
+                            None
+                        }
+                    },
+                    None => None,
+                };
+                // Geometry and DPI-derived scale must follow the mode that is actually scanning out.
+                let wl_mode = applied_mode.or(cur_mode).unwrap_or(Mode {
                     size: (1920, 1080).into(),
                     refresh: 60_000,
                 });
@@ -663,9 +705,12 @@ impl TtyBackendState {
 
                 let cur_scale = surface.output.current_scale().fractional_scale();
                 let cur_transform = surface.output.current_transform();
-                if (cur_scale - new_scale).abs() > 1e-4 || cur_transform != new_transform {
+                if applied_mode.is_some()
+                    || (cur_scale - new_scale).abs() > 1e-4
+                    || cur_transform != new_transform
+                {
                     surface.output.change_current_state(
-                        None,
+                        applied_mode,
                         Some(new_transform),
                         Some(Scale::Fractional(new_scale)),
                         None,
@@ -707,7 +752,7 @@ impl TtyBackendState {
     }
 
     /// Requests a live KMS modeset on `output` for the given Wayland `Mode` (`zwlr_output_manager_v1`).
-    pub fn apply_output_mode(&mut self, output: &Output, mode: Mode) -> Result<(), String> {
+    pub fn apply_output_mode(&mut self, output: &Output, mode: Mode) -> Result<Mode, String> {
         let name = output.name();
         for device in self.devices.values_mut() {
             if let Some(surface) = device
@@ -715,40 +760,7 @@ impl TtyBackendState {
                 .values_mut()
                 .find(|s| s.output == *output || s.output.name() == name)
             {
-                let target_w =
-                    u16::try_from(mode.size.w).map_err(|_| "mode width out of range".to_owned())?;
-                let target_h = u16::try_from(mode.size.h)
-                    .map_err(|_| "mode height out of range".to_owned())?;
-                let drm_mode = surface
-                    .drm_modes
-                    .iter()
-                    .copied()
-                    .find(|m| Mode::from(*m) == mode)
-                    .or_else(|| {
-                        surface
-                            .drm_modes
-                            .iter()
-                            .copied()
-                            .filter(|m| m.size() == (target_w, target_h))
-                            .filter(|m| {
-                                mode.refresh <= 0
-                                    || (Mode::from(*m).refresh - mode.refresh).abs() <= 500
-                            })
-                            .max_by_key(|m| m.vrefresh())
-                    })
-                    .ok_or_else(|| {
-                        format!(
-                            "mode {}x{}@{}mHz is not supported by DRM connector {}",
-                            mode.size.w, mode.size.h, mode.refresh, surface.connector_name
-                        )
-                    })?;
-
-                surface.compositor.use_mode(drm_mode).map_err(|err| {
-                    format!("DRM modeset failed on {}: {err:?}", surface.connector_name)
-                })?;
-                surface.refresh_mhz = Mode::from(drm_mode).refresh;
-                surface.redraw_state = SurfaceRedrawState::Queued;
-                return Ok(());
+                return apply_surface_mode(surface, mode);
             }
         }
         Err(format!("unknown TTY output `{name}`"))
@@ -1745,50 +1757,267 @@ fn vt_switch_errno_hint(errno: Errno) -> Option<&'static str> {
     }
 }
 
+/// Tolerance used when comparing a requested refresh rate against an advertised one. EDID
+/// vertical refresh rates are commonly truncated (`59.94`, `119.88`), so exact equality would
+/// reject a correct request, matching the tolerance the output-management path already uses.
+const MODE_REFRESH_TOLERANCE_MHZ: i32 = 500;
+
+/// A connector mode reduced to the fields mode resolution compares, keeping the resolver pure and
+/// unit-testable without a DRM device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AdvertisedMode {
+    width: u16,
+    height: u16,
+    /// Wayland refresh rate in millihertz, derived exactly like [`Mode::from`].
+    refresh_mhz: i32,
+    interlaced: bool,
+    preferred: bool,
+}
+
+impl AdvertisedMode {
+    fn from_drm_mode(mode: control::Mode) -> Self {
+        let (width, height) = mode.size();
+        Self {
+            width,
+            height,
+            refresh_mhz: Mode::from(mode).refresh,
+            interlaced: mode.flags().contains(ModeFlags::INTERLACE),
+            preferred: mode.mode_type().contains(ModeTypeFlags::PREFERRED),
+        }
+    }
+
+    /// Renders the mode as `WIDTHxHEIGHT@HZ` (three decimals) for logs and warnings.
+    fn describe(self) -> String {
+        format!(
+            "{}x{}@{:.3}",
+            self.width,
+            self.height,
+            f64::from(self.refresh_mhz) / 1000.0
+        )
+    }
+}
+
+/// Outcome of matching a `koma.monitor.mode` rule against the connector's advertised modes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModeRuleOutcome {
+    /// Index into the advertised mode list of the best match.
+    Mode(usize),
+    /// The rule asks for no concrete mode (`mode` omitted, empty, or `"preferred"`).
+    Preferred,
+    /// The rule is not `WIDTHxHEIGHT[@HZ]`.
+    Malformed,
+    /// The rule is well-formed but no advertised mode satisfies it.
+    NotAdvertised,
+}
+
+/// Resolves a `koma.monitor.mode` rule against advertised connector modes.
+///
+/// Grammar (identical to the startup path): `WIDTHxHEIGHT` with an optional `@HZ` suffix, where
+/// `HZ` may be fractional and may carry a literal `Hz` suffix (`2560x1600@240`, `1920x1080@59.94Hz`).
+/// Interlaced modes are never selected. With `HZ` the closest advertised refresh within
+/// [`MODE_REFRESH_TOLERANCE_MHZ`] wins (ties prefer the higher rate); without `HZ` the highest
+/// advertised refresh at that resolution wins.
+fn resolve_mode_rule(requested: Option<&str>, advertised: &[AdvertisedMode]) -> ModeRuleOutcome {
+    let Some(raw) = requested else {
+        return ModeRuleOutcome::Preferred;
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("preferred") {
+        return ModeRuleOutcome::Preferred;
+    }
+    let Some((width, height, refresh_mhz)) = parse_mode_spec(trimmed) else {
+        return ModeRuleOutcome::Malformed;
+    };
+    if width == 0 || height == 0 {
+        return ModeRuleOutcome::Malformed;
+    }
+    advertised
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| !m.interlaced && m.width == width && m.height == height)
+        .filter(|(_, m)| {
+            refresh_mhz
+                .is_none_or(|target| (m.refresh_mhz - target).abs() <= MODE_REFRESH_TOLERANCE_MHZ)
+        })
+        .min_by_key(|(_, m)| {
+            let delta = refresh_mhz.map_or(0, |target| (m.refresh_mhz - target).abs());
+            (delta, std::cmp::Reverse(m.refresh_mhz))
+        })
+        .map_or(ModeRuleOutcome::NotAdvertised, |(index, _)| {
+            ModeRuleOutcome::Mode(index)
+        })
+}
+
+/// Index of the connector's default mode: the `PREFERRED`-flagged non-interlaced mode with the
+/// largest area and refresh, otherwise the largest/highest-refresh non-interlaced mode. This
+/// mirrors [`pick_connector_mode`]'s fallback so hot reload and startup agree.
+fn preferred_mode_index(advertised: &[AdvertisedMode]) -> Option<usize> {
+    advertised
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| !m.interlaced)
+        .max_by_key(|(_, m)| {
+            (
+                m.preferred,
+                u32::from(m.width) * u32::from(m.height),
+                m.refresh_mhz,
+            )
+        })
+        .map(|(index, _)| index)
+}
+
+/// Renders the deduplicated non-interlaced mode list for warning messages.
+fn describe_supported_modes(advertised: &[AdvertisedMode]) -> String {
+    let mut seen: Vec<String> = Vec::new();
+    for mode in advertised.iter().filter(|m| !m.interlaced) {
+        let text = mode.describe();
+        if !seen.contains(&text) {
+            seen.push(text);
+        }
+    }
+    if seen.is_empty() {
+        "none".to_owned()
+    } else {
+        seen.join(", ")
+    }
+}
+
+/// Resolves the `koma.monitor.mode` rule for a hot-reloaded output, warning exactly once (naming
+/// the connector, the requested mode and the supported list) when the request cannot be honoured.
+fn resolve_reload_mode(
+    connector: &str,
+    requested: Option<&str>,
+    advertised: &[AdvertisedMode],
+    drm_modes: &[control::Mode],
+) -> Option<Mode> {
+    let request_label = requested
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("preferred");
+    match resolve_mode_rule(requested, advertised) {
+        ModeRuleOutcome::Mode(index) => drm_modes.get(index).copied().map(Mode::from),
+        ModeRuleOutcome::Preferred => preferred_mode_index(advertised)
+            .and_then(|index| drm_modes.get(index).copied())
+            .map(Mode::from),
+        ModeRuleOutcome::Malformed => {
+            warn!(
+                connector = %connector,
+                requested = %request_label,
+                supported = %describe_supported_modes(advertised),
+                "hot-reloaded `koma.monitor` mode is malformed (expected `WIDTHxHEIGHT[@HZ]`); keeping the current output mode"
+            );
+            None
+        }
+        ModeRuleOutcome::NotAdvertised => {
+            warn!(
+                connector = %connector,
+                requested = %request_label,
+                supported = %describe_supported_modes(advertised),
+                "hot-reloaded `koma.monitor` mode is not advertised by the connector; keeping the current output mode"
+            );
+            None
+        }
+    }
+}
+
+/// Renders a Wayland mode (or the absence of one) as `WIDTHxHEIGHT@HZ` for logs.
+fn describe_mode(mode: Option<Mode>) -> String {
+    mode.map_or_else(
+        || "unknown".to_owned(),
+        |m| {
+            format!(
+                "{}x{}@{:.3}",
+                m.size.w,
+                m.size.h,
+                f64::from(m.refresh) / 1000.0
+            )
+        },
+    )
+}
+
+/// Returns the mode a reload must apply, or `None` when the resolved mode already scans out, so a
+/// scale-only or transform-only reload never triggers a needless modeset.
+fn mode_change_required(current: Option<Mode>, resolved: Option<Mode>) -> Option<Mode> {
+    resolved.filter(|mode| Some(*mode) != current)
+}
+
+/// Performs the live KMS modeset on one surface and returns the mode that is now scanning out.
+/// Shared by the `zwlr_output_manager_v1` path and `init.lua` hot-reload.
+fn apply_surface_mode(surface: &mut DrmOutputSurface, mode: Mode) -> Result<Mode, String> {
+    let target_w = u16::try_from(mode.size.w).map_err(|_| "mode width out of range".to_owned())?;
+    let target_h = u16::try_from(mode.size.h).map_err(|_| "mode height out of range".to_owned())?;
+    let drm_mode = surface
+        .drm_modes
+        .iter()
+        .copied()
+        .find(|m| Mode::from(*m) == mode)
+        .or_else(|| {
+            surface
+                .drm_modes
+                .iter()
+                .copied()
+                .filter(|m| m.size() == (target_w, target_h))
+                .filter(|m| {
+                    mode.refresh <= 0
+                        || (Mode::from(*m).refresh - mode.refresh).abs()
+                            <= MODE_REFRESH_TOLERANCE_MHZ
+                })
+                .max_by_key(|m| m.vrefresh())
+        })
+        .ok_or_else(|| {
+            format!(
+                "mode {}x{}@{}mHz is not supported by DRM connector {}",
+                mode.size.w, mode.size.h, mode.refresh, surface.connector_name
+            )
+        })?;
+
+    surface
+        .compositor
+        .use_mode(drm_mode)
+        .map_err(|err| format!("DRM modeset failed on {}: {err:?}", surface.connector_name))?;
+    let applied = Mode::from(drm_mode);
+    surface.refresh_mhz = applied.refresh;
+    surface.redraw_state = SurfaceRedrawState::Queued;
+    Ok(applied)
+}
+
 /// Selects either the user-requested `"WIDTHxHEIGHT@HZ"` mode from `init.lua` or the connector's
 /// highest-refresh non-interlaced `PREFERRED` mode (`niri/src/backend/tty.rs` `pick_mode`).
 fn pick_connector_mode(
     connector: &connector::Info,
     requested_spec: Option<&str>,
 ) -> Option<control::Mode> {
-    if let Some(spec) = requested_spec
-        && let Some((target_w, target_h, target_mhz)) = parse_mode_spec(spec)
-    {
-        let mut best_match: Option<control::Mode> = None;
-        for m in connector.modes() {
-            if m.flags().contains(ModeFlags::INTERLACE) || m.size() != (target_w, target_h) {
-                continue;
-            }
-            if let Some(mhz) = target_mhz {
-                let wl_m = Mode::from(*m);
-                if (wl_m.refresh - mhz).abs() <= 500 {
-                    best_match = Some(*m);
-                    break;
-                }
-            } else if best_match.is_none_or(|curr| curr.vrefresh() < m.vrefresh()) {
-                best_match = Some(*m);
-            }
-        }
-        if best_match.is_some() {
-            return best_match;
-        }
-        warn!(
-            requested = %spec,
-            "configured output mode not advertised by EDID; falling back to preferred mode"
-        );
-    }
-
-    // Prefer `ModeTypeFlags::PREFERRED` with the highest refresh rate (e.g. 2560x1600@240Hz)
-    connector
+    let advertised: Vec<AdvertisedMode> = connector
         .modes()
         .iter()
         .copied()
-        .filter(|m| !m.flags().contains(ModeFlags::INTERLACE))
-        .max_by_key(|m| {
-            let is_pref = m.mode_type().contains(ModeTypeFlags::PREFERRED);
-            let (w, h) = m.size();
-            (is_pref, u32::from(w) * u32::from(h), m.vrefresh())
-        })
+        .map(AdvertisedMode::from_drm_mode)
+        .collect();
+    let fallback = || {
+        preferred_mode_index(&advertised).and_then(|index| connector.modes().get(index).copied())
+    };
+    match resolve_mode_rule(requested_spec, &advertised) {
+        ModeRuleOutcome::Mode(index) => connector.modes().get(index).copied(),
+        ModeRuleOutcome::Preferred => fallback(),
+        ModeRuleOutcome::Malformed => {
+            if let Some(spec) = requested_spec
+                .filter(|s| !s.trim().is_empty() && !s.trim().eq_ignore_ascii_case("preferred"))
+            {
+                warn!(
+                    requested = %spec,
+                    "configured output mode is malformed (expected `WIDTHxHEIGHT[@HZ]`); falling back to preferred mode"
+                );
+            }
+            fallback()
+        }
+        ModeRuleOutcome::NotAdvertised => {
+            warn!(
+                requested = %requested_spec.unwrap_or_default(),
+                "configured output mode not advertised by EDID; falling back to preferred mode"
+            );
+            fallback()
+        }
+    }
 }
 
 fn parse_mode_spec(spec: &str) -> Option<(u16, u16, Option<i32>)> {
@@ -2702,6 +2931,184 @@ mod tests {
         );
         assert_eq!(parse_mode_spec("1280x720"), Some((1280, 720, None)));
         assert_eq!(parse_mode_spec("preferred"), None);
+    }
+
+    /// Builds one advertised mode for resolver tests (`Hz` rounded to millihertz).
+    fn advertised(
+        width: u16,
+        height: u16,
+        hz: f64,
+        preferred: bool,
+        interlaced: bool,
+    ) -> AdvertisedMode {
+        AdvertisedMode {
+            width,
+            height,
+            refresh_mhz: (hz * 1000.0).round() as i32,
+            interlaced,
+            preferred,
+        }
+    }
+
+    #[test]
+    fn mode_rule_exact_match_wins() {
+        let modes = [
+            advertised(1920, 1080, 60.0, true, false),
+            advertised(1920, 1080, 240.0, false, false),
+            advertised(2560, 1600, 60.0, false, false),
+        ];
+        assert_eq!(
+            resolve_mode_rule(Some("1920x1080@240"), &modes),
+            ModeRuleOutcome::Mode(1)
+        );
+        assert_eq!(
+            resolve_mode_rule(Some(" 2560x1600@60 "), &modes),
+            ModeRuleOutcome::Mode(2)
+        );
+    }
+
+    #[test]
+    fn mode_rule_matches_refresh_with_tolerance() {
+        // EDID reports 59.94 Hz; the rule asks for the conventional 60 Hz.
+        let modes = [
+            advertised(2560, 1600, 59.94, true, false),
+            advertised(2560, 1600, 120.0, false, false),
+        ];
+        assert_eq!(
+            resolve_mode_rule(Some("2560x1600@60"), &modes),
+            ModeRuleOutcome::Mode(0)
+        );
+        assert_eq!(
+            resolve_mode_rule(Some("2560x1600@59.94Hz"), &modes),
+            ModeRuleOutcome::Mode(0)
+        );
+        // 144 Hz is not within tolerance of either advertised rate.
+        assert_eq!(
+            resolve_mode_rule(Some("2560x1600@144"), &modes),
+            ModeRuleOutcome::NotAdvertised
+        );
+    }
+
+    #[test]
+    fn mode_rule_resolution_only_picks_highest_refresh() {
+        let modes = [
+            advertised(1920, 1080, 60.0, true, false),
+            advertised(2560, 1600, 60.0, false, false),
+            advertised(1920, 1080, 240.0, false, false),
+            advertised(1920, 1080, 144.0, false, false),
+        ];
+        assert_eq!(
+            resolve_mode_rule(Some("1920x1080"), &modes),
+            ModeRuleOutcome::Mode(2)
+        );
+        assert_eq!(
+            resolve_mode_rule(Some("2560x1600"), &modes),
+            ModeRuleOutcome::Mode(1)
+        );
+    }
+
+    #[test]
+    fn mode_rule_reports_unadvertised_request() {
+        let modes = [advertised(1920, 1080, 60.0, true, false)];
+        assert_eq!(
+            resolve_mode_rule(Some("3840x2160@60"), &modes),
+            ModeRuleOutcome::NotAdvertised
+        );
+        assert_eq!(
+            resolve_mode_rule(Some("1920x1080@120"), &modes),
+            ModeRuleOutcome::NotAdvertised
+        );
+        assert_eq!(
+            resolve_mode_rule(Some("1920x1080@60"), &[]),
+            ModeRuleOutcome::NotAdvertised
+        );
+    }
+
+    #[test]
+    fn mode_rule_reports_malformed_request() {
+        let modes = [advertised(1920, 1080, 60.0, true, false)];
+        for spec in [
+            "1920*1080",
+            "1920x1080@",
+            "1920x1080@sixty",
+            "1920x",
+            "@240",
+            "0x0",
+            "1920x1080@60Hzx",
+        ] {
+            assert_eq!(
+                resolve_mode_rule(Some(spec), &modes),
+                ModeRuleOutcome::Malformed,
+                "{spec:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mode_rule_defaults_to_preferred_when_omitted() {
+        let modes = [
+            advertised(1920, 1080, 60.0, true, false),
+            advertised(2560, 1600, 240.0, false, false),
+            advertised(2560, 1600, 240.0, false, true),
+        ];
+        for spec in [
+            None,
+            Some(""),
+            Some("  "),
+            Some("preferred"),
+            Some("PREFERRED"),
+        ] {
+            assert_eq!(resolve_mode_rule(spec, &modes), ModeRuleOutcome::Preferred);
+        }
+        // `PREFERRED` flag dominates area and refresh, matching the startup selection.
+        assert_eq!(preferred_mode_index(&modes), Some(0));
+    }
+
+    #[test]
+    fn preferred_mode_falls_back_to_largest_highest_refresh() {
+        let modes = [
+            advertised(1920, 1080, 144.0, false, false),
+            advertised(2560, 1600, 60.0, false, false),
+            advertised(2560, 1600, 240.0, false, true),
+        ];
+        assert_eq!(preferred_mode_index(&modes), Some(1));
+        assert_eq!(preferred_mode_index(&[]), None);
+    }
+
+    #[test]
+    fn mode_rule_never_selects_interlaced_modes() {
+        let modes = [
+            advertised(1920, 1080, 60.0, false, false),
+            advertised(1920, 1080, 120.0, false, true),
+        ];
+        assert_eq!(
+            resolve_mode_rule(Some("1920x1080@120"), &modes),
+            ModeRuleOutcome::NotAdvertised
+        );
+        assert_eq!(
+            resolve_mode_rule(Some("1920x1080"), &modes),
+            ModeRuleOutcome::Mode(0)
+        );
+        assert_eq!(preferred_mode_index(&modes), Some(0));
+    }
+
+    #[test]
+    fn mode_change_skipped_when_resolved_mode_matches_current() {
+        let current = Mode {
+            size: (2560, 1600).into(),
+            refresh: 240_000,
+        };
+        assert_eq!(mode_change_required(Some(current), Some(current)), None);
+        let other = Mode {
+            size: (1920, 1080).into(),
+            refresh: 60_000,
+        };
+        assert_eq!(
+            mode_change_required(Some(current), Some(other)),
+            Some(other)
+        );
+        assert_eq!(mode_change_required(None, Some(other)), Some(other));
+        assert_eq!(mode_change_required(Some(current), None), None);
     }
 
     #[test]
