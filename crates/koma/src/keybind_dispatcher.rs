@@ -9,7 +9,9 @@ use std::{
     process::Command,
 };
 
-use koma_lua::{ActionDescriptor, BindHandleId, BindOptions, BindSpec, schema::TriggerEdge};
+use koma_lua::{
+    ActionDescriptor, BindHandleId, BindOptions, BindRepeat, BindSpec, schema::TriggerEdge,
+};
 use koma_model::{CardinalDir, LogicalPoint, PresentationTarget, WorkspaceState};
 use koma_proto::WorkspaceId;
 use smithay::{
@@ -27,6 +29,7 @@ use tracing::{debug, info, warn};
 
 use crate::{
     backend_winit::toggle_ring0_preempt_takeover,
+    keybind_repeat::{KeyRepeatState, RepeatRequest, arm_keybind_repeat_timer},
     macro_runtime::{execute_queued_host_actions, rearm_trampoline_timer},
     pointer_grabs::{
         BTN_EXTRA, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, BTN_SIDE, cancel_active_pointer_grab,
@@ -256,6 +259,30 @@ pub struct CompiledBind {
     pub press_action: Option<ActionDescriptor>,
     pub release_action: Option<ActionDescriptor>,
     pub options: BindOptions,
+    /// Resolved repeat class: explicit `repeat` option, else derived from the action.
+    pub repeat: BindRepeat,
+}
+
+impl CompiledBind {
+    /// Repeat request for a `WhileHeld` press of this chord on `keycode` with `mods` held.
+    ///
+    /// `None` for `Once` binds, for binds without a press action, and for `pass_through`
+    /// binds: those forward the key to the focused client, which repeats it from the
+    /// `wl_keyboard.repeat_info` Koma advertises, so a compositor repeat would double-dispatch.
+    #[must_use]
+    pub fn repeat_request(&self, keycode: u32, mods: u8) -> Option<RepeatRequest> {
+        if !self.repeat.repeats() || self.options.pass_through {
+            return None;
+        }
+        let action = self.press_action.clone()?;
+        Some(RepeatRequest {
+            bind_id: self.id,
+            keycode,
+            mods,
+            action,
+            allow_when_locked: self.options.allow_when_locked,
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -297,6 +324,8 @@ pub struct KeybindTable {
     pub pending_releases: HashMap<u32, PendingRelease>,
     pub pending_mouse_releases: HashMap<u32, PendingRelease>,
     pub suppressed_buttons: HashSet<u32>,
+    /// Repeat-while-held state shared by every keyboard bind (`komawm/koma#76`).
+    pub repeat: KeyRepeatState,
     pub horizontal_wheel_tracker: ScrollTracker,
     pub vertical_wheel_tracker: ScrollTracker,
     pub horizontal_finger_tracker: ScrollTracker,
@@ -503,6 +532,7 @@ impl KeybindTable {
                     chord,
                     press_action: Some(act.clone()),
                     release_action: None,
+                    repeat: options.effective_repeat(act),
                     options,
                 });
             }
@@ -521,6 +551,7 @@ impl KeybindTable {
                     chord,
                     press_action: Some(ActionDescriptor::WorkspaceFocus(ws_name.clone())),
                     release_action: None,
+                    repeat: BindRepeat::Once,
                     options: BindOptions::default(),
                 });
             }
@@ -537,6 +568,7 @@ impl KeybindTable {
                         follow: true,
                     }),
                     release_action: None,
+                    repeat: BindRepeat::Once,
                     options: BindOptions::default(),
                 });
             }
@@ -550,6 +582,7 @@ impl KeybindTable {
             pending_releases: HashMap::new(),
             pending_mouse_releases: HashMap::new(),
             suppressed_buttons: HashSet::new(),
+            repeat: KeyRepeatState::default(),
             horizontal_wheel_tracker: ScrollTracker::new(WHEEL_V120_TICK),
             vertical_wheel_tracker: ScrollTracker::new(WHEEL_V120_TICK),
             horizontal_finger_tracker: ScrollTracker::new(TOUCHPAD_SCROLL_TICK),
@@ -638,6 +671,7 @@ impl KeybindTable {
                 chord,
                 press_action,
                 release_action,
+                repeat: spec.options.effective_repeat(&spec.action),
                 options: spec.options.clone(),
             };
 
@@ -678,6 +712,7 @@ impl KeybindTable {
                 chord: lmb_chord,
                 press_action: Some(ActionDescriptor::WindowDragMove),
                 release_action: None,
+                repeat: BindRepeat::Once,
                 options: BindOptions::default(),
             });
         }
@@ -702,6 +737,7 @@ impl KeybindTable {
                 chord: rmb_chord,
                 press_action: Some(ActionDescriptor::WindowDragResize),
                 release_action: None,
+                repeat: BindRepeat::Once,
                 options: BindOptions::default(),
             });
         }
@@ -714,6 +750,7 @@ impl KeybindTable {
             pending_releases: HashMap::new(),
             pending_mouse_releases: HashMap::new(),
             suppressed_buttons: HashSet::new(),
+            repeat: KeyRepeatState::default(),
             horizontal_wheel_tracker: ScrollTracker::new(WHEEL_V120_TICK),
             vertical_wheel_tracker: ScrollTracker::new(WHEEL_V120_TICK),
             horizontal_finger_tracker: ScrollTracker::new(TOUCHPAD_SCROLL_TICK),
@@ -1161,6 +1198,8 @@ pub fn process_keyboard_key_event(
         FireAction {
             bind_id: Option<BindHandleId>,
             action: ActionDescriptor,
+            /// `Some` when the press starts a `WhileHeld` repeat (`#76`).
+            repeat: Option<RepeatRequest>,
         },
     }
 
@@ -1172,6 +1211,9 @@ pub fn process_keyboard_key_event(
     //    Fail-closed on locked sessions: never deliver lock-screen key events into an active IME grab!
     if key_state == KeyState::Released {
         let prev_mask = modifiers_mask_from_smithay(&keyboard.modifier_state());
+        if state.keybinds.repeat.is_repeating_keycode(raw_keycode) {
+            state.cancel_keybind_repeat("release");
+        }
         let release_act = state.keybinds.pending_releases.remove(&raw_keycode);
         if state.is_locked_or_abandoned() {
             if let Some(((), mods_changed)) = keyboard.input_intercept(
@@ -1198,6 +1240,9 @@ pub fn process_keyboard_key_event(
         let next_mask = modifiers_mask_from_smithay(&keyboard.modifier_state());
         if prev_mask != next_mask {
             state.keybinds.reset_scroll_trackers();
+            // Any modifier transition cancels a pending repeat: the held chord no longer
+            // matches the modifiers that armed it.
+            state.cancel_keybind_repeat("modifier_change");
         }
         if let Some(rel) = release_act
             && is_keybind_allowed_for_lock_state(
@@ -1236,6 +1281,16 @@ pub fn process_keyboard_key_event(
 
             let held_mask = modifiers_mask_from_smithay(modifiers);
             let phys_mod = state.keybinds.effective_mod_key(is_bare_metal_tty);
+
+            // A modifier pressed (or a chord re-pressed) outside the repeating chord cancels it.
+            if state
+                .keybinds
+                .repeat
+                .cancel_if_modifiers_changed(held_mask)
+                .is_some()
+            {
+                state.cancel_keybind_repeat("modifier_change");
+            }
 
             // Gate 0b: Ring 0 Human Preemptive Takeover (`Mod + G`) — blocked when locked!
             let raw_syms = handle.raw_syms();
@@ -1328,6 +1383,7 @@ pub fn process_keyboard_key_event(
                     FilterResult::Intercept(InterceptOutcome::FireAction {
                         bind_id: None,
                         action: ActionDescriptor::ModeExit,
+                        repeat: None,
                     })
                 };
             }
@@ -1354,9 +1410,11 @@ pub fn process_keyboard_key_event(
                     state.pending_passthrough_actions.push(action);
                     FilterResult::Forward
                 } else {
+                    let repeat = state.keybinds.binds[idx].repeat_request(raw_keycode, held_mask);
                     FilterResult::Intercept(InterceptOutcome::FireAction {
                         bind_id: Some(bind_id),
                         action,
+                        repeat,
                     })
                 }
             } else if pass_through {
@@ -1365,6 +1423,7 @@ pub fn process_keyboard_key_event(
                 FilterResult::Intercept(InterceptOutcome::FireAction {
                     bind_id: None,
                     action: ActionDescriptor::ModeExit,
+                    repeat: None,
                 })
             }
         },
@@ -1428,8 +1487,19 @@ pub fn process_keyboard_key_event(
         InterceptOutcome::FireAction {
             bind_id: Some(_),
             action,
+            repeat,
         } => {
             execute_action_descriptor(state, action, is_bare_metal_tty);
+            if let Some(request) = repeat {
+                state
+                    .keybinds
+                    .repeat
+                    .set_timing(state.keybind_repeat_timing());
+                let now_ms = state.elapsed_ms();
+                state.keybinds.repeat.arm(request, now_ms);
+                let delay_ms = state.keybinds.repeat.timing().delay_ms;
+                arm_keybind_repeat_timer(state, is_bare_metal_tty, delay_ms);
+            }
         }
         InterceptOutcome::FireAction { bind_id: None, .. } => {}
     }
@@ -2485,7 +2555,10 @@ fn cycle_workspace_focus(state: &mut KomaState, forward: bool) {
 
 #[cfg(test)]
 mod tests {
+    use koma_lua::KEYBIND_CATALOG;
+
     use super::*;
+    use crate::keybind_repeat::RepeatTiming;
 
     #[test]
     fn scroll_tracker_accumulates_fractional_v120_and_resets_on_reversal() {
@@ -2905,5 +2978,238 @@ mod tests {
             defaults.binds.len(),
             "generated keymap must not add binds beyond the built-in catalogue"
         );
+
+        // The generated map must repeat exactly the catalogue's `WhileHeld` rows.
+        for bind in &registry.binds {
+            let entry = KEYBIND_CATALOG
+                .iter()
+                .find(|entry| entry.chord == bind.chord)
+                .expect("generated bind has a catalogue entry");
+            assert_eq!(
+                bind.options.effective_repeat(&bind.action),
+                entry.repeat,
+                "generated repeat class for `{}` differs from the catalogue",
+                bind.chord
+            );
+        }
+    }
+
+    fn find_bind<'a>(table: &'a KeybindTable, chord: &str) -> &'a CompiledBind {
+        let chord = parse_chord_spec(chord).expect("valid chord");
+        table
+            .binds
+            .iter()
+            .find(|bind| bind.chord == chord)
+            .unwrap_or_else(|| panic!("`{chord:?}` is missing from the compiled table"))
+    }
+
+    /// Simulates a physical press followed by a `hold_ms` hold at 1 ms resolution.
+    ///
+    /// The returned timestamps include the initial press at `0`; a `Once` bind therefore
+    /// yields exactly one entry no matter how long the chord stays held.
+    fn simulate_hold(bind: &CompiledBind, timing: RepeatTiming, hold_ms: u64) -> Vec<u64> {
+        let mut machine = KeyRepeatState::default();
+        machine.set_timing(timing);
+        let mut dispatches = Vec::new();
+        if bind.press_action.is_some() {
+            dispatches.push(0);
+        }
+        if let Some(request) = bind.repeat_request(42, bind.chord.mods) {
+            machine.arm(request, 0);
+        }
+        // `hold_ms` is the release instant: a repeat due exactly then never fires.
+        for now_ms in 1..hold_ms {
+            if machine.take_due(now_ms).is_some() {
+                dispatches.push(now_ms);
+            }
+        }
+        machine.cancel();
+        assert_eq!(
+            machine.take_due(hold_ms + 5_000),
+            None,
+            "no repeat may fire after release"
+        );
+        dispatches
+    }
+
+    #[test]
+    fn once_binds_dispatch_exactly_once_while_held() {
+        let table = KeybindTable::with_builtin_defaults();
+        let timing = RepeatTiming::new(600, 25);
+        for chord in [
+            "Mod + Return",
+            "Mod + Q",
+            "Mod + Shift + E",
+            "Mod + Shift + R",
+        ] {
+            let bind = find_bind(&table, chord);
+            assert_eq!(
+                bind.repeat,
+                BindRepeat::Once,
+                "`{chord}` must never repeat while held"
+            );
+            assert!(bind.repeat_request(42, bind.chord.mods).is_none());
+            let dispatches = simulate_hold(bind, timing, 2_000);
+            assert_eq!(
+                dispatches,
+                vec![0],
+                "holding `{chord}` for 2 s must fire its action exactly once"
+            );
+        }
+    }
+
+    #[test]
+    fn while_held_binds_repeat_at_the_configured_delay_and_rate() {
+        let table = KeybindTable::with_builtin_defaults();
+        let timing = RepeatTiming::new(600, 25);
+
+        let focus = find_bind(&table, "Mod + H");
+        assert_eq!(focus.repeat, BindRepeat::WhileHeld);
+        let dispatches = simulate_hold(focus, timing, 1_000);
+        assert_eq!(
+            dispatches,
+            std::iter::once(0)
+                .chain((0..10).map(|i| 600 + i * 40))
+                .collect::<Vec<_>>(),
+            "a 1000 ms hold at 600 ms / 25 Hz is the press plus ten repeats"
+        );
+
+        let movement = find_bind(&table, "Mod + Shift + J");
+        assert_eq!(movement.repeat, BindRepeat::WhileHeld);
+        assert_eq!(simulate_hold(movement, timing, 700), vec![0, 600, 640, 680]);
+    }
+
+    #[test]
+    fn release_stops_the_repeat_immediately() {
+        let table = KeybindTable::with_builtin_defaults();
+        let bind = find_bind(&table, "Mod + Shift + L");
+        let mut machine = KeyRepeatState::default();
+        machine.set_timing(RepeatTiming::new(600, 25));
+        machine.arm(
+            bind.repeat_request(42, bind.chord.mods)
+                .expect("movement bind repeats"),
+            0,
+        );
+        assert!(machine.take_due(600).is_some());
+        assert_eq!(machine.next_deadline_ms(), Some(640));
+
+        // Physical release of the repeating keycode cancels through the same path the
+        // keyboard handler uses (`is_repeating_keycode` -> `cancel_keybind_repeat`).
+        assert!(machine.is_repeating_keycode(42));
+        assert!(machine.cancel().is_some());
+        assert!(!machine.is_repeating_keycode(42));
+        assert_eq!(machine.take_due(640), None);
+        assert_eq!(machine.take_due(1_000), None);
+    }
+
+    #[test]
+    fn explicit_repeat_option_overrides_the_action_class() {
+        let forced_once = BindSpec {
+            id: BindHandleId(900),
+            mode: None,
+            enabled: true,
+            chord: "Mod + Shift + H".to_owned(),
+            action: ActionDescriptor::WindowMoveDirection("left".to_owned()),
+            release_action: None,
+            options: BindOptions {
+                repeat_while_held: Some(false),
+                ..BindOptions::default()
+            },
+        };
+        let forced_repeat = BindSpec {
+            id: BindHandleId(901),
+            mode: None,
+            enabled: true,
+            chord: "Mod + Return".to_owned(),
+            action: ActionDescriptor::Spawn {
+                argv: vec!["bitty".to_owned()],
+            },
+            release_action: None,
+            options: BindOptions {
+                repeat_while_held: Some(true),
+                ..BindOptions::default()
+            },
+        };
+        let table = KeybindTable::compile_with_options(
+            &[forced_once, forced_repeat],
+            &[],
+            false,
+            Some("Super"),
+        )
+        .expect("compile");
+
+        assert_eq!(
+            find_bind(&table, "Mod + Shift + H").repeat,
+            BindRepeat::Once
+        );
+        assert_eq!(
+            find_bind(&table, "Mod + Return").repeat,
+            BindRepeat::WhileHeld
+        );
+        assert_eq!(
+            simulate_hold(
+                find_bind(&table, "Mod + Shift + H"),
+                RepeatTiming::new(600, 25),
+                1_000
+            ),
+            vec![0]
+        );
+        assert_eq!(
+            simulate_hold(
+                find_bind(&table, "Mod + Return"),
+                RepeatTiming::new(600, 25),
+                1_000
+            )
+            .len(),
+            11,
+            "an explicit `repeat = true` makes an otherwise one-shot action repeat"
+        );
+    }
+
+    #[test]
+    fn pass_through_binds_leave_repeat_to_the_focused_client() {
+        let spec = BindSpec {
+            id: BindHandleId(902),
+            mode: None,
+            enabled: true,
+            chord: "Mod + H".to_owned(),
+            action: ActionDescriptor::FocusDirection("left".to_owned()),
+            release_action: None,
+            options: BindOptions {
+                pass_through: true,
+                ..BindOptions::default()
+            },
+        };
+        let table = KeybindTable::compile_with_options(&[spec], &[], false, Some("Super"))
+            .expect("compile");
+        let bind = find_bind(&table, "Mod + H");
+        assert_eq!(bind.repeat, BindRepeat::WhileHeld);
+        assert!(
+            bind.repeat_request(42, bind.chord.mods).is_none(),
+            "the forwarded key already repeats through `wl_keyboard.repeat_info`; \
+             a compositor repeat would double-dispatch"
+        );
+        assert_eq!(
+            simulate_hold(bind, RepeatTiming::new(600, 25), 1_000),
+            vec![0]
+        );
+    }
+
+    #[test]
+    fn catalog_repeat_classes_match_the_runtime_derivation() {
+        let defaults = KeybindTable::with_builtin_defaults();
+        for bind in &defaults.binds {
+            let entry = KEYBIND_CATALOG
+                .iter()
+                .find(|entry| entry.chord == bind.raw_chord)
+                .unwrap_or_else(|| {
+                    panic!("`{}` is missing from the keybind catalogue", bind.raw_chord)
+                });
+            assert_eq!(
+                entry.repeat, bind.repeat,
+                "catalogue repeat class for `{}` drifted from the action-derived class",
+                bind.raw_chord
+            );
+        }
     }
 }

@@ -9,6 +9,8 @@ use koma_model::{
 use koma_proto::{KinematicProfileKind, MacroId, OutputId, TextInjectStrategy};
 use serde::{Deserialize, Deserializer, Serialize};
 
+use crate::keybind_catalog::BindRepeat;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct BindHandleId(pub u64);
 
@@ -124,7 +126,16 @@ pub enum TriggerEdge {
 #[serde(default)]
 pub struct BindOptions {
     pub edge: TriggerEdge,
-    pub repeat_key: bool,
+    /// Explicit repeat override for the bind (`#76`).
+    ///
+    /// `None` derives the class from the action ([`BindRepeat::for_action`]); an explicit value
+    /// wins, so `spawn` can repeat and a movement bind can be forced once.
+    ///
+    /// Lua spells it `repeat_while_held` because `repeat` is a reserved Lua keyword; the
+    /// JSON/IPC name is `repeat` (also accepted as `["repeat"]` in a Lua table literal), and
+    /// `repeat_key` remains accepted as a legacy alias.
+    #[serde(alias = "repeat", alias = "repeat_key")]
+    pub repeat_while_held: Option<bool>,
     pub cooldown_ms: Option<u64>,
     pub allow_when_locked: bool,
     pub allow_inhibiting: bool,
@@ -133,11 +144,29 @@ pub struct BindOptions {
     pub desc: Option<String>,
 }
 
+impl BindOptions {
+    /// Effective repeat class: an explicit `repeat` option wins over the action derivation.
+    #[must_use]
+    pub fn effective_repeat(&self, action: &ActionDescriptor) -> BindRepeat {
+        match self.repeat_while_held {
+            Some(true) => BindRepeat::WhileHeld,
+            Some(false) => BindRepeat::Once,
+            None => BindRepeat::for_action(action),
+        }
+    }
+
+    /// `true` when holding the chord repeats `action` (`#76`).
+    #[must_use]
+    pub fn repeats(&self, action: &ActionDescriptor) -> bool {
+        self.effective_repeat(action).repeats()
+    }
+}
+
 impl Default for BindOptions {
     fn default() -> Self {
         Self {
             edge: TriggerEdge::Press,
-            repeat_key: false,
+            repeat_while_held: None,
             cooldown_ms: None,
             allow_when_locked: false,
             allow_inhibiting: true,
