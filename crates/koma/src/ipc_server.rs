@@ -469,6 +469,38 @@ fn handle_raw_frame(
 
 /// Fail-closed IPC gate: blocks frame capture, scene introspection, and state mutation
 /// whenever the compositor is `Locked` or `Abandoned`, permitting only read-only `config.status`.
+/// Renders the effective `libinput` knobs reported by `config.status`.
+///
+/// A cursor that travels a different distance than another compositor at the same physical
+/// movement is almost always one of these values rather than the motion path: an unset
+/// `accel_profile` keeps libinput's adaptive curve, while `"flat"` removes acceleration entirely
+/// (komawm/koma#34). Reporting the *applied* values makes that inspectable instead of guessed.
+#[must_use]
+pub(crate) fn config_status_input_json(
+    input: &koma_lua::schema::InputConfigSpec,
+) -> serde_json::Value {
+    use koma_lua::schema::AccelProfileSpec;
+
+    json!({
+        "pointer": {
+            "accel_speed": input.pointer.accel_speed,
+            "accel_profile": input.pointer.accel_profile.map(|p| match p {
+                AccelProfileSpec::Adaptive => "adaptive",
+                AccelProfileSpec::Flat => "flat",
+            }),
+            "natural_scroll": input.pointer.natural_scroll,
+            "scroll_factor": input.pointer.scroll_factor,
+            "follow_mouse": input.pointer.follow_mouse,
+        },
+        "touchpad": {
+            "natural_scroll": input.touchpad.natural_scroll,
+            "tap_to_click": input.touchpad.tap,
+            "disable_while_typing": input.touchpad.dwt,
+            "scroll_factor": input.touchpad.scroll_factor,
+        },
+    })
+}
+
 pub(crate) fn check_ipc_lock_gate(
     is_locked_or_abandoned: bool,
     method: &str,
@@ -1819,6 +1851,7 @@ pub(crate) fn dispatch_rpc(
 
         "config.status" => {
             let active_path = state.config_path.active_init_path();
+            let input = state.lua_sandbox.config_snapshot().input;
             Ok((
                 json!({
                     "generation": state.config_generation,
@@ -1828,6 +1861,7 @@ pub(crate) fn dispatch_rpc(
                     "deferred_vm_pending": state.deferred_lua_sandbox.is_some(),
                     "locked": state.is_locked_or_abandoned(),
                     "lock_phase": state.session_lock.phase_label(),
+                    "input": config_status_input_json(&input),
                 }),
                 Vec::new(),
             ))
@@ -2521,5 +2555,34 @@ mod tests {
             .expect("vseat.cursor_settle succeeds");
         assert_eq!(settle_res["ok"], json!(true));
         assert!(state.step_agent_cursor_for_workspace(&ws_id).is_none());
+    }
+
+    #[test]
+    fn config_status_reports_the_effective_pointer_accel_instead_of_hiding_it() {
+        use koma_lua::schema::{AccelProfileSpec, PointerInputSpec};
+
+        // Unset profile = libinput keeps its adaptive curve; unset speed = no modification.
+        let mut input = koma_lua::schema::InputConfigSpec::default();
+        let defaults = config_status_input_json(&input);
+        assert_eq!(
+            defaults["pointer"]["accel_profile"],
+            serde_json::Value::Null
+        );
+        assert_eq!(defaults["pointer"]["accel_speed"], serde_json::Value::Null);
+
+        // The migration bug from komawm/koma#34: `sensitivity = 0` mapped to `flat`, which removes
+        // acceleration entirely. The report has to make that visible.
+        input.pointer = PointerInputSpec {
+            accel_profile: Some(AccelProfileSpec::Flat),
+            accel_speed: Some(0.0),
+            ..PointerInputSpec::default()
+        };
+        let flat = config_status_input_json(&input);
+        assert_eq!(flat["pointer"]["accel_profile"], "flat");
+        assert_eq!(flat["pointer"]["accel_speed"], 0.0);
+
+        input.pointer.accel_profile = Some(AccelProfileSpec::Adaptive);
+        let adaptive = config_status_input_json(&input);
+        assert_eq!(adaptive["pointer"]["accel_profile"], "adaptive");
     }
 }
