@@ -6,6 +6,29 @@ incubation versions; `v0.1.0` will be the first independently accepted product
 release. A `0.0.x` tag is a development prerelease and does not claim a working
 desktop, hardware support, or security guarantees.
 
+## [Unreleased]
+
+### Added
+
+- `komactl doctor`: a non-destructive configuration diagnostic that reuses the
+  jailed Shadow-VM evaluation of `komactl validate` and adds template-generation
+  freshness, missing `require()` targets under `lua/`, configuration table keys
+  the schema silently ignores, duplicate binds, binds that shadow a built-in
+  chord, `koma.monitor` / `preferred_output` names the kernel does not report as
+  connected, `XDG_RUNTIME_DIR` and `koma-admin.sock` reachability, and live
+  generation / lock state. Rows are grouped by area with `ok` / `warn` / `error`
+  / `skip` severities and a count summary, `--json` emits the same report for
+  scripting, and `--strict` turns warnings into exit code `1`. Without
+  `--strict`, a configuration error is reported but never changes the exit code,
+  because the compositor keeps running on its last valid configuration.
+- `komactl keys`: lists every effective keybind by merging the built-in
+  catalogue with the user configuration (`inherit_default_binds`, `koma.unbind`,
+  chord overrides), rendering chords as `Mod + Shift + 2`, marking user
+  overrides while keeping the catalogue description, and listing pointer
+  drag/scroll binds and touchpad gestures in their own sections. Supports
+  `--json` and `--grep <pattern>`, works offline, and merges the live
+  configuration path, generation, and lock state when a socket is reachable.
+
 ## [0.0.3] - 2026-11-18
 
 ### Added
@@ -16,7 +39,7 @@ desktop, hardware support, or security guarantees.
   destination is focused (`movetoworkspace` vs `movetoworkspacesilent`). Rejects
   unknown workspaces and empty sources with `ErrNotFound`, applies the session
   lock gate, and is exposed as `komactl win move-to-workspace <ws_id|name>
-  [--follow]`.
+[--follow]`.
 - `ext-workspace-v1` (staging) server support: one workspace group owning every
   output, one workspace handle per Koma workspace with its id, name, 1D
   coordinates and `active` / `hidden` state, plus `output_enter` /
@@ -75,6 +98,7 @@ desktop, hardware support, or security guarantees.
   other targets run an inert stub.
 
 ### Fixed
+
 - `workspace.focused` now fires for every activation path, including special
   (`special:<name>`) workspaces, output switches, output-less switches and
   `WorkspaceFocusNext` / `Prev` (cycling is a real activation and emits once),
@@ -140,7 +164,7 @@ desktop, hardware support, or security guarantees.
 ### Changed
 
 - The standalone `koma-mcp` binary is now `koma mcp [--print-tools]
-  [--auto-mint-admin]`; release archives, Nix builds, BSD CI and completions no
+[--auto-mint-admin]`; release archives, Nix builds, BSD CI and completions no
   longer install or reference a separate binary.
 - `appearance.animations.windows_close` and `close_scale_to` now drive a real
   close animation. Each mapped toplevel's last committed frame is cached in GPU

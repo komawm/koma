@@ -4,111 +4,35 @@
 
 mod admin_rpc;
 mod completions;
+mod config_probe;
+mod doctor;
+mod keys;
+mod lua_scan;
 mod sandbox_runner;
 
 use std::{
-    env, fs,
+    env,
     fs::File,
     io::{self, Read as _, Write as _},
     path::{Path, PathBuf},
     process,
 };
 
-use koma_lua::{
-    DEFAULT_HEAP_LIMIT_BYTES, TEMPLATE_VERSION, generate_luals_stubs, installed_template_version,
-    phodopus_bridge::PhodopusSandbox, render_config_template, scaffold_config_tree,
-    validate_gesture_spec,
-};
-use regex::Regex;
+use koma_lua::{TEMPLATE_VERSION, generate_luals_stubs, scaffold_config_tree};
 use serde_json::json;
 
 use crate::{
     admin_rpc::AdminClient,
+    config_probe::ValidationSummary,
     sandbox_runner::{dispatch_sandbox_subcommand, print_sandbox_help, print_sandbox_help_to},
 };
 
-fn default_init_lua_path() -> PathBuf {
-    env::var_os("KOMA_CONFIG")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| {
-            env::var_os("XDG_CONFIG_HOME")
-                .filter(|v| !v.is_empty())
-                .map(|p| PathBuf::from(p).join("koma/init.lua"))
-        })
-        .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".config/koma/init.lua")))
-        .unwrap_or_else(|| PathBuf::from("/etc/xdg/koma/init.lua"))
-}
-
-/// Offline Shadow-VM validation summary (`komactl validate [path]`, modeled on `niri validate`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ValidationSummary {
-    monitors: usize,
-    workspaces: usize,
-    binds: usize,
-    gestures: usize,
-    rules: usize,
-    macros: usize,
-}
-
 fn validate_init_lua_offline(path: &Path) -> Result<ValidationSummary, String> {
-    let src = fs::read_to_string(path)
-        .map_err(|e| format!("failed reading `{}`: {e}", path.display()))?;
-    let cfg_dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let mut vm = PhodopusSandbox::new(DEFAULT_HEAP_LIMIT_BYTES, Some(cfg_dir))?;
-    let registry = vm.eval_init_lua(&src)?;
-
-    for (idx, rule) in registry.window_rules.iter().enumerate() {
-        for m in rule.matches.iter().chain(rule.excludes.iter()) {
-            if let Some(pat) = &m.app_id {
-                Regex::new(pat)
-                    .map_err(|e| format!("window rule #{idx} invalid app_id regex `{pat}`: {e}"))?;
-            }
-            if let Some(pat) = &m.title {
-                Regex::new(pat)
-                    .map_err(|e| format!("window rule #{idx} invalid title regex `{pat}`: {e}"))?;
-            }
-        }
+    let evaluation = config_probe::evaluate(path)?;
+    match evaluation.validated_summary() {
+        Some(summary) => Ok(summary),
+        None => Err(evaluation.error_messages().join("; ")),
     }
-
-    for (idx, g) in registry.gestures.iter().enumerate() {
-        validate_gesture_spec(i64::from(g.fingers), &g.direction)
-            .map_err(|e| format!("gesture #{idx} invalid: {e}"))?;
-    }
-
-    Ok(ValidationSummary {
-        monitors: registry.monitors.len(),
-        workspaces: registry.workspaces.len(),
-        binds: registry.binds.len(),
-        gestures: registry.gestures.len(),
-        rules: registry.window_rules.len(),
-        macros: registry.macros.len(),
-    })
-}
-
-/// Template freshness reported by `komactl config-status`.
-fn template_report_at(init_lua: &Path) -> serde_json::Value {
-    let present = init_lua.exists();
-    let installed = if present {
-        installed_template_version(init_lua).ok().flatten()
-    } else {
-        None
-    };
-    let outdated = installed.is_some_and(|version| version < TEMPLATE_VERSION);
-    let config_root = init_lua.parent().unwrap_or_else(|| Path::new("."));
-    let missing_files: Vec<&str> = render_config_template()
-        .into_iter()
-        .map(|file| file.relative_path)
-        .filter(|relative| !config_root.join(relative).exists())
-        .collect();
-    json!({
-        "init_lua": init_lua.display().to_string(),
-        "present": present,
-        "installed_version": installed,
-        "shipped_version": TEMPLATE_VERSION,
-        "outdated": outdated,
-        "missing_files": missing_files,
-    })
 }
 
 /// Reports an outdated scaffold on stderr; returns `true` when the on-disk
@@ -135,9 +59,21 @@ fn warn_if_template_outdated(report: &serde_json::Value) -> bool {
 /// Exit status for usage errors (no or unknown subcommand).
 const USAGE_EXIT_CODE: i32 = 2;
 
+/// Writes to stdout and treats a closed pipe as success, so `komactl keys | head` exits cleanly.
+pub(crate) fn emit(text: &str) {
+    let mut out = io::stdout();
+    if let Err(err) = out.write_all(text.as_bytes())
+        && err.kind() != io::ErrorKind::BrokenPipe
+    {
+        eprintln!("komactl: failed writing to stdout: {err}");
+    }
+}
+
 fn usage_text() -> &'static str {
     "Usage:
   komactl validate [path/to/init.lua]
+  komactl doctor [path/to/init.lua] [--json] [--strict]
+  komactl keys [path/to/init.lua] [--json] [--grep <pattern>]
   komactl reload [path/to/init.lua]
   komactl config-status
   komactl init [dir] [--force]
@@ -185,7 +121,7 @@ fn main() -> io::Result<()> {
             let target = args
                 .get(1)
                 .map(PathBuf::from)
-                .unwrap_or_else(default_init_lua_path);
+                .unwrap_or_else(config_probe::default_init_lua_path);
             match validate_init_lua_offline(&target) {
                 Ok(summary) => println!(
                     "init.lua valid ({}) — {} monitor(s), {} workspace(s), {} bind(s), {} gesture(s), {} rule(s), {} macro(s)",
@@ -203,6 +139,8 @@ fn main() -> io::Result<()> {
                 }
             }
         }
+        Some("doctor") => process::exit(doctor::run(&args[1..])),
+        Some("keys") => process::exit(keys::run(&args[1..])),
         Some("reload") => {
             let explicit_path = args.get(1).cloned();
             let mut client = AdminClient::connect()?;
@@ -210,7 +148,7 @@ fn main() -> io::Result<()> {
             println!("{}", serde_json::to_string_pretty(&val).unwrap());
         }
         Some("config-status") => {
-            let template = template_report_at(&default_init_lua_path());
+            let template = config_probe::template_report_at(&config_probe::default_init_lua_path());
             warn_if_template_outdated(&template);
             let mut report = json!({ "template": template });
             match AdminClient::connect() {
@@ -252,7 +190,7 @@ fn main() -> io::Result<()> {
                 }
             }
             let root = target_dir.unwrap_or_else(|| {
-                default_init_lua_path()
+                config_probe::default_init_lua_path()
                     .parent()
                     .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
             });
@@ -408,7 +346,9 @@ mod tests {
 
     use koma_lua::{KEYBIND_CATALOG, scaffold_config_tree};
 
-    use super::{template_report_at, usage_text, validate_init_lua_offline};
+    use crate::config_probe::template_report_at;
+
+    use super::{usage_text, validate_init_lua_offline};
 
     static NEXT_ID: AtomicU32 = AtomicU32::new(0);
 
@@ -426,6 +366,8 @@ mod tests {
         let text = usage_text();
         for cmd in [
             "validate",
+            "doctor",
+            "keys",
             "reload",
             "config-status",
             "init",

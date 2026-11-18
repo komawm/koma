@@ -168,6 +168,44 @@ const ROOT_SUBS: &[Cmd] = &[
         subs: &[],
     },
     Cmd {
+        name: "doctor",
+        desc: "Diagnose the configuration without touching the compositor",
+        opts: &[
+            Opt {
+                long: "json",
+                short: None,
+                takes_value: false,
+                desc: "Emit a JSON report",
+            },
+            Opt {
+                long: "strict",
+                short: None,
+                takes_value: false,
+                desc: "Exit 1 when any warn or error is reported",
+            },
+        ],
+        subs: &[],
+    },
+    Cmd {
+        name: "keys",
+        desc: "List every effective keybind, pointer bind, and gesture",
+        opts: &[
+            Opt {
+                long: "json",
+                short: None,
+                takes_value: false,
+                desc: "Emit a JSON listing",
+            },
+            Opt {
+                long: "grep",
+                short: None,
+                takes_value: true,
+                desc: "Only list rows matching this regular expression",
+            },
+        ],
+        subs: &[],
+    },
+    Cmd {
         name: "reload",
         desc: "Atomically hot-reload init.lua",
         opts: &[],
