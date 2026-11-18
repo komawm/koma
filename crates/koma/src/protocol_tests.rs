@@ -45,7 +45,7 @@ use smithay::reexports::wayland_protocols::xdg::decoration::zv1::client::{
 };
 use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode;
 use smithay::reexports::wayland_protocols::xdg::shell::client::{
-    xdg_surface, xdg_toplevel, xdg_wm_base,
+    xdg_popup, xdg_positioner, xdg_surface, xdg_toplevel, xdg_wm_base,
 };
 use smithay::reexports::wayland_protocols::xdg::toplevel_icon::v1::client::{
     xdg_toplevel_icon_manager_v1, xdg_toplevel_icon_v1,
@@ -221,6 +221,9 @@ struct ClientHarness {
     outputs: Vec<wl_output::WlOutput>,
     seats: Vec<wl_seat::WlSeat>,
     pointers: Vec<wl_pointer::WlPointer>,
+    /// Surface-local `wl_pointer.motion` coordinates recorded per delivered motion event.
+    pointer_motion_coords: Vec<(f64, f64)>,
+
     /// `wl_pointer.button` events with the server serial that clients use for `start_drag`.
     pointer_buttons: Vec<(u32, wl_pointer::ButtonState, u32)>,
     data_device: Option<wl_data_device::WlDataDevice>,
@@ -533,6 +536,69 @@ impl ClientEnv {
         buffer.destroy();
         pool.destroy();
         (surface, xdg_surface, toplevel)
+    }
+
+    /// Spawns a client-side-decorated toplevel.
+    ///
+    /// The `64x64` harness buffer carries a decoration margin around the visible window
+    /// geometry: `xdg_surface.set_window_geometry` reports the inner rect in surface-local
+    /// coordinates and the input region covers exactly that rect, so the decoration band is not
+    /// clickable (matching how CSD clients avoid shadow clicks).
+    fn spawn_csd_window(
+        &mut self,
+        title: &str,
+        app_id: &str,
+        geometry: koma_model::LogicalRect,
+    ) -> (
+        wl_surface::WlSurface,
+        xdg_surface::XdgSurface,
+        xdg_toplevel::XdgToplevel,
+    ) {
+        let (surface, xdg_surface, toplevel) = self.spawn_window(title, app_id);
+        let qh = self.queue.handle();
+        let compositor = self
+            .client
+            .compositor
+            .clone()
+            .expect("compositor bound by spawn_window");
+
+        xdg_surface.set_window_geometry(
+            geometry.x,
+            geometry.y,
+            geometry.w as i32,
+            geometry.h as i32,
+        );
+        let input_region = compositor.create_region(&qh, ());
+        input_region.add(geometry.x, geometry.y, geometry.w as i32, geometry.h as i32);
+        surface.set_input_region(Some(&input_region));
+        input_region.destroy();
+        surface.commit();
+        self.pump();
+        (surface, xdg_surface, toplevel)
+    }
+
+    /// Moves the window under test to a deterministic floating rect.
+    fn float_window_at(
+        &mut self,
+        win_id: koma_proto::WindowId,
+        rect: koma_model::LogicalRect,
+    ) -> koma_model::LogicalRect {
+        let ws_id = self.state.active_ws_id.clone();
+        let now_ms = self.state.elapsed_ms();
+        if let Some(ws) = self.state.workspaces.get_mut(&ws_id) {
+            ws.toggle_floating(win_id, None, None, now_ms);
+            ws.floating.set_rect(win_id, rect);
+        }
+        self.state.sync_workspace_geometries(&ws_id);
+        self.state
+            .workspaces
+            .get(&ws_id)
+            .expect("workspace")
+            .compute_visible_geometries_at(self.state.elapsed_ms())
+            .into_iter()
+            .find(|(id, _, _)| *id == win_id)
+            .map(|(_, rect, _)| rect)
+            .expect("visible geometry")
     }
 }
 
@@ -1135,6 +1201,9 @@ delegate_noop!(ClientHarness: ignore wl_shm_pool::WlShmPool);
 delegate_noop!(ClientHarness: ignore wl_buffer::WlBuffer);
 delegate_noop!(ClientHarness: ignore wl_output::WlOutput);
 delegate_noop!(ClientHarness: ignore wl_seat::WlSeat);
+delegate_noop!(ClientHarness: ignore xdg_popup::XdgPopup);
+delegate_noop!(ClientHarness: ignore xdg_positioner::XdgPositioner);
+
 delegate_noop!(ClientHarness: ignore wl_data_device_manager::WlDataDeviceManager);
 delegate_noop!(ClientHarness: ignore wl_keyboard::WlKeyboard);
 delegate_noop!(ClientHarness: ignore zxdg_decoration_manager_v1::ZxdgDecorationManagerV1);
@@ -1161,14 +1230,21 @@ impl Dispatch<wl_pointer::WlPointer, ()> for ClientHarness {
         _: &Connection,
         _: &wayland_client::QueueHandle<Self>,
     ) {
-        if let wl_pointer::Event::Button {
-            button,
-            state: WEnum::Value(btn_state),
-            serial,
-            ..
-        } = event
-        {
-            state.pointer_buttons.push((button, btn_state, serial));
+        match event {
+            // Surface-local coordinates as the client sees them: the CSD pointer-offset
+            // regression asserts these equal `global - (inner_rect.loc - geometry.loc)`.
+            wl_pointer::Event::Motion {
+                surface_x,
+                surface_y,
+                ..
+            } => state.pointer_motion_coords.push((surface_x, surface_y)),
+            wl_pointer::Event::Button {
+                button,
+                state: WEnum::Value(btn_state),
+                serial,
+                ..
+            } => state.pointer_buttons.push((button, btn_state, serial)),
+            _ => {}
         }
     }
 }
@@ -2241,6 +2317,193 @@ fn pointer_constraints_clamping_relative_motion_and_lock_break() {
     locked.destroy();
     region.destroy();
     rel_ptr.destroy();
+}
+
+/// Asserts that pointer focus, `wl_pointer.motion` surface-local coordinates and
+/// `surface_global_origin` all agree with the rendering origin `inner_rect.loc - geometry.loc`.
+///
+/// `csd == true` selects a `set_window_geometry(12, 12, 40, 40)` client-side-decorated toplevel;
+/// `csd == false` selects a server-side-decorated toplevel whose geometry origin is `(0, 0)`.
+fn assert_toplevel_surface_origin(scale: f64, csd: bool) {
+    use smithay::output::Scale;
+
+    let mut env = ClientEnv::new();
+    if (scale - 1.0).abs() > f64::EPSILON {
+        let out = env._output.clone();
+        let (logical_w, logical_h) = (
+            (1920.0 / scale).round() as u32,
+            (1080.0 / scale).round() as u32,
+        );
+        out.change_current_state(None, None, Some(Scale::Fractional(scale)), None);
+        env.state
+            .handle_output_resized(&out, logical_w, logical_h, scale);
+        env.pump();
+    }
+
+    let geometry = koma_model::LogicalRect::new(12, 12, 40, 40);
+    let window_xdg_surface = if csd {
+        let (_, xdg_surface, _) = env.spawn_csd_window("CSD", "org.koma.csd", geometry);
+        Some(xdg_surface)
+    } else {
+        let _ = env.spawn_window("SSD", "org.koma.ssd");
+        None
+    };
+    let win_id = env
+        .state
+        .mapped_windows
+        .last()
+        .expect("mapped window")
+        .win_id;
+    let ws_id = env.state.active_ws_id.clone();
+    let rect = env.float_window_at(win_id, koma_model::LogicalRect::new(100, 100, 320, 240));
+    let out_origin = env.state.workspace_output_origin(&ws_id);
+
+    let border = env.state.lua_sandbox.config_snapshot().appearance.border;
+    assert!(border.enabled, "test expects the default window border");
+    let b_off = f64::from(border.width.max(0.0));
+
+    // Frame/border space: the inner rect is the visible window geometry.
+    let inner = Point::from((f64::from(rect.x) + b_off, f64::from(rect.y) + b_off));
+    // Surface space: CSD surfaces extend above/left of the geometry rect by its inset.
+    let geometry_loc = if csd {
+        Point::from((geometry.x, geometry.y))
+    } else {
+        Point::from((0, 0))
+    };
+    let surface_origin = inner - geometry_loc.to_f64();
+    let global_origin = out_origin + surface_origin;
+
+    let server_surface = env
+        .state
+        .mapped_windows
+        .iter()
+        .find(|m| m.win_id == win_id)
+        .and_then(|m| m.window.toplevel())
+        .expect("toplevel")
+        .wl_surface()
+        .clone();
+
+    // A point just inside the visible geometry rect must reach the client with surface-local
+    // coordinates derived from the same origin rendering used.
+    let inside = inner + Point::from((5.0, 5.0));
+
+    // Deliver pointer motion. The first motion establishes `wl_pointer.enter`; the second one
+    // emits `wl_pointer.motion`.
+    env.state.handle_pointer_absolute_motion(
+        inside - Point::from((1.0, 1.0)),
+        InputTime::from_millis(1),
+    );
+    env.state
+        .handle_pointer_absolute_motion(inside, InputTime::from_millis(2));
+    env.pump();
+    let (surface_x, surface_y) = *env
+        .client
+        .pointer_motion_coords
+        .last()
+        .expect("client must receive wl_pointer.motion over the window geometry");
+    let expected = inside - global_origin;
+    assert!(
+        (surface_x - expected.x).abs() < 1e-3 && (surface_y - expected.y).abs() < 1e-3,
+        "wl_pointer.motion must be surface-local (scale {scale}, csd {csd}): \
+         expected ({}, {}), got ({surface_x}, {surface_y})",
+        expected.x,
+        expected.y
+    );
+
+    // The hit test selects the toplevel and reports the surface origin that rendering used.
+    let hit = env
+        .state
+        .hit_test_target(inside)
+        .expect("point inside the window geometry must hit the toplevel");
+    match hit {
+        crate::state::PointerHitTarget::Window {
+            win_id: hit_win,
+            origin,
+            ..
+        } => {
+            assert_eq!(hit_win, win_id);
+            assert_eq!(
+                origin, global_origin,
+                "hit-test origin must be the surface origin (scale {scale})"
+            );
+        }
+        other => panic!("expected a window hit, got {other:?}"),
+    }
+
+    assert_eq!(
+        env.state.surface_global_origin(&server_surface),
+        Some(global_origin),
+        "surface_global_origin must use inner_rect.loc - geometry.loc (scale {scale})"
+    );
+
+    // The decoration band lies outside the window geometry (and outside the frame). With an
+    // input region covering only the geometry rect it must not be a hit target.
+    let margin = inner - Point::from((b_off + 2.0, b_off + 2.0));
+    assert!(
+        env.state.surface_under(margin).is_none(),
+        "CSD decoration band outside the window geometry must not be a pointer target (scale {scale})"
+    );
+
+    // An xdg_popup anchored at the parent's window-geometry origin sits at `inner` and must be
+    // hit-tested through the same surface origin (Smithay's POPUP branch already adds the root
+    // geometry inset, so it needs a surface-space point).
+    if let Some(parent_xdg_surface) = window_xdg_surface {
+        let qh = env.queue.handle();
+        let wm = env.client.xdg_wm_base.clone().expect("xdg_wm_base");
+        let compositor = env.client.compositor.clone().expect("wl_compositor");
+        let shm = env.client.shm.clone().expect("wl_shm");
+
+        let positioner = wm.create_positioner(&qh, ());
+        positioner.set_size(32, 32);
+        positioner.set_anchor_rect(0, 0, geometry.w as i32, geometry.h as i32);
+        positioner.set_anchor(xdg_positioner::Anchor::TopLeft);
+        positioner.set_gravity(xdg_positioner::Gravity::BottomRight);
+        let popup_surface = compositor.create_surface(&qh, ());
+        let popup_xdg_surface = wm.get_xdg_surface(&popup_surface, &qh, ());
+        let popup = popup_xdg_surface.get_popup(Some(&parent_xdg_surface), &positioner, &qh, ());
+        popup_surface.commit();
+        env.pump();
+
+        let popup_fd = create_portable_shm_fd(32 * 32 * 4, None);
+        let popup_pool = shm.create_pool(popup_fd.as_fd(), 32 * 32 * 4, &qh, ());
+        let popup_buffer =
+            popup_pool.create_buffer(0, 32, 32, 32 * 4, wl_shm::Format::Argb8888, &qh, ());
+        popup_surface.attach(Some(&popup_buffer), 0, 0);
+        popup_surface.commit();
+        env.pump();
+
+        let popup_origin = inner;
+        let popup_probe = popup_origin + Point::from((5.0, 5.0));
+        let (_, hit_origin) = env
+            .state
+            .surface_under(popup_probe)
+            .expect("csd popup must be hit-testable at the parent window-geometry origin");
+        assert_eq!(
+            hit_origin, popup_origin,
+            "popup origin must be inner_rect.loc - root geometry.loc + popup window-geometry
+             position (scale {scale})"
+        );
+
+        popup.destroy();
+        popup_xdg_surface.destroy();
+        popup_surface.destroy();
+        positioner.destroy();
+        popup_buffer.destroy();
+        popup_pool.destroy();
+    }
+}
+
+#[test]
+fn csd_window_geometry_defines_surface_origin_for_pointer_motion() {
+    assert_toplevel_surface_origin(1.0, true);
+    // SSD/XWayland (`geometry.loc == (0, 0)`) keeps its previous origin and coordinates.
+    assert_toplevel_surface_origin(1.0, false);
+}
+
+#[test]
+fn csd_window_geometry_defines_surface_origin_at_fractional_scale() {
+    assert_toplevel_surface_origin(1.6, true);
+    assert_toplevel_surface_origin(1.6, false);
 }
 
 #[test]
@@ -4534,6 +4797,26 @@ mod kom_0024_compat_tests {
         bar_surf.commit();
         env.pump();
 
+        // Layer-shell surfaces keep their own output-local origin: no window-geometry inset.
+        let (bar_hit_surface, bar_origin) = env
+            .state
+            .surface_under(Point::from((100.0, 10.0)))
+            .expect("top bar must be hit-testable");
+        let mapped_bar = {
+            let map = layer_map_for_output(&env.output);
+            map.layers()
+                .next()
+                .expect("mapped layer surface")
+                .wl_surface()
+                .clone()
+        };
+        assert_eq!(bar_hit_surface, mapped_bar);
+        assert_eq!(
+            bar_origin,
+            Point::from((0.0, 0.0)),
+            "layer-shell origin must stay output-local"
+        );
+
         // Popup anchored near the far right edge so unconstrained positioner flips/slides back on-screen.
         let pos = wm.create_positioner(&qh, ());
         pos.set_size(200, 120);
@@ -5662,6 +5945,20 @@ fn session_lock_acquire_confirm_unlock_cycles_schedule_rendering() {
         assert!(
             is_surface_mapped(lock_surface_ref.wl_surface()),
             "committed lock surface must be mapped so the locked frame draws it"
+        );
+        // Session-lock hit-testing keeps the lock surface's output origin unchanged.
+        let (lock_hit_surface, lock_hit_origin) = env
+            .state
+            .surface_under(Point::from((100.0, 100.0)))
+            .expect("committed lock surface must be hit-testable while locked");
+        assert_eq!(&lock_hit_surface, lock_surface_ref.wl_surface());
+        assert_eq!(
+            lock_hit_origin,
+            Point::from((
+                f64::from(out.current_location().x),
+                f64::from(out.current_location().y)
+            )),
+            "session-lock surface origin must stay at the output origin"
         );
         assert!(
             env.state.redraw_queued,
