@@ -17,11 +17,11 @@ use koma_lua::{
     LuaWorkspaceInfo, TrampolineScheduler, phodopus_bridge::PhodopusSandbox,
 };
 use koma_model::{
-    AgentCursorConfig, AgentCursorFrameSnapshot, AgentCursorVisualDynamics, LayoutMode,
+    AgentCursorConfig, AgentCursorFrameSnapshot, AgentCursorVisualDynamics, CurveSpec, LayoutMode,
     LogicalPoint, LogicalRect, LogicalViewport, OpenMode, OutputLayout, OutputTransform,
     PresentationTarget, ResizeCorner, SafeAreaInsets, SavedOutputConfig, SizeHints,
-    WindowAnimationTable, WindowMatchContext, WindowRuleEngine, WorkspaceLeaseState,
-    WorkspaceState, WorkspaceTransitionTable, is_waydroid_app_id,
+    WindowAnimationTable, WindowMatchContext, WindowOpenStyle, WindowRuleEngine,
+    WorkspaceLeaseState, WorkspaceState, WorkspaceTransitionTable, is_waydroid_app_id,
 };
 use koma_proto::{
     CapabilityToken, Epoch, EventTopic, OutputId, SeatId, TokenClaims, WindowId, WorkspaceEvent,
@@ -70,8 +70,9 @@ use smithay::{
     },
     wayland::{
         compositor::{
-            CompositorClientState, CompositorState, RectangleKind, SurfaceAttributes,
-            TraversalAction, get_parent, with_states, with_surface_tree_downward,
+            BufferAssignment, CompositorClientState, CompositorState, HookId, RectangleKind,
+            SurfaceAttributes, TraversalAction, add_pre_commit_hook, get_parent,
+            remove_pre_commit_hook, with_states, with_surface_tree_downward,
         },
         cursor_shape::CursorShapeManagerState,
         dmabuf::DmabufState,
@@ -824,8 +825,21 @@ pub struct KomaState {
     pub window_animations: RefCell<WindowAnimationTable>,
     /// Windows whose surface is gone but whose captured frame is still fading out.
     pub closing_windows: Vec<ClosingWindow>,
-    /// Latest committed pixels per mapped window, kept in GPU memory for `windows_close`.
+    /// On-demand unmap/destroy frame snapshots keyed by `WindowId` for `windows_close`.
+    /// Active mapped windows keep no entry here; snapshots are populated only right before a
+    /// closing surface loses its buffers and are consumed in [`Self::begin_close_animation`].
     pub window_frames: HashMap<WindowId, WindowFrameCache>,
+    /// Per-toplevel root `wl_surface` pre-commit hooks for capturing closing snapshots right
+    /// before an explicit unmap (`attach(null) + commit`) discards the surface's buffer.
+    pub toplevel_pre_commit_hooks: HashMap<WlSurface, HookId>,
+    /// Last known root `wl_surface` for child `wl_subsurface`s, retained across
+    /// `wl_subsurface.destroy` until `wl_surface.destroyed` so subsurface teardown can still
+    /// locate its parent toplevel.
+    pub subsurface_roots: HashMap<WlSurface, WlSurface>,
+    #[cfg(test)]
+    pub(crate) unmap_snapshot_attempts: u64,
+    #[cfg(test)]
+    pub(crate) last_snapshot_had_live_buffer: bool,
     pub workspace_transitions: RefCell<WorkspaceTransitionTable>,
     pub last_notified_focus_win_id: Option<WindowId>,
     /// Live 4-quadrant `smart_split` / `Scrolling` column drop zone `(ws_id, preview_rect)` during drag.
@@ -1072,6 +1086,12 @@ impl KomaState {
             window_animations: RefCell::new(WindowAnimationTable::default()),
             closing_windows: Vec::new(),
             window_frames: HashMap::new(),
+            toplevel_pre_commit_hooks: HashMap::new(),
+            subsurface_roots: HashMap::new(),
+            #[cfg(test)]
+            unmap_snapshot_attempts: 0,
+            #[cfg(test)]
+            last_snapshot_had_live_buffer: false,
             workspace_transitions: RefCell::new(WorkspaceTransitionTable::default()),
             last_notified_focus_win_id: None,
             active_drop_preview: None,
@@ -2574,9 +2594,6 @@ impl KomaState {
                 anim_style_override.as_deref(),
                 is_agent_ws,
             );
-            // Seed the close-frame cache: this commit already returned through the promotion path,
-            // so a client that closes before its next commit would otherwise have no pixels.
-            self.refresh_window_frame(win_id_created);
         }
 
         let visible_anywhere = ws_id == self.active_ws_id
@@ -3687,21 +3704,101 @@ impl KomaState {
                 .any(|ws| ws.scrolling.is_camera_animating(now_ms))
     }
 
-    /// Re-renders `win_id`'s committed frame into its GPU frame cache.
+    /// Returns `true` when `appearance.animations.windows_close` can produce a non-instant close
+    /// transition (so capturing an unmap/destroy snapshot is actually useful).
+    #[must_use]
+    pub(crate) fn close_animation_enabled(cfg: &koma_model::AnimationConfig) -> bool {
+        cfg.enabled
+            && cfg.windows_close.enabled != Some(false)
+            && !matches!(
+                cfg.channel_curve(&cfg.windows_close, None),
+                CurveSpec::Instant
+            )
+            && !matches!(
+                cfg.windows_close
+                    .style
+                    .as_deref()
+                    .and_then(WindowOpenStyle::parse),
+                Some(WindowOpenStyle::None)
+            )
+    }
+
+    /// Installs the per-toplevel `wl_surface` pre-commit hook that snapshots a closing window
+    /// right before an unmap commit (`attach(null) + commit`) discards its buffer, while doing
+    /// zero offscreen rendering on active frame commits.
+    pub fn register_toplevel_pre_commit_hook(&mut self, surface: &WlSurface) {
+        #[derive(Clone, Copy)]
+        enum PendingBufferOp {
+            Removed,
+            NewOrUnchanged,
+        }
+
+        if !surface.is_alive() {
+            return;
+        }
+        let hook_id = add_pre_commit_hook::<Self, _>(surface, |state, _dh, surface| {
+            let pending_op = with_states(surface, |states| {
+                let mut guard = states.cached_state.get::<SurfaceAttributes>();
+                match guard.pending().buffer.as_ref() {
+                    Some(BufferAssignment::Removed) => PendingBufferOp::Removed,
+                    Some(BufferAssignment::NewBuffer(_)) | None => PendingBufferOp::NewOrUnchanged,
+                }
+            });
+            let find_mapped_win_id = |state: &Self| {
+                state
+                    .mapped_windows
+                    .iter()
+                    .find(|m| {
+                        m.window
+                            .toplevel()
+                            .is_some_and(|t| t.wl_surface() == surface)
+                    })
+                    .map(|m| m.win_id)
+            };
+            match pending_op {
+                PendingBufferOp::Removed => {
+                    let Some(win_id) = find_mapped_win_id(state) else {
+                        return;
+                    };
+                    // Capture once before `on_commit_buffer_handler` discards the old buffer,
+                    // keeping any snapshot already captured when a subsurface was destroyed.
+                    if !state.window_frames.contains_key(&win_id) {
+                        state.refresh_window_frame(win_id);
+                    }
+                }
+                PendingBufferOp::NewOrUnchanged => {
+                    // Normal commit: zero offscreen FBO work; evict any stale snapshot (for
+                    // instance after a non-fatal subsurface destruction).
+                    if !state.window_frames.is_empty()
+                        && let Some(win_id) = find_mapped_win_id(state)
+                    {
+                        state.window_frames.remove(&win_id);
+                    }
+                }
+            }
+        });
+        if let Some(prev) = self
+            .toplevel_pre_commit_hooks
+            .insert(surface.clone(), hook_id)
+        {
+            remove_pre_commit_hook(surface, &prev);
+        }
+    }
+
+    /// Removes the per-toplevel pre-commit unmap-snapshot hook tracked for `surface`.
+    pub fn remove_toplevel_pre_commit_hook(&mut self, surface: &WlSurface) {
+        if let Some(hook_id) = self.toplevel_pre_commit_hooks.remove(surface) {
+            remove_pre_commit_hook(surface, &hook_id);
+        }
+    }
+
+    /// Captures `win_id`'s current committed surface tree into its offscreen snapshot cache.
     ///
-    /// Runs on every surface commit while close animations are enabled. A commit is the last
-    /// moment the client's buffer is readable (an unmap commit attaches a null buffer and
-    /// `destroy` releases the buffers), so this is the only point where the pixels a
-    /// `windows_close` spring needs can be kept.
+    /// Called lazily right before an unmap commit (`BufferAssignment::Removed`) or surface /
+    /// subsurface destruction drops the client's buffers, never on normal frame commits.
     pub fn refresh_window_frame(&mut self, win_id: WindowId) {
         let cfg = self.lua_sandbox.config_snapshot().appearance.animations;
-        if !cfg.enabled
-            || cfg.windows_close.enabled == Some(false)
-            || matches!(
-                cfg.channel_curve(&cfg.windows_close, None),
-                koma_model::CurveSpec::Instant
-            )
-        {
+        if !Self::close_animation_enabled(&cfg) {
             self.window_frames.remove(&win_id);
             return;
         }
@@ -3714,6 +3811,14 @@ impl KomaState {
         let rect = self.mapped_windows[idx].rect;
         if rect.w == 0 || rect.h == 0 {
             return;
+        }
+        #[cfg(test)]
+        {
+            self.unmap_snapshot_attempts += 1;
+            self.last_snapshot_had_live_buffer = self.mapped_windows[idx]
+                .window
+                .toplevel()
+                .is_some_and(|t| is_surface_mapped(t.wl_surface()));
         }
         let ws_id = self.mapped_windows[idx].ws_id.clone();
         let output_scale = self
@@ -3731,39 +3836,44 @@ impl KomaState {
             return;
         };
         let window = &self.mapped_windows[idx].window;
-        let cache = self.window_frames.entry(win_id).or_default();
         let scale = smithay::utils::Scale::from(output_scale);
-        backend.with_primary_renderer(|renderer| {
-            match window_snapshot_elements(renderer, window, rect, scale, radius) {
-                Ok(snapshot) => {
-                    if let Err(err) =
-                        cache.refresh(renderer, snapshot.size, scale, &snapshot.elements)
-                    {
+        let mut cache = self.window_frames.remove(&win_id).unwrap_or_default();
+        let cached_ok = backend
+            .with_primary_renderer(|renderer| {
+                match window_snapshot_elements(renderer, window, rect, scale, radius) {
+                    Ok(snapshot) => {
+                        if let Err(err) =
+                            cache.refresh(renderer, snapshot.size, scale, &snapshot.elements)
+                        {
+                            debug!(
+                                win_id = win_id.slot,
+                                %err,
+                                "window frame cache refresh failed; dropping cached pixels"
+                            );
+                            false
+                        } else {
+                            true
+                        }
+                    }
+                    Err(err) => {
                         debug!(
                             win_id = win_id.slot,
                             %err,
-                            "window frame cache refresh failed; dropping cached pixels"
+                            "window frame cache skipped: surface has no committed buffer"
                         );
-                        cache.clear();
+                        false
                     }
                 }
-                Err(err) => {
-                    debug!(
-                        win_id = win_id.slot,
-                        %err,
-                        "window frame cache skipped: surface has no committed buffer"
-                    );
-                }
-            }
-        });
+            })
+            .unwrap_or(false);
+        if cached_ok {
+            self.window_frames.insert(win_id, cache);
+        }
     }
 
-    /// Starts the `appearance.animations.windows_close` spring for `win_id`, using the last cached
-    /// frame (or a live capture when the surface still holds one).
-    ///
-    /// The pixels come from the per-window frame cache, which [`Self::refresh_window_frame`]
-    /// fills on every commit. A live capture is the fallback for clients that still hold a buffer
-    /// here; if neither yields pixels the window is freed synchronously.
+    /// Starts the `appearance.animations.windows_close` spring for `win_id`, using an on-demand
+    /// pre-commit/destruction snapshot in [`Self::window_frames`] or a live capture when the
+    /// surface still holds its buffer.
     ///
     /// Returns `true` only when a captured frame is now composited. A `false` result means the
     /// caller must free the window synchronously: no snapshot was possible or animations are off.
@@ -3779,7 +3889,7 @@ impl KomaState {
         let mut cached_frame = self.window_frames.remove(&win_id);
         let appearance = self.lua_sandbox.config_snapshot().appearance;
         let cfg = appearance.animations.clone();
-        if !cfg.enabled {
+        if !Self::close_animation_enabled(&cfg) {
             self.window_animations
                 .borrow_mut()
                 .remove_immediately(win_id);
@@ -6381,5 +6491,598 @@ pub(crate) mod tests {
             state.has_active_animations(),
             "switching workspace should start a WorkspaceTransitionTable slide animation"
         );
+    }
+
+    mod close_snapshot_tests {
+        use super::*;
+        use std::collections::BTreeMap;
+        use std::fs::{self, OpenOptions};
+        use std::os::fd::{AsFd as _, OwnedFd};
+        use std::os::unix::net::UnixStream;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        use calloop::EventLoop;
+        use koma_model::{AnimationChannelConfig, AnimationConfig};
+        use smithay::reexports::wayland_protocols::xdg::shell::client::{
+            xdg_surface, xdg_toplevel, xdg_wm_base,
+        };
+        use smithay::reexports::wayland_server::Display;
+        use wayland_client::protocol::{
+            wl_buffer, wl_callback, wl_compositor, wl_registry, wl_shm, wl_shm_pool,
+            wl_subcompositor, wl_subsurface, wl_surface,
+        };
+        use wayland_client::{Connection, Dispatch, EventQueue, delegate_noop};
+
+        static SHM_SEQ: AtomicU64 = AtomicU64::new(0);
+
+        fn create_shm_fd(len: usize) -> OwnedFd {
+            let seq = SHM_SEQ.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "koma-close-snapshot-test-{}-{seq}.bin",
+                std::process::id()
+            ));
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .expect("create shm backing file");
+            let _ = fs::remove_file(&path);
+            file.set_len(len as u64).expect("set shm file length");
+            OwnedFd::from(file)
+        }
+
+        #[derive(Default)]
+        struct TestClient {
+            sync_done: bool,
+            globals: BTreeMap<String, (u32, u32)>,
+            compositor: Option<wl_compositor::WlCompositor>,
+            subcompositor: Option<wl_subcompositor::WlSubcompositor>,
+            shm: Option<wl_shm::WlShm>,
+            wm_base: Option<xdg_wm_base::XdgWmBase>,
+        }
+
+        impl TestClient {
+            fn bind<I: wayland_client::Proxy + 'static>(
+                &self,
+                registry: &wl_registry::WlRegistry,
+                qh: &wayland_client::QueueHandle<Self>,
+                interface: &str,
+            ) -> I
+            where
+                Self: Dispatch<I, ()>,
+            {
+                let (name, version) = self
+                    .globals
+                    .get(interface)
+                    .copied()
+                    .unwrap_or_else(|| panic!("missing global {interface}"));
+                registry.bind::<I, (), Self>(name, version, qh, ())
+            }
+        }
+
+        impl Dispatch<wl_registry::WlRegistry, ()> for TestClient {
+            fn event(
+                state: &mut Self,
+                _: &wl_registry::WlRegistry,
+                event: wl_registry::Event,
+                _: &(),
+                _: &Connection,
+                _: &wayland_client::QueueHandle<Self>,
+            ) {
+                if let wl_registry::Event::Global {
+                    name,
+                    interface,
+                    version,
+                } = event
+                {
+                    state.globals.insert(interface, (name, version));
+                }
+            }
+        }
+
+        impl Dispatch<wl_callback::WlCallback, ()> for TestClient {
+            fn event(
+                state: &mut Self,
+                _: &wl_callback::WlCallback,
+                event: wl_callback::Event,
+                _: &(),
+                _: &Connection,
+                _: &wayland_client::QueueHandle<Self>,
+            ) {
+                if matches!(event, wl_callback::Event::Done { .. }) {
+                    state.sync_done = true;
+                }
+            }
+        }
+
+        impl Dispatch<xdg_wm_base::XdgWmBase, ()> for TestClient {
+            fn event(
+                _: &mut Self,
+                wm_base: &xdg_wm_base::XdgWmBase,
+                event: xdg_wm_base::Event,
+                _: &(),
+                _: &Connection,
+                _: &wayland_client::QueueHandle<Self>,
+            ) {
+                if let xdg_wm_base::Event::Ping { serial } = event {
+                    wm_base.pong(serial);
+                }
+            }
+        }
+
+        impl Dispatch<xdg_surface::XdgSurface, ()> for TestClient {
+            fn event(
+                _: &mut Self,
+                xdg_surface: &xdg_surface::XdgSurface,
+                event: xdg_surface::Event,
+                _: &(),
+                _: &Connection,
+                _: &wayland_client::QueueHandle<Self>,
+            ) {
+                if let xdg_surface::Event::Configure { serial } = event {
+                    xdg_surface.ack_configure(serial);
+                }
+            }
+        }
+
+        delegate_noop!(TestClient: ignore wl_compositor::WlCompositor);
+        delegate_noop!(TestClient: ignore wl_subcompositor::WlSubcompositor);
+        delegate_noop!(TestClient: ignore wl_subsurface::WlSubsurface);
+        delegate_noop!(TestClient: ignore wl_surface::WlSurface);
+        delegate_noop!(TestClient: ignore wl_shm::WlShm);
+        delegate_noop!(TestClient: ignore wl_shm_pool::WlShmPool);
+        delegate_noop!(TestClient: ignore wl_buffer::WlBuffer);
+        delegate_noop!(TestClient: ignore xdg_toplevel::XdgToplevel);
+
+        struct CloseTestEnv {
+            event_loop: EventLoop<'static, KomaState>,
+            display: Display<KomaState>,
+            state: KomaState,
+            _output: Output,
+            _output_global: smithay::reexports::wayland_server::backend::GlobalId,
+            conn: Connection,
+            queue: EventQueue<TestClient>,
+            client: TestClient,
+            registry: wl_registry::WlRegistry,
+        }
+
+        impl CloseTestEnv {
+            fn new() -> Self {
+                let (event_loop, display, mut state) = make_headless_test_state();
+                let output = test_output("DP-1");
+                let output_global = output.create_global::<KomaState>(&state.display_handle);
+                state.test_outputs.push(output.clone());
+
+                let (server_sock, client_sock) = UnixStream::pair().expect("UnixStream::pair");
+                display
+                    .handle()
+                    .insert_client(server_sock, Arc::new(ClientState::default()))
+                    .expect("insert client");
+                let conn = Connection::from_socket(client_sock).expect("Connection::from_socket");
+                let queue = conn.new_event_queue::<TestClient>();
+                let qh = queue.handle();
+                let registry = conn.display().get_registry(&qh, ());
+
+                let mut env = Self {
+                    event_loop,
+                    display,
+                    state,
+                    _output: output,
+                    _output_global: output_global,
+                    conn,
+                    queue,
+                    client: TestClient::default(),
+                    registry,
+                };
+                env.pump();
+                env
+            }
+
+            fn pump(&mut self) {
+                let qh = self.queue.handle();
+                self.client.sync_done = false;
+                let _cb = self.conn.display().sync(&qh, ());
+                self.conn.flush().expect("flush client");
+                for _ in 0..16 {
+                    self.display
+                        .dispatch_clients(&mut self.state)
+                        .expect("dispatch server clients");
+                    self.event_loop
+                        .dispatch(Some(Duration::ZERO), &mut self.state)
+                        .expect("dispatch calloop");
+                    self.display.flush_clients().expect("flush server clients");
+                    if let Some(guard) = self.queue.prepare_read() {
+                        let _ = guard.read();
+                    }
+                    self.queue
+                        .dispatch_pending(&mut self.client)
+                        .expect("dispatch client pending");
+                    self.conn.flush().expect("flush client post-dispatch");
+                    if self.client.sync_done {
+                        break;
+                    }
+                }
+                assert!(self.client.sync_done, "client-server sync failed");
+            }
+
+            fn ensure_globals(
+                &mut self,
+            ) -> (
+                wl_compositor::WlCompositor,
+                wl_subcompositor::WlSubcompositor,
+                wl_shm::WlShm,
+                xdg_wm_base::XdgWmBase,
+            ) {
+                let qh = self.queue.handle();
+                let compositor = self.client.compositor.clone().unwrap_or_else(|| {
+                    self.client.bind::<wl_compositor::WlCompositor>(
+                        &self.registry,
+                        &qh,
+                        "wl_compositor",
+                    )
+                });
+                self.client.compositor = Some(compositor.clone());
+                let subcompositor = self.client.subcompositor.clone().unwrap_or_else(|| {
+                    self.client.bind::<wl_subcompositor::WlSubcompositor>(
+                        &self.registry,
+                        &qh,
+                        "wl_subcompositor",
+                    )
+                });
+                self.client.subcompositor = Some(subcompositor.clone());
+                let shm = self.client.shm.clone().unwrap_or_else(|| {
+                    self.client
+                        .bind::<wl_shm::WlShm>(&self.registry, &qh, "wl_shm")
+                });
+                self.client.shm = Some(shm.clone());
+                let wm_base = self.client.wm_base.clone().unwrap_or_else(|| {
+                    self.client
+                        .bind::<xdg_wm_base::XdgWmBase>(&self.registry, &qh, "xdg_wm_base")
+                });
+                self.client.wm_base = Some(wm_base.clone());
+                (compositor, subcompositor, shm, wm_base)
+            }
+
+            fn create_buffer(
+                &self,
+                shm: &wl_shm::WlShm,
+            ) -> (wl_shm_pool::WlShmPool, wl_buffer::WlBuffer) {
+                let qh = self.queue.handle();
+                let fd = create_shm_fd(64 * 64 * 4);
+                let pool = shm.create_pool(fd.as_fd(), 64 * 64 * 4, &qh, ());
+                let buf = pool.create_buffer(0, 64, 64, 64 * 4, wl_shm::Format::Argb8888, &qh, ());
+                (pool, buf)
+            }
+
+            fn spawn_window(
+                &mut self,
+                title: &str,
+            ) -> (
+                wl_surface::WlSurface,
+                xdg_surface::XdgSurface,
+                xdg_toplevel::XdgToplevel,
+            ) {
+                let qh = self.queue.handle();
+                let (compositor, _, shm, wm_base) = self.ensure_globals();
+                let surface = compositor.create_surface(&qh, ());
+                let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
+                let toplevel = xdg_surface.get_toplevel(&qh, ());
+                toplevel.set_title(title.to_owned());
+                surface.commit();
+                self.pump();
+
+                let (pool, buf) = self.create_buffer(&shm);
+                surface.attach(Some(&buf), 0, 0);
+                surface.commit();
+                self.pump();
+
+                buf.destroy();
+                pool.destroy();
+                (surface, xdg_surface, toplevel)
+            }
+        }
+
+        #[test]
+        fn close_animation_enabled_respects_global_channel_instant_and_none_style() {
+            let mut cfg = AnimationConfig::default();
+            assert!(KomaState::close_animation_enabled(&cfg));
+
+            cfg.enabled = false;
+            assert!(!KomaState::close_animation_enabled(&cfg));
+
+            cfg.enabled = true;
+            cfg.windows_close = AnimationChannelConfig {
+                enabled: Some(false),
+                ..Default::default()
+            };
+            assert!(!KomaState::close_animation_enabled(&cfg));
+
+            cfg.windows_close = AnimationChannelConfig {
+                curve: Some("instant".to_owned()),
+                ..Default::default()
+            };
+            assert!(!KomaState::close_animation_enabled(&cfg));
+
+            cfg.windows_close = AnimationChannelConfig {
+                style: Some("none".to_owned()),
+                ..Default::default()
+            };
+            assert!(!KomaState::close_animation_enabled(&cfg));
+
+            cfg.windows_close = AnimationChannelConfig {
+                style: Some("popin 85%".to_owned()),
+                ..Default::default()
+            };
+            assert!(KomaState::close_animation_enabled(&cfg));
+        }
+
+        #[test]
+        fn normal_commits_and_initial_map_never_capture_fbo_and_evict_stale_cache() {
+            let mut env = CloseTestEnv::new();
+            let (surface, xdg_surface, toplevel) = env.spawn_window("VideoPlayer");
+            assert_eq!(env.state.mapped_windows.len(), 1);
+            let win_id = env.state.mapped_windows[0].win_id;
+
+            assert_eq!(env.state.toplevel_pre_commit_hooks.len(), 1);
+            assert_eq!(
+                env.state.unmap_snapshot_attempts, 0,
+                "initial map promotion must not trigger offscreen FBO rendering"
+            );
+            assert!(env.state.window_frames.is_empty());
+
+            // Simulate repeated active frame commits (new buffer + damage-only commit).
+            let (_, _, shm, _) = env.ensure_globals();
+            for _ in 0..5 {
+                let (pool, buf) = env.create_buffer(&shm);
+                surface.attach(Some(&buf), 0, 0);
+                surface.damage_buffer(0, 0, 64, 64);
+                surface.commit();
+                env.pump();
+                buf.destroy();
+                pool.destroy();
+            }
+            surface.damage_buffer(0, 0, 16, 16);
+            surface.commit();
+            env.pump();
+
+            assert_eq!(
+                env.state.unmap_snapshot_attempts, 0,
+                "normal surface commits must do zero offscreen FBO rendering"
+            );
+            assert!(env.state.window_frames.is_empty());
+
+            // A stale entry (e.g. from an earlier non-fatal subsurface teardown) is evicted on
+            // both new-buffer and bufferless commits without re-rendering.
+            env.state
+                .window_frames
+                .insert(win_id, WindowFrameCache::default());
+            let (pool, buf) = env.create_buffer(&shm);
+            surface.attach(Some(&buf), 0, 0);
+            surface.commit();
+            env.pump();
+            buf.destroy();
+            pool.destroy();
+            assert!(env.state.window_frames.is_empty());
+            assert_eq!(env.state.unmap_snapshot_attempts, 0);
+
+            env.state
+                .window_frames
+                .insert(win_id, WindowFrameCache::default());
+            surface.damage_buffer(0, 0, 8, 8);
+            surface.commit();
+            env.pump();
+            assert!(env.state.window_frames.is_empty());
+            assert_eq!(env.state.unmap_snapshot_attempts, 0);
+
+            toplevel.destroy();
+            xdg_surface.destroy();
+            surface.destroy();
+            env.pump();
+            assert!(env.state.toplevel_pre_commit_hooks.is_empty());
+            assert!(env.state.window_frames.is_empty());
+        }
+
+        #[test]
+        fn explicit_unmap_commit_captures_snapshot_only_when_windows_close_enabled() {
+            let mut env = CloseTestEnv::new();
+            let (surface, xdg_surface, toplevel) = env.spawn_window("UnmapTest");
+            assert_eq!(env.state.mapped_windows.len(), 1);
+            let win_id = env.state.mapped_windows[0].win_id;
+
+            // Explicit unmap commit with windows_close enabled: pre-commit hook runs while the
+            // surface still holds its buffer, then commit transitions the window back to unmapped.
+            surface.attach(None, 0, 0);
+            surface.commit();
+            env.pump();
+
+            assert_eq!(
+                env.state.unmap_snapshot_attempts, 1,
+                "attach(null) + commit must trigger pre-commit snapshot capture once"
+            );
+            assert!(
+                env.state.last_snapshot_had_live_buffer,
+                "pre-commit hook must capture before on_commit_buffer_handler clears the buffer"
+            );
+            assert!(env.state.mapped_windows.is_empty());
+            assert_eq!(env.state.unmapped_windows.len(), 1);
+            assert!(env.state.window_frames.is_empty());
+            assert_eq!(env.state.toplevel_pre_commit_hooks.len(), 1);
+
+            // Re-map the same toplevel afresh (initial commit -> configure/ack -> buffer commit).
+            surface.commit();
+            env.pump();
+            let (_, _, shm, _) = env.ensure_globals();
+            let (pool, buf) = env.create_buffer(&shm);
+            surface.attach(Some(&buf), 0, 0);
+            surface.commit();
+            env.pump();
+            buf.destroy();
+            pool.destroy();
+            assert_eq!(env.state.mapped_windows.len(), 1);
+            assert_eq!(env.state.unmap_snapshot_attempts, 1);
+
+            // Disable windows_close and unmap again: zero snapshot capture.
+            env.state
+                .lua_sandbox
+                .eval_init_lua(
+                    "koma.appearance({ animations = { windows_close = { enabled = false } } })",
+                )
+                .expect("disable windows_close");
+            surface.attach(None, 0, 0);
+            surface.commit();
+            env.pump();
+
+            assert_eq!(
+                env.state.unmap_snapshot_attempts, 1,
+                "unmapping with windows_close disabled must skip snapshot capture"
+            );
+            assert!(env.state.window_frames.is_empty());
+            assert!(env.state.closing_windows.is_empty());
+            assert!(!env.state.window_animations.borrow().is_closing(win_id));
+
+            // Re-map and disable global animations, then unmap: also skips capture.
+            surface.commit();
+            env.pump();
+            let (pool, buf) = env.create_buffer(&shm);
+            surface.attach(Some(&buf), 0, 0);
+            surface.commit();
+            env.pump();
+            buf.destroy();
+            pool.destroy();
+            env.state
+                .lua_sandbox
+                .eval_init_lua("koma.appearance({ animations = { enabled = false } })")
+                .expect("disable all animations");
+            surface.attach(None, 0, 0);
+            surface.commit();
+            env.pump();
+            assert_eq!(env.state.unmap_snapshot_attempts, 1);
+
+            toplevel.destroy();
+            xdg_surface.destroy();
+            surface.destroy();
+            env.pump();
+            assert!(env.state.toplevel_pre_commit_hooks.is_empty());
+            assert!(env.state.unmapped_windows.is_empty());
+            assert!(env.state.window_frames.is_empty());
+        }
+
+        #[test]
+        fn subsurface_destruction_and_both_destroy_orders_cleanup_hooks_without_leaks() {
+            let mut env = CloseTestEnv::new();
+            let (surface, xdg_surface, toplevel) = env.spawn_window("SubsurfaceOwner");
+            let win_id = env.state.mapped_windows[0].win_id;
+            let qh = env.queue.handle();
+            let (compositor, subcompositor, shm, _) = env.ensure_globals();
+
+            let sub_surface = compositor.create_surface(&qh, ());
+            let subsurface = subcompositor.get_subsurface(&sub_surface, &surface, &qh, ());
+            subsurface.set_desync();
+            let (pool, buf) = env.create_buffer(&shm);
+            sub_surface.attach(Some(&buf), 0, 0);
+            sub_surface.commit();
+            surface.commit();
+            env.pump();
+            buf.destroy();
+            pool.destroy();
+
+            assert_eq!(env.state.unmap_snapshot_attempts, 0);
+            assert!(env.state.window_frames.is_empty());
+
+            // Async subsurface commit evicts any stale cached frame without re-rendering.
+            env.state
+                .window_frames
+                .insert(win_id, WindowFrameCache::default());
+            let (pool2, buf2) = env.create_buffer(&shm);
+            sub_surface.attach(Some(&buf2), 0, 0);
+            sub_surface.commit();
+            env.pump();
+            buf2.destroy();
+            pool2.destroy();
+            assert!(env.state.window_frames.is_empty());
+            assert_eq!(env.state.unmap_snapshot_attempts, 0);
+
+            // Destroying the subsurface while windows_close is enabled triggers snapshot capture
+            // before Smithay detaches the subsurface.
+            subsurface.destroy();
+            sub_surface.destroy();
+            env.pump();
+            assert_eq!(env.state.unmap_snapshot_attempts, 1);
+            assert!(env.state.last_snapshot_had_live_buffer);
+
+            // A second subsurface destroyed while windows_close is disabled does not capture.
+            env.state
+                .lua_sandbox
+                .eval_init_lua(
+                    "koma.appearance({ animations = { windows_close = { enabled = false } } })",
+                )
+                .expect("disable windows_close");
+            let sub_surface2 = compositor.create_surface(&qh, ());
+            let subsurface2 = subcompositor.get_subsurface(&sub_surface2, &surface, &qh, ());
+            subsurface2.set_desync();
+            sub_surface2.commit();
+            env.pump();
+            subsurface2.destroy();
+            sub_surface2.destroy();
+            env.pump();
+            assert_eq!(env.state.unmap_snapshot_attempts, 1);
+
+            // Standard destroy order (`toplevel` before `wl_surface`) frees everything cleanly.
+            toplevel.destroy();
+            xdg_surface.destroy();
+            surface.destroy();
+            env.pump();
+            assert!(env.state.mapped_windows.is_empty());
+            assert!(env.state.unmapped_windows.is_empty());
+            assert!(env.state.window_frames.is_empty());
+            assert!(env.state.toplevel_pre_commit_hooks.is_empty());
+            assert!(env.state.subsurface_roots.is_empty());
+
+            // Reverse destroy order (`wl_surface` destroyed before `xdg_toplevel`, as can happen
+            // on unexpected client disconnect) still captures once before cleanup and leaks zero hooks.
+            env.state
+                .lua_sandbox
+                .eval_init_lua(
+                    "koma.appearance({ animations = { windows_close = { enabled = true } } })",
+                )
+                .expect("re-enable windows_close");
+            let (surface2, xdg_surface2, toplevel2) = env.spawn_window("ReverseDestroy");
+            assert_eq!(env.state.toplevel_pre_commit_hooks.len(), 1);
+            surface2.destroy();
+            env.pump();
+            assert_eq!(env.state.unmap_snapshot_attempts, 2);
+            assert!(env.state.last_snapshot_had_live_buffer);
+            assert!(
+                env.state.toplevel_pre_commit_hooks.is_empty(),
+                "WlSurface::destroyed must drop the pre-commit hook even before toplevel_destroyed"
+            );
+
+            toplevel2.destroy();
+            xdg_surface2.destroy();
+            env.pump();
+            assert!(env.state.mapped_windows.is_empty());
+            assert!(env.state.unmapped_windows.is_empty());
+            assert!(env.state.window_frames.is_empty());
+            assert!(env.state.toplevel_pre_commit_hooks.is_empty());
+            assert!(env.state.subsurface_roots.is_empty());
+
+            // Never-mapped toplevel destroyed cleanly removes its hook with zero snapshot attempts.
+            let wm_base = env.client.wm_base.clone().unwrap();
+            let unmapped_surface = compositor.create_surface(&qh, ());
+            let unmapped_xdg = wm_base.get_xdg_surface(&unmapped_surface, &qh, ());
+            let unmapped_tl = unmapped_xdg.get_toplevel(&qh, ());
+            unmapped_surface.commit();
+            env.pump();
+            assert_eq!(env.state.toplevel_pre_commit_hooks.len(), 1);
+            assert_eq!(env.state.unmap_snapshot_attempts, 2);
+            unmapped_tl.destroy();
+            unmapped_xdg.destroy();
+            unmapped_surface.destroy();
+            env.pump();
+            assert!(env.state.toplevel_pre_commit_hooks.is_empty());
+            assert!(env.state.unmapped_windows.is_empty());
+            assert_eq!(env.state.unmap_snapshot_attempts, 2);
+        }
     }
 }

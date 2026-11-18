@@ -147,16 +147,18 @@ pub fn capture_elements_to_memory(
         .context("window snapshot produced no pixels")
 }
 
-/// Latest committed pixels of one toplevel, kept in GPU memory so a close animation can fade them
-/// out after the client released its buffers.
+/// On-demand offscreen snapshot of one closing or unmapping toplevel, kept in GPU memory only
+/// between pre-commit/destruction capture and [`read_back`](Self::read_back).
 ///
-/// Refreshed in the `wl_surface` commit handler (the last moment the client's buffer is readable)
-/// and read back exactly once when the window actually closes.
+/// Active windows keep no permanent `WindowFrameCache` allocation; a single snapshot is captured
+/// only right before a mapped window loses its buffers (`BufferAssignment::Removed` on unmap or
+/// surface/subsurface destruction) and read back and released when the close animation starts.
 #[derive(Debug)]
 pub struct WindowFrameCache {
     texture: Option<GlesTexture>,
     buf_size: Size<i32, BufferCoords>,
     output_scale: Scale<f64>,
+    damage_tracker: Option<OutputDamageTracker>,
 }
 
 impl Default for WindowFrameCache {
@@ -165,6 +167,7 @@ impl Default for WindowFrameCache {
             texture: None,
             buf_size: Size::from((0, 0)),
             output_scale: Scale::from(1.0),
+            damage_tracker: None,
         }
     }
 }
@@ -176,7 +179,8 @@ impl WindowFrameCache {
         self.texture.is_none()
     }
 
-    /// Re-renders `elements` into the cached texture, reallocating it when the window resized.
+    /// Renders `elements` into the offscreen snapshot texture, allocating or resizing it and its
+    /// [`OutputDamageTracker`] only when dimensions or output scale change.
     ///
     /// # Errors
     ///
@@ -191,9 +195,10 @@ impl WindowFrameCache {
         let phys_w = (f64::from(size.w.max(1)) * output_scale.x).round().max(1.0) as i32;
         let phys_h = (f64::from(size.h.max(1)) * output_scale.y).round().max(1.0) as i32;
         let buf_size: Size<i32, BufferCoords> = Size::from((phys_w, phys_h));
-        let needs_alloc = self.texture.is_none()
-            || self.buf_size != buf_size
-            || (self.output_scale.x - output_scale.x).abs() > f64::EPSILON;
+        let scale_changed = (self.output_scale.x - output_scale.x).abs() > f64::EPSILON
+            || (self.output_scale.y - output_scale.y).abs() > f64::EPSILON;
+        let needs_alloc = self.texture.is_none() || self.buf_size != buf_size || scale_changed;
+        let phys_size: Size<i32, Physical> = Size::from((phys_w, phys_h));
         if needs_alloc {
             self.texture = Some(
                 renderer
@@ -202,10 +207,15 @@ impl WindowFrameCache {
             );
             self.buf_size = buf_size;
             self.output_scale = output_scale;
+            self.damage_tracker = Some(OutputDamageTracker::new(
+                phys_size,
+                output_scale,
+                Transform::Normal,
+            ));
         }
-        let phys_size: Size<i32, Physical> = Size::from((phys_w, phys_h));
-        let mut damage_tracker =
-            OutputDamageTracker::new(phys_size, output_scale, Transform::Normal);
+        let damage_tracker = self.damage_tracker.get_or_insert_with(|| {
+            OutputDamageTracker::new(phys_size, output_scale, Transform::Normal)
+        });
         let tex = self.texture.as_mut().expect("allocated above");
         let mut fb = renderer
             .bind(tex)
@@ -254,10 +264,11 @@ impl WindowFrameCache {
         Ok(Some((buffer, (buf_size.w, buf_size.h))))
     }
 
-    /// Releases the cached VRAM (the window closed or its animation settled).
+    /// Releases the cached VRAM and damage tracker (the window closed or its snapshot was evicted).
     pub fn clear(&mut self) {
         self.texture = None;
         self.buf_size = Size::from((0, 0));
+        self.damage_tracker = None;
     }
 }
 
@@ -286,4 +297,19 @@ pub fn duplicate_dmabuf_planes(
         });
     }
     Ok((fds, planes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WindowFrameCache;
+
+    #[test]
+    fn window_frame_cache_starts_empty_and_clears_cleanly() {
+        let mut cache = WindowFrameCache::default();
+        assert!(cache.is_empty());
+        assert!(cache.damage_tracker.is_none());
+        cache.clear();
+        assert!(cache.is_empty());
+        assert!(cache.damage_tracker.is_none());
+    }
 }
