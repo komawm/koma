@@ -6678,3 +6678,5 @@ mod dnd_tests {
         pool.destroy();
     }
 }
+
+mod kom_0072;

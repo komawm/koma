@@ -482,10 +482,16 @@ pub(crate) fn dispatch_output_frame_callbacks_filtered(
             );
         }
     }
-    let map = layer_map_for_output(output);
-    for layer in map.layers() {
-        layer.send_frame(output, elapsed, throttle, scanout);
-        layer.take_presentation_feedback(&mut output_feedback, scanout, flags);
+    // `layer_map_for_output` hands out a non-reentrant `MutexGuard`. `ime_popup_render_targets`
+    // resolves an IME popup's parent geometry, and for a parent that is not a mapped window (a
+    // layer-shell text field, an X11 window) that re-locks the same layer map. Keep the guard
+    // scoped to the layer frame loop so the IME pass below never runs under it (komawm/koma#64).
+    {
+        let map = layer_map_for_output(output);
+        for layer in map.layers() {
+            layer.send_frame(output, elapsed, throttle, scanout);
+            layer.take_presentation_feedback(&mut output_feedback, scanout, flags);
+        }
     }
     for (ime_surf, _) in state.ime_popup_render_targets(output) {
         send_frames_surface_tree(&ime_surf, output, elapsed, throttle, scanout);
