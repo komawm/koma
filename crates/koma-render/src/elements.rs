@@ -202,6 +202,9 @@ impl<R: Renderer + ImportAll> Element for KomaClippedSurfaceElement<R> {
     }
 
     fn opaque_regions(&self, scale: Scale<f64>) -> OpaqueRegions<i32, Physical> {
+        if self.inner.transform() != Transform::Normal {
+            return OpaqueRegions::default();
+        }
         clipped_surface_opaque_regions(
             self.inner.opaque_regions(scale),
             self.inner.geometry(scale).loc,
@@ -263,7 +266,7 @@ pub fn clipped_surface_opaque_regions(
     opacity: f32,
     scale: Scale<f64>,
 ) -> OpaqueRegions<i32, Physical> {
-    if opacity < 0.999 || inner_regions.is_empty() {
+    if opacity < 1.0 || inner_regions.is_empty() {
         return OpaqueRegions::default();
     }
 
@@ -1019,6 +1022,21 @@ pub fn split_drop_shadow_strips(
     }
 
     if x1 <= x0 || y1 <= y0 {
+        return vec![(4, area)];
+    }
+
+    let aligned_y = (y0 == area_y0
+        || phys_span_end_i32(area_y0, y0 - area_y0, sy) == phys_pos_i32(y0, sy))
+        && (y1 == area_y1
+            || (phys_span_end_i32(y0, y1 - y0, sy) == phys_pos_i32(y1, sy)
+                && phys_span_end_i32(y1, area_y1 - y1, sy)
+                    == phys_span_end_i32(area_y0, area.size.h, sy)));
+    let aligned_x = (x0 == area_x0
+        || phys_span_end_i32(area_x0, x0 - area_x0, sx) == phys_pos_i32(x0, sx))
+        && (x1 == area_x1
+            || phys_span_end_i32(x1, area_x1 - x1, sx)
+                == phys_span_end_i32(area_x0, area.size.w, sx));
+    if !aligned_x || !aligned_y {
         return vec![(4, area)];
     }
 

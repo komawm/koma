@@ -1226,16 +1226,17 @@ impl TtyBackendState {
             (d.render_node.is_none(), d.software_rendering)
         });
 
-        let render_formats: FormatSet = {
+        let (raw_render_formats, render_formats): (FormatSet, FormatSet) = {
             let renderer = self.gpu_manager.single_renderer(&target_render_node)?;
             let raw_formats = renderer.as_ref().egl_context().dmabuf_render_formats();
-            filter_render_formats(
+            let filtered = filter_render_formats(
                 raw_formats,
                 self.primary_render_node,
                 target_render_node,
                 is_display_only,
                 is_software,
-            )
+            );
+            (raw_formats.clone(), filtered)
         };
 
         let output = Output::new(
@@ -1309,11 +1310,11 @@ impl TtyBackendState {
                         connector = %connector_name,
                         "DrmCompositor::new failed with explicit modifiers ({err:?}); retrying with Modifier::Invalid"
                     );
-                    let invalid_mod_formats: FormatSet = render_formats
-                        .iter()
-                        .copied()
-                        .filter(|f| f.modifier == Modifier::Invalid)
-                        .collect();
+                    let invalid_mod_formats = fallback_invalid_render_formats(
+                        &raw_render_formats,
+                        &render_formats,
+                        is_display_only,
+                    );
                     let retry_surface =
                         device
                             .drm
@@ -1692,6 +1693,23 @@ fn filter_render_formats<N: Eq>(
                     | Modifier::Unrecognized(0x10000000000000c)
             )
         })
+        .collect()
+}
+
+fn fallback_invalid_render_formats(
+    raw_formats: &FormatSet,
+    filtered_formats: &FormatSet,
+    is_display_only: bool,
+) -> FormatSet {
+    let source = if is_display_only {
+        filtered_formats
+    } else {
+        raw_formats
+    };
+    source
+        .iter()
+        .copied()
+        .filter(|f| f.modifier == Modifier::Invalid)
         .collect()
 }
 
