@@ -43,6 +43,6 @@ work, and neither replaces your shell.
 - The agent's existing `bash` permission model stays the only execution surface.
 - `jiku` output is JSON, so the agent can reason over a report instead of pixels.
 
-The trade-off is that you lose the epoch-aware retry loop that `koma-mcp` gives
+The trade-off is that you lose the epoch-aware retry loop that `koma mcp` gives
 you for free. If the workflow is coordinate-heavy, attach the MCP server instead;
 see [`skills/koma-desktop/references/input-primitives.md`](../skills/koma-desktop/references/input-primitives.md).

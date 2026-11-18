@@ -180,6 +180,17 @@ const ROOT_SUBS: &[Cmd] = &[
         subs: &[],
     },
     Cmd {
+        name: "init",
+        desc: "Scaffold a commented configuration tree",
+        opts: &[Opt {
+            long: "force",
+            short: None,
+            takes_value: false,
+            desc: "Replace existing generated files",
+        }],
+        subs: &[],
+    },
+    Cmd {
         name: "gen-types",
         desc: "Emit LuaLS type stubs",
         opts: &[],

@@ -2,7 +2,7 @@
 # Build and assemble a Koma development-prerelease archive with a manifest and checksums.
 set -euo pipefail
 
-readonly BINARIES=(koma komactl koma-mcp koma-overview)
+readonly BINARIES=(koma komactl koma-overview)
 
 usage() {
     cat <<'EOF'

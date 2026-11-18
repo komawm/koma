@@ -571,6 +571,39 @@ impl KeyboardInputSpec {
     }
 }
 
+/// Pointer-focus policy under `koma.input({ pointer = { follow_mouse = ... } })`.
+///
+/// The three modes mirror `Hyprland` `input:follow_mouse`:
+/// - [`FollowMouseMode::Off`] is `0`: never focus from pointer motion, clicks still focus.
+/// - [`FollowMouseMode::Normal`] is `1`: `full`; hovering focuses the window under the cursor *and*
+///   raises it to the top of the workspace stack (the click-focus behaviour, without a click).
+/// - [`FollowMouseMode::FocusOnly`] is `2`: hovering transfers keyboard focus to the window under
+///   the cursor without raising it or changing the workspace's active-window stacking.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FollowMouseMode {
+    Off,
+    #[default]
+    Normal,
+    FocusOnly,
+}
+
+impl FollowMouseMode {
+    /// Parses a configured `follow_mouse` value, matching case-insensitively after trimming.
+    ///
+    /// Accepts the Koma names (`off`, `normal`, `focus_only`) and the equivalent `Hyprland`
+    /// numeric values (`0`, `1`, `2`). Unset values default to [`FollowMouseMode::Normal`] because
+    /// that is `Hyprland`'s `1`/`full` default; unrecognized values also fall back to `Normal` so a
+    /// typo can never silently disable pointer focusing.
+    #[must_use]
+    pub fn from_config_value(raw: Option<&str>) -> Self {
+        match raw.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+            Some("off" | "0") => Self::Off,
+            Some("focus_only" | "2") => Self::FocusOnly,
+            _ => Self::Normal,
+        }
+    }
+}
+
 /// Typed `libinput` pointer settings under `koma.input({ pointer = { ... } })`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -1663,6 +1696,53 @@ impl KomaConfigRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn follow_mouse_mode_parses_known_values_and_documents_fallback() {
+        assert_eq!(
+            FollowMouseMode::from_config_value(Some("off")),
+            FollowMouseMode::Off
+        );
+        assert_eq!(
+            FollowMouseMode::from_config_value(Some("normal")),
+            FollowMouseMode::Normal
+        );
+        assert_eq!(
+            FollowMouseMode::from_config_value(Some("focus_only")),
+            FollowMouseMode::FocusOnly
+        );
+
+        // `Hyprland` numeric spellings map onto the same modes.
+        assert_eq!(
+            FollowMouseMode::from_config_value(Some("0")),
+            FollowMouseMode::Off
+        );
+        assert_eq!(
+            FollowMouseMode::from_config_value(Some("1")),
+            FollowMouseMode::Normal
+        );
+        assert_eq!(
+            FollowMouseMode::from_config_value(Some("2")),
+            FollowMouseMode::FocusOnly
+        );
+
+        // Case and surrounding whitespace are tolerated.
+        assert_eq!(
+            FollowMouseMode::from_config_value(Some("  Focus_Only  ")),
+            FollowMouseMode::FocusOnly
+        );
+
+        // Documented fallback: unset and unrecognized values behave like `Hyprland`'s default `1`.
+        assert_eq!(
+            FollowMouseMode::from_config_value(None),
+            FollowMouseMode::Normal
+        );
+        assert_eq!(
+            FollowMouseMode::from_config_value(Some("typo")),
+            FollowMouseMode::Normal
+        );
+        assert_eq!(FollowMouseMode::default(), FollowMouseMode::Normal);
+    }
 
     fn apple_force_touch_probe() -> LibinputDeviceProbe {
         LibinputDeviceProbe {

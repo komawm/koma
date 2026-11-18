@@ -2162,6 +2162,33 @@ fn output_power_and_gamma_control_validation_and_transitions() {
 }
 
 #[test]
+fn toplevel_destroy_without_a_renderer_frees_window_state_synchronously() {
+    let mut env = ClientEnv::new();
+    let (surface, xdg_surface, toplevel) = env.spawn_window("Closing", "org.koma.closing");
+    assert_eq!(env.state.mapped_windows.len(), 1);
+    let win_id = env.state.mapped_windows[0].win_id;
+
+    toplevel.destroy();
+    xdg_surface.destroy();
+    surface.destroy();
+    env.pump();
+
+    assert!(
+        env.state.mapped_windows.is_empty(),
+        "a destroyed toplevel must leave layout, hit-testing and IPC immediately"
+    );
+    assert!(env.state.unmapped_windows.is_empty());
+    assert!(
+        !env.state.window_animations.borrow().is_closing(win_id),
+        "without a renderer no frame can be captured, so the close spring must not linger"
+    );
+    assert!(
+        env.state.closing_windows.is_empty(),
+        "no captured frame may outlive the toplevel when no snapshot was possible"
+    );
+}
+
+#[test]
 fn screencopy_copy_with_damage_waits_for_damage_and_minimizing_clears_focus() {
     let mut env = ClientEnv::new();
     let qh = env.queue.handle();
@@ -2471,6 +2498,250 @@ fn mapped_surface(
         .and_then(|m| m.window.toplevel())
         .map(|t| t.wl_surface().clone())
         .expect("mapped toplevel")
+}
+
+fn keyboard_focus(
+    state: &KomaState,
+) -> Option<smithay::reexports::wayland_server::protocol::wl_surface::WlSurface> {
+    state.seat.get_keyboard().and_then(|k| k.current_focus())
+}
+
+/// Reads the pending `xdg_toplevel` `Activated` flag, which `focus_active_deck_window` keeps in
+/// sync with the keyboard-focused tiling/floating window.
+fn toplevel_activated(state: &KomaState, win_id: koma_proto::WindowId) -> bool {
+    state
+        .mapped_windows
+        .iter()
+        .find(|m| m.win_id == win_id)
+        .and_then(|m| m.window.toplevel())
+        .is_some_and(|t| {
+            t.with_pending_state(|s| {
+                s.states
+                    .contains(smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State::Activated)
+            })
+        })
+}
+
+/// Applies `follow_mouse` through the real config path (`koma.input.pointer.follow_mouse`).
+fn apply_follow_mouse(env: &mut ClientEnv, value: &str) {
+    let mut registry = koma_lua::KomaConfigRegistry::default();
+    registry.input.pointer.follow_mouse = Some(value.to_owned());
+    env.state.apply_runtime_input_config(&registry);
+}
+
+/// Spawns two side-by-side floating windows (`left` below `right`) and returns both ids.
+///
+/// Floating rects keep the pointer probes deterministic: `left` covers `(0,0)-(800,600)` and
+/// `right` covers `(1000,0)-(1800,600)`, leaving a `(800,0)-(1000,600)` gap without any window.
+fn spawn_follow_mouse_windows(env: &mut ClientEnv) -> (koma_proto::WindowId, koma_proto::WindowId) {
+    let _left = env.spawn_window("FollowLeft", "org.koma.followleft").0;
+    let _right = env.spawn_window("FollowRight", "org.koma.followright").0;
+    let ws_id = env.state.active_ws_id.clone();
+    let now_ms = env.state.elapsed_ms();
+    let left = env.state.mapped_windows[0].win_id;
+    let right = env.state.mapped_windows[1].win_id;
+    if let Some(ws) = env.state.workspaces.get_mut(&ws_id) {
+        for (win_id, rect) in [
+            (left, koma_model::LogicalRect::new(0, 0, 800, 600)),
+            (right, koma_model::LogicalRect::new(1000, 0, 800, 600)),
+        ] {
+            ws.toggle_floating(win_id, None, None, now_ms);
+            ws.floating.set_rect(win_id, rect);
+        }
+    }
+    env.state.sync_workspace_geometries(&ws_id);
+    env.state.focus_active_deck_window();
+    assert_eq!(env.state.workspaces[&ws_id].active_window(), Some(right));
+    (left, right)
+}
+
+/// Pointer probe inside `win_id`'s current visible geometry (the harness buffer is `64x64`).
+fn probe_inside(
+    env: &ClientEnv,
+    ws_id: &koma_proto::WorkspaceId,
+    win_id: koma_proto::WindowId,
+) -> Point<f64, smithay::utils::Logical> {
+    let rect = env
+        .state
+        .workspaces
+        .get(ws_id)
+        .expect("workspace")
+        .compute_visible_geometries_at(env.state.elapsed_ms())
+        .into_iter()
+        .find(|(id, _, _)| *id == win_id)
+        .map(|(_, rect, _)| rect)
+        .expect("visible geometry");
+    Point::from((f64::from(rect.x) + 24.0, f64::from(rect.y) + 24.0))
+}
+
+fn move_pointer(env: &mut ClientEnv, pos: Point<f64, smithay::utils::Logical>) {
+    env.state
+        .handle_pointer_absolute_motion(pos, InputTime::from_millis(1));
+}
+
+fn move_pointer_onto(
+    env: &mut ClientEnv,
+    ws_id: &koma_proto::WorkspaceId,
+    win_id: koma_proto::WindowId,
+) {
+    let pos = probe_inside(env, ws_id, win_id);
+    move_pointer(env, pos);
+}
+
+#[test]
+fn follow_mouse_config_strings_map_to_modes() {
+    let mut env = ClientEnv::new();
+    use koma_lua::FollowMouseMode;
+    assert_eq!(env.state.follow_mouse_mode, FollowMouseMode::Normal);
+
+    apply_follow_mouse(&mut env, "off");
+    assert_eq!(env.state.follow_mouse_mode, FollowMouseMode::Off);
+    apply_follow_mouse(&mut env, "focus_only");
+    assert_eq!(env.state.follow_mouse_mode, FollowMouseMode::FocusOnly);
+    apply_follow_mouse(&mut env, "normal");
+    assert_eq!(env.state.follow_mouse_mode, FollowMouseMode::Normal);
+    // Unknown values fall back to `normal` (`Hyprland` `follow_mouse = 1`).
+    apply_follow_mouse(&mut env, "bogus");
+    assert_eq!(env.state.follow_mouse_mode, FollowMouseMode::Normal);
+}
+
+#[test]
+fn follow_mouse_off_keeps_click_to_focus() {
+    let mut env = ClientEnv::new();
+    let ws_id = env.state.active_ws_id.clone();
+    apply_follow_mouse(&mut env, "off");
+    let (left, right) = spawn_follow_mouse_windows(&mut env);
+    let right_surface = mapped_surface(&env.state, right);
+
+    move_pointer_onto(&mut env, &ws_id, left);
+
+    assert_eq!(
+        keyboard_focus(&env.state),
+        Some(right_surface),
+        "off must not transfer keyboard focus on hover"
+    );
+    assert_eq!(env.state.workspaces[&ws_id].active_window(), Some(right));
+    assert!(!toplevel_activated(&env.state, left));
+    assert!(toplevel_activated(&env.state, right));
+    assert_eq!(env.state.pointer_focus_window, None);
+
+    // `off` is click-to-focus, so an explicit click on the other window still focuses it.
+    let left_probe = probe_inside(&env, &ws_id, left);
+    env.state.focus_window_at_point(left_probe);
+    assert_eq!(env.state.workspaces[&ws_id].active_window(), Some(left));
+    assert_eq!(
+        keyboard_focus(&env.state),
+        Some(mapped_surface(&env.state, left))
+    );
+    assert!(toplevel_activated(&env.state, left));
+}
+
+#[test]
+fn follow_mouse_normal_focuses_and_raises_window_under_cursor() {
+    let mut env = ClientEnv::new();
+    let ws_id = env.state.active_ws_id.clone();
+    apply_follow_mouse(&mut env, "normal");
+    let (left, right) = spawn_follow_mouse_windows(&mut env);
+    assert_eq!(env.state.workspaces[&ws_id].floating.topmost(), Some(right));
+
+    move_pointer_onto(&mut env, &ws_id, left);
+
+    assert_eq!(
+        keyboard_focus(&env.state),
+        Some(mapped_surface(&env.state, left)),
+        "normal (`Hyprland` 1) must key the window under the cursor"
+    );
+    assert_eq!(
+        env.state.workspaces[&ws_id].active_window(),
+        Some(left),
+        "normal (`Hyprland` 1) must also raise/activate it in the workspace stack"
+    );
+    assert_eq!(
+        env.state.workspaces[&ws_id].floating.topmost(),
+        Some(left),
+        "raising must reorder the floating stack"
+    );
+    assert!(toplevel_activated(&env.state, left));
+    assert!(!toplevel_activated(&env.state, right));
+    assert_eq!(env.state.last_notified_focus_win_id, Some(left));
+    assert_eq!(env.state.focused_window_id(), Some(left));
+}
+
+#[test]
+fn follow_mouse_focus_only_transfers_keyboard_without_stack_change() {
+    let mut env = ClientEnv::new();
+    let ws_id = env.state.active_ws_id.clone();
+    apply_follow_mouse(&mut env, "focus_only");
+    let (left, right) = spawn_follow_mouse_windows(&mut env);
+
+    move_pointer_onto(&mut env, &ws_id, left);
+
+    assert_eq!(
+        keyboard_focus(&env.state),
+        Some(mapped_surface(&env.state, left)),
+        "focus_only must transfer keyboard focus to the window under the cursor"
+    );
+    assert_eq!(
+        env.state.workspaces[&ws_id].active_window(),
+        Some(right),
+        "focus_only must not change the workspace's active-window stacking"
+    );
+    assert_eq!(
+        env.state.workspaces[&ws_id].floating.topmost(),
+        Some(right),
+        "focus_only must not raise the hovered window"
+    );
+    assert_eq!(
+        env.state.focused_window_id(),
+        Some(left),
+        "the keyboard-focus source must follow the pointer in focus_only"
+    );
+    // `xdg_toplevel` `Activated` follows the transferred focus even though the stack is unchanged.
+    assert!(toplevel_activated(&env.state, left));
+    assert!(!toplevel_activated(&env.state, right));
+
+    // A click restores ordinary click-to-focus semantics and clears the pointer override.
+    let left_probe = probe_inside(&env, &ws_id, left);
+    env.state.focus_window_at_point(left_probe);
+    assert_eq!(env.state.pointer_focus_window, None);
+    assert_eq!(env.state.workspaces[&ws_id].active_window(), Some(left));
+}
+
+#[test]
+fn follow_mouse_same_window_gap_and_lock_do_not_transfer_focus() {
+    let mut env = ClientEnv::new();
+    let ws_id = env.state.active_ws_id.clone();
+    apply_follow_mouse(&mut env, "normal");
+    let (left, right) = spawn_follow_mouse_windows(&mut env);
+    let right_surface = mapped_surface(&env.state, right);
+
+    // Motion inside the already-focused window is a no-op.
+    move_pointer_onto(&mut env, &ws_id, right);
+    let right_probe = probe_inside(&env, &ws_id, right);
+    move_pointer(&mut env, right_probe + Point::from((16.0, 16.0)));
+    assert_eq!(keyboard_focus(&env.state), Some(right_surface.clone()));
+    assert_eq!(env.state.workspaces[&ws_id].active_window(), Some(right));
+
+    // Motion over the gap between both windows resolves no window and keeps focus.
+    let gap = Point::from((900.0, 300.0));
+    assert!(
+        env.state.hit_test_visible_surface(gap).is_none(),
+        "the probe must land on a real gap between the two windows"
+    );
+    move_pointer(&mut env, gap);
+    assert_eq!(keyboard_focus(&env.state), Some(right_surface.clone()));
+    assert_eq!(env.state.workspaces[&ws_id].active_window(), Some(right));
+
+    // Motion while the session is locked must never transfer focus to a window.
+    assert!(env.state.session_lock.try_lock(None));
+    move_pointer_onto(&mut env, &ws_id, left);
+    assert_eq!(env.state.workspaces[&ws_id].active_window(), Some(right));
+    assert_ne!(
+        keyboard_focus(&env.state),
+        Some(mapped_surface(&env.state, left)),
+        "locked sessions must not hand keyboard focus to a window under the pointer"
+    );
+    assert_eq!(env.state.pointer_focus_window, None);
 }
 
 #[test]

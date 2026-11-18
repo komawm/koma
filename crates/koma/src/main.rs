@@ -14,7 +14,7 @@
 //!                         ╭─╯   koma-wayland   │              ╭─╯ Scrolling  ╭──╯  ╭╯         │
 //!                        ╭╯  koma-seat/vSeat  ╭╯            ╭─╯ Deck/BSP  ╭──╯   ╭─╯         ╭╯
 //!                      ╭─╯ koma-lua/Phodopus  │           ╭─╯  Grid225  ╭─╯     ╭╯  15x15   ╭╯
-//!                    ╭─╯ koma-ipc / koma-mcp ╭╯         ╭─╯ 9-Anchor  ╭─╯    ╭──╯  vSeat   ╭╯
+//!                    ╭─╯ koma-ipc / koma mcp ╭╯         ╭─╯ 9-Anchor  ╭─╯    ╭──╯  vSeat   ╭╯
 //!                  ╭─╯ 240Hz KMS ╭╮ Smithay  │        ╭─╯ Hyprland  ╭─╯   ╭──╯   Epoch   ╭─╯
 //!                ╭─╯ DRM/Atom  ╭─╯│ GLES/GL ╭╯       ╭╯ Keybinds  ╭─╯ ╭───╯    Lease    ╭╯
 //!              ╭─╯  Libseat  ╭─╯ ╭╯ DMABUF ╭╯      ╭─╯ Overrides  ╰───╯  Shield Mode  ╭─╯
@@ -42,9 +42,9 @@
 //!                   ╭╯   drm-lease    ╭╯        ╰─╮  Bridge  ╰─╮         ╭─╯  JIKU DESKTOP AGENT   ╰─╮
 //!                   │  session-lock  ╭╯           ╰╮  MCP+CLI  ╰──╮     ╭╯ gemini-decision-1 Router  ╰╮
 //!                  ╭╯  virtual-in   ╭╯             ╰─╮  komactl   ╰──╮  ╰╮  Turn SSE & Live Bidi WS   │
-//!                  │   text-in-v3   │                ╰─╮  koma-mcp   ╰───╯ Structured Text Fallback  ╭╯
+//!                  │   text-in-v3   │                ╰─╮  koma mcp   ╰───╯ Structured Text Fallback  ╭╯
 //!                 ╭╯ security-ctx  ╭╯                  ╰─╮     koma --session | --tty | --winit     ╭╯
-//!                 │  data-control  │                     ╰──╮     komactl CLI & koma-mcp Server     │
+//!                 │  data-control  │                     ╰──╮     komactl CLI & koma mcp Server     │
 //!                ╭╯ idle-inhibit  ╭╯                        ╰──╮  LuaLS Stubs: komactl gen-types   ╭╯
 //!                │  presentation  │                            ╰────╮   ~/.config/koma/init.lua   ╭╯
 //!               ╭╯ linux-dmabuf  ╭╯                                 ╰──────╮        ╭──╮  240Hz   │
@@ -77,6 +77,8 @@ mod child_env;
 mod child_reaper;
 mod completions;
 #[cfg(feature = "smithay-winit")]
+mod config_bootstrap;
+#[cfg(feature = "smithay-winit")]
 mod config_watcher;
 #[cfg(feature = "smithay-winit")]
 mod cursor;
@@ -99,6 +101,8 @@ mod keybind_dispatcher;
 #[cfg(feature = "smithay-winit")]
 mod macro_runtime;
 #[cfg(feature = "smithay-winit")]
+mod mcp;
+#[cfg(feature = "smithay-winit")]
 mod output_management;
 #[cfg(feature = "smithay-winit")]
 mod output_power;
@@ -110,6 +114,7 @@ mod protocol_tests;
 mod screencopy;
 #[cfg(feature = "smithay-winit")]
 mod security_context;
+mod session_env;
 #[cfg(feature = "smithay-winit")]
 mod signals;
 #[cfg(feature = "smithay-winit")]
@@ -478,6 +483,50 @@ fn run_bare_metal_tty(
     Ok(())
 }
 
+/// Prints the live instance environment for `koma init <shell>`.
+///
+/// Read-only: it scans `$XDG_RUNTIME_DIR/koma/`, probes `koma-admin.sock` with a
+/// bare liveness connect (no RPC), and reads `/tmp/.X<n>-lock` to find the
+/// matching XWayland display. It never prints capability tokens.
+fn print_session_env(shell_name: &str, unset: bool) -> i32 {
+    use std::io::Write as _;
+
+    let Some(shell) = session_env::Shell::parse(shell_name) else {
+        eprintln!("koma: unknown shell `{shell_name}` (expected bash, zsh, fish, or nushell)");
+        return cli::USAGE_EXIT_CODE;
+    };
+    let runtime_base = match session_env::runtime_base() {
+        Ok(base) => base,
+        Err(err) => {
+            eprintln!("koma init: {err}");
+            return 1;
+        }
+    };
+    let preferred = env::var("KOMA_INSTANCE_SIGNATURE").ok();
+    let discovered = match session_env::discover(
+        &runtime_base,
+        std::path::Path::new("/tmp"),
+        preferred.as_deref(),
+    ) {
+        Ok(discovered) => discovered,
+        Err(err) => {
+            eprintln!("koma init: {err}");
+            return 1;
+        }
+    };
+
+    let rendered = session_env::render(shell, unset, &discovered);
+    let mut stdout = std::io::stdout();
+    if let Err(err) = stdout
+        .write_all(rendered.as_bytes())
+        .and_then(|()| stdout.flush())
+    {
+        eprintln!("koma init: failed writing to stdout: {err}");
+        return 1;
+    }
+    0
+}
+
 fn main() {
     let action = match cli::parse_args(env::args().skip(1)) {
         Ok(action) => action,
@@ -500,6 +549,21 @@ fn main() {
                 print!("{script}");
             }
             return;
+        }
+        CliAction::Init { shell, unset } => {
+            std::process::exit(print_session_env(&shell, unset));
+        }
+        CliAction::Mcp(opts) => {
+            #[cfg(feature = "smithay-winit")]
+            {
+                std::process::exit(crate::mcp::run(opts.print_tools, opts.auto_mint_admin));
+            }
+            #[cfg(not(feature = "smithay-winit"))]
+            {
+                let _ = opts;
+                eprintln!("koma built without `smithay-winit` feature; `koma mcp` is unavailable");
+                std::process::exit(1);
+            }
         }
         CliAction::Run(opts) => opts,
     };
@@ -538,6 +602,29 @@ fn main() {
         }
         explicit => explicit,
     };
+
+    // First-run scaffold: only when the user's XDG config is missing, never for
+    // `--headless-check`, never for an explicit `--config` path, and never when
+    // `KOMA_NO_SCAFFOLD=1`. Test builds compile this out.
+    #[cfg(feature = "smithay-winit")]
+    {
+        let config = crate::config_watcher::KomaConfigPath::resolve(config_override.clone());
+        let disabled =
+            env::var_os(crate::config_bootstrap::NO_SCAFFOLD_ENV).is_some_and(|value| value == "1");
+        if crate::config_bootstrap::should_auto_scaffold(resolved_mode, disabled)
+            && let Some(result) = crate::config_bootstrap::maybe_auto_scaffold(&config, disabled)
+        {
+            match result {
+                Ok(path) => tracing::info!(
+                    config = %path.display(),
+                    "created first-run configuration template"
+                ),
+                Err(err) => {
+                    tracing::warn!("failed to create the first-run configuration template: {err}")
+                }
+            }
+        }
+    }
 
     match resolved_mode {
         LaunchMode::Tty => {

@@ -2064,6 +2064,14 @@ fn build_act_namespace<'gc>(ctx: Context<'gc>) -> Result<Table<'gc>, LuaError<'g
     mode_ns.set_field(ctx, "exit", unit_act(ctx, ActionDescriptor::ModeExit));
     act.set_field(ctx, "mode", mode_ns);
 
+    // koma.act.reload_config() / koma.act.quit()
+    act.set_field(
+        ctx,
+        "reload_config",
+        unit_act(ctx, ActionDescriptor::ReloadConfig),
+    );
+    act.set_field(ctx, "quit", unit_act(ctx, ActionDescriptor::CompositorQuit));
+
     // koma.act.macro.run(macro_id, args?)
     let macro_act = Table::new(&ctx);
     macro_act.set_field(

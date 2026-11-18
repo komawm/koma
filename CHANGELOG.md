@@ -28,11 +28,99 @@ desktop, hardware support, or security guarantees.
 - `focused` in each `scene.inventory` workspace entry, true for exactly one
   workspace (`active_ws_id`), replacing the runtime-file bridge for status bars.
 
-### Fixed
+- `Mod + M` toggles **maximize**: the focused window fills the work area minus
+  gaps and exclusive zones, so the bar stays visible. `Mod + F` is true
+  fullscreen: it covers the whole monitor including gaps and suppresses
+  `Overlay`/`Top` layer surfaces for that output while staying mapped, so the
+  bar returns the moment fullscreen ends. The two are mutually exclusive and
+  both derive from one `WindowPresentation` state, so geometry, xdg states,
+  foreign-toplevel and hit-testing cannot disagree. `Mod + Shift + M` keeps
+  `ScrollingMaximizeColumn`, and the new Lua action is
+  `koma.act.window.maximize_toggle()`.
+- Dragging a window's frame edge or corner resizes it with no modifier, with
+  W/E/N/S/NW/NE/SW/SE cursor shapes and the previous cursor restored on exit
+  (including a client-provided one). `Mod + right-drag` still works. Deck
+  refuses a tiled edge drag and says why instead of doing nothing silently;
+  `LayoutMode::supports_frame_edge_resize` is the single policy table.
+- `koma.input({ pointer = { follow_mouse = ... } })` is implemented with
+  Hyprland's `input:follow_mouse` semantics: `off` (0, click-to-focus only),
+  `normal` (1, default: focus follows and raises), and `focus_only` (2: focus
+  follows without changing the workspace's active window or stacking). Unknown
+  values fall back to `normal`.
+- `move_to_workspace` follows the moved window to the destination workspace;
+  `koma.act.window.move_to_workspace(ws, { follow = false })` keeps the source
+  workspace focused (Hyprland `movetoworkspacesilent`).
 
+### Fixed
 - `workspace.focused` now fires for every activation path, including special
   (`special:<name>`) workspaces, output switches and output-less switches, and
   never twice for a no-op re-focus.
+
+- Tiled clients are no longer configured below the `xdg_toplevel` minimum size
+  they advertise. Chromium and Firefox refused to shrink past their minimum and
+  kept committing a cropped, un-reflowed buffer, which the compositor masked to
+  the too-small tile; splitting such a window to half width showed only its left
+  half. Per-window `SizeHints` now clamp every tiled geometry path, including
+  fullscreen and maximize rects.
+- A nested `koma --winit` presents upright. The EGL window surface handed the
+  parent compositor a vertically mirrored buffer while the compose step is
+  target-independent, so the nested desktop appeared upside down; the nested
+  damage tracker now composes with `Flipped180` while the output transform stays
+  `Normal`, and input needs no remap because the two mirrors cancel.
+- `ext-session-lock-v1` acquire no longer freezes the compositor. `set_focus`
+  dispatches `focus_changed` while holding Smithay's non-reentrant keyboard
+  mutex, and the locked-mode IME barrier re-entered it through
+  `current_focus()`, deadlocking the single event loop: no frames, no input and
+  an ignored SIGTERM.
+- Spawned children are reaped, so `spawn` no longer accumulates zombies that
+  break `pkill X || X`.
+- Client-side-decorated windows are no longer composited down and right by the
+  height of their window geometry.
+- Held keys repeat at 600 ms / 25 Hz, matching the Hyprland defaults a migrated
+  desktop expects, and the applied values are logged.
+- Translucent overlays no longer wash the screen: solid-color elements
+  premultiply their straight-alpha colors for the premultiplied GLES blender, so
+  the drag drop-zone fill, scratchpad scrim, grid hairlines and tab indicators
+  render at their intended opacity instead of `1/alpha`.
+- `Mod + left-drag` moving a window no longer flashes the background: the
+  drop-zone fill was the same premultiplication bug, painted at full intensity.
+- `komactl init [dir] [--force]` scaffolds a commented configuration tree
+  (`init.lua`, `lua/input.lua`, `lua/workspaces.lua`, `lua/appearance.lua`,
+  `lua/window_rules.lua`, `lua/keybinds.lua`, `lua/macros/example.lua`). The
+  keymap is a full expansion of a single Rust keybind catalogue shared with the
+  runtime defaults, and the tree validates with `inherit_default_binds = false`
+  and no `koma.monitor` block. Existing files are refused unless `--force` is
+  given. The header carries a template version marker, and `komactl config-status`
+  reports when the on-disk template is older than the shipped one.
+- `koma init <bash|zsh|fish|nushell> [--unset]` prints the live instance
+  environment (`WAYLAND_DISPLAY`, `KOMA_INSTANCE_SIGNATURE`, `XDG_RUNTIME_DIR`,
+  `DISPLAY` while XWayland is up, `XDG_SESSION_TYPE`, `XDG_CURRENT_DESKTOP`) so
+  `koma init fish | source` works from an external terminal. It scans
+  `$XDG_RUNTIME_DIR/koma/` read-only, fails clearly when zero or several
+  instances are live, and never prints capability tokens.
+- First-run auto-scaffold for a missing `$XDG_CONFIG_HOME/koma/init.lua`,
+  disabled with `KOMA_NO_SCAFFOLD=1`, skipped for `--headless-check`, and
+  compiled out of test builds.
+- `koma.act.reload_config()` and `koma.act.quit()` Lua actions so the generated
+  keymap can express `Mod + Shift + R` and `Mod + Shift + E` without a native
+  code path.
+
+### Changed
+
+- The standalone `koma-mcp` binary is now `koma mcp [--print-tools]
+  [--auto-mint-admin]`; release archives, Nix builds, BSD CI and completions no
+  longer install or reference a separate binary.
+- `appearance.animations.windows_close` and `close_scale_to` now drive a real
+  close animation. Each mapped toplevel's last committed frame is cached in GPU
+  memory on `wl_surface.commit` (the only moment a client buffer is readable),
+  read back once when the window leaves the layout, and composited with a
+  `windows_close` shrink/fade spring while the window is already gone from the
+  layout, hit-testing, focus and `scene.inventory`. `WindowAnimationTable`
+  reports the close spring through `start_close`, `sample_close`,
+  `is_closing` and `take_settled_closing`, and the frame loop reaps the captured
+  frame only when the spring settles. With animations disabled, a
+  `"none"`/`instant` close style, or no renderer, the window's state is freed
+  synchronously as before.
 
 ## [0.0.2] - 2026-11-17
 
@@ -95,27 +183,27 @@ Initial development prerelease of the imported incubation baseline.
   `koma-model`, `koma-lua`, `koma-render`, `koma-seat`, the `koma` compositor
   binary, `komactl`, `koma-mcp` and `koma-overview`.
 - Lua configuration through the Phodopus sandbox with configurable defaults:
-  - `Dwindle` is the default workspace layout; `koma.layout(...)`,
-    `koma.workspace({...})`, `koma.dwindle({...})` and `koma.scrolling({...})`
-    select and tune layouts globally or per workspace.
-  - Hyprland-compatible default keybinds loaded when
-    `inherit_default_binds = true`; `koma.bind(...)` overrides individual
-    chords in place and `koma.unbind(chord)` removes specific defaults.
-  - Typed appearance settings for borders, focus ring, shadow, dim, blur and
-    animations.
+    - `Dwindle` is the default workspace layout; `koma.layout(...)`,
+      `koma.workspace({...})`, `koma.dwindle({...})` and `koma.scrolling({...})`
+      select and tune layouts globally or per workspace.
+    - Hyprland-compatible default keybinds loaded when
+      `inherit_default_binds = true`; `koma.bind(...)` overrides individual
+      chords in place and `koma.unbind(chord)` removes specific defaults.
+    - Typed appearance settings for borders, focus ring, shadow, dim, blur and
+      animations.
 - `komactl gen-types` emits LuaLS definitions for the configuration API;
   `komactl validate` checks a configuration offline.
 - Compatibility & input protocols:
-  - `wp_single_pixel_buffer_v1` and `wp_presentation` feedback alongside
-    `wl_shm` `Abgr8888`/`Xbgr8888` pixel formats for `waybar`, `ironbar`,
-    `quickshell`, and Android/`Waydroid` surfaces.
-  - Full `wlr_layer_shell` `get_popup`, `xdg_popup` unconstraining and
-    pointer/keyboard grabs, plus `zwlr_virtual_pointer_manager_v1` and
-    `zwp_keyboard_shortcuts_inhibit_manager_v1` (with `Mod + G` / VT switch
-    kept un-inhibitable) for `RustDesk` and remote desktop tools.
-  - 2D damped Hooke's law semi-implicit Euler spring kinematics (`pointer.spring` /
-    `pointer.curve`) for smooth macro & cursor motion, plus smart `Waydroid`
-    `no_blur`, `clip_to_geometry` gating, and empty `input_region` click-through.
+    - `wp_single_pixel_buffer_v1` and `wp_presentation` feedback alongside
+      `wl_shm` `Abgr8888`/`Xbgr8888` pixel formats for `waybar`, `ironbar`,
+      `quickshell`, and Android/`Waydroid` surfaces.
+    - Full `wlr_layer_shell` `get_popup`, `xdg_popup` unconstraining and
+      pointer/keyboard grabs, plus `zwlr_virtual_pointer_manager_v1` and
+      `zwp_keyboard_shortcuts_inhibit_manager_v1` (with `Mod + G` / VT switch
+      kept un-inhibitable) for `RustDesk` and remote desktop tools.
+    - 2D damped Hooke's law semi-implicit Euler spring kinematics (`pointer.spring` /
+      `pointer.curve`) for smooth macro & cursor motion, plus smart `Waydroid`
+      `no_blur`, `clip_to_geometry` gating, and empty `input_region` click-through.
 - Session resources (desktop entry, systemd units, portals configuration,
   greetd example) and example configuration under `examples/`.
 - Shared local/CI quality gates (`just check`: descriptor validation,

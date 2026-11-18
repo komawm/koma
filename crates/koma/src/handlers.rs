@@ -250,9 +250,15 @@ impl CompositorHandler for KomaState {
             if surface == &root_surface && !is_surface_mapped(&root_surface) {
                 let removed = self.mapped_windows.remove(idx);
                 crate::foreign_toplevel::close_foreign_toplevel(self, removed.win_id);
-                self.window_animations
-                    .borrow_mut()
-                    .remove_immediately(removed.win_id);
+                // The client already released its buffer on the unmap commit, so this only keeps
+                // a fading frame when a snapshot is still possible; otherwise state is freed now.
+                self.begin_close_animation(
+                    removed.win_id,
+                    &removed.ws_id,
+                    &removed.window,
+                    removed.rect,
+                );
+                self.window_frames.remove(&removed.win_id);
                 let now_ms = self.elapsed_ms();
                 if let Some(ws) = self.workspaces.get_mut(&removed.ws_id) {
                     ws.remove_window(removed.win_id, now_ms);
@@ -317,6 +323,9 @@ impl CompositorHandler for KomaState {
             if hints_changed {
                 self.sync_workspace_geometries(&ws_id);
             }
+            // Cache the frame while the client's buffer is still readable; a later unmap commit
+            // attaches a null buffer and destroy releases the pixels entirely.
+            self.refresh_window_frame(win_id);
             notify_workspace_surface_damage(self, &ws_id);
             self.reconcile_idle_inhibitors();
             self.maybe_activate_pointer_constraint();
@@ -605,9 +614,15 @@ impl XdgShellHandler for KomaState {
         }) {
             let removed = self.mapped_windows.remove(pos);
             crate::foreign_toplevel::close_foreign_toplevel(self, removed.win_id);
-            self.window_animations
-                .borrow_mut()
-                .remove_immediately(removed.win_id);
+            // Smithay dispatches `toplevel_destroyed` before it clears the surface's cached state,
+            // so the client's last committed buffer can still be captured here.
+            self.begin_close_animation(
+                removed.win_id,
+                &removed.ws_id,
+                &removed.window,
+                removed.rect,
+            );
+            self.window_frames.remove(&removed.win_id);
             let now_ms = self.elapsed_ms();
             if let Some(ws) = self.workspaces.get_mut(&removed.ws_id) {
                 ws.remove_window(removed.win_id, now_ms);

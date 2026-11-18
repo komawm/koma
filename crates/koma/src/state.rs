@@ -13,8 +13,8 @@ use std::{
 
 use calloop::{LoopHandle, LoopSignal, RegistrationToken};
 use koma_lua::{
-    ActionDescriptor, DesktopQuerySnapshot, LuaOutputInfo, LuaWindowInfo, LuaWorkspaceInfo,
-    TrampolineScheduler, phodopus_bridge::PhodopusSandbox,
+    ActionDescriptor, DesktopQuerySnapshot, FollowMouseMode, LuaOutputInfo, LuaWindowInfo,
+    LuaWorkspaceInfo, TrampolineScheduler, phodopus_bridge::PhodopusSandbox,
 };
 use koma_model::{
     AgentCursorConfig, AgentCursorFrameSnapshot, AgentCursorVisualDynamics, LayoutMode,
@@ -28,14 +28,21 @@ use koma_proto::{
     WorkspaceId,
 };
 use koma_render::{
-    LazyFboPool, blur_pipeline::CachedBackdropBlur, frame_composer::WindowSceneItem,
-    offscreen_fbo::LazyOffscreenSurface,
+    LazyFboPool,
+    blur_pipeline::CachedBackdropBlur,
+    frame_composer::{
+        ClosingWindowSceneItem, WindowSceneItem, capture_window_snapshot, window_snapshot_elements,
+    },
+    offscreen_fbo::{LazyOffscreenSurface, WindowFrameCache},
 };
 use koma_seat::VirtualSeatLedger;
 use smithay::{
     backend::{
         allocator::dmabuf::Dmabuf,
-        renderer::{ImportDma as _, gles::GlesRenderer, utils::with_renderer_surface_state},
+        renderer::{
+            ImportDma as _, element::memory::MemoryRenderBuffer, gles::GlesRenderer,
+            utils::with_renderer_surface_state,
+        },
     },
     desktop::{
         LayerMap, PopupKind, PopupManager, Window, WindowSurfaceType, find_popup_root_surface,
@@ -329,7 +336,31 @@ pub enum PointerHitTarget {
     Window {
         surface: WlSurface,
         origin: Point<f64, Logical>,
+        /// Mapped window the surface belongs to, resolved by the same hit test that found it.
+        win_id: WindowId,
+        /// Workspace the hit window lives on (`special:<name>` when the overlay owns the hit).
+        ws_id: WorkspaceId,
     },
+}
+
+impl PointerHitTarget {
+    #[must_use]
+    pub fn surface(&self) -> &WlSurface {
+        match self {
+            Self::LockSurface { surface, .. }
+            | Self::Layer { surface, .. }
+            | Self::Window { surface, .. } => surface,
+        }
+    }
+
+    #[must_use]
+    pub fn origin(&self) -> Point<f64, Logical> {
+        match self {
+            Self::LockSurface { origin, .. }
+            | Self::Layer { origin, .. }
+            | Self::Window { origin, .. } => *origin,
+        }
+    }
 }
 
 /// Front-to-back scene tiers ranked cleanly from lock surface down to background layers.
@@ -606,6 +637,17 @@ pub struct MappedWindow {
     pub icon: Option<StoredToplevelIcon>,
 }
 
+/// A toplevel that left the layout while its `windows_close` spring is still settling: only its
+/// captured pixels linger, never its surface, layout slot, focus or IPC presence.
+pub struct ClosingWindow {
+    pub win_id: WindowId,
+    pub ws_id: WorkspaceId,
+    /// Last captured frame of the destroyed surface, uploaded through `ImportMem` at draw time.
+    pub snapshot: MemoryRenderBuffer,
+    /// Pixel dimensions of `snapshot` (its buffer scale is `1`).
+    pub snapshot_size: (i32, i32),
+}
+
 /// Layer-shell tiers composited for one output frame, split around the window scene.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OutputLayerTiers {
@@ -730,6 +772,10 @@ pub struct KomaState {
     pub applied_keyboard_repeat: (i32, i32),
     pub applied_startup_numlock: Option<bool>,
     pub virtual_keyboard_keymap_active: bool,
+    /// Resolved `koma.input({ pointer = { follow_mouse = ... } })` policy, refreshed on config apply.
+    pub follow_mouse_mode: FollowMouseMode,
+    /// Window that owns pointer-transferred keyboard focus in [`FollowMouseMode::FocusOnly`].
+    pub pointer_focus_window: Option<WindowId>,
 
     // Physical/nested host seat (`seat0` / `libseat`)
     pub seat: Seat<Self>,
@@ -763,6 +809,10 @@ pub struct KomaState {
     pub pointer_animations: Vec<ActivePointerAnimation>,
     pub agent_cursors: HashMap<WorkspaceId, AgentCursorRuntime>,
     pub window_animations: RefCell<WindowAnimationTable>,
+    /// Windows whose surface is gone but whose captured frame is still fading out.
+    pub closing_windows: Vec<ClosingWindow>,
+    /// Latest committed pixels per mapped window, kept in GPU memory for `windows_close`.
+    pub window_frames: HashMap<WindowId, WindowFrameCache>,
     pub workspace_transitions: RefCell<WorkspaceTransitionTable>,
     pub last_notified_focus_win_id: Option<WindowId>,
     /// Live 4-quadrant `smart_split` / `Scrolling` column drop zone `(ws_id, preview_rect)` during drag.
@@ -971,6 +1021,8 @@ impl KomaState {
             ),
             applied_startup_numlock: None,
             virtual_keyboard_keymap_active: false,
+            follow_mouse_mode: FollowMouseMode::default(),
+            pointer_focus_window: None,
             seat,
             pointer_location: Point::from((
                 f64::from(initial_viewport.width) * 0.5,
@@ -1002,6 +1054,8 @@ impl KomaState {
             pointer_animations: Vec::new(),
             agent_cursors: HashMap::new(),
             window_animations: RefCell::new(WindowAnimationTable::default()),
+            closing_windows: Vec::new(),
+            window_frames: HashMap::new(),
             workspace_transitions: RefCell::new(WorkspaceTransitionTable::default()),
             last_notified_focus_win_id: None,
             active_drop_preview: None,
@@ -2444,6 +2498,9 @@ impl KomaState {
             .map(|m| m.rect)
         {
             let anim_cfg = self.lua_sandbox.config_snapshot().appearance.animations;
+            // A recycled window slot must never inherit the previous occupant's fading frame.
+            self.closing_windows.retain(|c| c.win_id != win_id_created);
+            self.window_frames.remove(&win_id_created);
             self.window_animations.borrow_mut().on_window_opened(
                 win_id_created,
                 final_rect,
@@ -2453,6 +2510,9 @@ impl KomaState {
                 anim_style_override.as_deref(),
                 is_agent_ws,
             );
+            // Seed the close-frame cache: this commit already returned through the promotion path,
+            // so a client that closes before its next commit would otherwise have no pixels.
+            self.refresh_window_frame(win_id_created);
         }
 
         let visible_anywhere = ws_id == self.active_ws_id
@@ -2625,13 +2685,36 @@ impl KomaState {
         self.queue_redraw();
     }
 
+    /// Window that currently owns keyboard focus inside the interactive workspace.
+    ///
+    /// In [`FollowMouseMode::FocusOnly`] this is the pointer-focused window recorded by the
+    /// follow-mouse path; otherwise it is the workspace's active window. Keeping this a single
+    /// source of truth makes seat keyboard focus, `xdg_toplevel` `Activated`, foreign-toplevel
+    /// state and Lua/IPC snapshots agree without changing `WorkspaceState::active_window`.
+    #[must_use]
+    pub fn focused_window_id(&self) -> Option<WindowId> {
+        let ws_id = self.effective_interactive_ws_id();
+        if let Some(win_id) = self.pointer_focus_window
+            && self
+                .mapped_windows
+                .iter()
+                .any(|m| m.win_id == win_id && !m.is_minimized && m.ws_id == ws_id)
+        {
+            return Some(win_id);
+        }
+        self.workspaces
+            .get(&ws_id)
+            .and_then(WorkspaceState::active_window)
+            .filter(|id| {
+                self.mapped_windows
+                    .iter()
+                    .any(|m| m.win_id == *id && !m.is_minimized)
+            })
+    }
+
     #[must_use]
     fn active_deck_wl_surface(&self) -> Option<WlSurface> {
-        let target_ws_id = self.effective_interactive_ws_id();
-        let active_id = self
-            .workspaces
-            .get(&target_ws_id)
-            .and_then(WorkspaceState::active_window)?;
+        let active_id = self.focused_window_id()?;
         self.mapped_windows
             .iter()
             .find(|m| m.win_id == active_id && !m.is_minimized)
@@ -2756,15 +2839,7 @@ impl KomaState {
     /// seat keyboard focus without bypassing lock-screen or layer-shell priority.
     pub fn focus_active_deck_window(&mut self) {
         let target_ws_id = self.effective_interactive_ws_id();
-        let active_id = self
-            .workspaces
-            .get(&target_ws_id)
-            .and_then(WorkspaceState::active_window)
-            .filter(|id| {
-                self.mapped_windows
-                    .iter()
-                    .any(|m| m.win_id == *id && !m.is_minimized)
-            });
+        let active_id = self.focused_window_id();
         for mapped in &self.mapped_windows {
             if let Some(toplevel) = mapped.window.toplevel() {
                 let is_active = mapped.ws_id == target_ws_id
@@ -2910,8 +2985,13 @@ impl KomaState {
             return Some(hit);
         }
 
-        if let Some((_, _, surface, origin)) = self.hit_test_visible_surface(global_pos) {
-            return Some(PointerHitTarget::Window { surface, origin });
+        if let Some((win_id, ws_id, surface, origin)) = self.hit_test_visible_surface(global_pos) {
+            return Some(PointerHitTarget::Window {
+                surface,
+                origin,
+                win_id,
+                ws_id,
+            });
         }
 
         self.layer_surface_under_tiers(global_pos, [Layer::Bottom, Layer::Background])
@@ -2923,15 +3003,8 @@ impl KomaState {
         &self,
         global_pos: Point<f64, Logical>,
     ) -> Option<(WlSurface, Point<f64, Logical>)> {
-        self.hit_test_target(global_pos).map(|target| match target {
-            PointerHitTarget::LockSurface { surface, origin }
-            | PointerHitTarget::Layer {
-                surface, origin, ..
-            }
-            | PointerHitTarget::Window {
-                surface, origin, ..
-            } => (surface, origin),
-        })
+        self.hit_test_target(global_pos)
+            .map(|target| (target.surface().clone(), target.origin()))
     }
 
     #[must_use]
@@ -3342,6 +3415,8 @@ impl KomaState {
             self.reconcile_keyboard_focus();
             return;
         }
+        // An explicit click always wins over `focus_only` pointer-focus state.
+        self.pointer_focus_window = None;
 
         if let Some((target_ws_id, tab_win_id)) = self.tab_indicator_window_at(global_pos) {
             let now_ms = self.elapsed_ms();
@@ -3366,32 +3441,7 @@ impl KomaState {
         }
 
         if let Some((win_id, hit_ws_id, _, _)) = self.hit_test_visible_surface(global_pos) {
-            self.focused_ondemand_layer = None;
-            if self.active_special_ws_id.is_some()
-                && self.active_special_ws_id.as_ref() != Some(&hit_ws_id)
-            {
-                self.active_special_ws_id = None;
-            }
-            if let Some(hit_out) = self.output_at_point_strict(global_pos) {
-                let hit_out_name = hit_out.name();
-                self.focused_output_name = Some(hit_out_name.clone());
-                if !self
-                    .workspaces
-                    .get(&hit_ws_id)
-                    .is_some_and(|w| w.is_special)
-                {
-                    self.output_workspaces
-                        .insert(hit_out_name, hit_ws_id.clone());
-                    self.active_ws_id = hit_ws_id.clone();
-                }
-            }
-            let now_ms = self.elapsed_ms();
-            if let Some(ws) = self.workspaces.get_mut(&hit_ws_id) {
-                ws.activate_window(win_id, now_ms);
-            }
-            self.sync_workspace_geometries(&hit_ws_id);
-            self.focus_active_deck_window();
-            self.queue_redraw();
+            self.activate_window_hit(win_id, &hit_ws_id, global_pos);
         } else {
             self.focused_ondemand_layer = None;
             if let Some(hit_out) = self.output_at_point_strict(global_pos) {
@@ -3401,6 +3451,61 @@ impl KomaState {
             }
             self.focus_active_deck_window();
         }
+    }
+
+    /// Activates and raises the resolved `win_id` of `hit_ws_id` (click focus and
+    /// `follow_mouse = normal` share this path so both always agree).
+    pub(crate) fn activate_window_hit(
+        &mut self,
+        win_id: WindowId,
+        hit_ws_id: &WorkspaceId,
+        global_pos: Point<f64, Logical>,
+    ) {
+        let now_ms = self.elapsed_ms();
+        self.focused_ondemand_layer = None;
+        self.pointer_focus_window = None;
+        if self.active_special_ws_id.as_ref() != Some(hit_ws_id) {
+            self.active_special_ws_id = None;
+        }
+        if let Some(hit_out) = self.output_at_point_strict(global_pos) {
+            let hit_out_name = hit_out.name();
+            self.focused_output_name = Some(hit_out_name.clone());
+            if !self.workspaces.get(hit_ws_id).is_some_and(|w| w.is_special) {
+                self.output_workspaces
+                    .insert(hit_out_name, hit_ws_id.clone());
+                self.active_ws_id = hit_ws_id.clone();
+            }
+        }
+        if let Some(ws) = self.workspaces.get_mut(hit_ws_id) {
+            ws.activate_window(win_id, now_ms);
+        }
+        self.sync_workspace_geometries(hit_ws_id);
+        self.focus_active_deck_window();
+        self.queue_redraw();
+    }
+
+    /// `follow_mouse = focus_only`: transfers seat keyboard focus to `win_id` without raising it or
+    /// changing the workspace's active-window stacking, so the layout/tab order is untouched while
+    /// `Activated`, foreign-toplevel and Lua focus state follow the pointer.
+    pub(crate) fn focus_window_by_pointer(
+        &mut self,
+        win_id: WindowId,
+        hit_ws_id: &WorkspaceId,
+        global_pos: Point<f64, Logical>,
+    ) {
+        self.focused_ondemand_layer = None;
+        if let Some(hit_out) = self.output_at_point_strict(global_pos) {
+            let hit_out_name = hit_out.name();
+            self.focused_output_name = Some(hit_out_name.clone());
+            if !self.workspaces.get(hit_ws_id).is_some_and(|w| w.is_special) {
+                self.output_workspaces
+                    .insert(hit_out_name, hit_ws_id.clone());
+                self.active_ws_id = hit_ws_id.clone();
+            }
+        }
+        self.pointer_focus_window = Some(win_id);
+        self.focus_active_deck_window();
+        self.queue_redraw();
     }
 
     /// Collects **front-to-back** `WindowSceneItem`s for a single workspace (`ws_id`).
@@ -3416,6 +3521,7 @@ impl KomaState {
     /// (`30 px` trigger zone, `100 ms` debounce, `1500 px/s` ramp) before rendering!
     pub fn tick_frame_animations_and_edge_scroll(&mut self) {
         let now_ms = self.elapsed_ms();
+        self.reap_settled_closing_windows();
         for ws in self.workspaces.values_mut() {
             let _ = ws.scrolling.sample_camera_x(now_ms);
         }
@@ -3500,6 +3606,228 @@ impl KomaState {
                 .workspaces
                 .values()
                 .any(|ws| ws.scrolling.is_camera_animating(now_ms))
+    }
+
+    /// Re-renders `win_id`'s committed frame into its GPU frame cache.
+    ///
+    /// Runs on every surface commit while close animations are enabled. A commit is the last
+    /// moment the client's buffer is readable (an unmap commit attaches a null buffer and
+    /// `destroy` releases the buffers), so this is the only point where the pixels a
+    /// `windows_close` spring needs can be kept.
+    pub fn refresh_window_frame(&mut self, win_id: WindowId) {
+        let cfg = self.lua_sandbox.config_snapshot().appearance.animations;
+        if !cfg.enabled
+            || cfg.windows_close.enabled == Some(false)
+            || matches!(
+                cfg.channel_curve(&cfg.windows_close, None),
+                koma_model::CurveSpec::Instant
+            )
+        {
+            self.window_frames.remove(&win_id);
+            return;
+        }
+        let Some(idx) = self.mapped_windows.iter().position(|m| m.win_id == win_id) else {
+            return;
+        };
+        if self.mapped_windows[idx].is_minimized {
+            return;
+        }
+        let rect = self.mapped_windows[idx].rect;
+        if rect.w == 0 || rect.h == 0 {
+            return;
+        }
+        let ws_id = self.mapped_windows[idx].ws_id.clone();
+        let output_scale = self
+            .workspaces
+            .get(&ws_id)
+            .map_or(1.0, |ws| ws.viewport.scale);
+        let radius = f32::from(
+            self.lua_sandbox
+                .config_snapshot()
+                .appearance
+                .corner_radius
+                .unwrap_or(10),
+        );
+        let Some(backend) = self.backend.as_mut() else {
+            return;
+        };
+        let window = &self.mapped_windows[idx].window;
+        let cache = self.window_frames.entry(win_id).or_default();
+        let scale = smithay::utils::Scale::from(output_scale);
+        backend.with_primary_renderer(|renderer| {
+            match window_snapshot_elements(renderer, window, rect, scale, radius) {
+                Ok(snapshot) => {
+                    if let Err(err) =
+                        cache.refresh(renderer, snapshot.size, scale, &snapshot.elements)
+                    {
+                        debug!(
+                            win_id = win_id.slot,
+                            %err,
+                            "window frame cache refresh failed; dropping cached pixels"
+                        );
+                        cache.clear();
+                    }
+                }
+                Err(err) => {
+                    debug!(
+                        win_id = win_id.slot,
+                        %err,
+                        "window frame cache skipped: surface has no committed buffer"
+                    );
+                }
+            }
+        });
+    }
+
+    /// Starts the `appearance.animations.windows_close` spring for `win_id`, using the last cached
+    /// frame (or a live capture when the surface still holds one).
+    ///
+    /// The pixels come from the per-window frame cache, which [`Self::refresh_window_frame`]
+    /// fills on every commit. A live capture is the fallback for clients that still hold a buffer
+    /// here; if neither yields pixels the window is freed synchronously.
+    ///
+    /// Returns `true` only when a captured frame is now composited. A `false` result means the
+    /// caller must free the window synchronously: no snapshot was possible or animations are off.
+    pub fn begin_close_animation(
+        &mut self,
+        win_id: WindowId,
+        ws_id: &WorkspaceId,
+        window: &Window,
+        rect: LogicalRect,
+    ) -> bool {
+        let now_ms = self.elapsed_ms();
+        // Take the cached frame first: whatever happens below, this window never needs it again.
+        let mut cached_frame = self.window_frames.remove(&win_id);
+        let appearance = self.lua_sandbox.config_snapshot().appearance;
+        let cfg = appearance.animations.clone();
+        if !cfg.enabled {
+            self.window_animations
+                .borrow_mut()
+                .remove_immediately(win_id);
+            return false;
+        }
+        let Some(ws_viewport) = self.workspaces.get(ws_id).map(|ws| ws.viewport) else {
+            self.window_animations
+                .borrow_mut()
+                .remove_immediately(win_id);
+            return false;
+        };
+        let radius = f32::from(appearance.corner_radius.unwrap_or(10));
+        let output_scale = smithay::utils::Scale::from(ws_viewport.scale);
+        let cached = self
+            .backend
+            .as_mut()
+            .and_then(|backend| match cached_frame.as_mut() {
+                Some(cache) => backend.with_primary_renderer(|renderer| cache.read_back(renderer)),
+                None => Some(Ok(None)),
+            });
+        let live_capture = |state: &mut Self| {
+            state.backend.as_mut().and_then(|backend| {
+                backend.with_primary_renderer(|renderer| {
+                    capture_window_snapshot(renderer, window, rect, output_scale, radius)
+                })
+            })
+        };
+        let snapshot = match cached {
+            Some(Ok(Some(captured))) => Some(Ok(captured)),
+            Some(Err(err)) => {
+                debug!(
+                    win_id = win_id.slot,
+                    %err,
+                    "close animation: cached frame read-back failed, retrying live capture"
+                );
+                live_capture(self)
+            }
+            Some(Ok(None)) | None => live_capture(self),
+        };
+        let (snapshot, snapshot_size) = match snapshot {
+            Some(Ok(captured)) => captured,
+            Some(Err(err)) => {
+                debug!(
+                    win_id = win_id.slot,
+                    %err,
+                    "close animation skipped: toplevel has no snappable frame"
+                );
+                self.window_animations
+                    .borrow_mut()
+                    .remove_immediately(win_id);
+                return false;
+            }
+            None => {
+                debug!(
+                    win_id = win_id.slot,
+                    "close animation skipped: no active renderer"
+                );
+                self.window_animations
+                    .borrow_mut()
+                    .remove_immediately(win_id);
+                return false;
+            }
+        };
+        if !self.window_animations.borrow_mut().start_close(
+            win_id,
+            rect,
+            ws_viewport,
+            now_ms,
+            &cfg,
+            None,
+        ) {
+            return false;
+        }
+        debug!(win_id = win_id.slot, "close animation started");
+        self.closing_windows.retain(|c| c.win_id != win_id);
+        self.closing_windows.push(ClosingWindow {
+            win_id,
+            ws_id: ws_id.clone(),
+            snapshot,
+            snapshot_size,
+        });
+        self.queue_redraw();
+        true
+    }
+
+    /// Scene items for the captured closing frames of `ws_id`, sampled at the current time.
+    ///
+    /// Only pixels are returned: the windows are already gone from `mapped_windows`, so layout,
+    /// hit-testing, focus and `scene.inventory` never see them again.
+    #[must_use]
+    pub fn closing_window_scene_items(
+        &self,
+        ws_id: &WorkspaceId,
+    ) -> Vec<ClosingWindowSceneItem<'_>> {
+        let now_ms = self.elapsed_ms();
+        let mut animations = self.window_animations.borrow_mut();
+        self.closing_windows
+            .iter()
+            .filter(|closing| &closing.ws_id == ws_id)
+            .filter_map(|closing| {
+                let sampled = animations.sample_close(closing.win_id, now_ms)?;
+                if sampled.opacity_multiplier <= 0.002 {
+                    return None;
+                }
+                Some(ClosingWindowSceneItem {
+                    snapshot: &closing.snapshot,
+                    snapshot_size: closing.snapshot_size,
+                    rect: sampled.rect,
+                    opacity: sampled.opacity_multiplier,
+                })
+            })
+            .collect()
+    }
+
+    /// Releases captured closing frames once their `windows_close` spring has settled.
+    pub fn reap_settled_closing_windows(&mut self) {
+        let now_ms = self.elapsed_ms();
+        let settled = self
+            .window_animations
+            .borrow_mut()
+            .take_settled_closing(now_ms);
+        if settled.is_empty() {
+            return;
+        }
+        self.closing_windows
+            .retain(|closing| !settled.contains(&closing.win_id));
+        self.queue_redraw();
     }
 
     pub fn collect_workspace_scene_items<'a>(
@@ -4247,6 +4575,19 @@ impl KomaState {
     pub fn apply_runtime_input_config(&mut self, registry: &KomaConfigRegistry) {
         self.apply_keyboard_spec_to_seat(&registry.input.keyboard, false);
         self.apply_backend_input_config(&registry.input, &registry.devices);
+        self.apply_follow_mouse_config(registry.input.pointer.follow_mouse.as_deref());
+    }
+
+    /// Caches the resolved [`FollowMouseMode`] so pointer motion never re-clones the config registry,
+    /// and drops any stale `focus_only` pointer-focus override when the policy stops allowing it.
+    fn apply_follow_mouse_config(&mut self, raw: Option<&str>) {
+        let mode = FollowMouseMode::from_config_value(raw);
+        self.follow_mouse_mode = mode;
+        // Only `focus_only` may keep keyboard focus on a window that is not the workspace's active
+        // window, so any other policy must drop the override and re-derive focus from the stack.
+        if mode != FollowMouseMode::FocusOnly && self.pointer_focus_window.take().is_some() {
+            self.focus_active_deck_window();
+        }
     }
 
     /// Restores the compositor's configured Lua XKB layout after a custom `zwp_virtual_keyboard_v1`
@@ -4437,10 +4778,7 @@ impl KomaState {
         scope_ws_id: Option<&WorkspaceId>,
     ) -> DesktopQuerySnapshot {
         let active_ws_id = self.effective_interactive_ws_id();
-        let active_focused_id = self
-            .workspaces
-            .get(&active_ws_id)
-            .and_then(WorkspaceState::active_window);
+        let active_focused_id = self.focused_window_id();
 
         let mut windows = Vec::new();
         let mut focused_window = None;
@@ -4726,6 +5064,7 @@ impl KomaState {
             ws.activate_window(win_id, now_ms);
         }
         self.focused_ondemand_layer = None;
+        self.pointer_focus_window = None;
         self.break_active_pointer_constraints();
         self.sync_workspace_geometries(&ws_id);
         self.focus_active_deck_window();
@@ -4800,6 +5139,8 @@ impl KomaState {
         let ws_id = mapped.ws_id.clone();
         if minimized {
             self.break_active_pointer_constraints();
+            // A minimized window is not on screen; never resurrect its pixels when it closes.
+            self.window_frames.remove(&win_id);
         } else {
             let now_ms = self.elapsed_ms();
             if let Some(ws) = self.workspaces.get_mut(&ws_id) {
@@ -5140,6 +5481,65 @@ pub(crate) mod tests {
             state.active_deck_wl_surface().is_none(),
             "an emptied source workspace must not resolve a keyboard focus surface"
         );
+    }
+
+    #[test]
+    fn closing_window_frame_lingers_until_the_close_spring_settles() {
+        use smithay::{
+            backend::allocator::Fourcc, backend::renderer::element::memory::MemoryRenderBuffer,
+            utils::Transform,
+        };
+
+        let (_el, _disp, mut state) = make_headless_test_state();
+        let ws_id = state.active_ws_id.clone();
+        let win_id = WindowId::new(1, 0);
+        let rect = LogicalRect::new(120, 90, 640, 480);
+        let viewport = state.workspaces.get(&ws_id).expect("workspace").viewport;
+        let now_ms = state.elapsed_ms();
+        let cfg = koma_model::AnimationConfig::default();
+        assert!(
+            state
+                .window_animations
+                .borrow_mut()
+                .start_close(win_id, rect, viewport, now_ms, &cfg, None,),
+            "closing a mapped window must report an in-flight close spring"
+        );
+        state.closing_windows.push(ClosingWindow {
+            win_id,
+            ws_id: ws_id.clone(),
+            snapshot: MemoryRenderBuffer::from_slice(
+                &[0u8; 64 * 64 * 4],
+                Fourcc::Abgr8888,
+                (64, 64),
+                1,
+                Transform::Normal,
+                None,
+            ),
+            snapshot_size: (64, 64),
+        });
+
+        let items = state.closing_window_scene_items(&ws_id);
+        assert_eq!(items.len(), 1, "the captured frame must keep compositing");
+        assert!(state.window_animations.borrow().is_closing(win_id));
+        assert!(
+            state.has_active_animations(),
+            "an in-flight close spring must keep the frame loop repainting"
+        );
+
+        // In flight: the compositor must not drop the frame yet.
+        state.reap_settled_closing_windows();
+        assert_eq!(state.closing_windows.len(), 1);
+
+        // Advance the compositor clock past the spring: only then is the frame released.
+        state.start_time -= Duration::from_millis(5_000);
+        state.reap_settled_closing_windows();
+        assert!(
+            state.closing_windows.is_empty(),
+            "a settled close spring must release the captured frame"
+        );
+        assert!(!state.window_animations.borrow().is_closing(win_id));
+        assert!(state.closing_window_scene_items(&ws_id).is_empty());
+        assert!(!state.has_active_animations());
     }
 
     #[test]

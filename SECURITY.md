@@ -21,7 +21,7 @@ requests, discussions, or chat channels.
 When reporting, include as much of the following as possible:
 
 - Affected crate, component, or file (`koma`, `koma-proto`, `koma-model`,
-  `koma-lua`, `koma-render`, `koma-seat`, `komactl`, `koma-mcp`,
+  `koma-lua`, `koma-render`, `koma-seat`, `komactl`,
   `koma-overview`, or session resources)
 - Minimal reproduction steps or proof of concept
 - Expected versus observed behavior and security impact
@@ -47,7 +47,7 @@ does not claim that security controls or sandbox boundaries are independently
 accepted. Current boundaries include Wayland client surfaces, `koma-proto` IPC
 framing and `SCM_RIGHTS` FD transport, capability tokens and epoch fencing,
 `koma-lua` Phodopus fuel/memory limits, `koma-render` protected-surface capture
-blackout, `koma-seat` preemption (`Mod+G`), and `komactl` / `koma-mcp`
+blackout, `koma-seat` preemption (`Mod+G`), and `komactl` / `koma mcp`
 boundaries.
 
 For normative design requirements, current implementation status, and review

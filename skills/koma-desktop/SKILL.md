@@ -41,9 +41,9 @@ komactl inventory      # workspaces, epochs, Deck/Stash windows
 komactl config-status  # validated configuration and active bindings
 ```
 
-- A running Koma session. `komactl` and `koma-mcp` both need
+- A running Koma session. `komactl` and `koma mcp` both need
   `$XDG_RUNTIME_DIR/koma/$KOMA_INSTANCE_SIGNATURE/`.
-- For `koma-mcp`, a capability token: `komactl token mint <label>` exports
+- For `koma mcp`, a capability token: `komactl token mint <label>` exports
   `KOMA_CAPABILITY_TOKEN`. Never use `--auto-mint-admin` for an agent host.
 
 ## Two Entry Points
@@ -51,7 +51,7 @@ komactl config-status  # validated configuration and active bindings
 | Entry point | Use when                                                                |
 | ----------- | ----------------------------------------------------------------------- |
 | `komactl`   | Terminal-first agent: you already have a shell and want no schema cost. |
-| `koma-mcp`  | Your host is an MCP client and needs PNG content blocks.                |
+| `koma mcp`  | Your host is an MCP client and needs PNG content blocks.                |
 
 Both talk to the same `koma-agent.sock`. Pick one per task; do not interleave
 mutations from both against the same workspace.
