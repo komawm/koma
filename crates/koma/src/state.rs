@@ -1548,6 +1548,55 @@ impl KomaState {
         }
     }
 
+    /// First unclaimed physical workspace whose `preferred_output` is `out_name`, in canonical
+    /// order.
+    ///
+    /// Iterating `self.workspaces` directly would be wrong: it is a `HashMap`, so with the usual
+    /// config (`1..10` all preferring the internal panel) a monitor claimed an arbitrary one of them
+    /// and the session could start on workspace 3 instead of 1. Canonical order makes startup
+    /// deterministic and always begins on the lowest-numbered workspace of that output.
+    #[must_use]
+    fn initial_workspace_candidate(&self, out_name: &str) -> Option<WorkspaceId> {
+        self.ordered_workspace_ids().into_iter().find(|id| {
+            let Some(ws) = self.workspaces.get(id) else {
+                return false;
+            };
+            !ws.is_special
+                && matches!(
+                    &ws.presentation,
+                    PresentationTarget::Physical(out_id) if out_id.as_str() == out_name
+                )
+                && !self
+                    .output_workspaces
+                    .values()
+                    .any(|assigned| assigned == id)
+        })
+    }
+
+    /// Workspaces in canonical order: numeric names first (by value), then the rest by name.
+    ///
+    /// `self.workspaces` is a `HashMap`, so anything that must be reproducible - startup workspace
+    /// assignment, bar snapshots - has to iterate this order instead of the map itself.
+    #[must_use]
+    pub fn ordered_workspace_ids(&self) -> Vec<WorkspaceId> {
+        let mut ids: Vec<WorkspaceId> = self.workspaces.keys().cloned().collect();
+        ids.sort_by_key(|id| {
+            let name = self
+                .workspaces
+                .get(id)
+                .map(|ws| ws.name.clone())
+                .unwrap_or_default();
+            let numeric = name.parse::<u32>().ok();
+            (
+                numeric.is_none(),
+                numeric.unwrap_or(u32::MAX),
+                name,
+                id.as_str().to_owned(),
+            )
+        });
+        ids
+    }
+
     pub fn ensure_initial_workspace_for_output(&mut self, output: &Output) -> WorkspaceId {
         let out_name = output.name();
         if let Some(existing) = self.output_workspaces.get(&out_name).cloned()
@@ -1578,22 +1627,7 @@ impl KomaState {
         }
 
         // 2. Claim an existing unassigned physical workspace with matching `preferred_output`.
-        let matching_unassigned = self
-            .workspaces
-            .iter()
-            .find(|(id, ws)| {
-                !ws.is_special
-                    && matches!(
-                        &ws.presentation,
-                        PresentationTarget::Physical(out_id) if out_id.as_str() == out_name
-                    )
-                    && !self
-                        .output_workspaces
-                        .values()
-                        .any(|assigned| assigned == *id)
-            })
-            .map(|(id, _)| id.clone());
-        if let Some(ws_id) = matching_unassigned {
+        if let Some(ws_id) = self.initial_workspace_candidate(&out_name) {
             self.output_workspaces.insert(out_name, ws_id.clone());
             return ws_id;
         }
@@ -6366,5 +6400,44 @@ pub(crate) mod tests {
             state.has_active_animations(),
             "switching workspace should start a WorkspaceTransitionTable slide animation"
         );
+    }
+
+    #[test]
+    fn startup_claims_the_lowest_numbered_workspace_not_a_hashmap_order_survivor() {
+        // Regression for "the session sometimes starts on workspace 3 instead of 1": every
+        // `koma.workspace({ name = "1".."10", preferred_output = "eDP-1" })` carries
+        // `Physical("eDP-1")`, so step 2 of `ensure_initial_workspace_for_output` used to pick
+        // whichever entry a `HashMap` iteration happened to visit first.
+        let (_event_loop, _display, mut state) = make_headless_test_state();
+        let vp = LogicalViewport::new(1920, 1080, 1.0);
+        for name in ["7", "3", "10", "1", "2"] {
+            let id = WorkspaceId::from(format!("ws_{name:0>2}").as_str());
+            let ws = WorkspaceState::new(
+                id.clone(),
+                name,
+                SeatId::from("vseat_01"),
+                vp,
+                PresentationTarget::Physical(OutputId::from("eDP-1")),
+                LayoutMode::Dwindle,
+                0,
+            );
+            state.workspaces.insert(id, ws);
+        }
+
+        assert_eq!(
+            state
+                .initial_workspace_candidate("eDP-1")
+                .map(|id| state.workspaces[&id].name.clone()),
+            Some("1".to_owned()),
+            "the first monitor must claim workspace 1, not a map-order survivor"
+        );
+
+        // Canonical order is numeric, so 2 < 10 instead of the lexical "10" < "2".
+        let names: Vec<String> = state
+            .ordered_workspace_ids()
+            .iter()
+            .map(|id| state.workspaces[id].name.clone())
+            .collect();
+        assert_eq!(names, ["1", "2", "3", "7", "10"]);
     }
 }
