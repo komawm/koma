@@ -63,6 +63,28 @@ fn candidate_runtime_bases() -> Vec<PathBuf> {
     bases
 }
 
+/// Existing `koma-admin.sock` paths across the candidate runtime bases, newest instance last.
+///
+/// Used by `komactl doctor` / `komactl keys` to tell "no compositor is running" apart from
+/// "a socket exists but cannot be reached".
+#[must_use]
+pub(crate) fn existing_admin_sockets() -> Vec<PathBuf> {
+    let mut sockets = Vec::new();
+    for base in candidate_runtime_bases() {
+        let Ok(entries) = fs::read_dir(base.join("koma")) else {
+            continue;
+        };
+        sockets.extend(
+            entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.path().join(ADMIN_SOCKET_NAME))
+                .filter(|path| path.exists()),
+        );
+    }
+    sockets.sort();
+    sockets
+}
+
 /// Resolves `$XDG_RUNTIME_DIR/koma/<signature>/koma-admin.sock` either from
 /// `KOMA_INSTANCE_SIGNATURE` or by scanning runtime base directories for an active socket.
 pub fn discover_koma_instance() -> io::Result<DiscoveredInstance> {
