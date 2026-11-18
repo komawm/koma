@@ -42,6 +42,17 @@ desktop, hardware support, or security guarantees.
   destroyed, moved between workspaces or minimized/restored, and on workspace
   switch and configuration reload, so the strip cannot go stale.
 
+### Fixed
+
+- `komactl reload` now applies a changed `koma.monitor({ mode = ... })` to a live
+  output instead of silently keeping the old resolution and refresh rate. The
+  mode string is resolved against the connector's advertised modes and applied
+  through the same KMS modeset `zwlr_output_manager_v1` uses. An unsupported or
+  malformed mode logs one warning naming the connector, the requested mode and
+  the supported list, and the output keeps scanning out its current mode, so the
+  reload itself still succeeds. Scale-only and transform-only reloads skip the
+  modeset when the resolved mode already matches.
+
 ## [0.0.3] - 2026-11-18
 
 ### Added

@@ -673,7 +673,7 @@ pub fn reload_from_lua_source(
     //    mapped windows, Deck stacks, or active Agent `WorkspaceLease` `Epoch`s!)
     reconcile_declarative_workspaces(state, &registry, now_ms);
 
-    // 3. Reconcile live KMS monitor scales, transforms, 2D positions & notch safe areas
+    // 3. Reconcile live KMS monitor modes, scales, transforms, 2D positions & notch safe areas
     #[cfg(feature = "smithay-tty")]
     {
         let updated = if let Some(ActiveBackend::Tty(tty)) = state.backend.as_mut() {
