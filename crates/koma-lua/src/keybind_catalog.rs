@@ -118,6 +118,14 @@ pub const KEYBIND_CATALOG: &[KeybindCatalogEntry] = &[
     KeybindCatalogEntry {
         id: 31,
         chord: "Mod + M",
+        lua_action: "koma.act.window.maximize_toggle()",
+        description: "Toggle maximize (work area, bar stays visible)",
+        cooldown_ms: None,
+        group: LAYOUT,
+    },
+    KeybindCatalogEntry {
+        id: 36,
+        chord: "Mod + Shift + M",
         lua_action: "koma.act.scrolling.maximize_column()",
         description: "Maximize active Scrolling column",
         cooldown_ms: None,
