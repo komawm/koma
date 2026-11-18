@@ -10,9 +10,7 @@ use std::{
 };
 
 use koma_lua::{ActionDescriptor, BindHandleId, BindOptions, BindSpec, schema::TriggerEdge};
-use koma_model::{
-    CardinalDir, LogicalPoint, PresentationTarget, SPECIAL_WORKSPACE_PREFIX, WorkspaceState,
-};
+use koma_model::{CardinalDir, LogicalPoint, PresentationTarget, WorkspaceState};
 use koma_proto::WorkspaceId;
 use smithay::{
     backend::input::{
@@ -533,7 +531,10 @@ impl KeybindTable {
                     enabled: true,
                     raw_chord: move_chord_str,
                     chord,
-                    press_action: Some(ActionDescriptor::WindowMoveToWorkspace(ws_name)),
+                    press_action: Some(ActionDescriptor::WindowMoveToWorkspace {
+                        workspace: ws_name,
+                        follow: true,
+                    }),
                     release_action: None,
                     options: BindOptions::default(),
                 });
@@ -1908,10 +1909,11 @@ pub fn execute_action_descriptor(
             }
         }
 
-        ActionDescriptor::WindowMoveToWorkspace(target_name) => {
-            let dst_ws_id = state.ensure_workspace_by_name_or_id(&target_name);
+        ActionDescriptor::WindowMoveToWorkspace { workspace, follow } => {
+            let dst_ws_id = state.ensure_workspace_by_name_or_id(&workspace);
             let src_ws_id = state.effective_interactive_ws_id();
-            let _ = state.move_active_window_between_workspaces(&src_ws_id, &dst_ws_id);
+            let _ = state
+                .move_active_window_between_workspaces_with_follow(&src_ws_id, &dst_ws_id, follow);
         }
 
         ActionDescriptor::WindowMoveToMonitor(target_monitor) => {
@@ -2218,9 +2220,11 @@ pub fn execute_action_descriptor(
             let src_ws_id = state.effective_interactive_ws_id();
             if src_ws_id == sp_id {
                 let dst_ws_id = state.active_ws_id.clone();
-                let _ = state.move_active_window_between_workspaces(&sp_id, &dst_ws_id);
+                let _ = state
+                    .move_active_window_between_workspaces_with_follow(&sp_id, &dst_ws_id, false);
             } else {
-                let _ = state.move_active_window_between_workspaces(&src_ws_id, &sp_id);
+                let _ = state
+                    .move_active_window_between_workspaces_with_follow(&src_ws_id, &sp_id, false);
                 if !silent {
                     state.active_special_ws_id = Some(sp_id);
                 }
@@ -2281,57 +2285,8 @@ pub fn execute_action_descriptor(
         }
 
         ActionDescriptor::WorkspaceFocus(target) | ActionDescriptor::WorkspacePeek(target) => {
-            state.break_active_pointer_constraints();
-            if target.starts_with(SPECIAL_WORKSPACE_PREFIX) {
-                let sp_id = state.ensure_special_workspace(Some(&target));
-                state.active_special_ws_id = Some(sp_id);
-                state.focus_active_deck_window();
-                state.reconcile_idle_inhibitors();
-                state.sync_foreign_toplevels();
-                state.queue_redraw();
-            } else {
-                let ws_id = state.ensure_workspace_by_name_or_id(&target);
-                if let Some(hosting_out) = state
-                    .output_workspaces
-                    .iter()
-                    .find(|(_, id)| *id == &ws_id)
-                    .map(|(name, _)| name.clone())
-                {
-                    let _ = state.focus_output(&hosting_out);
-                    return;
-                }
-                state.active_special_ws_id = None;
-                let prev_ws_id = state.active_ws_id.clone();
-                state.active_ws_id = ws_id.clone();
-                let mut switched_out: Option<String> = None;
-                if let Some(focused_out) = state.focused_output() {
-                    let out_name = focused_out.name();
-                    state
-                        .output_workspaces
-                        .insert(out_name.clone(), ws_id.clone());
-                    let vp = state.viewport_for_output(&focused_out);
-                    let now_ms = state.elapsed_ms();
-                    if let Some(ws) = state.workspaces.get_mut(&ws_id) {
-                        ws.presentation = koma_model::PresentationTarget::Physical(
-                            koma_proto::OutputId::new(&out_name),
-                        );
-                        if ws.viewport != vp {
-                            ws.viewport = vp;
-                            ws.recalculate(now_ms);
-                        }
-                    }
-                    state.sync_workspace_geometries(&ws_id);
-                    state.sync_window_output_membership(&ws_id);
-                    switched_out = Some(out_name);
-                }
-                state.focus_active_deck_window();
-                if let Some(out_name) = switched_out {
-                    state.trigger_workspace_transition(&out_name, &prev_ws_id, &ws_id, 0);
-                }
-                state.reconcile_idle_inhibitors();
-                state.sync_foreign_toplevels();
-                state.queue_redraw();
-            }
+            let ws_id = state.ensure_workspace_by_name_or_id(&target);
+            let _ = state.focus_workspace(&ws_id);
         }
 
         ActionDescriptor::WorkspaceFocusNext => {
@@ -2627,7 +2582,11 @@ mod tests {
             }));
             assert!(defaults.binds.iter().any(|b| {
                 b.chord == move_chord
-                    && b.press_action == Some(ActionDescriptor::WindowMoveToWorkspace(ws.clone()))
+                    && b.press_action
+                        == Some(ActionDescriptor::WindowMoveToWorkspace {
+                            workspace: ws.clone(),
+                            follow: true,
+                        })
             }));
         }
 

@@ -1783,10 +1783,85 @@ impl KomaState {
         true
     }
 
+    /// Makes `ws_id` the focused workspace, switching the output that owns it when needed.
+    ///
+    /// This is the single workspace-switch path shared by `workspace.focus`, `ws.focus` and
+    /// window moves that follow the window (`Hyprland` `movetoworkspace`), so a followed move
+    /// lands in exactly the same state as an explicit workspace focus.
+    pub fn focus_workspace(&mut self, ws_id: &WorkspaceId) -> bool {
+        let Some(is_special) = self.workspaces.get(ws_id).map(|ws| ws.is_special) else {
+            return false;
+        };
+        self.break_active_pointer_constraints();
+        if is_special {
+            self.active_special_ws_id = Some(ws_id.clone());
+            self.focus_active_deck_window();
+            self.reconcile_idle_inhibitors();
+            self.sync_foreign_toplevels();
+            self.queue_redraw();
+            return true;
+        }
+
+        if let Some(hosting_out) = self
+            .output_workspaces
+            .iter()
+            .find(|(_, id)| *id == ws_id)
+            .map(|(name, _)| name.clone())
+        {
+            return self.focus_output(&hosting_out);
+        }
+
+        self.active_special_ws_id = None;
+        let prev_ws_id = self.active_ws_id.clone();
+        self.active_ws_id = ws_id.clone();
+        let mut switched_out: Option<String> = None;
+        if let Some(focused_out) = self.focused_output() {
+            let out_name = focused_out.name();
+            self.output_workspaces
+                .insert(out_name.clone(), ws_id.clone());
+            let vp = self.viewport_for_output(&focused_out);
+            let now_ms = self.elapsed_ms();
+            if let Some(ws) = self.workspaces.get_mut(ws_id) {
+                ws.presentation = PresentationTarget::Physical(OutputId::new(&out_name));
+                if ws.viewport != vp {
+                    ws.viewport = vp;
+                    ws.recalculate(now_ms);
+                }
+            }
+            self.sync_workspace_geometries(ws_id);
+            self.sync_window_output_membership(ws_id);
+            switched_out = Some(out_name);
+        }
+        self.focus_active_deck_window();
+        if let Some(out_name) = switched_out {
+            self.trigger_workspace_transition(&out_name, &prev_ws_id, ws_id, 0);
+        }
+        self.reconcile_idle_inhibitors();
+        self.sync_foreign_toplevels();
+        self.queue_redraw();
+        true
+    }
+
+    /// Moves the active window of `src_ws_id` into `dst_ws_id` and follows it, like
+    /// `Hyprland` `movetoworkspace`.
     pub fn move_active_window_between_workspaces(
         &mut self,
         src_ws_id: &WorkspaceId,
         dst_ws_id: &WorkspaceId,
+    ) -> bool {
+        self.move_active_window_between_workspaces_with_follow(src_ws_id, dst_ws_id, true)
+    }
+
+    /// Moves the active window of `src_ws_id` into `dst_ws_id`.
+    ///
+    /// With `follow` the destination workspace is focused and the moved window takes
+    /// keyboard focus. Without it the source workspace keeps focus, matching `Hyprland`
+    /// `movetoworkspacesilent`.
+    pub fn move_active_window_between_workspaces_with_follow(
+        &mut self,
+        src_ws_id: &WorkspaceId,
+        dst_ws_id: &WorkspaceId,
+        follow: bool,
     ) -> bool {
         if src_ws_id == dst_ws_id {
             return false;
@@ -1836,7 +1911,11 @@ impl KomaState {
         self.sync_workspace_geometries(src_ws_id);
         self.sync_workspace_geometries(dst_ws_id);
         self.sync_window_output_membership(dst_ws_id);
-        self.focus_active_deck_window();
+        if follow {
+            self.focus_workspace(dst_ws_id);
+        } else {
+            self.focus_active_deck_window();
+        }
         self.queue_redraw();
         true
     }
@@ -4888,6 +4967,80 @@ pub(crate) mod tests {
             LogicalViewport::new(1920, 1080, 1.0),
         );
         (event_loop, display, state)
+    }
+
+    fn insert_test_window(state: &mut KomaState, ws_id: &WorkspaceId, win_id: WindowId) {
+        let now_ms = state.elapsed_ms();
+        state
+            .workspaces
+            .get_mut(ws_id)
+            .expect("workspace exists")
+            .insert_window(win_id, false, None, None, None, None, false, true, now_ms);
+    }
+
+    #[test]
+    fn move_to_workspace_follows_window_and_focuses_destination() {
+        let (_el, _disp, mut state) = make_headless_test_state();
+        let src = state.active_ws_id.clone();
+        let dst = state.ensure_workspace_by_name_or_id("2");
+        let win = WindowId::new(1, 1);
+        insert_test_window(&mut state, &src, win);
+        assert_eq!(state.workspaces[&src].focused_window, Some(win));
+
+        assert!(state.move_active_window_between_workspaces_with_follow(&src, &dst, true));
+
+        assert_eq!(state.active_ws_id, dst);
+        assert_eq!(state.effective_interactive_ws_id(), dst);
+        assert_eq!(state.workspaces[&dst].focused_window, Some(win));
+        assert_eq!(state.workspaces[&dst].active_window(), Some(win));
+        assert_ne!(state.workspaces[&src].active_window(), Some(win));
+        assert!(
+            state.workspaces[&src].active_window().is_none(),
+            "source workspace must not keep a dangling active window"
+        );
+    }
+
+    #[test]
+    fn silent_move_to_workspace_keeps_source_focused_and_window_unfocused() {
+        let (_el, _disp, mut state) = make_headless_test_state();
+        let src = state.active_ws_id.clone();
+        let dst = state.ensure_workspace_by_name_or_id("2");
+        let stay = WindowId::new(1, 1);
+        let moved = WindowId::new(2, 1);
+        insert_test_window(&mut state, &src, stay);
+        insert_test_window(&mut state, &src, moved);
+        assert_eq!(state.workspaces[&src].focused_window, Some(moved));
+
+        assert!(state.move_active_window_between_workspaces_with_follow(&src, &dst, false));
+
+        assert_eq!(state.active_ws_id, src);
+        assert_eq!(state.effective_interactive_ws_id(), src);
+        assert_eq!(state.workspaces[&src].focused_window, Some(stay));
+        assert_eq!(state.workspaces[&dst].active_window(), Some(moved));
+        assert_ne!(
+            state.workspaces[&state.effective_interactive_ws_id()].active_window(),
+            Some(moved),
+            "silent move must not leave the moved window keyboard-focused"
+        );
+    }
+
+    #[test]
+    fn moving_last_window_away_leaves_no_dangling_focus() {
+        let (_el, _disp, mut state) = make_headless_test_state();
+        let src = state.active_ws_id.clone();
+        let dst = state.ensure_workspace_by_name_or_id("2");
+        let moved = WindowId::new(1, 1);
+        insert_test_window(&mut state, &src, moved);
+
+        assert!(state.move_active_window_between_workspaces_with_follow(&src, &dst, false));
+
+        assert_eq!(state.effective_interactive_ws_id(), src);
+        assert_eq!(state.workspaces[&src].focused_window, None);
+        assert_eq!(state.workspaces[&src].active_window(), None);
+        assert!(
+            state.active_deck_wl_surface().is_none(),
+            "an emptied source workspace must not resolve a keyboard focus surface"
+        );
     }
 
     #[test]
