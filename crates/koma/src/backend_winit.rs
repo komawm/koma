@@ -488,6 +488,20 @@ pub(crate) fn dispatch_output_frame_callbacks_filtered(
         send_frames_surface_tree(&ime_surf, output, elapsed, throttle, scanout);
         take_presentation_feedback_surface_tree(&ime_surf, &mut output_feedback, scanout, flags);
     }
+    // A drag icon is not mapped into any space, so it only sees frame callbacks from the output
+    // the cursor is on. Without them an animated icon would never advance.
+    if let Some(icon) = state.dnd_icon() {
+        let (out_w, out_h, _) = crate::state::output_logical_viewport(output);
+        let origin = output.current_location().to_f64();
+        let pointer = state.pointer_location;
+        let on_output = pointer.x >= origin.x
+            && pointer.y >= origin.y
+            && pointer.x < origin.x + f64::from(out_w)
+            && pointer.y < origin.y + f64::from(out_h);
+        if on_output && icon.surface().alive() {
+            send_frames_surface_tree(icon.surface(), output, elapsed, throttle, scanout);
+        }
+    }
 
     output_feedback.presented::<_, Monotonic>(
         state.clock.now(),
@@ -528,6 +542,14 @@ pub fn render_winit_frame(state: &mut KomaState) -> anyhow::Result<()> {
         output_scale,
         now_ms,
     );
+    let dnd_icon_elems = state.dnd_icon().map_or_else(Vec::new, |icon| {
+        crate::dnd::icon_render_elements(
+            icon,
+            winit_state.backend.renderer(),
+            pointer_loc,
+            output_scale,
+        )
+    });
     if let Some(delay_ms) = state
         .cursor_manager
         .next_frame_delay_ms(output_scale.x, now_ms)
@@ -678,7 +700,9 @@ pub fn render_winit_frame(state: &mut KomaState) -> anyhow::Result<()> {
                 agent_cursor_snap.as_ref(),
                 &mut elements,
             );
+            let cursor_len = cursor_elems.len();
             elements.splice(0..0, cursor_elems);
+            elements.splice(cursor_len..cursor_len, dnd_icon_elems);
             (elements, DEFAULT_BACKDROP_CLEAR)
         };
 
