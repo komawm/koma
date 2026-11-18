@@ -2040,6 +2040,86 @@ fn screencopy_copy_with_damage_waits_for_damage_and_minimizing_clears_focus() {
 }
 
 #[test]
+fn move_to_workspace_follow_and_silent_variants_move_keyboard_focus() {
+    let mut env = ClientEnv::new();
+    let ws1 = env.state.active_ws_id.clone();
+    let _surf_a = env.spawn_window("Stay", "org.koma.stay").0;
+    let (_surf_b, _xs_b, _tl_b) = env.spawn_window("Moved", "org.koma.moved");
+    let moved_win = env.state.mapped_windows[1].win_id;
+    let moved_server_surface = mapped_surface(&env.state, moved_win);
+    env.state.focus_active_deck_window();
+    assert_eq!(
+        env.state.seat.get_keyboard().unwrap().current_focus(),
+        Some(moved_server_surface.clone()),
+        "the newest window must start keyed"
+    );
+
+    execute_action_descriptor(
+        &mut env.state,
+        ActionDescriptor::WindowMoveToWorkspace {
+            workspace: "2".to_owned(),
+            follow: true,
+        },
+        false,
+    );
+    let ws2 = env.state.active_ws_id.clone();
+    assert_ne!(ws1, ws2, "follow must switch the active workspace");
+    assert_eq!(env.state.workspaces[&ws2].active_window(), Some(moved_win));
+    assert_eq!(
+        env.state.seat.get_keyboard().unwrap().current_focus(),
+        Some(moved_server_surface),
+        "the moved window must hold keyboard focus after a followed move"
+    );
+
+    // A new window on the destination becomes active; the silent move of that window
+    // must keep the destination workspace and the previous window focused.
+    let (_surf_c, _xs_c, _tl_c) = env.spawn_window("Silent", "org.koma.silent");
+    let silent_win = env.state.mapped_windows[2].win_id;
+    let silent_server_surface = mapped_surface(&env.state, silent_win);
+    env.state.focus_active_deck_window();
+    assert_eq!(
+        env.state.seat.get_keyboard().unwrap().current_focus(),
+        Some(silent_server_surface.clone())
+    );
+
+    execute_action_descriptor(
+        &mut env.state,
+        ActionDescriptor::WindowMoveToWorkspace {
+            workspace: "3".to_owned(),
+            follow: false,
+        },
+        false,
+    );
+    assert_eq!(
+        env.state.active_ws_id, ws2,
+        "silent move must keep the source workspace focused"
+    );
+    assert_eq!(env.state.workspaces[&ws2].active_window(), Some(moved_win));
+    assert_eq!(
+        env.state.seat.get_keyboard().unwrap().current_focus(),
+        Some(mapped_surface(&env.state, moved_win))
+    );
+    assert_ne!(
+        env.state.seat.get_keyboard().unwrap().current_focus(),
+        Some(silent_server_surface),
+        "the silently moved window must not keep keyboard focus"
+    );
+}
+
+fn mapped_surface(
+    state: &KomaState,
+    win_id: koma_proto::WindowId,
+) -> smithay::reexports::wayland_server::protocol::wl_surface::WlSurface {
+    state
+        .mapped_windows
+        .iter()
+        .find(|m| m.win_id == win_id)
+        .and_then(|m| m.window.toplevel())
+        .map(|t| t.wl_surface().clone())
+        .expect("mapped toplevel")
+}
+
+#[test]
 fn wlr_output_manager_head_advertisement_test_apply_cancel_and_sandbox() {
     use koma_model::SafeAreaInsets;
     use smithay::{

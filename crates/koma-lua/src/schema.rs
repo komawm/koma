@@ -46,7 +46,14 @@ pub enum ActionDescriptor {
         width: i32,
         height: i32,
     },
-    WindowMoveToWorkspace(String),
+    /// Moves the active window into `workspace`. With `follow: true` the destination
+    /// workspace becomes active and the moved window takes keyboard focus (`Hyprland`
+    /// `movetoworkspace`); with `follow: false` the source workspace stays focused
+    /// (`Hyprland` `movetoworkspacesilent`).
+    WindowMoveToWorkspace {
+        workspace: String,
+        follow: bool,
+    },
     WindowSwapDirection(String),
     WindowMoveDirection(String),
     FocusDirection(String),
