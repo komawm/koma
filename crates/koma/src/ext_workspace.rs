@@ -206,22 +206,8 @@ struct WorkspaceSnapshot {
 
 /// Workspaces in strip order: numeric names first (by value), then the remaining names.
 fn ordered_workspace_ids(state: &KomaState) -> Vec<WorkspaceId> {
-    let mut ids: Vec<WorkspaceId> = state.workspaces.keys().cloned().collect();
-    ids.sort_by_key(|id| {
-        let name = state
-            .workspaces
-            .get(id)
-            .map(|ws| ws.name.clone())
-            .unwrap_or_default();
-        let numeric = name.parse::<u32>().ok();
-        (
-            numeric.is_none(),
-            numeric.unwrap_or(u32::MAX),
-            name,
-            id.as_str().to_owned(),
-        )
-    });
-    ids
+    // One definition of canonical order, shared with startup workspace assignment.
+    state.ordered_workspace_ids()
 }
 
 fn capture_snapshot(state: &KomaState) -> Vec<WorkspaceSnapshot> {
