@@ -13,7 +13,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     env, fs,
-    os::unix::fs::MetadataExt,
+    os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
 };
 
@@ -115,6 +115,8 @@ impl Outputs {
 pub(crate) struct DoctorContext {
     pub outputs: Outputs,
     pub live: LiveProbe,
+    /// Program lookup roots for `bind.spawn-*`; `None` reads the process `PATH`.
+    pub spawn_path: Option<Vec<PathBuf>>,
 }
 
 impl DoctorContext {
@@ -123,6 +125,17 @@ impl DoctorContext {
         Self {
             outputs: Outputs::detect(),
             live: config_probe::probe_live(),
+            spawn_path: None,
+        }
+    }
+
+    /// Directories searched for a bare program name.
+    fn program_paths(&self) -> Vec<PathBuf> {
+        match &self.spawn_path {
+            Some(dirs) => dirs.clone(),
+            None => env::var_os("PATH")
+                .map(|value| env::split_paths(&value).collect())
+                .unwrap_or_default(),
         }
     }
 }
@@ -753,6 +766,524 @@ fn check_shadowed_builtins(registry: &KomaConfigRegistry, report: &mut Report) {
     }
 }
 
+// =============================================================================
+// Spawn target resolution
+// =============================================================================
+
+/// Shells that put the real program in a `-c` command string.
+const COMMAND_SHELLS: &[&str] = &["sh", "bash", "dash", "zsh", "ksh", "mksh", "fish"];
+
+/// Wrappers that exec a program named in their own arguments.
+const SPAWN_WRAPPERS: &[&str] = &[
+    "env", "sudo", "doas", "pkexec", "busybox", "nohup", "timeout", "xargs",
+];
+
+/// Shell syntax that is not a program: POSIX sh keywords/builtins plus fish builtins.
+const SHELL_WORDS: &[&str] = &[
+    "!",
+    ".",
+    ":",
+    "[",
+    "abbr",
+    "alias",
+    "and",
+    "begin",
+    "bg",
+    "bind",
+    "block",
+    "break",
+    "builtin",
+    "case",
+    "cd",
+    "command",
+    "contains",
+    "continue",
+    "count",
+    "do",
+    "done",
+    "echo",
+    "elif",
+    "else",
+    "emit",
+    "end",
+    "esac",
+    "eval",
+    "exec",
+    "exit",
+    "export",
+    "false",
+    "fg",
+    "fi",
+    "fish_add_path",
+    "for",
+    "function",
+    "functions",
+    "getopts",
+    "hash",
+    "if",
+    "in",
+    "jobs",
+    "kill",
+    "let",
+    "local",
+    "math",
+    "not",
+    "or",
+    "path",
+    "printf",
+    "pwd",
+    "random",
+    "read",
+    "readonly",
+    "return",
+    "set",
+    "shift",
+    "source",
+    "status",
+    "string",
+    "switch",
+    "test",
+    "then",
+    "time",
+    "times",
+    "trap",
+    "true",
+    "type",
+    "ulimit",
+    "umask",
+    "unalias",
+    "unset",
+    "until",
+    "wait",
+    "while",
+];
+
+/// Characters that make a token depend on expansion rather than on a literal program.
+const EXPANSION_CHARS: &[char] = &['$', '*', '?', '[', ']', '~', '{', '}', '"', '\'', '`'];
+
+/// Shell operators that turn a command string into a compound statement.
+const SHELL_OPERATORS: &[char] = &['|', ';', '&', '<', '>', '`', '(', ')', '{', '}', '\n'];
+
+/// How a bare name that is not on `PATH` is interpreted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BareName {
+    /// `koma.act.spawn` calls `execve`, so a missing name is a dead bind.
+    Execve,
+    /// A word inside a `fish -c` string may be a fish function or alias.
+    FishWord,
+    /// A word inside another shell's `-c` string; only `PATH` can be trusted offline.
+    ShellWord,
+}
+
+/// Outcome of resolving one program token without executing anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Resolution {
+    /// An executable file at this path.
+    Executable(PathBuf),
+    /// The program is unusable; the clause completes ``` `chord` spawns `program`, <clause> ```.
+    Missing(String),
+    /// Doctor cannot decide offline; the clause explains why.
+    Skip(String),
+}
+
+/// First program-like word of a `-c` command string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ShellWord {
+    Program(String),
+    Skip(String),
+}
+
+/// One effective spawn bind after the built-in/config merge.
+struct SpawnBind {
+    /// Chord label, including a mode suffix when the bind is mode-scoped.
+    chord: String,
+    argv: Vec<String>,
+    /// `true` when the bind comes from the built-in catalogue.
+    builtin: bool,
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    fs::metadata(path).is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+}
+
+fn program_name(program: &str) -> &str {
+    program.rsplit('/').next().unwrap_or(program)
+}
+
+/// Resolves `token` the way `execve` would, without running anything.
+fn resolve_program(token: &str, path_dirs: &[PathBuf], bare: BareName) -> Resolution {
+    let token = token.trim();
+    if token.is_empty() {
+        return Resolution::Skip("is empty".to_owned());
+    }
+    if token.starts_with('-') {
+        return Resolution::Skip(format!("is the option `{token}`, not a program"));
+    }
+    if let Some(ch) = token.chars().find(|ch| EXPANSION_CHARS.contains(ch)) {
+        return Resolution::Skip(format!(
+            "needs shell expansion (`{ch}`), which doctor does not perform"
+        ));
+    }
+    if token.contains('/') {
+        let path = Path::new(token);
+        if !path.is_absolute() {
+            return Resolution::Skip(format!(
+                "is the relative path `{token}`, and the spawned process working directory is \
+                 unknown"
+            ));
+        }
+        if is_executable_file(path) {
+            return Resolution::Executable(path.to_path_buf());
+        }
+        if path.exists() {
+            return Resolution::Missing("exists but is not executable".to_owned());
+        }
+        return Resolution::Missing("is not installed".to_owned());
+    }
+
+    let mut existing = None;
+    for dir in path_dirs {
+        if dir.as_os_str().is_empty() || !dir.is_absolute() {
+            continue;
+        }
+        let candidate = dir.join(token);
+        if is_executable_file(&candidate) {
+            return Resolution::Executable(candidate);
+        }
+        if existing.is_none() && candidate.exists() {
+            existing = Some(candidate);
+        }
+    }
+    if let Some(path) = existing {
+        return Resolution::Missing(format!(
+            "exists at {} but is not executable",
+            path.display()
+        ));
+    }
+    match bare {
+        BareName::Execve | BareName::ShellWord => Resolution::Missing("is not on PATH".to_owned()),
+        BareName::FishWord => Resolution::Skip(
+            "is not an executable on PATH (it may be a fish function or alias, which doctor does \
+             not run a shell to confirm)"
+                .to_owned(),
+        ),
+    }
+}
+
+/// `Some(command)` when `argv` is `<shell> -c <command>` (also `-lc`, `-ec`, ...).
+fn command_string(argv: &[String]) -> Option<&str> {
+    let program = program_name(argv.first()?);
+    if !COMMAND_SHELLS.contains(&program) {
+        return None;
+    }
+    let flag = argv.get(1)?;
+    let reads_command = flag.starts_with('-')
+        && !flag.starts_with("--")
+        && flag.chars().skip(1).any(|ch| ch == 'c');
+    if !reads_command {
+        return None;
+    }
+    argv.get(2).map(String::as_str)
+}
+
+fn is_assignment(word: &str) -> bool {
+    let Some((name, _)) = word.split_once('=') else {
+        return false;
+    };
+    !name.is_empty()
+        && name
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_')
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
+/// Extracts the first program word of a shell command string, skipping assignments.
+fn first_shell_word(command: &str) -> ShellWord {
+    let command = command.trim();
+    if command.is_empty() {
+        return ShellWord::Skip("is empty".to_owned());
+    }
+    if let Some(op) = command.chars().find(|ch| SHELL_OPERATORS.contains(ch)) {
+        return ShellWord::Skip(format!(
+            "uses the shell operator `{op}`, so its program is part of a compound command"
+        ));
+    }
+    let mut rest = command;
+    loop {
+        let (word, tail) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+        if !is_assignment(word) {
+            return classify_shell_word(word);
+        }
+        let tail = tail.trim_start();
+        if tail.is_empty() {
+            return ShellWord::Skip(
+                "only assigns environment variables and runs no program".to_owned(),
+            );
+        }
+        rest = tail;
+    }
+}
+
+fn classify_shell_word(word: &str) -> ShellWord {
+    if let Some(ch) = word.chars().find(|ch| EXPANSION_CHARS.contains(ch)) {
+        return ShellWord::Skip(if ch == '$' && word.starts_with('$') {
+            format!("starts with the variable `{word}`, which doctor does not expand")
+        } else if ch == '"' || ch == '\'' {
+            "starts with a quoted word, which doctor does not parse".to_owned()
+        } else {
+            format!("needs shell expansion (`{ch}`), which doctor does not perform")
+        });
+    }
+    let name = program_name(word);
+    if SHELL_WORDS.contains(&name) {
+        return ShellWord::Skip(format!(
+            "starts with `{name}`, a shell builtin or keyword rather than a program"
+        ));
+    }
+    if SPAWN_WRAPPERS.contains(&name) {
+        return ShellWord::Skip(format!(
+            "starts with `{name}`, which wraps the real program in its own arguments"
+        ));
+    }
+    if word.starts_with('-') || word.contains('=') {
+        return ShellWord::Skip(format!("starts with `{word}`, which is not a program name"));
+    }
+    ShellWord::Program(word.to_owned())
+}
+
+/// Truncated, quote-safe rendering of a shell command string for messages.
+fn shell_snippet(command: &str) -> String {
+    let trimmed = command.trim();
+    let mut text: String = trimmed.chars().take(48).collect();
+    if trimmed.chars().count() > 48 {
+        text.push_str("...");
+    }
+    format!("\"{}\"", text.replace('"', "'"))
+}
+
+/// Collects the effective spawn binds: built-ins after unbinds, then config overrides.
+fn effective_spawns(
+    registry: &KomaConfigRegistry,
+    config_path: &Path,
+    catalogue: &BTreeMap<String, (ActionDescriptor, &'static str)>,
+) -> Vec<SpawnBind> {
+    let mod_key = registry.input.mod_key.as_deref();
+    let mut config_actions: BTreeMap<(Option<String>, String, String), ActionDescriptor> =
+        BTreeMap::new();
+    for spec in &registry.binds {
+        let key = (
+            spec.mode.clone(),
+            format!("{:?}", spec.options.edge),
+            chord_identity(&spec.chord, mod_key),
+        );
+        // Later definitions win, matching `merge_binds`.
+        config_actions.insert(key, spec.action.clone());
+    }
+
+    let mut spawns = Vec::new();
+    for row in merge_binds(registry, config_path, KEYBIND_CATALOG) {
+        let identity = chord_identity(&row.raw_chord, mod_key);
+        let key = (
+            row.mode.clone(),
+            format!("{:?}", row.edge),
+            identity.clone(),
+        );
+        let action = config_actions
+            .get(&key)
+            .or_else(|| catalogue.get(&identity).map(|(action, _)| action));
+        let Some(ActionDescriptor::Spawn { argv }) = action else {
+            continue;
+        };
+        let chord = match &row.mode {
+            Some(mode) => format!("{} (mode `{mode}`)", row.chord),
+            None => row.chord.clone(),
+        };
+        spawns.push(SpawnBind {
+            chord,
+            argv: argv.clone(),
+            builtin: row.source == "builtin",
+        });
+    }
+    spawns
+}
+
+fn check_spawn_targets(
+    registry: &KomaConfigRegistry,
+    config_path: &Path,
+    path_dirs: &[PathBuf],
+    report: &mut Report,
+) {
+    let catalogue = match catalogue_actions(registry.input.mod_key.as_deref()) {
+        Ok(catalogue) => catalogue,
+        Err(err) => {
+            for check in ["bind.spawn-target", "bind.spawn-target-deep"] {
+                report.push(
+                    "binds",
+                    check,
+                    Severity::Skip,
+                    format!("could not evaluate the built-in catalogue: {err}"),
+                );
+            }
+            return;
+        }
+    };
+
+    let spawns = effective_spawns(registry, config_path, &catalogue);
+    if spawns.is_empty() {
+        report.push(
+            "binds",
+            "bind.spawn-target",
+            Severity::Ok,
+            "no bind spawns a program".to_owned(),
+        );
+        report.push(
+            "binds",
+            "bind.spawn-target-deep",
+            Severity::Ok,
+            "no `<shell> -c` command string to follow".to_owned(),
+        );
+    } else {
+        check_spawn_programs(&spawns, path_dirs, report);
+    }
+}
+
+fn check_spawn_programs(spawns: &[SpawnBind], path_dirs: &[PathBuf], report: &mut Report) {
+    let mut resolved = 0usize;
+    let mut deep_resolved = 0usize;
+    for spawn in spawns {
+        let Some(program) = spawn.argv.first() else {
+            report.push(
+                "binds",
+                "bind.spawn-target",
+                Severity::Skip,
+                format!("`{}` spawns an empty argv", spawn.chord),
+            );
+            continue;
+        };
+        let origin = if spawn.builtin {
+            " (built-in default)"
+        } else {
+            ""
+        };
+        let name = program_name(program);
+        if SPAWN_WRAPPERS.contains(&name) {
+            report.push(
+                "binds",
+                "bind.spawn-target",
+                Severity::Skip,
+                format!(
+                    "`{}` runs `{name}`, which wraps the real program in its arguments",
+                    spawn.chord
+                ),
+            );
+            continue;
+        }
+
+        let resolution = resolve_program(program, path_dirs, BareName::Execve);
+        match &resolution {
+            Resolution::Executable(path) => {
+                if COMMAND_SHELLS.contains(&name) && command_string(&spawn.argv).is_none() {
+                    report.push(
+                        "binds",
+                        "bind.spawn-target",
+                        Severity::Skip,
+                        format!(
+                            "`{}` runs `{}` with interpreter arguments, which doctor does not \
+                             follow",
+                            spawn.chord,
+                            path.display()
+                        ),
+                    );
+                } else {
+                    resolved += 1;
+                }
+            }
+            Resolution::Missing(reason) => report.push(
+                "binds",
+                "bind.spawn-target",
+                Severity::Warn,
+                format!(
+                    "`{}` spawns `{program}`, which {reason}{origin}",
+                    spawn.chord
+                ),
+            ),
+            Resolution::Skip(reason) => report.push(
+                "binds",
+                "bind.spawn-target",
+                Severity::Skip,
+                format!("`{}` spawns `{program}`, which {reason}", spawn.chord),
+            ),
+        }
+
+        let Some(command) = command_string(&spawn.argv) else {
+            continue;
+        };
+        if matches!(resolution, Resolution::Missing(_)) {
+            continue;
+        }
+        let snippet = shell_snippet(command);
+        match first_shell_word(command) {
+            ShellWord::Program(word) => {
+                let bare = if name == "fish" {
+                    BareName::FishWord
+                } else {
+                    BareName::ShellWord
+                };
+                match resolve_program(&word, path_dirs, bare) {
+                    Resolution::Executable(_) => deep_resolved += 1,
+                    Resolution::Missing(reason) => report.push(
+                        "binds",
+                        "bind.spawn-target-deep",
+                        Severity::Warn,
+                        format!(
+                            "`{}` runs `{name} -c {snippet}`, whose program `{word}` {reason}",
+                            spawn.chord
+                        ),
+                    ),
+                    Resolution::Skip(reason) => report.push(
+                        "binds",
+                        "bind.spawn-target-deep",
+                        Severity::Skip,
+                        format!(
+                            "`{}` runs `{name} -c {snippet}`, whose program `{word}` {reason}",
+                            spawn.chord
+                        ),
+                    ),
+                }
+            }
+            ShellWord::Skip(reason) => report.push(
+                "binds",
+                "bind.spawn-target-deep",
+                Severity::Skip,
+                format!(
+                    "`{}` runs `{name} -c {snippet}`, which {reason}",
+                    spawn.chord
+                ),
+            ),
+        }
+    }
+
+    if resolved > 0 {
+        report.push(
+            "binds",
+            "bind.spawn-target",
+            Severity::Ok,
+            format!("{resolved} spawn program(s) resolve to an executable"),
+        );
+    }
+    if deep_resolved > 0 {
+        report.push(
+            "binds",
+            "bind.spawn-target-deep",
+            Severity::Ok,
+            format!("{deep_resolved} `<shell> -c` program(s) resolve to an executable"),
+        );
+    }
+}
+
 fn check_monitors(registry: &KomaConfigRegistry, outputs: &Outputs, report: &mut Report) {
     let mut seen: BTreeMap<String, usize> = BTreeMap::new();
     for monitor in &registry.monitors {
@@ -1176,6 +1707,7 @@ pub(crate) fn diagnose(config_path: &Path, context: &DoctorContext) -> Report {
         check_unbinds(registry, &mut report);
         check_duplicate_binds(registry, &mut report);
         check_shadowed_builtins(registry, &mut report);
+        check_spawn_targets(registry, config_path, &context.program_paths(), &mut report);
         check_gestures(evaluation, registry, &mut report);
         check_monitors(registry, &context.outputs, &mut report);
         check_workspaces(registry, &mut report);
@@ -1198,6 +1730,8 @@ pub(crate) fn diagnose(config_path: &Path, context: &DoctorContext) -> Report {
             ("bind.unbind", "binds"),
             ("bind.duplicate", "binds"),
             ("bind.shadow-builtin", "binds"),
+            ("bind.spawn-target", "binds"),
+            ("bind.spawn-target-deep", "binds"),
             ("input.gesture", "binds"),
             ("monitor.connector", "monitors"),
             ("workspace.duplicate", "workspaces"),
@@ -1337,11 +1871,17 @@ Runs every non-destructive check and groups the rows by area:
 
   config       file readability, Lua sandbox evaluation, require() targets under lua/
   template     template generation vs the shipped v{TEMPLATE_VERSION}, missing generated files
-  binds        chord syntax, duplicate chords, binds that shadow a built-in chord
+  binds        chord syntax, duplicate chords, binds that shadow a built-in chord, and spawn
+               programs that are missing or not executable
   monitors     koma.monitor output names vs the kernel's connected connectors
   workspaces   duplicate workspace names, preferred outputs that are not connected
   rules        window/layer rule regexes, gesture specs
   environment  XDG_RUNTIME_DIR, admin-socket reachability, live generation, lock state
+
+Spawn checks never execute a bind: absolute paths must exist and be executable, bare
+names resolve through `PATH`, and `<shell> -c` command strings are followed one level
+to their first program word. Shell variables, globs, keywords, built-ins and pipelines
+are `skip`, and a fish function or alias is never resolved by running a shell.
 
 `doctor` reuses the same jailed Shadow-VM evaluation as `komactl validate`. A
 syntax error is reported as `error` and can never fail the compositor: Koma keeps
@@ -1436,6 +1976,7 @@ mod tests {
     use std::{
         fmt::Write as _,
         fs,
+        os::unix::fs::PermissionsExt,
         sync::atomic::{AtomicU32, Ordering},
     };
 
@@ -1462,7 +2003,32 @@ mod tests {
             live: LiveProbe::Offline {
                 detail: "unit test".to_owned(),
             },
+            spawn_path: None,
         }
+    }
+
+    /// Context with an explicit program search path, so spawn checks never depend on the host.
+    fn context_with_path(outputs: Outputs, spawn_path: Vec<PathBuf>) -> DoctorContext {
+        DoctorContext {
+            outputs,
+            live: LiveProbe::Offline {
+                detail: "unit test".to_owned(),
+            },
+            spawn_path: Some(spawn_path),
+        }
+    }
+
+    /// Creates `<root>/bin` with executable stand-ins (symlinks to `/bin/sh`).
+    fn fixture_bin(root: &Path, names: &[&str]) -> Vec<PathBuf> {
+        let bin = root.join("bin");
+        fs::create_dir_all(&bin).expect("create fixture bin");
+        for name in names {
+            let path = bin.join(name);
+            if !path.exists() {
+                std::os::unix::fs::symlink("/bin/sh", &path).expect("symlink fixture program");
+            }
+        }
+        vec![bin]
     }
 
     fn offline_context() -> DoctorContext {
@@ -1803,7 +2369,14 @@ mod tests {
     #[test]
     fn help_documents_severities_and_exit_codes() {
         let help = doctor_help();
-        for needle in ["--json", "--strict", "Exit codes:", "skip", "never fail"] {
+        for needle in [
+            "--json",
+            "--strict",
+            "Exit codes:",
+            "skip",
+            "never fail",
+            "Spawn checks never execute a bind",
+        ] {
             assert!(help.contains(needle), "help is missing `{needle}`");
         }
     }
@@ -1816,5 +2389,287 @@ mod tests {
         assert_eq!(parsed.path, Some(PathBuf::from("/tmp/koma/x.lua")));
         assert!(parse_args(&["--bogus".to_owned()]).is_err());
         assert!(parse_args(&["a".to_owned(), "b".to_owned()]).is_err());
+    }
+
+    fn spawn_warnings(report: &Report) -> Vec<&Finding> {
+        report
+            .findings
+            .iter()
+            .filter(|row| row.check.starts_with("bind.spawn-") && row.severity == Severity::Warn)
+            .collect()
+    }
+
+    #[test]
+    fn spawn_targets_warn_for_missing_programs_and_follow_shell_strings() {
+        let root = temp_root("spawn-missing");
+        let bin = fixture_bin(&root, &["bitty", "koma-doctor-terminal"]);
+        fs::write(
+            root.join("init.lua"),
+            "koma.bind(\"Mod + T\", koma.act.spawn({ \"koma-doctor-terminal\" }))\n\
+             koma.bind(\"Mod + R\", koma.act.spawn({ \"/usr/bin/koma-doctor-absent\", \"-a\" }))\n\
+             koma.bind(\"Mod + Y\", koma.act.spawn({ \"koma-doctor-absent\" }))\n\
+             koma.bind(\"Mod + U\", koma.act.spawn({ \"/bin/sh\", \"-c\", \
+             \"koma-doctor-absent --flag\" }))\n",
+        )
+        .expect("write init.lua");
+        let init = root.join("init.lua");
+        let mut report = diagnose(
+            &init,
+            &context_with_path(Outputs::Unavailable("unit test".to_owned()), bin),
+        );
+
+        let warnings = spawn_warnings(&report);
+        assert_eq!(warnings.len(), 3, "{warnings:#?}");
+        assert!(
+            warnings.iter().any(|row| row.check == "bind.spawn-target"
+                && row.message.contains("`Mod + R`")
+                && row.message.contains("/usr/bin/koma-doctor-absent")
+                && row.message.contains("is not installed")),
+            "{warnings:#?}"
+        );
+        assert!(
+            warnings.iter().any(|row| row.check == "bind.spawn-target"
+                && row.message.contains("`Mod + Y`")
+                && row.message.contains("is not on PATH")),
+            "{warnings:#?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|row| row.check == "bind.spawn-target-deep"
+                    && row.message.contains("`Mod + U`")
+                    && row.message.contains("koma-doctor-absent")
+                    && row.message.contains("is not on PATH")),
+            "{warnings:#?}"
+        );
+        assert!(
+            finding(&report, "bind.spawn-target")
+                .iter()
+                .any(|row| row.severity == Severity::Ok && row.message.contains("resolve")),
+            "the valid spawn must be counted as resolved"
+        );
+        assert_eq!(report.exit_code(), 0, "warnings never change the exit code");
+        report.strict = true;
+        assert_eq!(report.exit_code(), 1, "--strict gates on spawn warnings");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn spawn_checks_skip_shell_syntax_variables_and_pipelines() {
+        let root = temp_root("spawn-skip");
+        let bin = fixture_bin(&root, &["bitty", "fish"]);
+        fs::write(
+            root.join("init.lua"),
+            "koma.bind(\"Mod + A\", koma.act.spawn({ \"/bin/sh\", \"-c\", \"cd /tmp\" }))\n\
+             koma.bind(\"Mod + B\", koma.act.spawn({ \"/bin/sh\", \"-c\", \"if true\" }))\n\
+             koma.bind(\"Mod + C\", koma.act.spawn({ \"/bin/sh\", \"-c\", \"$TERMINAL\" }))\n\
+             koma.bind(\"Mod + E\", koma.act.spawn({ \"/bin/sh\", \"-c\", \
+             \"cliphist list | wofi --show dmenu\" }))\n\
+             koma.bind(\"Mod + F\", koma.act.spawn({ \"fish\", \"-c\", \"changewp\" }))\n\
+             koma.bind(\"Mod + G\", koma.act.spawn({ \"fish\", \"togglemode.fish\" }))\n\
+             koma.bind(\"Mod + H\", koma.act.spawn({ \"$TERMINAL\" }))\n\
+             koma.bind(\"Mod + J\", koma.act.spawn({ \"./script.sh\" }))\n\
+             koma.bind(\"Mod + K\", koma.act.spawn({ \"env\", \"FOO=1\", \"kitty\" }))\n",
+        )
+        .expect("write init.lua");
+        let init = root.join("init.lua");
+        let report = diagnose(
+            &init,
+            &context_with_path(Outputs::Unavailable("unit test".to_owned()), bin),
+        );
+
+        assert!(
+            spawn_warnings(&report).is_empty(),
+            "{:#?}",
+            spawn_warnings(&report)
+        );
+        let skips: Vec<&Finding> = report
+            .findings
+            .iter()
+            .filter(|row| row.check.starts_with("bind.spawn-") && row.severity == Severity::Skip)
+            .collect();
+        let messages: Vec<&str> = skips.iter().map(|row| row.message.as_str()).collect();
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("`Mod + A`") && message.contains("`cd`")),
+            "{messages:#?}"
+        );
+        assert!(
+            messages.iter().any(|message| message.contains("`Mod + B`")
+                && message.contains("shell builtin or keyword")),
+            "{messages:#?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("`Mod + C`") && message.contains("variable")),
+            "{messages:#?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("`Mod + E`") && message.contains("operator `|`")),
+            "{messages:#?}"
+        );
+        assert!(
+            messages.iter().any(|message| message.contains("`Mod + F`")
+                && message.contains("fish function or alias")),
+            "{messages:#?}"
+        );
+        assert!(
+            messages.iter().any(|message| message.contains("`Mod + G`")
+                && message.contains("interpreter arguments")),
+            "{messages:#?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("`Mod + H`")
+                    && message.contains("shell expansion")),
+            "{messages:#?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("`Mod + J`") && message.contains("relative path")),
+            "{messages:#?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("`Mod + K`") && message.contains("wraps")),
+            "{messages:#?}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn spawn_targets_warn_for_files_that_are_not_executable() {
+        let root = temp_root("spawn-mode");
+        let bin = root.join("bin");
+        fs::create_dir_all(&bin).expect("create fixture bin");
+        std::os::unix::fs::symlink("/bin/sh", bin.join("bitty")).expect("symlink bitty");
+        let script = bin.join("koma-doctor-script");
+        fs::write(&script, "#!/bin/sh\nexit 0\n").expect("write script");
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o644)).expect("chmod script");
+        fs::write(
+            root.join("init.lua"),
+            format!(
+                "koma.bind(\"Mod + P\", koma.act.spawn({{ {} }}))\n\
+                 koma.bind(\"Mod + O\", koma.act.spawn({{ \"koma-doctor-script\" }}))\n",
+                lua_quote(&script.display().to_string())
+            ),
+        )
+        .expect("write init.lua");
+        let report = diagnose(
+            &root.join("init.lua"),
+            &context_with_path(Outputs::Unavailable("unit test".to_owned()), vec![bin]),
+        );
+
+        let warnings = spawn_warnings(&report);
+        assert_eq!(warnings.len(), 2, "{warnings:#?}");
+        assert!(
+            warnings.iter().any(|row| row.message.contains("`Mod + P`")
+                && row.message.contains("is not executable")),
+            "{warnings:#?}"
+        );
+        assert!(
+            warnings.iter().any(|row| row.message.contains("`Mod + O`")
+                && row.message.contains("exists at")
+                && row.message.contains("is not executable")),
+            "{warnings:#?}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scaffold_spawn_targets_resolve() {
+        let root = temp_root("scaffold-spawn");
+        scaffold_config_tree(&root, false).expect("scaffold");
+        let bin = fixture_bin(&root, &["bitty"]);
+        let report = diagnose(
+            &root.join("init.lua"),
+            &context_with_path(Outputs::Unavailable("unit test".to_owned()), bin),
+        );
+
+        let targets = finding(&report, "bind.spawn-target");
+        assert!(!targets.is_empty());
+        assert!(
+            targets.iter().all(|row| row.severity == Severity::Ok),
+            "{targets:#?}"
+        );
+        assert!(
+            finding(&report, "bind.spawn-target-deep")
+                .iter()
+                .all(|row| row.severity == Severity::Ok)
+        );
+        assert!(spawn_warnings(&report).is_empty());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn spawn_resolver_and_shell_word_extraction_cover_the_edge_cases() {
+        assert!(matches!(
+            resolve_program("/bin/sh", &[], BareName::Execve),
+            Resolution::Executable(_)
+        ));
+        assert!(matches!(
+            resolve_program("$TERMINAL", &[], BareName::Execve),
+            Resolution::Skip(_)
+        ));
+        assert!(matches!(
+            resolve_program("fire*", &[], BareName::Execve),
+            Resolution::Skip(_)
+        ));
+        assert!(matches!(
+            resolve_program("./script.sh", &[], BareName::Execve),
+            Resolution::Skip(_)
+        ));
+        assert!(matches!(
+            resolve_program("koma-doctor-absent", &[], BareName::Execve),
+            Resolution::Missing(_)
+        ));
+        assert!(matches!(
+            resolve_program("koma-doctor-absent", &[], BareName::FishWord),
+            Resolution::Skip(_)
+        ));
+
+        assert_eq!(
+            first_shell_word("koma-doctor-absent --flag"),
+            ShellWord::Program("koma-doctor-absent".to_owned())
+        );
+        assert_eq!(
+            first_shell_word("FOO=1 BAR=2 /usr/bin/kitty"),
+            ShellWord::Program("/usr/bin/kitty".to_owned())
+        );
+        for command in [
+            "",
+            "   ",
+            "cd /tmp",
+            "if true",
+            "$TERMINAL",
+            "a | b",
+            "a && b",
+            "FOO=1",
+            "\"quoted word\"",
+        ] {
+            assert!(
+                matches!(first_shell_word(command), ShellWord::Skip(_)),
+                "`{command}` should be skipped"
+            );
+        }
+        assert_eq!(
+            command_string(&["sh".to_owned(), "-c".to_owned(), "x".to_owned()]),
+            Some("x")
+        );
+        assert_eq!(
+            command_string(&["/bin/bash".to_owned(), "-lc".to_owned(), "x".to_owned()]),
+            Some("x")
+        );
+        assert_eq!(
+            command_string(&["bash".to_owned(), "script.sh".to_owned()]),
+            None
+        );
     }
 }
