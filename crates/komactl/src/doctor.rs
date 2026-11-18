@@ -1215,6 +1215,19 @@ fn check_spawn_programs(spawns: &[SpawnBind], path_dirs: &[PathBuf], report: &mu
                     resolved += 1;
                 }
             }
+            // A missing program behind a *built-in default* is not a configuration mistake:
+            // the compositor already warns and falls back when the bind fires, and a stock
+            // install has no reason to be told that the shipped default terminal is absent.
+            Resolution::Missing(reason) if spawn.builtin => report.push(
+                "binds",
+                "bind.spawn-target",
+                Severity::Skip,
+                format!(
+                    "`{}` spawns the built-in default `{program}`, which {reason}; the \
+                     compositor falls back when the bind fires",
+                    spawn.chord
+                ),
+            ),
             Resolution::Missing(reason) => report.push(
                 "binds",
                 "bind.spawn-target",
@@ -2449,6 +2462,44 @@ mod tests {
         drop(listener);
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&instance);
+    }
+
+    /// A missing program behind a built-in default is `skip`, not `warn`: the shipped keymap
+    /// must not make a stock install look misconfigured (the compositor falls back when it fires).
+    #[test]
+    fn missing_builtin_default_program_is_skipped_instead_of_warned() {
+        let root = fixture("builtin-spawn-missing", "koma.layout(\"dwindle\")\n");
+        let report = diagnose(
+            &root.join("init.lua"),
+            &context_with_path(Outputs::Unavailable("unit test".to_owned()), Vec::new()),
+        );
+        let rows = finding(&report, "bind.spawn-target");
+        let terminal = rows
+            .iter()
+            .find(|row| row.message.contains("Mod + Return"))
+            .expect("the built-in terminal bind must still be reported");
+        assert_eq!(
+            terminal.severity,
+            Severity::Skip,
+            "a missing built-in default must not warn: {}",
+            terminal.message
+        );
+        assert!(
+            terminal.message.contains("built-in default"),
+            "{}",
+            terminal.message
+        );
+        assert!(
+            !report.has_warn(),
+            "a stock config with an empty PATH must not warn: {:?}",
+            report
+                .findings
+                .iter()
+                .filter(|f| f.severity == Severity::Warn)
+                .map(|f| f.message.clone())
+                .collect::<Vec<_>>()
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// `environment.overview-daemon` — `warn` when the socket file outlived the listener.
