@@ -3341,7 +3341,10 @@ impl KomaState {
         b_off: f64,
     ) -> Option<(WindowId, WlSurface, Point<f64, Logical>)> {
         let ws = self.workspaces.get(ws_id)?;
-        for (win_id, rect, _) in ws
+        let focused_id = ws.active_window();
+        let fullscreen_id = ws.fullscreen_window();
+        let is_agent_ws = matches!(ws.presentation, PresentationTarget::Offscreen { .. });
+        for (win_id, rect, is_floating) in ws
             .compute_visible_geometries_at(self.elapsed_ms())
             .into_iter()
             .rev()
@@ -3352,17 +3355,56 @@ impl KomaState {
             if mapped.is_minimized {
                 continue;
             }
-            // Frame space: the inner rect is the window geometry (border/border-fallback checks).
-            let inner_origin = Point::from((f64::from(rect.x) + b_off, f64::from(rect.y) + b_off));
+            let is_waydroid_click_through = is_waydroid_app_id(&mapped.app_id)
+                && mapped.window.toplevel().is_some_and(|t| {
+                    let root = t.wl_surface();
+                    is_surface_mapped(root) && surface_has_empty_input_region(root)
+                });
+            let eff_b_off = if fullscreen_id == Some(win_id) || is_waydroid_click_through {
+                0.0
+            } else {
+                b_off
+            };
+            // Frame space: the inner rect matches `frame_composer`'s `clip_geo`.
+            let inner_origin =
+                Point::from((f64::from(rect.x) + eff_b_off, f64::from(rect.y) + eff_b_off));
             let local_pos = output_local - inner_origin;
+            let inner_w = (f64::from(rect.w) - 2.0 * eff_b_off).max(16.0);
+            let inner_h = (f64::from(rect.h) - 2.0 * eff_b_off).max(16.0);
+            let in_clip_rect = local_pos.x >= 0.0
+                && local_pos.y >= 0.0
+                && local_pos.x < inner_w
+                && local_pos.y < inner_h;
+            let dyn_rules = self.rules.resolve_dynamic(&WindowMatchContext {
+                app_id: &mapped.app_id,
+                title: &mapped.title,
+                is_floating,
+                is_focused: Some(win_id) == focused_id,
+                is_xwayland: false,
+                is_modal_dialog: false,
+                is_screencast_target: false,
+                is_agent_workspace: is_agent_ws,
+            });
+            let eff_clip_to_geometry =
+                dyn_rules.clip_to_geometry.unwrap_or(true) && !is_waydroid_click_through;
+
             // Surface space: CSD surfaces extend above/left of the geometry rect, so hit-test the
             // surface tree at its real `(0, 0)` and report that same origin for pointer focus.
             let win_surface_origin = surface_origin(inner_origin, mapped.window.geometry().loc);
             let surface_pos = output_local - win_surface_origin;
             let global_origin = win_surface_origin + out_origin;
+            // Popups render unclipped above the window, whereas main surfaces clip to `inner_rect`.
             if let Some((surf, surf_offset)) = mapped
                 .window
-                .surface_under(surface_pos, WindowSurfaceType::ALL)
+                .surface_under(surface_pos, WindowSurfaceType::POPUP)
+            {
+                return Some((win_id, surf, surf_offset.to_f64() + global_origin));
+            }
+            if (!eff_clip_to_geometry || in_clip_rect)
+                && let Some((surf, surf_offset)) = mapped.window.surface_under(
+                    surface_pos,
+                    WindowSurfaceType::TOPLEVEL | WindowSurfaceType::SUBSURFACE,
+                )
             {
                 return Some((win_id, surf, surf_offset.to_f64() + global_origin));
             }
@@ -3378,8 +3420,8 @@ impl KomaState {
                 !is_surface_mapped(root)
                     || local_pos.x < 0.0
                     || local_pos.y < 0.0
-                    || local_pos.x >= f64::from(rect.w) - 2.0 * b_off
-                    || local_pos.y >= f64::from(rect.h) - 2.0 * b_off
+                    || local_pos.x >= f64::from(rect.w) - 2.0 * eff_b_off
+                    || local_pos.y >= f64::from(rect.h) - 2.0 * eff_b_off
             });
             if in_frame
                 && allow_frame_fallback
