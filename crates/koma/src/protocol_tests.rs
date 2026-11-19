@@ -7532,3 +7532,223 @@ fn issue_123_keybind_simulation_covers_scratchpad_overlay_paging_and_user_chords
         "Escape closes keybind overlay"
     );
 }
+
+#[test]
+fn issue_123_scrolling_and_deck_layout_modes_and_chords_work_end_to_end() {
+    use crate::keybind_dispatcher::{execute_action_descriptor, process_keyboard_key_event};
+    use koma_lua::ActionDescriptor;
+    use koma_model::LayoutMode;
+    use smithay::backend::input::{InputTime, KeyState, Keycode};
+
+    let mut env = ClientEnv::new();
+    env.state
+        .lua_sandbox
+        .eval_init_lua(
+            r#"
+            koma.input({ mod_key = "Super", inherit_default_binds = true })
+            koma.workspace({ name = "special:magic", presentation = "headed", layout = "dwindle", gaps = { inner = 10, outer = 48 } })
+            koma.bind("Mod + S", koma.act.scratchpad.toggle("magic"))
+            koma.bind("Mod + Shift + S", koma.act.scratchpad.move_window("magic", false))
+            koma.bind("Mod + F", koma.act.window.maximize_toggle())
+            koma.bind("Mod + Shift + F", koma.act.window.fullscreen_toggle())
+            koma.bind("Mod + Space", koma.act.scrolling.center_column())
+            koma.bind("Mod + Alt + R", koma.act.scrolling.switch_preset_column_width())
+            koma.bind("Mod + Alt + M", koma.act.scrolling.maximize_column())
+            koma.bind("Mod + Shift + H", koma.act.window.resize({ width = -30, height = 0 }))
+            koma.bind("Mod + Shift + L", koma.act.window.resize({ width = 30, height = 0 }))
+            koma.bind("Mod + Ctrl + H", koma.act.window.move_direction("left"))
+            koma.bind("Mod + Ctrl + L", koma.act.window.move_direction("right"))
+        "#,
+        )
+        .expect("eval user-style config");
+    let snap = env.state.lua_sandbox.config_snapshot();
+    env.state.keybinds = crate::keybind_dispatcher::KeybindTable::compile_with_options(
+        &snap.binds,
+        &snap.unbinds,
+        snap.input.inherit_default_binds,
+        snap.input.mod_key.as_deref(),
+    )
+    .expect("compile keybinds");
+
+    let (_s1, _xs1, tl1) = env.spawn_window("App1", "org.koma.app1");
+    let (_s2, _xs2, tl2) = env.spawn_window("App2", "org.koma.app2");
+    env.pump();
+
+    let win1 = env.state.mapped_windows[0].win_id;
+    let win2 = env.state.mapped_windows[1].win_id;
+    let ws_id = env.state.active_ws_id.clone();
+
+    let press = |state: &mut KomaState, mods: &[u32], evdev_key: u32, t: &mut u32| {
+        for &m in mods {
+            *t += 1;
+            process_keyboard_key_event(
+                state,
+                Keycode::from(m + 8),
+                KeyState::Pressed,
+                InputTime::from_millis(*t),
+                false,
+            );
+        }
+        *t += 1;
+        process_keyboard_key_event(
+            state,
+            Keycode::from(evdev_key + 8),
+            KeyState::Pressed,
+            InputTime::from_millis(*t),
+            false,
+        );
+        *t += 1;
+        process_keyboard_key_event(
+            state,
+            Keycode::from(evdev_key + 8),
+            KeyState::Released,
+            InputTime::from_millis(*t),
+            false,
+        );
+        for &m in mods.iter().rev() {
+            *t += 1;
+            process_keyboard_key_event(
+                state,
+                Keycode::from(m + 8),
+                KeyState::Released,
+                InputTime::from_millis(*t),
+                false,
+            );
+        }
+    };
+
+    const MOD: u32 = 125;
+    const SHIFT: u32 = 42;
+    const CTRL: u32 = 29;
+    const ALT: u32 = 56;
+    const KEY_H: u32 = 35;
+    const KEY_L: u32 = 38;
+    const KEY_R: u32 = 19;
+    const KEY_M: u32 = 50;
+    const KEY_F: u32 = 33;
+    const KEY_S: u32 = 31;
+    const KEY_SPACE: u32 = 57;
+
+    let mut t = 500_u32;
+
+    // --- 1. Scrolling mode ---
+    execute_action_descriptor(
+        &mut env.state,
+        ActionDescriptor::WorkspaceSetLayout {
+            layout: LayoutMode::Scrolling,
+            workspace: None,
+        },
+        false,
+    );
+    assert_eq!(
+        env.state.workspaces[&ws_id].layout_mode,
+        LayoutMode::Scrolling
+    );
+
+    // Focus navigation (`Mod+H` / `Mod+L`), preset width (`Mod+Alt+R`), maximize column (`Mod+Alt+M`), center (`Mod+Space`).
+    press(&mut env.state, &[MOD], KEY_H, &mut t);
+    let focused_after_h = env.state.workspaces[&ws_id].active_window();
+    press(&mut env.state, &[MOD], KEY_L, &mut t);
+    let focused_after_l = env.state.workspaces[&ws_id].active_window();
+    assert_ne!(
+        focused_after_h, focused_after_l,
+        "Scrolling Mod+H/L must move focus between columns"
+    );
+
+    let w_before_preset = env
+        .state
+        .mapped_windows
+        .iter()
+        .find(|m| m.win_id == win2)
+        .unwrap()
+        .rect
+        .w;
+    press(&mut env.state, &[MOD, ALT], KEY_R, &mut t);
+    let w_after_preset = env
+        .state
+        .mapped_windows
+        .iter()
+        .find(|m| m.win_id == win2)
+        .unwrap()
+        .rect
+        .w;
+    assert_ne!(
+        w_before_preset, w_after_preset,
+        "Scrolling Mod+Alt+R must cycle preset column width"
+    );
+
+    press(&mut env.state, &[MOD, ALT], KEY_M, &mut t);
+    press(&mut env.state, &[MOD], KEY_SPACE, &mut t);
+    press(&mut env.state, &[MOD, SHIFT], KEY_H, &mut t);
+    press(&mut env.state, &[MOD, CTRL], KEY_H, &mut t);
+
+    // Fullscreen in Scrolling must configure full output without border inset.
+    press(&mut env.state, &[MOD, SHIFT], KEY_F, &mut t);
+    env.pump();
+    assert!(env.state.workspaces[&ws_id].is_fullscreen(win2));
+    let fs_cfg = *env.client.toplevel_configures[&tl2.id().protocol_id()]
+        .last()
+        .unwrap();
+    assert_eq!(fs_cfg, (1920, 1080));
+    press(&mut env.state, &[MOD, SHIFT], KEY_F, &mut t);
+    env.pump();
+    assert!(!env.state.workspaces[&ws_id].is_fullscreen(win2));
+
+    // --- 2. Deck mode ---
+    execute_action_descriptor(
+        &mut env.state,
+        ActionDescriptor::WorkspaceSetLayout {
+            layout: LayoutMode::Deck,
+            workspace: None,
+        },
+        false,
+    );
+    assert_eq!(env.state.workspaces[&ws_id].layout_mode, LayoutMode::Deck);
+
+    // Cycle deck active window via `DeckCycleNext` and `Mod+H`/`Mod+L`.
+    let deck_a = env.state.workspaces[&ws_id].active_window();
+    execute_action_descriptor(&mut env.state, ActionDescriptor::DeckCycleNext, false);
+    let deck_b = env.state.workspaces[&ws_id].active_window();
+    assert_ne!(
+        deck_a, deck_b,
+        "DeckCycleNext must switch active deck window"
+    );
+
+    // Maximize & Fullscreen in Deck.
+    press(&mut env.state, &[MOD], KEY_F, &mut t);
+    assert!(env.state.workspaces[&ws_id].is_maximized(deck_b.unwrap()));
+    press(&mut env.state, &[MOD, SHIFT], KEY_F, &mut t);
+    env.pump();
+    assert!(env.state.workspaces[&ws_id].is_fullscreen(deck_b.unwrap()));
+    let active_tl = if deck_b == Some(win1) {
+        tl1.id().protocol_id()
+    } else {
+        tl2.id().protocol_id()
+    };
+    assert_eq!(
+        *env.client.toplevel_configures[&active_tl].last().unwrap(),
+        (1920, 1080)
+    );
+    press(&mut env.state, &[MOD, SHIFT], KEY_F, &mut t);
+    env.pump();
+
+    // Scratchpad from Deck mode.
+    press(&mut env.state, &[MOD, SHIFT], KEY_S, &mut t);
+    assert!(env.state.active_special_ws_id.is_some());
+    press(&mut env.state, &[MOD], KEY_S, &mut t);
+    assert!(env.state.active_special_ws_id.is_none());
+
+    // --- 3. Back to Dwindle cleanly ---
+    execute_action_descriptor(
+        &mut env.state,
+        ActionDescriptor::WorkspaceSetLayout {
+            layout: LayoutMode::Dwindle,
+            workspace: None,
+        },
+        false,
+    );
+    assert_eq!(
+        env.state.workspaces[&ws_id].layout_mode,
+        LayoutMode::Dwindle
+    );
+}

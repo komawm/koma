@@ -251,6 +251,91 @@ impl WorkspaceState {
         }
     }
 
+    /// Switches `layout_mode` and migrates existing non-floating windows into the target layout
+    /// container so windows opened in Dwindle, Scrolling, or Deck stay present after switching.
+    pub fn set_layout(&mut self, layout: LayoutMode, now_ms: u64) {
+        if self.layout_mode == layout {
+            self.recalculate(now_ms);
+            return;
+        }
+        let mut tiled_ids: Vec<WindowId> = match self.layout_mode {
+            LayoutMode::Dwindle => self
+                .dwindle
+                .tiled_geometries()
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect(),
+            LayoutMode::Scrolling => self
+                .scrolling
+                .visible_geometries(self.viewport)
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect(),
+            LayoutMode::Deck => self
+                .deck
+                .active()
+                .into_iter()
+                .chain(self.deck.stash_windows().iter().copied())
+                .collect(),
+        };
+        if tiled_ids.is_empty() {
+            tiled_ids = self
+                .deck
+                .active()
+                .into_iter()
+                .chain(self.deck.stash_windows().iter().copied())
+                .collect();
+        }
+
+        for id in tiled_ids {
+            if self.floating.contains(id) {
+                continue;
+            }
+            match layout {
+                LayoutMode::Dwindle => {
+                    if !self.dwindle.contains(id) {
+                        let max_sz = self.size_hints.get(&id).and_then(|h| {
+                            (h.max_w > 0 && h.max_h > 0).then_some((h.max_w, h.max_h))
+                        });
+                        let _ = self.dwindle.insert(
+                            id,
+                            self.viewport,
+                            self.focused_window,
+                            None,
+                            max_sz,
+                            None,
+                        );
+                    }
+                }
+                LayoutMode::Scrolling => {
+                    if !self.scrolling.contains(id) {
+                        self.scrolling
+                            .insert_column(id, None, self.viewport, now_ms);
+                    }
+                }
+                LayoutMode::Deck => {
+                    if self.deck.active() != Some(id) && !self.deck.stash_windows().contains(&id) {
+                        self.deck.push_deck_top(id);
+                    }
+                }
+            }
+        }
+
+        self.layout_mode = layout;
+        if let Some(focused) = self.focused_window {
+            match layout {
+                LayoutMode::Scrolling => {
+                    let _ = self.scrolling.activate(focused, self.viewport, now_ms);
+                }
+                LayoutMode::Deck => {
+                    let _ = self.deck.activate(focused);
+                }
+                LayoutMode::Dwindle => {}
+            }
+        }
+        self.recalculate(now_ms);
+    }
+
     /// Removes `win_id` from whichever layer (`FloatingStack` or Tiled) owns it and updates focus.
     pub fn remove_window(&mut self, win_id: WindowId, now_ms: u64) -> Option<WindowId> {
         if self.presented_window_id() == Some(win_id) {

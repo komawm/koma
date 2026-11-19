@@ -5768,8 +5768,7 @@ impl KomaState {
         let Some(ws) = self.workspaces.get_mut(&ws_id) else {
             return false;
         };
-        ws.layout_mode = layout;
-        ws.recalculate(now_ms);
+        ws.set_layout(layout, now_ms);
         self.sync_workspace_geometries(&ws_id);
         self.queue_redraw();
         true
