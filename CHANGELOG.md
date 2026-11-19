@@ -6,6 +6,31 @@ incubation versions; `v0.1.0` will be the first independently accepted product
 release. A `0.0.x` tag is a development prerelease and does not claim a working
 desktop, hardware support, or security guarantees.
 
+## [0.0.9] - 2026-11-20
+
+### Added
+
+- Keybind overlay (`Mod + Shift + /`) pagination (`komawm/koma#123`, `komawm/koma#124`):
+  adds `layout_keybind_overlay_page` and multi-page navigation (`Left`/`Right`,
+  `PageUp`/`PageDown`, `Up`/`Down`, `H`/`J`/`K`/`L`, `Space`, `N`/`P`, `BackSpace`) so
+  every effective keybind is reachable instead of truncated at `+N more`.
+
+### Fixed
+
+- Keybind overlay per-frame CPU lag and stuck modifiers (`komawm/koma#123`, `komawm/koma#124`):
+  caches the rasterized `MemoryRenderBuffer` in `KeybindOverlay` instead of re-rasterizing on
+  every frame, and feeds `KeyState::Released` through XKB `input_intercept` while the overlay
+  is open so releasing `Mod + Shift` clears `held_mask` without leaking releases to clients.
+- `Mod + Tab` overview hover re-capture storm & workspace switch (`komawm/koma#123`, `komawm/koma#124`):
+  splits `draw_grid_from_cache` out of `capture_and_draw_grid` so pointer hover and keyboard
+  navigation redraw from `frame_cache` instead of re-capturing all 12 workspaces over IPC,
+  adds a bottom interaction hint bar, and switches normal workspaces via `ws.focus` on
+  click/Enter.
+- `special:` scratchpad viewport sync and layout-mode window migration (`komawm/koma#123`, `komawm/koma#124`):
+  syncs `special:` workspace viewports to the focused output in `ensure_special_workspace`,
+  `ScratchpadToggle`, and `ScratchpadMoveWindow`, and migrates existing non-floating windows
+  across `Dwindle`, `Scrolling`, and `Deck` in `WorkspaceState::set_layout`.
+
 ## [0.0.8] - 2026-11-19
 
 ### Fixed
