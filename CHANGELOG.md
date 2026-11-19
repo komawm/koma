@@ -6,6 +6,29 @@ incubation versions; `v0.1.0` will be the first independently accepted product
 release. A `0.0.x` tag is a development prerelease and does not claim a working
 desktop, hardware support, or security guarantees.
 
+## [0.0.6] - 2026-11-19
+
+### Fixed
+
+- Dwindle bottom-up `min_size` propagation and work-area bounds clamping (`komawm/koma#105`, `komawm/koma#111`):
+  propagates minimum size constraints cleanly across Dwindle splits, clamps pseudotile
+  dimensions safely for sub-48px cells, and preserves off-screen scrolling strip geometry.
+- Overview `scene.inventory` workspace ordering and `5x7` glyph coverage (`komawm/koma#106`, `komawm/koma#107`, `komawm/koma#111`):
+  sorts overview scene inventory via `ordered_workspace_ids()` so thumbnails render on the
+  matching workspace cards, and completes `B`, `F`, `J`, `Q`, `U`, `X`, `Y`, `Z` in the `5x7`
+  fallback bitmap glyph set.
+- Fullscreen / maximized presentation handoff on focus navigation (`komawm/koma#108`, `komawm/koma#111`):
+  clears `window_presentation` on `FocusDirection` and successful `activate_window` (and
+  updates the Scrolling layout camera target) so directional focus can move out of fullscreen.
+- Waybar tray right-click / popup teardown freeze (`komawm/koma#109`, `komawm/koma#111`):
+  eliminates `PointerInternal` / `KeyboardInternal` self-reentrancy deadlocks via `seat_guard`,
+  `with_pointer_dispatch` / `with_keyboard_dispatch`, deferred `focus_changed` constraint
+  breaks, `can_receive_keyboard_focus` gating on non-focusable layer popups, and
+  `XdgShellHandler::popup_destroyed` cleanup.
+- Startup workspace claim with declarative `preferred_output` (`komawm/koma#110`, `komawm/koma#111`):
+  propagates `spec.preferred_output` onto pre-seeded `ws_01` when reconciling declarative
+  workspaces so startup focuses Workspace 1 instead of claiming Workspace 2.
+
 ## [0.0.5] - 2026-11-19
 
 ### Added
