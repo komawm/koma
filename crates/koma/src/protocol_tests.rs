@@ -6305,6 +6305,9 @@ fn session_lock_acquire_confirm_unlock_cycles_schedule_rendering() {
 #[test]
 fn split_resize_configures_tiled_clients_above_their_minimum_size() {
     let mut env = ClientEnv::new();
+    for ws in env.state.workspaces.values_mut() {
+        ws.dwindle.config.size_limits_tiled = true;
+    }
     let (_surf_a, _xs_a, toplevel_a) = env.spawn_window("Browser", "org.koma.browser");
     let browser_id = toplevel_a.id().protocol_id();
 
@@ -6381,6 +6384,96 @@ fn split_resize_configures_tiled_clients_above_their_minimum_size() {
         terminal.rect.w as i32 - border_inset,
         "unconstrained clients are still configured at their tile size"
     );
+}
+
+#[test]
+fn issue_113_default_dwindle_resizes_and_partitions_large_min_size_clients_without_overlap() {
+    let mut env = ClientEnv::new();
+    let (_surf_qq, _xs_qq, toplevel_qq) = env.spawn_window("QQ", "QQ");
+    toplevel_qq.set_min_size(1100, 600);
+    _surf_qq.commit();
+    env.pump();
+
+    let (_surf_wc, _xs_wc, toplevel_wc) = env.spawn_window("WeChat", "wechat");
+    toplevel_wc.set_min_size(1000, 600);
+    _surf_wc.commit();
+    env.pump();
+
+    let qq_id = env
+        .state
+        .mapped_windows
+        .iter()
+        .find(|m| m.app_id == "QQ")
+        .unwrap()
+        .win_id;
+    let wc_id = env
+        .state
+        .mapped_windows
+        .iter()
+        .find(|m| m.app_id == "wechat")
+        .unwrap()
+        .win_id;
+    let ws_id = env.state.active_ws_id.clone();
+    assert!(
+        env.state
+            .workspaces
+            .get_mut(&ws_id)
+            .unwrap()
+            .activate_window(qq_id, 1)
+    );
+    env.state.focus_active_deck_window();
+
+    let rect_of = |st: &KomaState, id| {
+        st.mapped_windows
+            .iter()
+            .find(|m| m.win_id == id)
+            .unwrap()
+            .rect
+    };
+    let init_qq = rect_of(&env.state, qq_id);
+    let init_wc = rect_of(&env.state, wc_id);
+    assert!(init_qq.x + init_qq.w as i32 <= init_wc.x);
+    assert!(init_qq.w < 1100 && init_wc.w < 1000);
+
+    // Resize left (`WindowResizeDelta { width: -120, height: 0 }`) shrinks QQ smoothly below min_w
+    for _ in 0..4 {
+        execute_action_descriptor(
+            &mut env.state,
+            ActionDescriptor::WindowResizeDelta {
+                width: -30,
+                height: 0,
+            },
+            false,
+        );
+    }
+    env.pump();
+    let shrunk_qq = rect_of(&env.state, qq_id);
+    let grown_wc = rect_of(&env.state, wc_id);
+    assert!(
+        shrunk_qq.w <= init_qq.w - 90,
+        "QQ failed to shrink left: {shrunk_qq:?} vs {init_qq:?}"
+    );
+    assert!(shrunk_qq.x + shrunk_qq.w as i32 <= grown_wc.x);
+
+    // Resize right (`WindowResizeDelta { width: +240, height: 0 }`) expands QQ smoothly
+    for _ in 0..8 {
+        execute_action_descriptor(
+            &mut env.state,
+            ActionDescriptor::WindowResizeDelta {
+                width: 30,
+                height: 0,
+            },
+            false,
+        );
+    }
+    env.pump();
+    let grown_qq = rect_of(&env.state, qq_id);
+    let shrunk_wc = rect_of(&env.state, wc_id);
+    assert!(
+        grown_qq.w >= init_qq.w + 90,
+        "QQ failed to grow right: {grown_qq:?} vs {init_qq:?}"
+    );
+    assert!(grown_qq.x + grown_qq.w as i32 <= shrunk_wc.x);
 }
 
 /// Client `wl_data_device` drag-and-drop grab coverage (`komawm/koma#68`).

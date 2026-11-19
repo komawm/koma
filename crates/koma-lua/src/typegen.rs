@@ -358,7 +358,7 @@ function MacroContext:dispatch(action) end
 ---@field layout fun(mode: KomaLayoutMode)
 ---@field monitor fun(spec: KomaMonitorSpec)
 ---@field workspace fun(spec: table)
----@field dwindle fun(spec: { force_split?: 0|1|2, preserve_split?: boolean, smart_split?: boolean, use_active_for_splits?: boolean, default_split_ratio?: number, split_width_multiplier?: number, smart_resizing?: boolean, pseudotile?: boolean, inner_gap?: integer, outer_gap?: integer })
+---@field dwindle fun(spec: { force_split?: 0|1|2, preserve_split?: boolean, smart_split?: boolean, use_active_for_splits?: boolean, default_split_ratio?: number, split_width_multiplier?: number, smart_resizing?: boolean, pseudotile?: boolean, size_limits_tiled?: boolean, inner_gap?: integer, outer_gap?: integer })
 ---@field scrolling fun(spec: { preset_column_widths?: KomaPresetColumnWidth[], preset_window_heights?: KomaPresetColumnWidth[], default_column_width?: KomaPresetColumnWidth, default_column_display?: KomaColumnDisplay, tab_indicator?: { enabled?: boolean, hide_when_single_tab?: boolean, place_within_column?: boolean, position?: KomaTabIndicatorPosition, width?: number, gap?: number, gaps_between_tabs?: number, length_proportion?: number, corner_radius?: number }, center_focused_column?: KomaCenterFocusedColumn, always_center_single_column?: boolean, camera_damping_ratio?: number, camera_stiffness?: number, swipe_working_area_movement?: number, inner_gap?: integer, outer_gap?: integer, edge_auto_scroll?: { enabled?: boolean, trigger_width?: number, delay_ms?: number, max_speed?: number } })
 ---@field input fun(spec: KomaInputSpec)
 ---@field device fun(spec: table)

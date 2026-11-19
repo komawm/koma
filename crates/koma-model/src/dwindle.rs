@@ -193,6 +193,10 @@ pub struct DwindleConfig {
     pub smart_resizing: bool,
     /// Allow `pseudotile` windows to retain their preferred floating size centered inside their tile.
     pub pseudotile: bool,
+    /// Enforce client-advertised `xdg_toplevel` `min_size` hints on tiled windows (matching
+    /// Hyprland's `misc:size_limits_tiled`; `false` by default so overflowing tiles never overlap
+    /// or lock split-ratio resizing).
+    pub size_limits_tiled: bool,
     /// Inner gap (logical px) between sibling tiles.
     pub inner_gap: u32,
     /// Outer margin (logical px) around the workspace perimeter.
@@ -210,6 +214,7 @@ impl Default for DwindleConfig {
             split_width_multiplier: 1.0,
             smart_resizing: true,
             pseudotile: true,
+            size_limits_tiled: false,
             inner_gap: 6,
             outer_gap: 10,
         }
@@ -786,7 +791,7 @@ impl DwindleTree {
             root_node.visual_box = work;
         }
         self.recalc_node_recursive(root_id, work, false, false, false, false);
-        if !self.leaf_min_sizes.is_empty() {
+        if self.config.size_limits_tiled && !self.leaf_min_sizes.is_empty() {
             // Second pass lets nested nodes settle `split_top` for their resized aspect ratio so
             // bottom-up `subtree_min_size` reads accurate child orientations.
             self.recalc_node_recursive(root_id, work, false, false, false, false);
@@ -924,7 +929,7 @@ impl DwindleTree {
         if !is_top {
             let desired = ((f64::from(raw_box.w) * 0.5 * ratio).round() as i32)
                 .clamp(32, (raw_box.w as i32 - 32).max(32)) as u32;
-            let first_w = if self.leaf_min_sizes.is_empty() {
+            let first_w = if !cfg.size_limits_tiled || self.leaf_min_sizes.is_empty() {
                 desired
             } else {
                 let (min_w0, _) = self.subtree_min_size(c0, gap_left, true, gap_top, gap_bottom);
@@ -939,7 +944,7 @@ impl DwindleTree {
         } else {
             let desired = ((f64::from(raw_box.h) * 0.5 * ratio).round() as i32)
                 .clamp(32, (raw_box.h as i32 - 32).max(32)) as u32;
-            let first_h = if self.leaf_min_sizes.is_empty() {
+            let first_h = if !cfg.size_limits_tiled || self.leaf_min_sizes.is_empty() {
                 desired
             } else {
                 let (_, min_h0) = self.subtree_min_size(c0, gap_left, gap_right, gap_top, true);

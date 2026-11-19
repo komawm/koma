@@ -150,7 +150,8 @@ impl WorkspaceState {
             let min_changed = self
                 .dwindle
                 .set_window_min_size(win_id, hints.min_w, hints.min_h);
-            if min_changed && self.dwindle.contains(win_id) {
+            if self.dwindle.config.size_limits_tiled && min_changed && self.dwindle.contains(win_id)
+            {
                 self.dwindle.recalculate(self.viewport);
             }
         }
@@ -160,43 +161,6 @@ impl WorkspaceState {
     #[must_use]
     pub fn size_hints(&self, win_id: WindowId) -> Option<SizeHints> {
         self.size_hints.get(&win_id).copied()
-    }
-
-    /// Clamps every presented/tiled geometry to the owning client's advertised size constraints,
-    /// while keeping expanded tiles inside the workspace bounds (`work_area` for tiled/maximized,
-    /// full viewport for fullscreen) so overflowing minimums stay on-screen instead of clipping off
-    /// the monitor edge (`komawm/koma#105`).
-    fn clamp_tiled_size_hints(&self, out: &mut [(WindowId, LogicalRect, bool)]) {
-        if self.size_hints.is_empty() {
-            return;
-        }
-        let bounds = match self.window_presentation {
-            Some((_, WindowPresentation::Fullscreen)) => {
-                LogicalRect::new(0, 0, self.viewport.width, self.viewport.height)
-            }
-            _ => self.viewport.work_area_rect(),
-        };
-        let clamp_x_to_bounds =
-            !(self.layout_mode == LayoutMode::Scrolling && self.presentation_geometry().is_none());
-        for (win_id, rect, is_floating) in out {
-            if *is_floating {
-                continue;
-            }
-            if let Some(hints) = self.size_hints.get(win_id) {
-                let mut clamped = hints.clamp_rect(*rect);
-                if clamp_x_to_bounds {
-                    let max_x = bounds
-                        .x
-                        .saturating_add((bounds.w as i32 - clamped.w as i32).max(0));
-                    clamped.x = clamped.x.clamp(bounds.x, max_x);
-                }
-                let max_y = bounds
-                    .y
-                    .saturating_add((bounds.h as i32 - clamped.h as i32).max(0));
-                clamped.y = clamped.y.clamp(bounds.y, max_y);
-                *rect = clamped;
-            }
-        }
     }
 
     /// Currently active/focused window in this workspace (across both `FloatingStack` and Tiled).
@@ -679,9 +643,7 @@ impl WorkspaceState {
     #[must_use]
     pub fn compute_animation_target_geometries(&self) -> Vec<(WindowId, LogicalRect, bool)> {
         if let Some((win_id, rect)) = self.presentation_geometry() {
-            let mut out = vec![(win_id, rect, false)];
-            self.clamp_tiled_size_hints(&mut out);
-            return out;
+            return vec![(win_id, rect, false)];
         }
 
         let mut out: Vec<(WindowId, LogicalRect, bool)> = match self.layout_mode {
@@ -709,7 +671,6 @@ impl WorkspaceState {
             out.push((entry.win_id, entry.rect, true));
         }
 
-        self.clamp_tiled_size_hints(&mut out);
         out
     }
 
@@ -718,9 +679,7 @@ impl WorkspaceState {
     #[must_use]
     pub fn compute_visible_geometries_at(&self, now_ms: u64) -> Vec<(WindowId, LogicalRect, bool)> {
         if let Some((win_id, rect)) = self.presentation_geometry() {
-            let mut out = vec![(win_id, rect, false)];
-            self.clamp_tiled_size_hints(&mut out);
-            return out;
+            return vec![(win_id, rect, false)];
         }
 
         let mut out: Vec<(WindowId, LogicalRect, bool)> = match self.layout_mode {
@@ -750,7 +709,6 @@ impl WorkspaceState {
             out.push((entry.win_id, entry.rect, true));
         }
 
-        self.clamp_tiled_size_hints(&mut out);
         out
     }
 
@@ -758,9 +716,7 @@ impl WorkspaceState {
     #[must_use]
     pub fn compute_visible_geometries(&self) -> Vec<(WindowId, LogicalRect, bool)> {
         if let Some((win_id, rect)) = self.presentation_geometry() {
-            let mut out = vec![(win_id, rect, false)];
-            self.clamp_tiled_size_hints(&mut out);
-            return out;
+            return vec![(win_id, rect, false)];
         }
 
         let mut out: Vec<(WindowId, LogicalRect, bool)> = match self.layout_mode {
@@ -788,7 +744,6 @@ impl WorkspaceState {
             out.push((entry.win_id, entry.rect, true));
         }
 
-        self.clamp_tiled_size_hints(&mut out);
         out
     }
 }
@@ -850,9 +805,10 @@ mod tests {
         );
     }
 
-    /// `komawm/koma#33`: a dwindle split may not hand a client a tile narrower than the
-    /// `xdg_toplevel.set_min_size` it advertised, or Chromium/Firefox keep their minimum content
-    /// size and commit a cropped buffer that the compositor then masks ("clipped, not resized").
+    /// `komawm/koma#33`: when `dwindle.size_limits_tiled` is opted in, a dwindle split yields
+    /// unconstrained sibling slack so a client does not get a tile narrower than its advertised
+    /// `xdg_toplevel.set_min_size`. By default (`size_limits_tiled = false`, matching Hyprland)
+    /// Dwindle partitions strictly by `split_ratio` (`komawm/koma#113`).
     #[test]
     fn size_hints_clamp_tiled_geometry_to_the_client_minimum() {
         let vp = LogicalViewport::new(800, 600, 1.0);
@@ -869,6 +825,7 @@ mod tests {
         ws.dwindle.config.inner_gap = 0;
         ws.dwindle.config.smart_split = false;
         ws.dwindle.config.split_width_multiplier = 0.1;
+        ws.dwindle.config.size_limits_tiled = true;
 
         let browser = WindowId::new(1, 1);
         let terminal = WindowId::new(2, 1);
@@ -1015,6 +972,7 @@ mod tests {
         ws.dwindle.config.force_split = 2;
         ws.dwindle.config.smart_split = false;
         ws.dwindle.config.split_width_multiplier = 0.1;
+        ws.dwindle.config.size_limits_tiled = true;
 
         let c1 = WindowId::new(1, 1);
         let c2 = WindowId::new(2, 1);
@@ -1074,15 +1032,146 @@ mod tests {
             "Terminal overlapped Unity Hub: {tr:?} vs {ur:?}"
         );
 
-        // 3. Overflowing minimums (two 1000 px windows in 1600 px) clamp x inside work_area
+        // 3. Overflowing minimums (two 1000 px windows in 1600 px) must keep disjoint tiles
+        //    inside work_area instead of stacking/overlapping siblings (`komawm/koma#113`).
         ws_unity.set_size_hints(term, SizeHints::new(1000, 600, 0, 0));
-        for (_, r, _) in ws_unity.compute_visible_geometries() {
-            assert_eq!(r.w, 1000);
+        let overflow_rects: Vec<LogicalRect> = ws_unity
+            .compute_visible_geometries()
+            .into_iter()
+            .map(|(_, r, _)| r)
+            .collect();
+        assert_eq!(overflow_rects.len(), 2);
+        for r in &overflow_rects {
             assert!(
                 r.x >= wa.x && r.x + r.w as i32 <= wa.x + wa.w as i32,
                 "overflowing tile must stay within work_area: {r:?}"
             );
         }
+        let mut sorted = overflow_rects;
+        sorted.sort_by_key(|r| r.x);
+        assert!(
+            sorted[0].x + sorted[0].w as i32 <= sorted[1].x,
+            "overflowing tiles must never overlap siblings: {sorted:?}"
+        );
+    }
+
+    /// `komawm/koma#113`: by default (`size_limits_tiled = false`, matching Hyprland):
+    /// 1) 6 Firefox windows advertising large `min_size` never overlap or stack on `1600x1000`.
+    /// 2) Side-by-side QQ (`min_w=800`) + WeChat (`min_w=720`) resize freely left and right.
+    #[test]
+    fn issue_113_default_dwindle_never_stacks_browsers_and_resizes_qq_wechat_freely() {
+        let base_vp = LogicalViewport::new(1600, 1000, 1.0);
+        let wa = base_vp.work_area_from_edges(35, 0, 0, 0);
+        let vp = base_vp.with_work_area_zone(wa.x, wa.y, wa.w as i32, wa.h as i32);
+
+        // 1. Six Firefox instances with `min_size = (615, 495)` in Dwindle (`outer=15, inner=5`).
+        let mut ff_ws = WorkspaceState::new(
+            WorkspaceId::new("ws_03"),
+            "3",
+            SeatId::new("seat0"),
+            vp,
+            PresentationTarget::Physical(OutputId::new("eDP-1")),
+            LayoutMode::Dwindle,
+            0,
+        );
+        ff_ws.dwindle.config.outer_gap = 15;
+        ff_ws.dwindle.config.inner_gap = 5;
+        ff_ws.dwindle.config.preserve_split = true;
+        assert!(!ff_ws.dwindle.config.size_limits_tiled);
+
+        for i in 1..=6u64 {
+            let wid = WindowId::new(i, 1);
+            let cursor = ff_ws
+                .compute_visible_geometries()
+                .last()
+                .map(|(_, r, _)| LogicalPoint {
+                    x: f64::from(r.x) + f64::from(r.w) * 0.5,
+                    y: f64::from(r.y) + f64::from(r.h) * 0.5,
+                });
+            ff_ws.insert_window(wid, false, None, None, None, cursor, false, true, i);
+            ff_ws.set_size_hints(wid, SizeHints::new(615, 495, 0, 0));
+        }
+
+        let ff_rects: Vec<LogicalRect> = ff_ws
+            .compute_visible_geometries()
+            .into_iter()
+            .map(|(_, r, _)| r)
+            .collect();
+        assert_eq!(ff_rects.len(), 6);
+        for (i, a) in ff_rects.iter().enumerate() {
+            assert!(
+                a.x >= wa.x
+                    && a.y >= wa.y
+                    && a.x + a.w as i32 <= wa.x + wa.w as i32
+                    && a.y + a.h as i32 <= wa.y + wa.h as i32,
+                "tile {i} escaped work_area: {a:?}"
+            );
+            for (j, b) in ff_rects.iter().enumerate().skip(i + 1) {
+                let overlap_x = a.x < b.x + b.w as i32 && b.x < a.x + a.w as i32;
+                let overlap_y = a.y < b.y + b.h as i32 && b.y < a.y + a.h as i32;
+                assert!(
+                    !(overlap_x && overlap_y),
+                    "tiles {i} and {j} overlapped/stacked: {a:?} vs {b:?}"
+                );
+            }
+        }
+
+        // 2. QQ (left, `min_w = 800`) + WeChat (right, `min_w = 720`) in `1570 px` work area.
+        let mut chat_ws = WorkspaceState::new(
+            WorkspaceId::new("ws_02"),
+            "2",
+            SeatId::new("seat0"),
+            vp,
+            PresentationTarget::Physical(OutputId::new("eDP-1")),
+            LayoutMode::Dwindle,
+            0,
+        );
+        chat_ws.dwindle.config.outer_gap = 15;
+        chat_ws.dwindle.config.inner_gap = 5;
+        chat_ws.dwindle.config.preserve_split = true;
+
+        let qq = WindowId::new(20, 1);
+        let wechat = WindowId::new(21, 1);
+        chat_ws.insert_window(qq, false, None, None, None, None, false, true, 0);
+        chat_ws.set_size_hints(qq, SizeHints::new(800, 600, 0, 0));
+        chat_ws.insert_window(wechat, false, None, None, None, None, false, true, 1);
+        chat_ws.set_size_hints(wechat, SizeHints::new(720, 560, 0, 0));
+
+        let rect_of = |ws: &WorkspaceState, id: WindowId| {
+            ws.compute_visible_geometries()
+                .into_iter()
+                .find(|(w, _, _)| *w == id)
+                .unwrap()
+                .1
+        };
+        let init_qq = rect_of(&chat_ws, qq);
+        let init_wc = rect_of(&chat_ws, wechat);
+        assert!(init_qq.x + init_qq.w as i32 <= init_wc.x);
+        assert!((init_qq.w as i32 - init_wc.w as i32).abs() <= 4);
+
+        // Shrink QQ left (`Mod + Shift + H` equivalent): must freely narrow below `min_w = 800`.
+        for _ in 0..6 {
+            assert!(chat_ws.dwindle.resize_target(qq, -30.0, 0.0, vp));
+        }
+        let shrunk_qq = rect_of(&chat_ws, qq);
+        let grown_wc = rect_of(&chat_ws, wechat);
+        assert!(
+            shrunk_qq.w <= init_qq.w - 150,
+            "QQ must shrink leftward freely below 800 px: {shrunk_qq:?} vs {init_qq:?}"
+        );
+        assert!(shrunk_qq.x + shrunk_qq.w as i32 <= grown_wc.x);
+
+        // Grow QQ right (`Mod + Shift + L` equivalent): must freely pass `1570 - 720`.
+        for _ in 0..14 {
+            assert!(chat_ws.dwindle.resize_target(qq, 30.0, 0.0, vp));
+        }
+        let grown_qq = rect_of(&chat_ws, qq);
+        let shrunk_wc = rect_of(&chat_ws, wechat);
+        assert!(
+            grown_qq.w >= 950,
+            "QQ must grow rightward freely past WeChat min_w: {grown_qq:?}"
+        );
+        assert!(grown_qq.x + grown_qq.w as i32 <= shrunk_wc.x);
     }
 
     #[test]

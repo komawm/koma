@@ -2432,11 +2432,9 @@ impl KomaState {
             .filter(|ws_id| self.workspaces.contains_key(ws_id))
             .unwrap_or_else(|| self.effective_interactive_ws_id());
 
-        let viewport = self
-            .workspaces
-            .get(&target_ws_id)
-            .map(|ws| ws.viewport)
-            .unwrap_or_default();
+        let ws_cfg = self.workspaces.get(&target_ws_id);
+        let viewport = ws_cfg.map(|ws| ws.viewport).unwrap_or_default();
+        let size_limits_tiled = ws_cfg.is_some_and(|ws| ws.dwindle.config.size_limits_tiled);
 
         // If `xdg_toplevel` already has a parent or explicit fixed `max_size`, don't force full-screen size
         let (min_sz, max_sz) = read_toplevel_min_max_size(toplevel.wl_surface());
@@ -2446,11 +2444,15 @@ impl KomaState {
             None
         } else {
             let wa = viewport.work_area_rect();
-            let inner_w = wa.w.saturating_sub(24);
-            let inner_h = wa.h.saturating_sub(24);
-            let clamped =
-                hints.clamp_rect(LogicalRect::new(0, 0, inner_w.max(64), inner_h.max(64)));
-            Some(Size::from((clamped.w as i32, clamped.h as i32)))
+            let inner_w = wa.w.saturating_sub(24).max(64);
+            let inner_h = wa.h.saturating_sub(24).max(64);
+            let base = LogicalRect::new(0, 0, inner_w, inner_h);
+            let target = if size_limits_tiled {
+                hints.clamp_rect(base)
+            } else {
+                base
+            };
+            Some(Size::from((target.w as i32, target.h as i32)))
         };
 
         toplevel.with_pending_state(|state| {
