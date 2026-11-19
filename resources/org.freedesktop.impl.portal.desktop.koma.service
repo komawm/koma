@@ -1,0 +1,4 @@
+[D-BUS Service]
+Name=org.freedesktop.impl.portal.desktop.koma
+Exec=/usr/bin/xdg-desktop-portal-koma
+SystemdService=xdg-desktop-portal-koma.service

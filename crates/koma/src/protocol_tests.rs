@@ -1584,7 +1584,8 @@ fn all_kom_0018_protocols_registered_and_sandbox_filtered() {
 fn portals_conf_and_screencopy_lock_fail_closed_behavior() {
     let portals = include_str!("../../../resources/koma-portals.conf");
     assert!(portals.contains("default=gnome;gtk;"));
-    assert!(portals.contains("org.freedesktop.impl.portal.ScreenCast=wlr;"));
+    assert!(portals.contains("org.freedesktop.impl.portal.RemoteDesktop=koma;"));
+    assert!(portals.contains("org.freedesktop.impl.portal.ScreenCast=koma;"));
     assert!(portals.contains("org.freedesktop.impl.portal.Screenshot=wlr;"));
 
     assert_eq!(timestamp_parts(Duration::new(10, 5)), (0, 10, 5));

@@ -47,6 +47,7 @@
           nativeBuildInputs = with pkgs; [
             pkg-config
             makeWrapper
+            rustPlatform.bindgenHook
           ];
 
           runtimeLibs = with pkgs; [
@@ -61,6 +62,7 @@
             pixman
             dbus
             fontconfig
+            pipewire
           ] ++ pkgs.lib.optional (pkgs ? libgbm) pkgs.libgbm;
 
           commonArgs = {
@@ -68,7 +70,7 @@
             pname = "koma";
             strictDeps = true;
             buildInputs = runtimeLibs;
-            cargoExtraArgs = "--locked -p koma -p komactl -p koma-overview";
+            cargoExtraArgs = "--locked -p koma -p komactl -p koma-overview -p koma-portal";
           };
 
           cargoArtifacts = craneLib.buildDepsOnly commonArgs;
@@ -88,6 +90,15 @@
                 --replace-fail "/usr/bin/koma" "$out/bin/koma"
               install -Dm644 resources/koma-shutdown.target "$out/lib/systemd/user/koma-shutdown.target"
               install -Dm644 resources/koma-portals.conf "$out/share/xdg-desktop-portal/koma-portals.conf"
+              install -Dm644 resources/koma.portal "$out/share/xdg-desktop-portal/portals/koma.portal"
+              install -Dm644 resources/org.freedesktop.impl.portal.desktop.koma.service \
+                "$out/share/dbus-1/services/org.freedesktop.impl.portal.desktop.koma.service"
+              substituteInPlace "$out/share/dbus-1/services/org.freedesktop.impl.portal.desktop.koma.service" \
+                --replace-fail "/usr/bin/xdg-desktop-portal-koma" "$out/bin/xdg-desktop-portal-koma"
+              install -Dm644 resources/xdg-desktop-portal-koma.service \
+                "$out/lib/systemd/user/xdg-desktop-portal-koma.service"
+              substituteInPlace "$out/lib/systemd/user/xdg-desktop-portal-koma.service" \
+                --replace-fail "/usr/bin/xdg-desktop-portal-koma" "$out/bin/xdg-desktop-portal-koma"
 
               install -Dm644 examples/init.lua "$out/share/doc/koma/examples/init.lua"
               install -Dm644 resources/greetd-config.toml "$out/share/doc/koma/examples/greetd-config.toml"
@@ -96,7 +107,7 @@
 
             postFixup = ''
               rpath="${pkgs.lib.makeLibraryPath runtimeLibs}"
-              for bin in "$out/bin/koma" "$out/bin/komactl" "$out/bin/koma-overview"; do
+              for bin in "$out/bin/koma" "$out/bin/komactl" "$out/bin/koma-overview" "$out/bin/xdg-desktop-portal-koma"; do
                 if [ -x "$bin" ]; then
                   existing="$(patchelf --print-rpath "$bin" || true)"
                   if [ -n "$existing" ]; then
