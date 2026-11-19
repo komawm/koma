@@ -7220,3 +7220,80 @@ mod dnd_tests {
 }
 
 mod kom_0072;
+
+#[test]
+fn issue_118_fullscreen_window_is_configured_to_the_full_output_without_border_inset() {
+    let mut env = ClientEnv::new();
+    let (_surf, _xs, toplevel) = env.spawn_window("Player", "org.koma.player");
+    env.pump();
+    let tl_id = toplevel.id().protocol_id();
+
+    let border = env.state.lua_sandbox.config_snapshot().appearance.border;
+    assert!(
+        border.enabled && border.width > 0.0,
+        "the default config must draw a border, otherwise this test proves nothing"
+    );
+    let border_inset = (border.width.max(0.0) * 2.0).round() as i32;
+
+    let windowed = *env.client.toplevel_configures[&tl_id]
+        .last()
+        .expect("windowed configure");
+
+    let win_id = env
+        .state
+        .mapped_windows
+        .iter()
+        .find(|m| m.app_id == "org.koma.player")
+        .expect("player mapped")
+        .win_id;
+    env.state.set_window_fullscreen(win_id, true, None);
+    env.pump();
+
+    let rect = env
+        .state
+        .mapped_windows
+        .iter()
+        .find(|m| m.win_id == win_id)
+        .expect("player mapped")
+        .rect;
+    let viewport = env
+        .state
+        .workspaces
+        .get(&env.state.active_ws_id)
+        .expect("active workspace")
+        .viewport;
+    assert_eq!(
+        (rect.w, rect.h),
+        (viewport.width, viewport.height),
+        "fullscreen rect is the whole output"
+    );
+
+    let fullscreen = *env.client.toplevel_configures[&tl_id]
+        .last()
+        .expect("fullscreen configure");
+    assert_eq!(
+        fullscreen,
+        (viewport.width as i32, viewport.height as i32),
+        "a fullscreen window has no border, so it is configured to the full output \
+         (windowed configure was {windowed:?}, border inset {border_inset})"
+    );
+
+    // Leaving fullscreen restores the border-inset size.
+    env.state.set_window_fullscreen(win_id, false, None);
+    env.pump();
+    let restored = *env.client.toplevel_configures[&tl_id]
+        .last()
+        .expect("restored configure");
+    let rect = env
+        .state
+        .mapped_windows
+        .iter()
+        .find(|m| m.win_id == win_id)
+        .expect("player mapped")
+        .rect;
+    assert_eq!(
+        restored,
+        (rect.w as i32 - border_inset, rect.h as i32 - border_inset),
+        "windowed configure subtracts the border inset again"
+    );
+}
