@@ -62,13 +62,16 @@ pub fn paint_workspace_card(
     };
     stroke_rect_argb(canvas, canvas_w, canvas_h, card_rect, 2, border_col);
 
-    // 3. Crisp 2x-scaled 5x7 pixel status label (`1:MAIN | E:4 | DECK`)
+    // 3. Crisp 2x-scaled 5x7 pixel status label, strictly clipped to `header_rect`
+    let label_start_x = header_rect.x + 6;
+    let label_max_x = header_rect.x.saturating_add(header_rect.w as i32 - 6);
     draw_label_5x7(
         canvas,
         canvas_w,
         canvas_h,
-        header_rect.x + 6,
+        label_start_x,
         header_rect.y + 7,
+        label_max_x,
         &meta.title_label,
         ARGB_TEXT_PRIMARY,
     );
@@ -200,19 +203,45 @@ fn blit_scaled_rgba_to_argb(
 }
 
 /// Minimal crisp `5x7` uppercase/digit/symbol glyph renderer (2x pixel scale -> `10x14` px)
-/// so status headers render cleanly with zero system font / Pango / Cairo C dependencies!
+/// clipped strictly inside `[start_x, max_x)` so long labels never bleed into neighboring cards.
+#[allow(clippy::too_many_arguments)]
 fn draw_label_5x7(
     canvas: &mut [u8],
     canvas_w: u32,
     canvas_h: u32,
     start_x: i32,
     start_y: i32,
+    max_x: i32,
     text: &str,
     argb: u32,
 ) {
+    let avail_px = max_x.saturating_sub(start_x).max(0);
+    // Each character advances 12 px and draws 10 px wide (`+2 px` trailing gap).
+    let max_chars = if avail_px < 10 {
+        0
+    } else {
+        ((avail_px - 10) / 12 + 1) as usize
+    };
+    if max_chars == 0 {
+        return;
+    }
+
+    let char_count = text.chars().count();
+    let truncated: String = if char_count > max_chars {
+        if max_chars >= 3 {
+            let mut s: String = text.chars().take(max_chars - 3).collect();
+            s.push_str("...");
+            s
+        } else {
+            text.chars().take(max_chars).collect()
+        }
+    } else {
+        text.to_owned()
+    };
+
     let px = argb.to_le_bytes();
     let mut cursor_x = start_x;
-    for ch in text.chars().take(34) {
+    for ch in truncated.chars() {
         let rows = glyph_5x7(ch.to_ascii_uppercase());
         for (ry, row_bits) in rows.iter().enumerate() {
             for rx in 0..5 {
@@ -223,7 +252,12 @@ fn draw_label_5x7(
                         for sub_x in 0..2 {
                             let x = gx + sub_x;
                             let y = gy + sub_y;
-                            if x >= 0 && y >= 0 && (x as u32) < canvas_w && (y as u32) < canvas_h {
+                            if x >= start_x
+                                && x < max_x
+                                && y >= 0
+                                && (x as u32) < canvas_w
+                                && (y as u32) < canvas_h
+                            {
                                 let idx = ((y as u32 * canvas_w) + x as u32) as usize * 4;
                                 canvas[idx..idx + 4].copy_from_slice(&px);
                             }
@@ -355,6 +389,9 @@ const fn glyph_5x7(c: char) -> [u8; 7] {
         '|' => [
             0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100,
         ],
+        '.' => [
+            0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b01100, 0b01100,
+        ],
         _ => [0b00000; 7],
     }
 }
@@ -365,9 +402,50 @@ mod tests {
 
     #[test]
     fn glyph_5x7_covers_full_alphanumeric_set_without_blanks() {
-        for c in ('A'..='Z').chain('0'..='9') {
+        for c in ('A'..='Z').chain('0'..='9').chain(['.', ':', '-', '|']) {
             let rows = glyph_5x7(c);
             assert_ne!(rows, [0; 7], "missing 5x7 glyph bitmap for '{c}'");
+        }
+    }
+
+    #[test]
+    fn issue_120_long_card_label_is_clipped_strictly_inside_header_rect() {
+        let canvas_w = 500_u32;
+        let canvas_h = 200_u32;
+        let mut canvas = vec![0_u8; (canvas_w * canvas_h * 4) as usize];
+        clear_argb8888_canvas(&mut canvas, ARGB_BACKDROP_DIM);
+
+        let card_rect = LogicalRect::new(20, 20, 220, 140);
+        let header_rect = LogicalRect::new(26, 26, 208, 30);
+        let thumb_rect = LogicalRect::new(26, 56, 208, 98);
+        let meta = CardVisualMeta {
+            title_label: "AGENT:WORK | VERY-LONG-NAME-THAT-WOULD-OVERFLOW-CARD".to_owned(),
+            is_selected: false,
+            is_agent_leased: true,
+            is_human_preempted: false,
+        };
+        paint_workspace_card(
+            &mut canvas,
+            canvas_w,
+            canvas_h,
+            card_rect,
+            header_rect,
+            thumb_rect,
+            &meta,
+            None,
+        );
+
+        let right_edge = (card_rect.x + card_rect.w as i32) as u32;
+        let bg = ARGB_BACKDROP_DIM.to_le_bytes();
+        for y in 0..canvas_h {
+            for x in right_edge..canvas_w {
+                let idx = ((y * canvas_w) + x) as usize * 4;
+                assert_eq!(
+                    &canvas[idx..idx + 4],
+                    &bg,
+                    "overview card pixel leaked past card right edge at ({x}, {y})"
+                );
+            }
         }
     }
 }

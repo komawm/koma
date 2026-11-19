@@ -25,6 +25,8 @@ pub const OVERVIEW_CONTROL_SOCK_NAME: &str = "koma-overview.ctl.sock";
 pub struct InventoryWorkspaceItem {
     pub ws_id: WorkspaceId,
     pub name: String,
+    #[serde(default)]
+    pub focused: bool,
     pub epoch: Epoch,
     pub is_human_preempted: bool,
     pub frame_tier: String,
