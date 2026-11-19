@@ -4977,10 +4977,10 @@ mod kom_0024_compat_tests {
     fn issue_109_popup_grab_teardown_and_pointer_motion_never_deadlocks_and_layer_none_skips_keyboard_grab()
      {
         use crate::pointer_grabs::BTN_RIGHT;
-        use smithay::backend::input::ButtonState;
+        use smithay::{backend::input::ButtonState, desktop::PopupPointerGrab};
 
         let (tx, rx) = std::sync::mpsc::channel::<()>();
-        std::thread::spawn(move || {
+        let handle = std::thread::spawn(move || {
             let mut env = CompatEnv::new(false);
             let qh = env.queue.handle();
             let (comp, wm, shm) = env.ensure_globals();
@@ -5020,6 +5020,7 @@ mod kom_0024_compat_tests {
             bar_surf.commit();
             env.pump();
 
+            env.client.last_button_serial = None;
             env.state.handle_pointer_absolute_motion(
                 Point::from((1350.0, 15.0)),
                 InputTime::from_millis(10),
@@ -5045,9 +5046,14 @@ mod kom_0024_compat_tests {
             layer_pop_surf.commit();
             env.pump();
 
-            assert!(
-                env.state.seat.get_pointer().unwrap().is_grabbed(),
-                "pointer popup grab must be active on layer surface popup"
+            assert_eq!(
+                env.state
+                    .seat
+                    .get_pointer()
+                    .unwrap()
+                    .with_grab(|_, grab| grab.is::<PopupPointerGrab<KomaState>>()),
+                Some(true),
+                "PopupPointerGrab must be active on layer surface popup"
             );
             assert!(
                 !env.state.seat.get_keyboard().unwrap().is_grabbed(),
@@ -5058,9 +5064,22 @@ mod kom_0024_compat_tests {
             layer_pop_xdg.destroy();
             layer_pop_surf.destroy();
             env.pump();
+            assert_eq!(
+                env.state
+                    .seat
+                    .get_pointer()
+                    .unwrap()
+                    .with_grab(|_, grab| grab.is::<PopupPointerGrab<KomaState>>()),
+                Some(true),
+                "PopupPointerGrab remains installed until pointer motion observes ended popup"
+            );
             env.state.handle_pointer_absolute_motion(
                 Point::from((1325.0, 15.0)),
                 InputTime::from_millis(30),
+            );
+            assert!(
+                !env.state.seat.get_pointer().unwrap().is_grabbed(),
+                "pointer motion after layer popup teardown must clear PopupPointerGrab before button release"
             );
             crate::keybind_dispatcher::process_pointer_button_event(
                 &mut env.state,
@@ -5076,6 +5095,7 @@ mod kom_0024_compat_tests {
             //    pointer triggers `PopupPointerGrab::motion` -> `unset_keyboard_grab` -> `focus_changed`.
             let (_win_surf, win_xdg, _win_tl, win_id) =
                 env.spawn_window("popup-parent", "popup.parent", false);
+            let parent_srv_surf = mapped_surface(&env.state, win_id);
             let win_rect = env
                 .state
                 .mapped_windows
@@ -5083,6 +5103,7 @@ mod kom_0024_compat_tests {
                 .find(|m| m.win_id == win_id)
                 .expect("mapped win")
                 .rect;
+            env.client.last_button_serial = None;
             env.state.handle_pointer_absolute_motion(
                 Point::from((f64::from(win_rect.x) + 20.0, f64::from(win_rect.y) + 20.0)),
                 InputTime::from_millis(50),
@@ -5109,13 +5130,36 @@ mod kom_0024_compat_tests {
             win_pop.grab(&seat, win_serial);
             win_pop_surf.commit();
             env.pump();
-            assert!(env.state.seat.get_pointer().unwrap().is_grabbed());
+            assert_eq!(
+                env.state
+                    .seat
+                    .get_pointer()
+                    .unwrap()
+                    .with_grab(|_, grab| grab.is::<PopupPointerGrab<KomaState>>()),
+                Some(true),
+                "PopupPointerGrab must be active on toplevel popup"
+            );
             assert!(env.state.seat.get_keyboard().unwrap().is_grabbed());
+            let popup_kb_focus = env.state.seat.get_keyboard().unwrap().current_focus();
+            assert!(
+                popup_kb_focus.is_some() && popup_kb_focus.as_ref() != Some(&parent_srv_surf),
+                "keyboard focus must move onto the popup while grabbed (got {popup_kb_focus:?})"
+            );
 
             win_pop.destroy();
             win_pop_xdg.destroy();
             win_pop_surf.destroy();
             env.pump();
+            assert_eq!(
+                env.state
+                    .seat
+                    .get_pointer()
+                    .unwrap()
+                    .with_grab(|_, grab| grab.is::<PopupPointerGrab<KomaState>>()),
+                Some(true),
+                "PopupPointerGrab remains active until motion handles ended popup"
+            );
+            assert!(env.state.seat.get_keyboard().unwrap().is_grabbed());
 
             env.state.handle_pointer_absolute_motion(
                 Point::from((f64::from(win_rect.x) + 25.0, f64::from(win_rect.y) + 25.0)),
@@ -5124,14 +5168,27 @@ mod kom_0024_compat_tests {
             assert!(!env.state.seat.get_pointer().unwrap().is_grabbed());
             assert!(!env.state.seat.get_keyboard().unwrap().is_grabbed());
             assert!(!env.state.pending_pointer_constraint_break);
+            assert_eq!(
+                env.state.seat.get_keyboard().unwrap().current_focus(),
+                Some(parent_srv_surf),
+                "ungrabbing popup keyboard grab via focus_changed must restore focus to parent window"
+            );
 
             bar_buf.destroy();
             bar_pool.destroy();
             let _ = tx.send(());
         });
 
-        rx.recv_timeout(std::time::Duration::from_secs(5))
-            .expect("popup grab teardown and pointer motion must not deadlock the event loop");
+        match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(()) => handle.join().expect("test thread panicked"),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                handle.join().expect("test thread panicked");
+                panic!("test thread disconnected without signaling completion");
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                panic!("popup grab teardown and pointer motion must not deadlock the event loop");
+            }
+        }
     }
 
     #[test]

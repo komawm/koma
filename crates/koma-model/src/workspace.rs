@@ -176,19 +176,23 @@ impl WorkspaceState {
             }
             _ => self.viewport.work_area_rect(),
         };
+        let clamp_x_to_bounds =
+            !(self.layout_mode == LayoutMode::Scrolling && self.presentation_geometry().is_none());
         for (win_id, rect, is_floating) in out {
             if *is_floating {
                 continue;
             }
             if let Some(hints) = self.size_hints.get(win_id) {
                 let mut clamped = hints.clamp_rect(*rect);
-                let max_x = bounds
-                    .x
-                    .saturating_add((bounds.w as i32 - clamped.w as i32).max(0));
+                if clamp_x_to_bounds {
+                    let max_x = bounds
+                        .x
+                        .saturating_add((bounds.w as i32 - clamped.w as i32).max(0));
+                    clamped.x = clamped.x.clamp(bounds.x, max_x);
+                }
                 let max_y = bounds
                     .y
                     .saturating_add((bounds.h as i32 - clamped.h as i32).max(0));
-                clamped.x = clamped.x.clamp(bounds.x, max_x);
                 clamped.y = clamped.y.clamp(bounds.y, max_y);
                 *rect = clamped;
             }
@@ -494,10 +498,10 @@ impl WorkspaceState {
 
     /// Focuses `win_id` (raising it to top if in `FloatingStack`, or scrolling/activating in Tiled).
     pub fn activate_window(&mut self, win_id: WindowId, now_ms: u64) -> bool {
-        if self.presented_window_id().is_some_and(|p| p != win_id) {
-            self.window_presentation = None;
-        }
         if self.floating.raise_to_top(win_id) {
+            if self.presented_window_id().is_some_and(|p| p != win_id) {
+                self.window_presentation = None;
+            }
             self.focused_window = Some(win_id);
             return true;
         }
@@ -512,6 +516,9 @@ impl WorkspaceState {
             found = true;
         }
         if found {
+            if self.presented_window_id().is_some_and(|p| p != win_id) {
+                self.window_presentation = None;
+            }
             self.focused_window = Some(win_id);
         }
         found
@@ -525,17 +532,20 @@ impl WorkspaceState {
     pub fn focus_direction(&mut self, dir: CardinalDir, now_ms: u64) -> Option<WindowId> {
         let cur = self.active_window()?;
         if self.floating.contains(cur) {
-            if self.window_presentation.take().is_some()
-                && let Some(target) = self
-                    .dwindle
-                    .first_window()
-                    .filter(|w| *w != cur)
-                    .or_else(|| self.scrolling.active_window().filter(|w| *w != cur))
-                    .or_else(|| self.deck.active().filter(|w| *w != cur))
-            {
-                self.focused_window = Some(target);
-                let _ = self.deck.activate(target);
-                return self.focused_window;
+            if self.window_presentation.take().is_some() {
+                let target = match self.layout_mode {
+                    LayoutMode::Dwindle => self.dwindle.first_window().filter(|w| *w != cur),
+                    LayoutMode::Scrolling => self.scrolling.active_window().filter(|w| *w != cur),
+                    LayoutMode::Deck => self.deck.active().filter(|w| *w != cur),
+                };
+                if let Some(target) = target {
+                    if self.layout_mode == LayoutMode::Scrolling {
+                        let _ = self.scrolling.activate(target, self.viewport, now_ms);
+                    }
+                    self.focused_window = Some(target);
+                    let _ = self.deck.activate(target);
+                    return self.focused_window;
+                }
             }
             return Some(cur);
         }

@@ -890,8 +890,8 @@ impl DwindleTree {
                     if cfg.pseudotile
                         && let Some((pw, ph)) = *pseudotile_size
                     {
-                        let cw = pw.clamp(48, cell_visual.w);
-                        let ch = ph.clamp(48, cell_visual.h);
+                        let cw = pw.clamp(48.min(cell_visual.w), cell_visual.w);
+                        let ch = ph.clamp(48.min(cell_visual.h), cell_visual.h);
                         let cx = cell_visual.x + ((cell_visual.w - cw) / 2) as i32;
                         let cy = cell_visual.y + ((cell_visual.h - ch) / 2) as i32;
                         node.visual_box = LogicalRect::new(cx, cy, cw, ch);

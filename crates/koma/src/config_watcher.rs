@@ -869,6 +869,7 @@ fn reconcile_declarative_workspaces(
             if !is_headless
                 && !existing.is_special
                 && !bound_to_output
+                && matches!(existing.presentation, PresentationTarget::Physical(_))
                 && let Some(out_id) = &spec.preferred_output
             {
                 existing.presentation = PresentationTarget::Physical(out_id.clone());
