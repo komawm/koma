@@ -2,7 +2,8 @@
 # Build and assemble a Koma development-prerelease archive with a manifest and checksums.
 set -euo pipefail
 
-readonly BINARIES=(koma komactl koma-overview)
+readonly BINARIES=(koma komactl koma-overview xdg-desktop-portal-koma)
+readonly PACKAGES=(koma komactl koma-overview koma-portal)
 
 usage() {
     cat <<'EOF'
@@ -99,8 +100,8 @@ export SOURCE_DATE_EPOCH
 
 host_target="$(rustc -vV | sed -n 's/^host: //p')"
 build_args=(build --release --locked)
-for bin in "${BINARIES[@]}"; do
-    build_args+=(-p "$bin")
+for pkg in "${PACKAGES[@]}"; do
+    build_args+=(-p "$pkg")
 done
 if [[ "$target" != "$host_target" ]]; then
     build_args+=(--target "$target")

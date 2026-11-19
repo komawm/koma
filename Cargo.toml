@@ -9,6 +9,7 @@ members = [
     "crates/koma",
     "crates/komactl",
     "crates/koma-overview",
+    "crates/koma-portal",
 ]
 default-members = [
     "crates/koma-proto",
@@ -60,9 +61,15 @@ smithay = { git = "https://github.com/Smithay/smithay.git", rev = "65aa86fa5236e
 smithay-drm-extras = { git = "https://github.com/Smithay/smithay.git", rev = "65aa86fa5236e41775c313408102a5d5c2d1e2ca", default-features = false }
 wayland-server = "0.31.14"
 wayland-client = "0.31.15"
+wayland-protocols = { version = "0.32.13", features = ["client"] }
+wayland-protocols-misc = { version = "0.3.12", features = ["client"] }
 wayland-protocols-wlr = { version = "0.3.12", features = ["client"] }
 calloop-wayland-source = "0.4.1"
 xcursor = "0.3.11"
+xkbcommon = "0.9.0"
+zbus = { version = "6", default-features = false, features = ["service", "tokio"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+pipewire = { version = "0.10", features = ["v0_3_33"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"
