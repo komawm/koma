@@ -99,9 +99,9 @@ impl PortalState {
         }
 
         if has_sc {
-            let mut stream_entries: Vec<Variant<'static>> = Vec::new();
+            let mut stream_entries: Vec<(u32, HashMap<String, Variant<'static>>)> = Vec::new();
+            let outputs = self.wayland.list_outputs().unwrap_or_default();
             if existing_nodes.is_empty() {
-                let outputs = self.wayland.list_outputs().unwrap_or_default();
                 let overlay_cursor = cursor_mode != 1;
                 let mut new_nodes = Vec::new();
 
@@ -124,7 +124,7 @@ impl PortalState {
                                 Variant::from((out.logical_w, out.logical_h)),
                             );
                             props.insert("source_type".to_owned(), Variant::from(1_u32));
-                            stream_entries.push(Variant::from((node_id, props)));
+                            stream_entries.push((node_id, props));
                         }
                         Err(err) => {
                             tracing::error!(error = %err, "failed to start screencast PipeWire stream");
@@ -138,7 +138,34 @@ impl PortalState {
 
                 let mut map = self.sessions.lock().await;
                 if let Some(sess) = map.get_mut(&key) {
-                    sess.stream_nodes = new_nodes;
+                    if sess.stream_nodes.is_empty() {
+                        sess.stream_nodes = new_nodes;
+                    } else {
+                        for (dup_id, _) in new_nodes {
+                            self.pipewire.stop_stream(dup_id);
+                        }
+                    }
+                } else {
+                    for (orphan_id, _) in new_nodes {
+                        self.pipewire.stop_stream(orphan_id);
+                    }
+                    return Ok((2, HashMap::new()));
+                }
+            } else {
+                for (node_id, out_name) in existing_nodes {
+                    let mut props: HashMap<String, Variant<'static>> = HashMap::new();
+                    if let Some(out) = outputs.iter().find(|o| o.name == out_name) {
+                        props.insert(
+                            "position".to_owned(),
+                            Variant::from((out.logical_x, out.logical_y)),
+                        );
+                        props.insert(
+                            "size".to_owned(),
+                            Variant::from((out.logical_w, out.logical_h)),
+                        );
+                    }
+                    props.insert("source_type".to_owned(), Variant::from(1_u32));
+                    stream_entries.push((node_id, props));
                 }
             }
             if let Ok(v) = OwnedVariant::try_from(Variant::from(stream_entries)) {
@@ -429,7 +456,8 @@ mod tests {
 
     #[tokio::test]
     async fn combined_session_tracks_devices_cursor_mode_and_close() {
-        let (wayland, _rx) = WaylandBridge::for_test();
+        let (wayland, rx) = WaylandBridge::for_test();
+        drop(rx);
         let pipewire = PipeWireManager::for_test();
         let state = PortalState::new(wayland, pipewire);
         let session_path = "/org/freedesktop/portal/desktop/session/test/s1";
@@ -450,7 +478,8 @@ mod tests {
             .expect("start_session");
         assert_eq!(code, 0);
         assert!(results.contains_key("devices"));
-        assert!(results.contains_key("streams"));
+        let streams = results.get("streams").expect("streams result");
+        assert_eq!(streams.value_signature(), "a(ua{sv})");
 
         state.close_session(session_path).await;
         assert!(!state.sessions.lock().await.contains_key(session_path));

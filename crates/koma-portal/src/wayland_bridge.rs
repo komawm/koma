@@ -9,15 +9,16 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::{AsFd, OwnedFd};
 use std::sync::mpsc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
+use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use rustix::fs::{MemfdFlags, ftruncate, memfd_create};
 use wayland_client::globals::{GlobalListContents, registry_queue_init};
-use wayland_client::protocol::{
-    wl_keyboard, wl_output, wl_pointer, wl_registry, wl_seat, wl_shm, wl_shm_pool,
-};
-use wayland_client::{Connection, Dispatch, QueueHandle, delegate_noop};
+#[cfg(target_os = "linux")]
+use wayland_client::protocol::wl_keyboard;
+use wayland_client::protocol::{wl_output, wl_pointer, wl_registry, wl_seat, wl_shm, wl_shm_pool};
+use wayland_client::{Connection, Dispatch, Proxy, QueueHandle, delegate_noop};
 use wayland_protocols::xdg::xdg_output::zv1::client::{zxdg_output_manager_v1, zxdg_output_v1};
 use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::{
     zwp_virtual_keyboard_manager_v1, zwp_virtual_keyboard_v1,
@@ -28,6 +29,7 @@ use wayland_protocols_wlr::screencopy::v1::client::{
 use wayland_protocols_wlr::virtual_pointer::v1::client::{
     zwlr_virtual_pointer_manager_v1, zwlr_virtual_pointer_v1,
 };
+#[cfg(target_os = "linux")]
 use xkbcommon::xkb;
 
 #[derive(Debug, Clone)]
@@ -44,19 +46,22 @@ pub struct OutputInfo {
 
 #[derive(Debug, Clone)]
 pub struct CapturedFrame {
-    #[expect(dead_code)]
+    #[cfg_attr(not(target_os = "linux"), expect(dead_code))]
     pub width: u32,
-    #[expect(dead_code)]
+    #[cfg_attr(not(target_os = "linux"), expect(dead_code))]
     pub height: u32,
+    #[cfg_attr(not(target_os = "linux"), expect(dead_code))]
     pub stride: u32,
     #[expect(dead_code)]
     pub format: u32,
+    #[cfg_attr(not(target_os = "linux"), expect(dead_code))]
     pub pixels: Vec<u8>,
 }
 
 #[derive(Debug)]
 pub enum WaylandCommand {
     ListOutputs(mpsc::Sender<Vec<OutputInfo>>),
+    #[cfg_attr(not(target_os = "linux"), expect(dead_code))]
     CaptureFrame {
         output_name: Option<String>,
         overlay_cursor: bool,
@@ -183,6 +188,7 @@ struct WaylandClientState {
     virtual_keyboard_mgr: Option<zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1>,
     virtual_pointer: Option<zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1>,
     virtual_keyboard: Option<zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1>,
+    #[cfg(target_os = "linux")]
     xkb_keymap: Option<xkb::Keymap>,
     xkb_mods_depressed: u32,
     capture: CaptureBufferSpec,
@@ -205,6 +211,7 @@ impl WaylandClientState {
         self.virtual_pointer.as_ref()
     }
 
+    #[cfg(target_os = "linux")]
     fn ensure_virtual_keyboard(
         &mut self,
         qh: &QueueHandle<Self>,
@@ -246,6 +253,14 @@ impl WaylandClientState {
         }
         Ok(self.virtual_keyboard.as_ref().expect("virtual keyboard"))
     }
+
+    #[cfg(not(target_os = "linux"))]
+    fn ensure_virtual_keyboard(
+        &mut self,
+        _qh: &QueueHandle<Self>,
+    ) -> anyhow::Result<&zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1> {
+        bail!("virtual keyboard keymap requires Linux")
+    }
 }
 
 fn create_memfd(name: &str, size: usize) -> anyhow::Result<OwnedFd> {
@@ -280,6 +295,7 @@ fn run_wayland_thread(
         virtual_keyboard_mgr: globals.bind(&qh, 1..=1, ()).ok(),
         virtual_pointer: None,
         virtual_keyboard: None,
+        #[cfg(target_os = "linux")]
         xkb_keymap: None,
         xkb_mods_depressed: 0,
         capture: CaptureBufferSpec::default(),
@@ -427,7 +443,7 @@ fn run_wayland_thread(
                 let ks = if pressed { 1 } else { 0 };
                 if state.ensure_virtual_keyboard(&qh).is_ok()
                     && let Some((evdev_kc, needs_shift)) =
-                        find_evdev_keycode_for_keysym(state.xkb_keymap.as_ref(), keysym)
+                        find_evdev_keycode_for_keysym(&state, keysym)
                     && let Some(vkbd) = &state.virtual_keyboard
                 {
                     if needs_shift && pressed {
@@ -449,11 +465,12 @@ fn run_wayland_thread(
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn find_evdev_keycode_for_keysym(
-    keymap: Option<&xkb::Keymap>,
+    state: &WaylandClientState,
     target_sym: u32,
 ) -> Option<(u32, bool)> {
-    let km = keymap?;
+    let km = state.xkb_keymap.as_ref()?;
     let target = xkb::Keysym::new(target_sym);
     let min_kc = km.min_keycode().raw();
     let max_kc = km.max_keycode().raw();
@@ -466,6 +483,42 @@ fn find_evdev_keycode_for_keysym(
         }
     }
     None
+}
+
+#[cfg(not(target_os = "linux"))]
+fn find_evdev_keycode_for_keysym(
+    _state: &WaylandClientState,
+    _target_sym: u32,
+) -> Option<(u32, bool)> {
+    None
+}
+
+fn dispatch_with_timeout(
+    event_queue: &mut wayland_client::EventQueue<WaylandClientState>,
+    state: &mut WaylandClientState,
+    deadline: Instant,
+) -> anyhow::Result<()> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        bail!("Wayland screencopy timed out");
+    }
+    event_queue.flush()?;
+    if let Some(guard) = event_queue.prepare_read() {
+        let fd = guard.connection_fd();
+        let mut fds = [PollFd::new(&fd, PollFlags::IN)];
+        let ts = Timespec {
+            tv_sec: remaining.as_secs() as _,
+            tv_nsec: remaining.subsec_nanos() as _,
+        };
+        let ready = poll(&mut fds, Some(&ts)).context("poll Wayland fd failed")?;
+        if ready == 0 {
+            drop(guard);
+            bail!("Wayland screencopy timed out");
+        }
+        guard.read()?;
+    }
+    event_queue.dispatch_pending(state)?;
+    Ok(())
 }
 
 fn capture_output_shm(
@@ -494,9 +547,13 @@ fn capture_output_shm(
 
     state.capture = CaptureBufferSpec::default();
     let frame = mgr.capture_output(i32::from(overlay_cursor), &wl_out, qh, ());
+    let deadline = Instant::now() + Duration::from_secs(2);
 
     while !state.capture.buffer_done && !state.capture.failed {
-        event_queue.blocking_dispatch(state)?;
+        if let Err(err) = dispatch_with_timeout(event_queue, state, deadline) {
+            frame.destroy();
+            return Err(err);
+        }
     }
     if state.capture.failed {
         frame.destroy();
@@ -515,7 +572,12 @@ fn capture_output_shm(
 
     frame.copy(&wl_buf);
     while !state.capture.ready && !state.capture.failed {
-        event_queue.blocking_dispatch(state)?;
+        if let Err(err) = dispatch_with_timeout(event_queue, state, deadline) {
+            wl_buf.destroy();
+            pool.destroy();
+            frame.destroy();
+            return Err(err);
+        }
     }
 
     wl_buf.destroy();
@@ -542,13 +604,49 @@ fn capture_output_shm(
 
 impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for WaylandClientState {
     fn event(
-        _state: &mut Self,
-        _proxy: &wl_registry::WlRegistry,
-        _event: wl_registry::Event,
+        state: &mut Self,
+        proxy: &wl_registry::WlRegistry,
+        event: wl_registry::Event,
         _data: &GlobalListContents,
         _conn: &Connection,
-        _qh: &QueueHandle<Self>,
+        qh: &QueueHandle<Self>,
     ) {
+        match event {
+            wl_registry::Event::Global {
+                name,
+                interface,
+                version,
+            } => {
+                if interface == "wl_output" && !state.outputs.contains_key(&name) {
+                    let wl_out: wl_output::WlOutput = proxy.bind(name, version.min(4), qh, name);
+                    let xdg_out = state
+                        .xdg_output_mgr
+                        .as_ref()
+                        .map(|m| m.get_xdg_output(&wl_out, qh, name));
+                    state.outputs.insert(
+                        name,
+                        OutputSlot {
+                            wl_output: wl_out,
+                            _xdg_output: xdg_out,
+                            info: OutputInfo {
+                                name: format!("output-{name}"),
+                                description: String::new(),
+                                logical_x: 0,
+                                logical_y: 0,
+                                logical_w: 1920,
+                                logical_h: 1080,
+                                pixel_w: 1920,
+                                pixel_h: 1080,
+                            },
+                        },
+                    );
+                }
+            }
+            wl_registry::Event::GlobalRemove { name } => {
+                state.outputs.remove(&name);
+            }
+            _ => {}
+        }
     }
 }
 
@@ -632,6 +730,9 @@ impl Dispatch<zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1, ()> for WaylandCl
                 state.capture.width = width;
                 state.capture.height = height;
                 state.capture.stride = stride;
+                if _proxy.version() < 3 {
+                    state.capture.buffer_done = true;
+                }
             }
             zwlr_screencopy_frame_v1::Event::BufferDone => {
                 state.capture.buffer_done = true;

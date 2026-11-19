@@ -198,6 +198,23 @@ mod linux_pw {
                 else {
                     continue;
                 };
+                let (cur_w, cur_h) = {
+                    let g = active.inner.borrow();
+                    (g.width, g.height)
+                };
+                if frame.width != cur_w || frame.height != cur_h {
+                    {
+                        let mut g = active.inner.borrow_mut();
+                        g.width = frame.width.max(1);
+                        g.height = frame.height.max(1);
+                    }
+                    let fmt_bytes = build_format_pod_bytes(frame.width.max(1), frame.height.max(1));
+                    if let Some(fmt_pod) = Pod::from_bytes(&fmt_bytes) {
+                        let mut params = [fmt_pod];
+                        let _ = active.stream.update_params(&mut params);
+                    }
+                    continue;
+                }
                 if let Some(mut pw_buf) = active.stream.dequeue_buffer() {
                     let datas = pw_buf.datas_mut();
                     if let Some(data) = datas.first_mut()
@@ -259,6 +276,18 @@ mod linux_pw {
                 let nid = stream.node_id();
                 let mut guard = inner_state.borrow_mut();
                 guard.is_streaming = new == StreamState::Streaming;
+                if matches!(new, StreamState::Error(_)) && guard.node_id.is_none() {
+                    if let Some(tx) = guard.reply.take() {
+                        let _ =
+                            tx.send(Err(anyhow::anyhow!("pipewire stream entered error state")));
+                    }
+                    drop(guard);
+                    let mut p = pending_state.borrow_mut();
+                    p.retain(|s| {
+                        s.inner.borrow().reply.is_some() || s.inner.borrow().node_id.is_some()
+                    });
+                    return;
+                }
                 if nid != SPA_ID_INVALID && guard.node_id.is_none() {
                     guard.node_id = Some(nid);
                     if let Some(tx) = guard.reply.take() {
@@ -315,6 +344,28 @@ mod linux_pw {
             .register()
             .map_err(|e| anyhow::anyhow!("stream listener register failed: {e}"))?;
 
+        let fmt_bytes = build_format_pod_bytes(width.max(1), height.max(1));
+        let fmt_pod = Pod::from_bytes(&fmt_bytes).context("invalid format pod bytes")?;
+        let mut params = [fmt_pod];
+
+        stream
+            .connect(
+                Direction::Output,
+                None,
+                StreamFlags::DRIVER | StreamFlags::MAP_BUFFERS,
+                &mut params,
+            )
+            .map_err(|e| anyhow::anyhow!("stream connect failed: {e}"))?;
+
+        pending.borrow_mut().push(ActiveStream {
+            stream,
+            _listener: listener,
+            inner,
+        });
+        Ok(())
+    }
+
+    fn build_format_pod_bytes(width: u32, height: u32) -> Vec<u8> {
         let format_obj = pod::object!(
             SpaTypes::ObjectParamFormat,
             ParamType::EnumFormat,
@@ -332,10 +383,7 @@ mod linux_pw {
             pod::property!(
                 FormatProperties::VideoSize,
                 Rectangle,
-                Rectangle {
-                    width: width.max(1),
-                    height: height.max(1),
-                }
+                Rectangle { width, height }
             ),
             pod::property!(
                 FormatProperties::VideoFramerate,
@@ -343,25 +391,7 @@ mod linux_pw {
                 Fraction { num: 30, denom: 1 }
             ),
         );
-        let fmt_bytes = serialize_pod_object(format_obj);
-        let fmt_pod = Pod::from_bytes(&fmt_bytes).context("invalid format pod bytes")?;
-        let mut params = [fmt_pod];
-
-        stream
-            .connect(
-                Direction::Output,
-                None,
-                StreamFlags::DRIVER | StreamFlags::ALLOC_BUFFERS,
-                &mut params,
-            )
-            .map_err(|e| anyhow::anyhow!("stream connect failed: {e}"))?;
-
-        pending.borrow_mut().push(ActiveStream {
-            stream,
-            _listener: listener,
-            inner,
-        });
-        Ok(())
+        serialize_pod_object(format_obj)
     }
 
     fn serialize_pod_object(obj: pod::Object) -> Vec<u8> {

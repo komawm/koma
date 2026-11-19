@@ -24,8 +24,8 @@ wayland-client.workspace = true
 wayland-protocols.workspace = true
 wayland-protocols-misc.workspace = true
 wayland-protocols-wlr.workspace = true
-xkbcommon.workspace = true
 zbus.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 pipewire.workspace = true
+xkbcommon.workspace = true
