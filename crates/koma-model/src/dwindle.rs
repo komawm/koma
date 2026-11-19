@@ -259,6 +259,7 @@ pub struct DwindleTree {
     root: Option<DwindleNodeId>,
     nodes: BTreeMap<DwindleNodeId, DwindleNode>,
     win_to_leaf: BTreeMap<WindowId, DwindleNodeId>,
+    leaf_min_sizes: BTreeMap<WindowId, (u32, u32)>,
 }
 
 impl Default for DwindleTree {
@@ -276,6 +277,22 @@ impl DwindleTree {
             root: None,
             nodes: BTreeMap::new(),
             win_to_leaf: BTreeMap::new(),
+            leaf_min_sizes: BTreeMap::new(),
+        }
+    }
+
+    /// Records (or clears when `(0, 0)`) the client-advertised minimum visual size `(min_w, min_h)`
+    /// for `win_id` so subsequent `recalculate` passes yield slack from sibling subtrees.
+    pub fn set_window_min_size(&mut self, win_id: WindowId, min_w: u32, min_h: u32) -> bool {
+        if min_w == 0 && min_h == 0 {
+            return self.leaf_min_sizes.remove(&win_id).is_some();
+        }
+        match self.leaf_min_sizes.get(&win_id) {
+            Some(&cur) if cur == (min_w, min_h) => false,
+            _ => {
+                self.leaf_min_sizes.insert(win_id, (min_w, min_h));
+                true
+            }
         }
     }
 
@@ -769,6 +786,77 @@ impl DwindleTree {
             root_node.visual_box = work;
         }
         self.recalc_node_recursive(root_id, work, false, false, false, false);
+        if !self.leaf_min_sizes.is_empty() {
+            // Second pass lets nested nodes settle `split_top` for their resized aspect ratio so
+            // bottom-up `subtree_min_size` reads accurate child orientations.
+            self.recalc_node_recursive(root_id, work, false, false, false, false);
+        }
+    }
+
+    fn gap_insets(
+        &self,
+        gap_left: bool,
+        gap_right: bool,
+        gap_top: bool,
+        gap_bottom: bool,
+    ) -> (i32, i32, i32, i32) {
+        let inner = self.config.inner_gap;
+        let half_gap = (inner / 2) as i32;
+        let rem_gap = (inner - inner / 2) as i32;
+        (
+            if gap_left { half_gap } else { 0 },
+            if gap_right { rem_gap } else { 0 },
+            if gap_top { half_gap } else { 0 },
+            if gap_bottom { rem_gap } else { 0 },
+        )
+    }
+
+    /// Computes bottom-up minimum raw dimensions `(min_raw_w, min_raw_h)` required so no leaf in
+    /// `node_id`'s subtree falls below its advertised client minimum after subtracting inner gaps.
+    fn subtree_min_size(
+        &self,
+        node_id: DwindleNodeId,
+        gap_left: bool,
+        gap_right: bool,
+        gap_top: bool,
+        gap_bottom: bool,
+    ) -> (u32, u32) {
+        let Some(node) = self.nodes.get(&node_id) else {
+            return (32, 32);
+        };
+        match &node.kind {
+            DwindleNodeKind::Leaf { win_id, .. } => {
+                let (mw, mh) = self.leaf_min_sizes.get(win_id).copied().unwrap_or((0, 0));
+                let (il, ir, it, ib) = self.gap_insets(gap_left, gap_right, gap_top, gap_bottom);
+                let req_w = if mw > 0 {
+                    mw.saturating_add((il + ir) as u32).max(32)
+                } else {
+                    32
+                };
+                let req_h = if mh > 0 {
+                    mh.saturating_add((it + ib) as u32).max(32)
+                } else {
+                    32
+                };
+                (req_w, req_h)
+            }
+            DwindleNodeKind::Split {
+                children,
+                split_top,
+                ..
+            } => {
+                let [c0, c1] = *children;
+                if !*split_top {
+                    let (w0, h0) = self.subtree_min_size(c0, gap_left, true, gap_top, gap_bottom);
+                    let (w1, h1) = self.subtree_min_size(c1, true, gap_right, gap_top, gap_bottom);
+                    (w0.saturating_add(w1), h0.max(h1))
+                } else {
+                    let (w0, h0) = self.subtree_min_size(c0, gap_left, gap_right, gap_top, true);
+                    let (w1, h1) = self.subtree_min_size(c1, gap_left, gap_right, true, gap_bottom);
+                    (w0.max(w1), h0.saturating_add(h1))
+                }
+            }
+        }
     }
 
     fn recalc_node_recursive(
@@ -781,85 +869,88 @@ impl DwindleTree {
         gap_bottom: bool,
     ) {
         let cfg = self.config;
-        let half_gap = (cfg.inner_gap / 2) as i32;
-        let rem_gap = (cfg.inner_gap - cfg.inner_gap / 2) as i32;
-
-        let inset_left = if gap_left { half_gap } else { 0 };
-        let inset_right = if gap_right { rem_gap } else { 0 };
-        let inset_top = if gap_top { half_gap } else { 0 };
-        let inset_bottom = if gap_bottom { rem_gap } else { 0 };
+        let (inset_left, inset_right, inset_top, inset_bottom) =
+            self.gap_insets(gap_left, gap_right, gap_top, gap_bottom);
 
         let vis_w = (raw_box.w as i32 - inset_left - inset_right).max(32) as u32;
         let vis_h = (raw_box.h as i32 - inset_top - inset_bottom).max(32) as u32;
         let cell_visual =
             LogicalRect::new(raw_box.x + inset_left, raw_box.y + inset_top, vis_w, vis_h);
 
-        let Some(node) = self.nodes.get_mut(&node_id) else {
-            return;
-        };
-        node.raw_box = raw_box;
+        let split_info = {
+            let Some(node) = self.nodes.get_mut(&node_id) else {
+                return;
+            };
+            node.raw_box = raw_box;
 
-        match &mut node.kind {
-            DwindleNodeKind::Leaf {
-                pseudotile_size, ..
-            } => {
-                if cfg.pseudotile
-                    && let Some((pw, ph)) = *pseudotile_size
-                {
-                    let cw = pw.clamp(48, cell_visual.w);
-                    let ch = ph.clamp(48, cell_visual.h);
-                    let cx = cell_visual.x + ((cell_visual.w - cw) / 2) as i32;
-                    let cy = cell_visual.y + ((cell_visual.h - ch) / 2) as i32;
-                    node.visual_box = LogicalRect::new(cx, cy, cw, ch);
+            match &mut node.kind {
+                DwindleNodeKind::Leaf {
+                    pseudotile_size, ..
+                } => {
+                    if cfg.pseudotile
+                        && let Some((pw, ph)) = *pseudotile_size
+                    {
+                        let cw = pw.clamp(48.min(cell_visual.w), cell_visual.w);
+                        let ch = ph.clamp(48.min(cell_visual.h), cell_visual.h);
+                        let cx = cell_visual.x + ((cell_visual.w - cw) / 2) as i32;
+                        let cy = cell_visual.y + ((cell_visual.h - ch) / 2) as i32;
+                        node.visual_box = LogicalRect::new(cx, cy, cw, ch);
+                        return;
+                    }
+                    node.visual_box = cell_visual;
                     return;
                 }
-                node.visual_box = cell_visual;
-            }
-            DwindleNodeKind::Split {
-                children,
-                split_top,
-                split_ratio,
-                locked_split,
-            } => {
-                node.visual_box = cell_visual;
-                if !cfg.preserve_split && !*locked_split && !cfg.smart_split {
-                    let mult = cfg.split_width_multiplier.max(0.1);
-                    *split_top = f64::from(raw_box.h) * mult > f64::from(raw_box.w);
+                DwindleNodeKind::Split {
+                    children,
+                    split_top,
+                    split_ratio,
+                    locked_split,
+                } => {
+                    node.visual_box = cell_visual;
+                    if !cfg.preserve_split && !*locked_split && !cfg.smart_split {
+                        let mult = cfg.split_width_multiplier.max(0.1);
+                        *split_top = f64::from(raw_box.h) * mult > f64::from(raw_box.w);
+                    }
+                    (
+                        *split_top,
+                        split_ratio.clamp(MIN_SPLIT_RATIO, MAX_SPLIT_RATIO),
+                        *children,
+                    )
                 }
-                let is_top = *split_top;
-                let ratio = split_ratio.clamp(MIN_SPLIT_RATIO, MAX_SPLIT_RATIO);
-                let [c0, c1] = *children;
+            }
+        };
 
-                if !is_top {
-                    let first_w = ((f64::from(raw_box.w) * 0.5 * ratio).round() as i32)
-                        .clamp(32, (raw_box.w as i32 - 32).max(32))
-                        as u32;
-                    let second_w = raw_box.w.saturating_sub(first_w).max(32);
-                    let box0 = LogicalRect::new(raw_box.x, raw_box.y, first_w, raw_box.h);
-                    let box1 = LogicalRect::new(
-                        raw_box.x + first_w as i32,
-                        raw_box.y,
-                        second_w,
-                        raw_box.h,
-                    );
-                    self.recalc_node_recursive(c0, box0, gap_left, true, gap_top, gap_bottom);
-                    self.recalc_node_recursive(c1, box1, true, gap_right, gap_top, gap_bottom);
-                } else {
-                    let first_h = ((f64::from(raw_box.h) * 0.5 * ratio).round() as i32)
-                        .clamp(32, (raw_box.h as i32 - 32).max(32))
-                        as u32;
-                    let second_h = raw_box.h.saturating_sub(first_h).max(32);
-                    let box0 = LogicalRect::new(raw_box.x, raw_box.y, raw_box.w, first_h);
-                    let box1 = LogicalRect::new(
-                        raw_box.x,
-                        raw_box.y + first_h as i32,
-                        raw_box.w,
-                        second_h,
-                    );
-                    self.recalc_node_recursive(c0, box0, gap_left, gap_right, gap_top, true);
-                    self.recalc_node_recursive(c1, box1, gap_left, gap_right, true, gap_bottom);
-                }
-            }
+        let (is_top, ratio, [c0, c1]) = split_info;
+        if !is_top {
+            let desired = ((f64::from(raw_box.w) * 0.5 * ratio).round() as i32)
+                .clamp(32, (raw_box.w as i32 - 32).max(32)) as u32;
+            let first_w = if self.leaf_min_sizes.is_empty() {
+                desired
+            } else {
+                let (min_w0, _) = self.subtree_min_size(c0, gap_left, true, gap_top, gap_bottom);
+                let (min_w1, _) = self.subtree_min_size(c1, true, gap_right, gap_top, gap_bottom);
+                distribute_split_axis(raw_box.w, desired, min_w0, min_w1)
+            };
+            let second_w = raw_box.w.saturating_sub(first_w).max(32);
+            let box0 = LogicalRect::new(raw_box.x, raw_box.y, first_w, raw_box.h);
+            let box1 = LogicalRect::new(raw_box.x + first_w as i32, raw_box.y, second_w, raw_box.h);
+            self.recalc_node_recursive(c0, box0, gap_left, true, gap_top, gap_bottom);
+            self.recalc_node_recursive(c1, box1, true, gap_right, gap_top, gap_bottom);
+        } else {
+            let desired = ((f64::from(raw_box.h) * 0.5 * ratio).round() as i32)
+                .clamp(32, (raw_box.h as i32 - 32).max(32)) as u32;
+            let first_h = if self.leaf_min_sizes.is_empty() {
+                desired
+            } else {
+                let (_, min_h0) = self.subtree_min_size(c0, gap_left, gap_right, gap_top, true);
+                let (_, min_h1) = self.subtree_min_size(c1, gap_left, gap_right, true, gap_bottom);
+                distribute_split_axis(raw_box.h, desired, min_h0, min_h1)
+            };
+            let second_h = raw_box.h.saturating_sub(first_h).max(32);
+            let box0 = LogicalRect::new(raw_box.x, raw_box.y, raw_box.w, first_h);
+            let box1 = LogicalRect::new(raw_box.x, raw_box.y + first_h as i32, raw_box.w, second_h);
+            self.recalc_node_recursive(c0, box0, gap_left, gap_right, gap_top, true);
+            self.recalc_node_recursive(c1, box1, gap_left, gap_right, true, gap_bottom);
         }
     }
 
@@ -1457,6 +1548,20 @@ fn point_to_rect_dist_sq(pt: LogicalPoint, r: LogicalRect) -> f64 {
         0.0
     };
     dx * dx + dy * dy
+}
+
+fn distribute_split_axis(avail: u32, desired: u32, min0: u32, min1: u32) -> u32 {
+    if avail <= 64 {
+        return (avail / 2).max(32).min(avail.max(1));
+    }
+    let max_span = avail.saturating_sub(32).max(32);
+    let lower = min0.min(max_span).max(32);
+    let upper = avail.saturating_sub(min1).max(32).min(max_span);
+    if lower <= upper {
+        desired.clamp(lower, upper)
+    } else {
+        desired.clamp(32, max_span)
+    }
 }
 
 #[cfg(test)]

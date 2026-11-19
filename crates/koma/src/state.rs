@@ -906,6 +906,10 @@ pub struct KomaState {
     pub cursor_anim_generation: u64,
     /// Active client `wl_data_device` drag-and-drop grab, including its optional icon surface.
     pub dnd_drag: Option<ActiveDnd>,
+    /// Set when `SeatHandler::focus_changed` runs while `SeatHandle::Pointer` is locked
+    /// (e.g. `PopupPointerGrab::unset` -> `unset_keyboard_grab` -> `keyboard.set_focus`) so
+    /// pointer constraint reconciliation runs immediately once the outer pointer call exits.
+    pub(crate) pending_pointer_constraint_break: bool,
 
     // Koma pure domain model (`koma-model` + `koma-lua` + `koma-seat`)
     pub output_layout: OutputLayout,
@@ -1175,6 +1179,7 @@ impl KomaState {
             cursor_anim_timer_token: None,
             cursor_anim_generation: 0,
             dnd_drag: None,
+            pending_pointer_constraint_break: false,
             output_layout: OutputLayout::new(),
             output_workspaces: HashMap::new(),
             focused_output_name: None,
@@ -2060,20 +2065,20 @@ impl KomaState {
                 f64::from(rect.loc.y) + f64::from(rect.size.h) * 0.5,
             ));
             self.pointer_location = center;
-            if let Some(pointer) = self.ptr()
-                && !pointer.is_grabbed()
-            {
+            if self.ptr().is_some_and(|p| !p.is_grabbed()) {
                 let under = self.surface_under(center);
-                pointer.motion(
-                    self,
-                    under,
-                    &smithay::input::pointer::MotionEvent {
-                        location: center,
-                        serial: SERIAL_COUNTER.next_serial(),
-                        time: smithay::backend::input::InputTime::now(),
-                    },
-                );
-                pointer.frame(self);
+                self.with_pointer_dispatch(|state, pointer| {
+                    pointer.motion(
+                        state,
+                        under,
+                        &smithay::input::pointer::MotionEvent {
+                            location: center,
+                            serial: SERIAL_COUNTER.next_serial(),
+                            time: smithay::backend::input::InputTime::now(),
+                        },
+                    );
+                    pointer.frame(state);
+                });
             }
         }
 
@@ -2334,27 +2339,28 @@ impl KomaState {
             SERIAL_COUNTER.next_serial(),
             now_input,
         );
-        if let Some(pointer) = self.ptr() {
+        let pos = self.pointer_location;
+        self.with_pointer_dispatch(|state, pointer| {
             let serial = SERIAL_COUNTER.next_serial();
             pointer.motion(
-                self,
+                state,
                 None,
                 &smithay::input::pointer::MotionEvent {
-                    location: self.pointer_location,
+                    location: pos,
                     serial,
                     time: now_input,
                 },
             );
-            pointer.frame(self);
-        }
+            pointer.frame(state);
+        });
         self.clear_ime_state_for_lock();
         if let Some(touch) = self.touch() {
             touch.cancel(self);
         }
-        if let Some(keyboard) = self.kb() {
+        self.with_keyboard_dispatch(|state, keyboard| {
             let serial = SERIAL_COUNTER.next_serial();
-            keyboard.set_focus(self, None, serial);
-        }
+            keyboard.set_focus(state, None, serial);
+        });
     }
 
     pub fn import_client_dmabuf(&mut self, dmabuf: &Dmabuf) -> bool {
@@ -3067,11 +3073,14 @@ impl KomaState {
             KeyboardFocusSource::ActiveWindow => self.active_deck_wl_surface(),
         };
 
-        if let Some(keyboard) = self.kb()
-            && keyboard.current_focus() != target_surface
+        if self
+            .kb()
+            .is_some_and(|keyboard| keyboard.current_focus() != target_surface)
         {
-            let serial = SERIAL_COUNTER.next_serial();
-            keyboard.set_focus(self, target_surface, serial);
+            self.with_keyboard_dispatch(|state, keyboard| {
+                let serial = SERIAL_COUNTER.next_serial();
+                keyboard.set_focus(state, target_surface, serial);
+            });
         }
     }
 
@@ -4560,10 +4569,10 @@ impl KomaState {
         let time = smithay::backend::input::InputTime::now();
         // `KomaState::ptr`/`touch` respect the seat re-entrancy guards, so a cancel triggered from
         // inside a seat callback fails soft instead of wedging the event loop.
-        if let Some(pointer) = self.ptr()
-            && pointer.is_grabbed()
-        {
-            pointer.unset_grab(self, serial, time);
+        if self.ptr().is_some_and(|pointer| pointer.is_grabbed()) {
+            self.with_pointer_dispatch(|state, pointer| {
+                pointer.unset_grab(state, serial, time);
+            });
         }
         if let Some(touch) = self.touch()
             && touch.is_grabbed()
@@ -4650,6 +4659,77 @@ impl KomaState {
     #[must_use]
     pub fn pointer_handle(&self) -> Option<smithay::input::pointer::PointerHandle<Self>> {
         self.seat.get_pointer()
+    }
+
+    /// Marks `SeatHandle::Pointer` held while invoking a Smithay `PointerHandle` operation that
+    /// holds `PointerInternal` across grab callbacks (`PopupPointerGrab`, `DefaultGrab`, `unset`),
+    /// then flushes any deferred pointer-constraint breakage (`komawm/koma#109`).
+    pub(crate) fn with_pointer_dispatch<R>(
+        &mut self,
+        f: impl FnOnce(&mut Self, &smithay::input::pointer::PointerHandle<Self>) -> R,
+    ) -> Option<R> {
+        let pointer = self.seat.get_pointer()?;
+        let _held = crate::seat_guard::pointer_callback();
+        let out = f(self, &pointer);
+        drop(_held);
+        self.flush_deferred_pointer_constraint_break();
+        Some(out)
+    }
+
+    /// Marks `SeatHandle::Keyboard` held while invoking a Smithay `KeyboardHandle` operation that
+    /// holds `KbdInternal` across `SeatHandler::focus_changed` or grab callbacks.
+    pub(crate) fn with_keyboard_dispatch<R>(
+        &mut self,
+        f: impl FnOnce(&mut Self, &smithay::input::keyboard::KeyboardHandle<Self>) -> R,
+    ) -> Option<R> {
+        let keyboard = self.seat.get_keyboard()?;
+        let _held = crate::seat_guard::keyboard_callback();
+        Some(f(self, &keyboard))
+    }
+
+    /// Reconciles active pointer constraints with keyboard focus when `SeatHandle::Pointer` is free,
+    /// breaking active constraints if pointer and keyboard focus belong to different root surfaces.
+    pub(crate) fn reconcile_pointer_constraints_with_keyboard_focus(
+        &mut self,
+        focused: Option<&WlSurface>,
+    ) {
+        if crate::seat_guard::is_held(SeatHandle::Pointer) {
+            self.pending_pointer_constraint_break = true;
+            return;
+        }
+        let pointer_root = self
+            .ptr()
+            .and_then(|pointer| pointer.current_focus())
+            .map(|ptr_surf| {
+                let mut root = ptr_surf;
+                while let Some(parent) = smithay::wayland::compositor::get_parent(&root) {
+                    root = parent;
+                }
+                root
+            });
+        if let Some(ptr_root) = pointer_root {
+            let same_root = focused.is_some_and(|f| {
+                let mut kb_root = f.clone();
+                while let Some(p) = smithay::wayland::compositor::get_parent(&kb_root) {
+                    kb_root = p;
+                }
+                kb_root == ptr_root
+            });
+            if !same_root {
+                self.break_active_pointer_constraints();
+            }
+        }
+    }
+
+    /// Flushes a constraint-break check deferred during an active `PointerInternal` mutex scope.
+    pub(crate) fn flush_deferred_pointer_constraint_break(&mut self) {
+        if !self.pending_pointer_constraint_break || crate::seat_guard::is_held(SeatHandle::Pointer)
+        {
+            return;
+        }
+        self.pending_pointer_constraint_break = false;
+        let focused = self.kb().and_then(|kb| kb.current_focus());
+        self.reconcile_pointer_constraints_with_keyboard_focus(focused.as_ref());
     }
 
     /// Whether a cursor-animation timer captured at `generation` still owns the pending redraw.

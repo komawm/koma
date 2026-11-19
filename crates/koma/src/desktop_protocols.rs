@@ -763,7 +763,7 @@ impl KomaState {
         // forward motion or focus changes to the clients behind the scrim.
         if self.keybind_overlay_is_open() && !self.is_locked_or_abandoned() {
             self.pointer_location = self.clamp_pointer_to_outputs(candidate_pos);
-            pointer.frame(self);
+            self.with_pointer_dispatch(|state, pointer| pointer.frame(state));
             self.queue_redraw();
             return;
         }
@@ -796,8 +796,10 @@ impl KomaState {
             match mode {
                 MotionConstraintMode::Locked => {
                     let origin = self.surface_global_origin(&focused).unwrap_or_default();
-                    pointer.relative_motion(self, Some((focused, origin)), &rel_event);
-                    pointer.frame(self);
+                    self.with_pointer_dispatch(|state, pointer| {
+                        pointer.relative_motion(state, Some((focused, origin)), &rel_event);
+                        pointer.frame(state);
+                    });
                     return;
                 }
                 MotionConstraintMode::Confined(region) => {
@@ -811,17 +813,19 @@ impl KomaState {
                         );
                         let clamped_global = self.clamp_pointer_to_outputs(origin + clamped_local);
                         self.pointer_location = clamped_global;
-                        pointer.motion(
-                            self,
-                            Some((focused.clone(), origin)),
-                            &smithay::input::pointer::MotionEvent {
-                                location: clamped_global,
-                                serial,
-                                time,
-                            },
-                        );
-                        pointer.relative_motion(self, Some((focused, origin)), &rel_event);
-                        pointer.frame(self);
+                        self.with_pointer_dispatch(|state, pointer| {
+                            pointer.motion(
+                                state,
+                                Some((focused.clone(), origin)),
+                                &smithay::input::pointer::MotionEvent {
+                                    location: clamped_global,
+                                    serial,
+                                    time,
+                                },
+                            );
+                            pointer.relative_motion(state, Some((focused, origin)), &rel_event);
+                            pointer.frame(state);
+                        });
                         self.queue_redraw();
                         return;
                     }
@@ -855,17 +859,19 @@ impl KomaState {
         {
             under = None;
         }
-        pointer.motion(
-            self,
-            under.clone(),
-            &smithay::input::pointer::MotionEvent {
-                location: clamped,
-                serial,
-                time,
-            },
-        );
-        pointer.relative_motion(self, under, &rel_event);
-        pointer.frame(self);
+        self.with_pointer_dispatch(|state, pointer| {
+            pointer.motion(
+                state,
+                under.clone(),
+                &smithay::input::pointer::MotionEvent {
+                    location: clamped,
+                    serial,
+                    time,
+                },
+            );
+            pointer.relative_motion(state, under, &rel_event);
+            pointer.frame(state);
+        });
         self.refresh_frame_edge_hover(clamped);
         self.maybe_activate_pointer_constraint();
         self.queue_redraw();

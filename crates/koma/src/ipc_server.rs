@@ -968,10 +968,13 @@ pub(crate) fn dispatch_rpc(
         "scene.inventory" => {
             let (caller_sess, agent_tok) = resolve_caller_identity(&auth_snapshot)?;
             let mut list = Vec::new();
-            for (ws_id, ws) in &state.workspaces {
+            for ws_id in state.ordered_workspace_ids() {
+                let Some(ws) = state.workspaces.get(&ws_id) else {
+                    continue;
+                };
                 if let Some(tok) = &agent_tok {
                     let allowed = state.token_store.get(tok).is_some_and(|c| {
-                        c.authorize_workspace(ws_id, PrivilegeLevel::ObserveOnly, now_ms, false)
+                        c.authorize_workspace(&ws_id, PrivilegeLevel::ObserveOnly, now_ms, false)
                             .is_ok()
                     });
                     if !allowed {
@@ -1008,7 +1011,7 @@ pub(crate) fn dispatch_rpc(
                 list.push(json!({
                     "ws_id": ws_id,
                     "name": ws.name,
-                    "focused": *ws_id == state.active_ws_id,
+                    "focused": ws_id == state.active_ws_id,
                     "is_special": ws.is_special,
                     "layout_mode": ws.layout_mode,
                     "frame_tier": ws.frame_clock.current_tier(now_ms),
@@ -3010,5 +3013,47 @@ mod tests {
             reported["keyboard"]["options"],
             "caps:escape,altwin:swap_alt_win"
         );
+    }
+
+    #[test]
+    fn issue_106_scene_inventory_orders_workspaces_canonically() {
+        let (_el, _disp, mut state) = crate::state::tests::make_headless_test_state();
+        let vp = LogicalViewport::new(1600, 1000, 1.0);
+        for (ws_id, name) in [
+            ("ws_06", "6"),
+            ("ws_agent_b", "agent-b"),
+            ("ws_02", "2"),
+            ("ws_agent_a", "agent-a"),
+            ("ws_03", "3"),
+        ] {
+            state.workspaces.insert(
+                WorkspaceId::new(ws_id),
+                WorkspaceState::new(
+                    WorkspaceId::new(ws_id),
+                    name,
+                    SeatId::new(format!("vseat_{ws_id}")),
+                    vp,
+                    PresentationTarget::Offscreen { lazy_fbo_slot: 0 },
+                    LayoutMode::Deck,
+                    0,
+                ),
+            );
+        }
+
+        insert_admin_conn(&mut state, 1);
+        let req = IpcRequest {
+            id: 42,
+            method: "scene.inventory".to_owned(),
+            params: json!({}),
+        };
+        let (res, _) =
+            dispatch_rpc(&mut state, 1, req, Vec::new()).expect("scene.inventory succeeds");
+        let names: Vec<&str> = res["workspaces"]
+            .as_array()
+            .expect("workspaces array")
+            .iter()
+            .filter_map(|item| item["name"].as_str())
+            .collect();
+        assert_eq!(names, vec!["1", "2", "3", "6", "agent-a", "agent-b"]);
     }
 }

@@ -247,7 +247,10 @@ pub fn start_client_drag<S: Source>(
             }
             let grab =
                 DnDGrab::new_pointer(&state.display_handle, start_data, source, seat.clone());
-            pointer.set_grab(state, grab, serial, Focus::Keep);
+            drop(pointer);
+            state.with_pointer_dispatch(|state, pointer| {
+                pointer.set_grab(state, grab, serial, Focus::Keep);
+            });
         }
         GrabType::Touch => {
             let Some(touch) = state.touch() else {

@@ -135,16 +135,26 @@ impl WorkspaceState {
     /// `sync_workspace_geometries` and re-configure a client that updated its minimum size after a
     /// configure (Chromium does this on every settled resize).
     pub fn set_size_hints(&mut self, win_id: WindowId, hints: SizeHints) -> bool {
-        if hints.is_unconstrained() {
-            return self.size_hints.remove(&win_id).is_some();
-        }
-        match self.size_hints.get(&win_id) {
-            Some(existing) if *existing == hints => false,
-            _ => {
-                self.size_hints.insert(win_id, hints);
-                true
+        let changed = if hints.is_unconstrained() {
+            self.size_hints.remove(&win_id).is_some()
+        } else {
+            match self.size_hints.get(&win_id) {
+                Some(existing) if *existing == hints => false,
+                _ => {
+                    self.size_hints.insert(win_id, hints);
+                    true
+                }
+            }
+        };
+        if changed {
+            let min_changed = self
+                .dwindle
+                .set_window_min_size(win_id, hints.min_w, hints.min_h);
+            if min_changed && self.dwindle.contains(win_id) {
+                self.dwindle.recalculate(self.viewport);
             }
         }
+        changed
     }
 
     #[must_use]
@@ -152,29 +162,39 @@ impl WorkspaceState {
         self.size_hints.get(&win_id).copied()
     }
 
-    /// Clamps every presented/tiled geometry to the owning client's advertised size constraints.
-    ///
-    /// A layout box narrower/shorter than a client's minimum cannot be honoured by that client: it
-    /// keeps its minimum content size and commits a cropped buffer, which the compositor then masks
-    /// to the smaller tile ("clipped instead of resized"). Growing the reported tile to the minimum
-    /// makes the layout honest again.
-    ///
-    /// Fullscreen/maximize presentation rects go through the same clamp, so a presentation never
-    /// hands a client a size below its `xdg_toplevel` minimum.
-    ///
-    /// When the workspace genuinely cannot fit both neighbours' minimums the clamped tile overlaps
-    /// its sibling (the focused window stays complete and usable). Propagating minimums through the
-    /// split ratios so the sibling yields space is a follow-up, not a regression of this fix.
+    /// Clamps every presented/tiled geometry to the owning client's advertised size constraints,
+    /// while keeping expanded tiles inside the workspace bounds (`work_area` for tiled/maximized,
+    /// full viewport for fullscreen) so overflowing minimums stay on-screen instead of clipping off
+    /// the monitor edge (`komawm/koma#105`).
     fn clamp_tiled_size_hints(&self, out: &mut [(WindowId, LogicalRect, bool)]) {
         if self.size_hints.is_empty() {
             return;
         }
+        let bounds = match self.window_presentation {
+            Some((_, WindowPresentation::Fullscreen)) => {
+                LogicalRect::new(0, 0, self.viewport.width, self.viewport.height)
+            }
+            _ => self.viewport.work_area_rect(),
+        };
+        let clamp_x_to_bounds =
+            !(self.layout_mode == LayoutMode::Scrolling && self.presentation_geometry().is_none());
         for (win_id, rect, is_floating) in out {
             if *is_floating {
                 continue;
             }
             if let Some(hints) = self.size_hints.get(win_id) {
-                *rect = hints.clamp_rect(*rect);
+                let mut clamped = hints.clamp_rect(*rect);
+                if clamp_x_to_bounds {
+                    let max_x = bounds
+                        .x
+                        .saturating_add((bounds.w as i32 - clamped.w as i32).max(0));
+                    clamped.x = clamped.x.clamp(bounds.x, max_x);
+                }
+                let max_y = bounds
+                    .y
+                    .saturating_add((bounds.h as i32 - clamped.h as i32).max(0));
+                clamped.y = clamped.y.clamp(bounds.y, max_y);
+                *rect = clamped;
             }
         }
     }
@@ -274,6 +294,7 @@ impl WorkspaceState {
         }
         let _ = self.deck.remove(win_id);
         self.size_hints.remove(&win_id);
+        let _ = self.dwindle.set_window_min_size(win_id, 0, 0);
         let was_floating = self.floating.remove(win_id).is_some();
         let next_tiled = if !was_floating {
             let d_next = self.dwindle.remove(win_id, self.viewport);
@@ -478,6 +499,9 @@ impl WorkspaceState {
     /// Focuses `win_id` (raising it to top if in `FloatingStack`, or scrolling/activating in Tiled).
     pub fn activate_window(&mut self, win_id: WindowId, now_ms: u64) -> bool {
         if self.floating.raise_to_top(win_id) {
+            if self.presented_window_id().is_some_and(|p| p != win_id) {
+                self.window_presentation = None;
+            }
             self.focused_window = Some(win_id);
             return true;
         }
@@ -492,15 +516,37 @@ impl WorkspaceState {
             found = true;
         }
         if found {
+            if self.presented_window_id().is_some_and(|p| p != win_id) {
+                self.window_presentation = None;
+            }
             self.focused_window = Some(win_id);
         }
         found
     }
 
     /// Directional focus navigation (`movefocus l/r/u/d`).
+    ///
+    /// Moving focus away from a fullscreen or maximized window (or calling directional focus on a
+    /// fullscreen/maximized floating window) clears `window_presentation` so the destination
+    /// window becomes visible and interactive (`komawm/koma#108`).
     pub fn focus_direction(&mut self, dir: CardinalDir, now_ms: u64) -> Option<WindowId> {
         let cur = self.active_window()?;
         if self.floating.contains(cur) {
+            if self.window_presentation.take().is_some() {
+                let target = match self.layout_mode {
+                    LayoutMode::Dwindle => self.dwindle.first_window().filter(|w| *w != cur),
+                    LayoutMode::Scrolling => self.scrolling.active_window().filter(|w| *w != cur),
+                    LayoutMode::Deck => self.deck.active().filter(|w| *w != cur),
+                };
+                if let Some(target) = target {
+                    if self.layout_mode == LayoutMode::Scrolling {
+                        let _ = self.scrolling.activate(target, self.viewport, now_ms);
+                    }
+                    self.focused_window = Some(target);
+                    let _ = self.deck.activate(target);
+                    return self.focused_window;
+                }
+            }
             return Some(cur);
         }
         let next = match self.layout_mode {
@@ -517,6 +563,9 @@ impl WorkspaceState {
             },
         };
         if let Some(target) = next {
+            if target != cur {
+                self.window_presentation = None;
+            }
             self.focused_window = Some(target);
             let _ = self.deck.activate(target);
         }
@@ -828,8 +877,8 @@ mod tests {
         assert!(!ws.set_size_hints(browser, SizeHints::new(500, 87, 0, 0)));
         ws.insert_window(terminal, false, None, None, None, None, false, true, 1);
 
-        // The raw dwindle box is a 400 px half, but the reported/configured tile must be the
-        // 500 px minimum the client can actually honour.
+        // Dwindle split propagation yields sibling slack so `browser` gets 500 px cleanly without
+        // overlapping `terminal` (300 px), and both visible/animation paths agree.
         let targets = ws.compute_animation_target_geometries();
         let (_, browser_rect, browser_float) = targets
             .iter()
@@ -839,7 +888,7 @@ mod tests {
         assert!(!browser_float);
         assert_eq!(browser_rect.w, 500);
         assert_eq!(browser_rect.h, 600);
-        assert_eq!(ws.dwindle.rect_of(browser).map(|r| r.w), Some(400));
+        assert_eq!(ws.dwindle.rect_of(browser).map(|r| r.w), Some(500));
 
         // The visible-geometry, settled and animated sampling paths must agree, otherwise the
         // renderer would draw the client back into the too-small box.
@@ -854,13 +903,13 @@ mod tests {
             }
         }
 
-        // Unconstrained clients keep the raw layout box untouched.
+        // Unconstrained sibling yields its excess slack so the two windows do not overlap.
         let (_, terminal_rect, _) = targets
             .iter()
             .find(|(w, _, _)| *w == terminal)
             .copied()
             .expect("terminal geometry");
-        assert_eq!(terminal_rect.w, 400);
+        assert_eq!(terminal_rect.w, 300);
 
         // Closing the browser drops its hints.
         let _ = ws.remove_window(browser, 3);
@@ -943,5 +992,161 @@ mod tests {
                 .iter()
                 .any(|(id, rect, _)| *id == w1 && *rect != maximized)
         );
+    }
+
+    #[test]
+    fn issue_105_dwindle_propagates_min_size_for_three_chromes_and_unity_hub_and_clamps_overflow() {
+        let base_vp = LogicalViewport::new(1600, 1000, 1.0);
+        let wa = base_vp.work_area_from_edges(35, 0, 0, 0);
+        let vp = base_vp.with_work_area_zone(wa.x, wa.y, wa.w as i32, wa.h as i32);
+
+        // 1. Three Chrome windows (min_w = 500) side-by-side in 1600x965 with outer=15, inner=5
+        let mut ws = WorkspaceState::new(
+            WorkspaceId::new("ws_04"),
+            "4",
+            SeatId::new("seat0"),
+            vp,
+            PresentationTarget::Physical(OutputId::new("eDP-1")),
+            LayoutMode::Dwindle,
+            0,
+        );
+        ws.dwindle.config.outer_gap = 15;
+        ws.dwindle.config.inner_gap = 5;
+        ws.dwindle.config.force_split = 2;
+        ws.dwindle.config.smart_split = false;
+        ws.dwindle.config.split_width_multiplier = 0.1;
+
+        let c1 = WindowId::new(1, 1);
+        let c2 = WindowId::new(2, 1);
+        let c3 = WindowId::new(3, 1);
+        for (i, &w) in [c1, c2, c3].iter().enumerate() {
+            ws.insert_window(w, false, None, None, None, None, false, true, i as u64);
+            assert!(ws.set_size_hints(w, SizeHints::new(500, 200, 0, 0)));
+        }
+
+        let mut rects: Vec<LogicalRect> = ws
+            .compute_visible_geometries()
+            .into_iter()
+            .map(|(_, r, _)| r)
+            .collect();
+        rects.sort_by_key(|r| r.x);
+        assert_eq!(rects.len(), 3);
+        for (idx, r) in rects.iter().enumerate() {
+            assert!(r.w >= 500, "chrome {idx} shrank below min_w: {r:?}");
+            assert!(
+                r.x >= wa.x && r.x + r.w as i32 <= wa.x + wa.w as i32,
+                "chrome {idx} clipped outside work_area: {r:?}"
+            );
+        }
+        assert!(
+            rects[0].x + rects[0].w as i32 <= rects[1].x
+                && rects[1].x + rects[1].w as i32 <= rects[2].x,
+            "3 Chromes overlapped: {rects:?}"
+        );
+
+        // 2. Terminal (unconstrained) + Unity Hub (min_w = 1000) side-by-side
+        let mut ws_unity = WorkspaceState::new(
+            WorkspaceId::new("ws_03"),
+            "3",
+            SeatId::new("seat0"),
+            vp,
+            PresentationTarget::Physical(OutputId::new("eDP-1")),
+            LayoutMode::Dwindle,
+            0,
+        );
+        ws_unity.dwindle.config = ws.dwindle.config;
+        let term = WindowId::new(10, 1);
+        let unity = WindowId::new(11, 1);
+        ws_unity.insert_window(term, false, None, None, None, None, false, true, 0);
+        ws_unity.insert_window(unity, false, None, None, None, None, false, true, 1);
+        ws_unity.set_size_hints(unity, SizeHints::new(1000, 600, 0, 0));
+
+        let u_geos = ws_unity.compute_visible_geometries();
+        let tr = u_geos.iter().find(|(w, _, _)| *w == term).unwrap().1;
+        let ur = u_geos.iter().find(|(w, _, _)| *w == unity).unwrap().1;
+        assert_eq!(ur.w, 1000);
+        assert!(
+            ur.x + ur.w as i32 <= wa.x + wa.w as i32,
+            "Unity Hub clipped right edge: {ur:?}"
+        );
+        assert!(
+            tr.x + tr.w as i32 <= ur.x,
+            "Terminal overlapped Unity Hub: {tr:?} vs {ur:?}"
+        );
+
+        // 3. Overflowing minimums (two 1000 px windows in 1600 px) clamp x inside work_area
+        ws_unity.set_size_hints(term, SizeHints::new(1000, 600, 0, 0));
+        for (_, r, _) in ws_unity.compute_visible_geometries() {
+            assert_eq!(r.w, 1000);
+            assert!(
+                r.x >= wa.x && r.x + r.w as i32 <= wa.x + wa.w as i32,
+                "overflowing tile must stay within work_area: {r:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn issue_108_focus_direction_clears_fullscreen_and_maximized_presentation() {
+        let vp = LogicalViewport::new(1600, 1000, 1.0);
+        let mut ws = WorkspaceState::new(
+            WorkspaceId::new("ws_01"),
+            "1",
+            SeatId::new("seat0"),
+            vp,
+            PresentationTarget::Physical(OutputId::new("eDP-1")),
+            LayoutMode::Dwindle,
+            0,
+        );
+        ws.dwindle.config.outer_gap = 0;
+        ws.dwindle.config.inner_gap = 0;
+        let left = WindowId::new(1, 1);
+        let right = WindowId::new(2, 1);
+        ws.insert_window(left, false, None, None, None, None, false, true, 0);
+        ws.insert_window(
+            right,
+            false,
+            None,
+            None,
+            None,
+            Some(LogicalPoint {
+                x: 1400.0,
+                y: 500.0,
+            }),
+            false,
+            true,
+            1,
+        );
+
+        assert!(ws.toggle_fullscreen(left));
+        assert_eq!(ws.fullscreen_window(), Some(left));
+        assert_eq!(ws.focus_direction(CardinalDir::Right, 2), Some(right));
+        assert_eq!(ws.fullscreen_window(), None);
+        assert_eq!(ws.active_window(), Some(right));
+        assert_eq!(ws.compute_visible_geometries().len(), 2);
+
+        assert!(ws.toggle_maximized(right));
+        assert_eq!(ws.maximized_window(), Some(right));
+        assert_eq!(ws.focus_direction(CardinalDir::Left, 3), Some(left));
+        assert_eq!(ws.maximized_window(), None);
+        assert_eq!(ws.active_window(), Some(left));
+
+        // Floating window in fullscreen exits presentation on directional focus toward tiled window
+        let float_win = WindowId::new(3, 1);
+        ws.insert_window(
+            float_win,
+            true,
+            None,
+            None,
+            Some((400, 300)),
+            None,
+            false,
+            true,
+            4,
+        );
+        assert!(ws.toggle_fullscreen(float_win));
+        assert_eq!(ws.fullscreen_window(), Some(float_win));
+        let next = ws.focus_direction(CardinalDir::Left, 5);
+        assert_eq!(ws.fullscreen_window(), None);
+        assert!(next.is_some_and(|w| w != float_win));
     }
 }

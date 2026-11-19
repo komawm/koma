@@ -825,11 +825,20 @@ fn reconcile_declarative_workspaces(
             || spec.gaps.inner != 6
             || spec.gaps.outer != 10;
 
-        if let Some((existing_id, existing)) = state
+        let existing_id = state
             .workspaces
-            .iter_mut()
+            .iter()
             .find(|(_, w)| w.name == spec.name)
-        {
+            .map(|(id, _)| id.clone());
+        if let Some(existing_id) = existing_id {
+            let bound_to_output = state
+                .output_workspaces
+                .values()
+                .any(|assigned| assigned == &existing_id);
+            let existing = state
+                .workspaces
+                .get_mut(&existing_id)
+                .expect("existing_id was resolved from workspaces");
             let mut d_cfg = registry.dwindle;
             let mut s_cfg = registry.scrolling.clone();
             if use_spec_gaps {
@@ -855,11 +864,21 @@ fn reconcile_declarative_workspaces(
             let vp = existing.viewport;
             existing.scrolling.update_config(s_cfg, vp, now_ms);
             existing.set_layout_mode(effective_layout, now_ms);
+            // Propagate `preferred_output` onto pre-seeded `ws_01` (initially `Physical("primary")`)
+            // and any unclaimed physical workspace so startup output matching picks `"1"` (`#110`).
+            if !is_headless
+                && !existing.is_special
+                && !bound_to_output
+                && matches!(existing.presentation, PresentationTarget::Physical(_))
+                && let Some(out_id) = &spec.preferred_output
+            {
+                existing.presentation = PresentationTarget::Physical(out_id.clone());
+            }
             // The reload owns the opt-out flag, so flipping `persistent` in `init.lua` takes
             // effect without restarting the compositor.
             existing.persistent = spec.persistent;
-            if !sync_ids.contains(existing_id) {
-                sync_ids.push(existing_id.clone());
+            if !sync_ids.contains(&existing_id) {
+                sync_ids.push(existing_id);
             }
             continue;
         }
@@ -981,3 +1000,49 @@ pub fn reload_active_config_now(
 
 #[allow(dead_code)]
 fn _keep_rule_engine_type_check(_: &WindowRuleEngine) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
+
+    #[test]
+    fn issue_110_startup_reconcile_propagates_preferred_output_to_preseeded_ws_01() {
+        let (_el, _disp, mut state) = crate::state::tests::make_headless_test_state();
+        let src = r#"
+            koma.workspace({ name = "1", preferred_output = "eDP-1" })
+            koma.workspace({ name = "2", preferred_output = "eDP-1" })
+        "#;
+        let report = reload_from_lua_source(
+            &mut state,
+            Path::new("/tmp/init.lua"),
+            Path::new("/tmp"),
+            src,
+            false,
+        )
+        .expect("apply workspace preferred_output config");
+        assert!(report.generation >= 1);
+
+        let output = Output::new(
+            "eDP-1".to_owned(),
+            PhysicalProperties {
+                size: (340, 210).into(),
+                subpixel: Subpixel::Unknown,
+                make: "Test".to_owned(),
+                model: "Panel".to_owned(),
+                serial_number: "001".to_owned(),
+            },
+        );
+        output.change_current_state(
+            Some(Mode {
+                size: (1600, 1000).into(),
+                refresh: 60_000,
+            }),
+            None,
+            None,
+            None,
+        );
+        let claimed = state.ensure_initial_workspace_for_output(&output);
+        assert_eq!(claimed, WorkspaceId::from("ws_01"));
+    }
+}
