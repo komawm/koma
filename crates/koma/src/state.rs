@@ -963,6 +963,10 @@ pub struct KomaState {
     /// Active `MoveWindowGrab` cursor state `(ws_id, cursor_x)` driving continuous VBlank edge auto-scroll.
     pub active_drag_edge_scroll: Option<(WorkspaceId, f64)>,
     pub edge_scroll_keep_alive: bool,
+    /// Workspace currently undergoing an interactive `ResizeWindowGrab` (`Mod + MouseRight`,
+    /// frame-edge drag, or CSD `xdg_toplevel.resize`), used to emit `xdg_toplevel::State::Resizing`
+    /// and coalesce rapid size-only configures until each previous configure is committed.
+    pub active_resize_ws: Option<WorkspaceId>,
     /// Frame edge currently hovered for interactive resize: `(win_id, corner)` plus the cursor
     /// status to restore once the pointer leaves the edge (`Hyprland` border-drag parity).
     pub frame_edge_hover: Option<(WindowId, ResizeCorner)>,
@@ -1218,6 +1222,7 @@ impl KomaState {
             active_drop_preview: None,
             active_drag_edge_scroll: None,
             edge_scroll_keep_alive: false,
+            active_resize_ws: None,
             frame_edge_hover: None,
             cursor_before_frame_edge: None,
             backdrop_blur_cache: RefCell::new(CachedBackdropBlur::default()),
@@ -2322,6 +2327,7 @@ impl KomaState {
         self.active_drop_preview = None;
         self.active_drag_edge_scroll = None;
         self.edge_scroll_keep_alive = false;
+        self.active_resize_ws = None;
         self.keybinds.pending_releases.clear();
         self.keybinds.pending_mouse_releases.clear();
         self.keybinds.suppressed_buttons.clear();
@@ -2501,6 +2507,7 @@ impl KomaState {
             return;
         };
         let is_offscreen = matches!(ws.presentation, PresentationTarget::Offscreen { .. });
+        let is_resizing_ws = self.active_resize_ws.as_ref() == Some(ws_id);
         let visible = ws.compute_animation_target_geometries();
         let now_ms = self.elapsed_ms();
         let appearance = self.lua_sandbox.config_snapshot().appearance;
@@ -2530,11 +2537,13 @@ impl KomaState {
                 }
                 let is_fs = ws.is_fullscreen(win_id);
                 let is_max = ws.is_maximized(win_id);
+                let is_resizing = is_resizing_ws && !is_fs && !is_max;
                 let dec_mode = mapped.decoration_mode;
                 let state_needs_configure = mapped.window.toplevel().is_some_and(|t| {
                     t.with_pending_state(|st| {
                         st.states.contains(xdg_toplevel::State::Fullscreen) != is_fs
                             || st.states.contains(xdg_toplevel::State::Maximized) != is_max
+                            || st.states.contains(xdg_toplevel::State::Resizing) != is_resizing
                             || st.decoration_mode != Some(dec_mode)
                     })
                 });
@@ -2561,9 +2570,23 @@ impl KomaState {
                             } else {
                                 st.states.unset(xdg_toplevel::State::Fullscreen);
                             }
+                            if is_resizing {
+                                st.states.set(xdg_toplevel::State::Resizing);
+                            } else {
+                                st.states.unset(xdg_toplevel::State::Resizing);
+                            }
                             st.decoration_mode = Some(dec_mode);
                         });
-                        toplevel.send_pending_configure();
+                        // During interactive pointer resize, throttle size-only configures until
+                        // the client commits the previous size so high-rate motion never builds an
+                        // IPC configure backlog (`niri` `ConfigureIntent::Throttled`).
+                        let should_send = !is_resizing
+                            || float_changed
+                            || state_needs_configure
+                            || toplevel_ready_for_interactive_resize_configure(toplevel);
+                        if should_send {
+                            toplevel.send_pending_configure();
+                        }
                     }
                 }
             }
@@ -3496,8 +3519,9 @@ impl KomaState {
             .workspaces
             .get(&ws_id)
             .and_then(|ws| ws.fullscreen_window());
-        // Focused window first, then the rest: shared tiled borders resize the focused tile.
-        candidates.sort_by_key(|m| Some(m.win_id) != focused);
+        // Floating windows sit above tiled windows; within each layer prefer the focused window
+        // so shared tiled borders resize the focused tile cleanly.
+        candidates.sort_by_key(|m| (!m.is_floating, Some(m.win_id) != focused));
 
         for mapped in candidates {
             if fullscreen == Some(mapped.win_id) {
@@ -5871,6 +5895,29 @@ impl KomaState {
         self.sync_foreign_toplevels();
         self.queue_redraw();
     }
+}
+
+/// Returns `true` when `toplevel` has acked and committed the latest configure sent by the
+/// compositor, so sending the next interactive resize configure will not build an IPC backlog.
+#[must_use]
+pub fn toplevel_ready_for_interactive_resize_configure(
+    toplevel: &smithay::wayland::shell::xdg::ToplevelSurface,
+) -> bool {
+    let (has_unacked_configures, server_size) = with_states(toplevel.wl_surface(), |states| {
+        let Some(attrs) = states.data_map.get::<XdgToplevelSurfaceData>() else {
+            return (false, None);
+        };
+        let guard = attrs.lock().unwrap();
+        (
+            !guard.pending_configures().is_empty(),
+            guard.current_server_state().size,
+        )
+    });
+    if has_unacked_configures {
+        return false;
+    }
+    let committed_size = toplevel.with_committed_state(|st| st.and_then(|s| s.size));
+    committed_size == server_size || committed_size.is_none()
 }
 
 pub fn read_toplevel_metadata(wl_surface: &WlSurface) -> (String, String) {

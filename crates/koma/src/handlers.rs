@@ -352,6 +352,12 @@ impl CompositorHandler for KomaState {
             }
             if hints_changed {
                 self.sync_workspace_geometries(&ws_id);
+            } else if let Some(toplevel) = self.mapped_windows[idx].window.toplevel()
+                && toplevel.has_pending_changes()
+                && (self.active_resize_ws.as_ref() != Some(&ws_id)
+                    || crate::state::toplevel_ready_for_interactive_resize_configure(toplevel))
+            {
+                toplevel.send_pending_configure();
             }
             // Active commit (including async subsurfaces): zero offscreen FBO rendering; drop any
             // stale snapshot captured before a non-fatal subsurface teardown.

@@ -241,6 +241,8 @@ struct ClientHarness {
     xdg_surface_configures: usize,
     /// `xdg_toplevel.configure(w, h)` sizes recorded per toplevel protocol id.
     toplevel_configures: BTreeMap<u32, Vec<(i32, i32)>>,
+    /// `xdg_toplevel.configure` state arrays (decoded `u32` enum values) per toplevel protocol id.
+    toplevel_states: BTreeMap<u32, Vec<Vec<u32>>>,
     toplevel_close_count: usize,
     decoration_modes: Vec<WEnum<zxdg_toplevel_decoration_v1::Mode>>,
     activation_tokens: Vec<String>,
@@ -891,12 +893,29 @@ impl Dispatch<xdg_toplevel::XdgToplevel, ()> for ClientHarness {
         if matches!(event, xdg_toplevel::Event::Close) {
             state.toplevel_close_count += 1;
         }
-        if let xdg_toplevel::Event::Configure { width, height, .. } = event {
+        if let xdg_toplevel::Event::Configure {
+            width,
+            height,
+            states,
+        } = event
+        {
+            let proto_id = toplevel.id().protocol_id();
             state
                 .toplevel_configures
-                .entry(toplevel.id().protocol_id())
+                .entry(proto_id)
                 .or_default()
                 .push((width, height));
+            let decoded: Vec<u32> = states
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|&c| u32::from_le_bytes(c))
+                .collect();
+            state
+                .toplevel_states
+                .entry(proto_id)
+                .or_default()
+                .push(decoded);
         }
     }
 }
@@ -6578,6 +6597,107 @@ fn issue_113_clipped_oversized_surface_never_steals_neighbor_pointer_hits() {
     pool_b.destroy();
     buf.destroy();
     pool.destroy();
+}
+
+#[test]
+fn issue_115_interactive_resize_sets_resizing_throttles_bursts_and_flushes_on_commit_and_ungrab() {
+    use crate::pointer_grabs::BTN_LEFT;
+    use smithay::backend::input::ButtonState;
+
+    let mut env = ClientEnv::new();
+    let (surf_a, _xs_a, tl_a) = env.spawn_window("QQ", "QQ");
+    let (_surf_b, _xs_b, _tl_b) = env.spawn_window("WeChat", "wechat");
+    env.pump();
+
+    let a_id = tl_a.id().protocol_id();
+    let win_a = env
+        .state
+        .mapped_windows
+        .iter()
+        .find(|m| m.app_id == "QQ")
+        .unwrap()
+        .win_id;
+    let rect_a = env
+        .state
+        .mapped_windows
+        .iter()
+        .find(|m| m.win_id == win_a)
+        .unwrap()
+        .rect;
+
+    let ws_id = env.state.active_ws_id.clone();
+    assert!(
+        env.state
+            .workspaces
+            .get_mut(&ws_id)
+            .unwrap()
+            .activate_window(win_a, 1)
+    );
+    env.state.focus_active_deck_window();
+
+    // Hover right edge of left tile and press BTN_LEFT to start frame-edge ResizeWindowGrab.
+    let edge_x = f64::from(rect_a.x + rect_a.w as i32) - 1.0;
+    let edge_y = f64::from(rect_a.y) + f64::from(rect_a.h) * 0.5;
+    env.state
+        .handle_pointer_absolute_motion(Point::from((edge_x, edge_y)), InputTime::from_millis(10));
+    env.pump();
+    let cfg_before = env.client.toplevel_configures[&a_id].len();
+
+    crate::keybind_dispatcher::process_pointer_button_event(
+        &mut env.state,
+        BTN_LEFT,
+        ButtonState::Pressed,
+        InputTime::from_millis(20),
+        true,
+    );
+    env.pump();
+
+    assert_eq!(env.state.active_resize_ws.as_ref(), Some(&ws_id));
+    let resizing_code = xdg_toplevel::State::Resizing as u32;
+    assert!(
+        env.client.toplevel_states[&a_id]
+            .last()
+            .is_some_and(|st| st.contains(&resizing_code)),
+        "interactive resize grab must emit xdg_toplevel::State::Resizing"
+    );
+
+    // Rapidly move 6 times without client surface commits -> configures must coalesce/throttle!
+    for step in 1..=6i32 {
+        env.state.handle_pointer_absolute_motion(
+            Point::from((edge_x - f64::from(step * 25), edge_y)),
+            InputTime::from_millis(20 + step as u32),
+        );
+    }
+    env.pump();
+    let cfg_after_burst = env.client.toplevel_configures[&a_id].len();
+    assert!(
+        cfg_after_burst <= cfg_before + 2,
+        "burst of 6 motion steps before commit must throttle configures (before={cfg_before}, after={cfg_after_burst})"
+    );
+
+    // Committing the client surface flushes the latest throttled target width in one configure.
+    surf_a.commit();
+    env.pump();
+    let cfg_after_commit = env.client.toplevel_configures[&a_id].len();
+    assert_eq!(cfg_after_commit, cfg_after_burst + 1);
+
+    // Releasing BTN_LEFT ends ResizeWindowGrab, unsets Resizing, and flushes settled state.
+    crate::keybind_dispatcher::process_pointer_button_event(
+        &mut env.state,
+        BTN_LEFT,
+        ButtonState::Released,
+        InputTime::from_millis(40),
+        true,
+    );
+    env.pump();
+    assert!(env.state.active_resize_ws.is_none());
+    assert!(
+        !env.client.toplevel_states[&a_id]
+            .last()
+            .unwrap()
+            .contains(&resizing_code),
+        "releasing resize grab must unset xdg_toplevel::State::Resizing"
+    );
 }
 
 /// Client `wl_data_device` drag-and-drop grab coverage (`komawm/koma#68`).
