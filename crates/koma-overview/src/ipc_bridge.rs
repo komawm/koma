@@ -113,6 +113,19 @@ impl AdminIpcClient {
         Ok(())
     }
 
+    pub fn focus_workspace(&mut self, ws_id: &WorkspaceId) -> io::Result<()> {
+        let req = IpcRequest {
+            id: self.alloc_id(),
+            method: "ws.focus".to_owned(),
+            params: json!({ "ws_id": ws_id }),
+        };
+        let (resp, _): (IpcResponse, _) = sync_roundtrip(&self.stream, &req, Vec::new())?;
+        if let Some(err) = resp.error {
+            return Err(io::Error::other(err.to_string()));
+        }
+        Ok(())
+    }
+
     pub fn set_workspace_mode(
         &mut self,
         ws_id: &WorkspaceId,

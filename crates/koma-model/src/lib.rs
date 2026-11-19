@@ -48,7 +48,7 @@ pub use crate::{
     },
     keybind_overlay::{
         KeybindOverlayLayout, KeybindOverlayRow, KeybindOverlayText, KeybindOverlayTextRole,
-        compact_chord, layout_keybind_overlay,
+        compact_chord, layout_keybind_overlay, layout_keybind_overlay_page,
     },
     kinematics::{
         BezierPointerSolver, MAX_POINTER_SPRING_MS, MinimumJerkSolver, PointerSpring2D,

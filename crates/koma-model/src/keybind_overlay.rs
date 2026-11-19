@@ -89,8 +89,12 @@ pub struct KeybindOverlayLayout {
     /// Number of columns used.
     pub columns: usize,
     pub rows_per_column: usize,
-    /// Rows that did not fit and were replaced by the final `+N more` row.
+    /// Rows on later pages (counted in the final `+N more` slot when `total_pages > 1`).
     pub hidden: usize,
+    /// Zero-based active page index.
+    pub page: usize,
+    /// Total number of pages for the current viewport.
+    pub total_pages: usize,
 }
 
 impl KeybindOverlayLayout {
@@ -123,7 +127,7 @@ pub fn compact_chord(chord: &str) -> String {
     chord.replace(" + ", "+")
 }
 
-/// Lays the effective bindings out on `viewport`.
+/// Lays the effective bindings out on `viewport` (page 0).
 ///
 /// `rows` must already be ordered by presentation group; a group header is emitted whenever the
 /// group name changes.
@@ -131,6 +135,17 @@ pub fn compact_chord(chord: &str) -> String {
 pub fn layout_keybind_overlay(
     rows: &[KeybindOverlayRow],
     viewport: LogicalViewport,
+) -> KeybindOverlayLayout {
+    layout_keybind_overlay_page(rows, viewport, 0)
+}
+
+/// Lays one page of the effective bindings out on `viewport`, clamping `requested_page` to the
+/// valid page range.
+#[must_use]
+pub fn layout_keybind_overlay_page(
+    rows: &[KeybindOverlayRow],
+    viewport: LogicalViewport,
+    requested_page: usize,
 ) -> KeybindOverlayLayout {
     let viewport_w = viewport.width.max(1);
     let viewport_h = viewport.height.max(1);
@@ -179,18 +194,23 @@ pub fn layout_keybind_overlay(
         .min(max_columns_by_width)
         .clamp(1, OVERLAY_MAX_COLUMNS);
 
-    let visible_slots = if total_slots <= columns * rows_per_column {
-        total_slots
+    let page_capacity = (columns * rows_per_column).max(1);
+    let (total_pages, slots_per_page) = if total_slots <= page_capacity {
+        (1, page_capacity)
     } else {
-        // Reserve the last slot for the `+N more` row.
-        (columns * rows_per_column).saturating_sub(1)
+        // Reserve the last slot on multi-page layouts for `+N more`.
+        let per_page = page_capacity.saturating_sub(1).max(1);
+        (total_slots.div_ceil(per_page).max(1), per_page)
     };
-    // `hidden` counts bindings only: a dropped group header must not inflate `+N more`.
-    let visible_bindings = slots[..visible_slots]
+    let page = requested_page.min(total_pages - 1);
+    let start_slot = page * slots_per_page;
+    let end_slot = ((page + 1) * slots_per_page).min(total_slots);
+    let page_slots = end_slot.saturating_sub(start_slot);
+    // `hidden` counts bindings on later pages: a dropped group header must not inflate `+N more`.
+    let hidden = slots[end_slot..]
         .iter()
-        .filter(|(is_header, _)| !is_header)
+        .filter(|(is_header, _)| !*is_header)
         .count();
-    let hidden = rows.len() - visible_bindings;
 
     let column_width = (((available_width
         .saturating_sub((columns.saturating_sub(1) as u32) * OVERLAY_GUTTER))
@@ -201,12 +221,11 @@ pub fn layout_keybind_overlay(
         / OVERLAY_CHAR_ADVANCE) as usize)
         .clamp(1, OVERLAY_DESCRIPTION_CHARS);
 
-    // Columns fill top-to-bottom, so the tallest column is the first one until the last partial
-    // column; with truncation every column is full.
-    let used_rows = if hidden > 0 {
+    // Columns fill top-to-bottom; multi-page layouts keep full height for consistent paging.
+    let used_rows = if total_pages > 1 {
         rows_per_column
     } else {
-        visible_slots.min(rows_per_column).max(1)
+        page_slots.min(rows_per_column).max(1)
     };
     let panel_width = columns as u32 * column_width
         + (columns.saturating_sub(1) as u32) * OVERLAY_GUTTER
@@ -222,10 +241,14 @@ pub fn layout_keybind_overlay(
         panel_height.min(viewport_h),
     );
 
-    let mut texts = Vec::with_capacity(total_slots.min(visible_slots) * 2 + 4);
-    let mut title = String::from("Keybinds");
-    title = truncate(
-        &title,
+    let mut texts = Vec::with_capacity(page_slots * 2 + 4);
+    let raw_title = if total_pages > 1 {
+        format!("Keybinds ({}/{})", page + 1, total_pages)
+    } else {
+        String::from("Keybinds")
+    };
+    let title = truncate(
+        &raw_title,
         ((panel_width.saturating_sub(2 * OVERLAY_PADDING)) / OVERLAY_CHAR_ADVANCE) as usize,
     );
     texts.push(KeybindOverlayText {
@@ -245,15 +268,17 @@ pub fn layout_keybind_overlay(
     let column_x =
         |column: usize| OVERLAY_PADDING + column as u32 * (column_width + OVERLAY_GUTTER);
 
-    for slot in 0..visible_slots {
-        let column = slot / rows_per_column;
-        let row_in_column = slot % rows_per_column;
+    for local_slot in 0..page_slots {
+        let slot = start_slot + local_slot;
+        let column = local_slot / rows_per_column;
+        let row_in_column = local_slot % rows_per_column;
         let y = first_row_y + row_in_column as u32 * OVERLAY_LINE_HEIGHT;
         let (is_header, row_index) = slots[slot];
         if is_header {
             // Header slots carry the group of the following bind row.
-            let group = slots[slot + 1]
-                .1
+            let group = slots
+                .get(slot + 1)
+                .and_then(|(_, idx)| *idx)
                 .map(|index| rows[index].group)
                 .unwrap_or("");
             texts.push(KeybindOverlayText {
@@ -284,7 +309,7 @@ pub fn layout_keybind_overlay(
 
     if hidden > 0 {
         let column = columns - 1;
-        let row_in_column = visible_slots - column * rows_per_column;
+        let row_in_column = page_slots.saturating_sub(column * rows_per_column);
         texts.push(KeybindOverlayText {
             x: column_x(column),
             y: first_row_y + row_in_column as u32 * OVERLAY_LINE_HEIGHT,
@@ -293,7 +318,11 @@ pub fn layout_keybind_overlay(
         });
     }
 
-    let hint = "Esc or click to close | Mod + Shift + Slash toggles";
+    let hint = if total_pages > 1 {
+        "Esc/click close · Left/Right or PgUp/PgDn page · Mod+Shift+/ toggles"
+    } else {
+        "Esc or click to close | Mod + Shift + Slash toggles"
+    };
     texts.push(KeybindOverlayText {
         x: OVERLAY_PADDING,
         y: OVERLAY_PADDING + OVERLAY_TITLE_BLOCK + used_rows as u32 * OVERLAY_LINE_HEIGHT + 4,
@@ -310,6 +339,8 @@ pub fn layout_keybind_overlay(
         columns,
         rows_per_column,
         hidden,
+        page,
+        total_pages,
     }
 }
 
@@ -439,5 +470,31 @@ mod tests {
             .unwrap();
         assert!(chord.text.ends_with(".."));
         assert_eq!(chord.text.chars().count(), OVERLAY_CHORD_CHARS);
+    }
+
+    #[test]
+    fn issue_123_pagination_exposes_every_binding_across_pages() {
+        let all = rows(100);
+        let vp = viewport(800, 600);
+        let p0 = layout_keybind_overlay_page(&all, vp, 0);
+        assert!(p0.total_pages > 1);
+        assert_eq!(p0.page, 0);
+
+        let mut total_visible = 0_usize;
+        for page in 0..p0.total_pages {
+            let layout = layout_keybind_overlay_page(&all, vp, page);
+            assert_eq!(layout.page, page);
+            assert_eq!(layout.total_pages, p0.total_pages);
+            total_visible += layout.visible_bind_count();
+        }
+        assert_eq!(
+            total_visible,
+            all.len(),
+            "paginating across all pages must show every single binding without dropping any"
+        );
+        let last = layout_keybind_overlay_page(&all, vp, p0.total_pages - 1);
+        assert_eq!(last.hidden, 0);
+        let clamped = layout_keybind_overlay_page(&all, vp, 999);
+        assert_eq!(clamped.page, p0.total_pages - 1);
     }
 }

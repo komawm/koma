@@ -1250,6 +1250,29 @@ impl KomaState {
             .unwrap_or_else(|| self.active_ws_id.clone())
     }
 
+    /// Aligns a `special:<name>` scratchpad workspace's viewport with the focused output so
+    /// overlays declared before outputs settle never lay out at a stale default resolution.
+    pub fn sync_special_workspace_viewport(&mut self, sp_id: &WorkspaceId) {
+        let vp = self
+            .focused_output()
+            .map(|o| self.viewport_for_output(&o))
+            .or_else(|| {
+                self.workspaces
+                    .get(&self.active_ws_id)
+                    .map(|ws| ws.viewport)
+            });
+        let Some(vp) = vp else {
+            return;
+        };
+        let now_ms = self.elapsed_ms();
+        if let Some(ws) = self.workspaces.get_mut(sp_id)
+            && ws.viewport != vp
+        {
+            ws.viewport = vp;
+            ws.recalculate(now_ms);
+        }
+    }
+
     /// Finds or lazily creates a `special:<name>` Scratchpad overlay workspace matching the
     /// current physical output viewport (`Hyprland` `togglespecialworkspace` / `special:magic`).
     pub fn ensure_special_workspace(&mut self, raw_name: Option<&str>) -> WorkspaceId {
@@ -1259,7 +1282,9 @@ impl KomaState {
             .iter()
             .find(|(_, ws)| ws.name == canonical_name)
         {
-            return existing_id.clone();
+            let id = existing_id.clone();
+            self.sync_special_workspace_viewport(&id);
+            return id;
         }
 
         let next_idx = self.workspaces.len() + 1;

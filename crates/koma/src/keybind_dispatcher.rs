@@ -1194,6 +1194,7 @@ pub fn process_keyboard_key_event(
         CancelPointerGrab,
         ExitSubmapMode,
         DismissKeybindOverlay,
+        KeybindOverlayPage(isize),
         ConsumeKey,
         FireAction {
             bind_id: Option<BindHandleId>,
@@ -1210,7 +1211,18 @@ pub fn process_keyboard_key_event(
     //    reset scroll trackers if any modifier bit changed (`niri` modifier release rule).
     //    Fail-closed on locked sessions: never deliver lock-screen key events into an active IME grab!
     if key_state == KeyState::Released && state.keybind_overlay_is_open() {
-        // The overview owns a keyboard grab: never leak releases to the focused client.
+        // The overview owns a keyboard grab: update internal XKB modifier state on release
+        // (so releasing `Mod`/`Shift` after `Mod + Shift + /` clears `held_mask`) without
+        // forwarding key-release events to the focused client.
+        state.with_keyboard_dispatch(|state, keyboard| {
+            let _ = keyboard.input_intercept(
+                smithay::input::keyboard::KeyboardSource::MAIN,
+                state,
+                keycode,
+                key_state,
+                |_, _, _| (),
+            );
+        });
         return;
     }
     if key_state == KeyState::Released {
@@ -1296,14 +1308,48 @@ pub fn process_keyboard_key_event(
                     let phys_mod = state.keybinds.effective_mod_key(is_bare_metal_tty);
                     let overlay_open = state.keybind_overlay_is_open() && !is_locked;
 
-                    // Gate 0a3: the keybind overview owns the keyboard grab. `Escape` closes it and every
-                    // other chord is either the overlay toggle itself or swallowed before reaching a client.
-                    if overlay_open
-                        && key_state == KeyState::Pressed
-                        && mod_raw == keysyms::KEY_Escape
-                        && held_mask == 0
-                    {
-                        return FilterResult::Intercept(InterceptOutcome::DismissKeybindOverlay);
+                    // Gate 0a3: the keybind overview owns the keyboard grab. `Escape` closes it,
+                    // directional / page keys turn pages, and every other chord is either the
+                    // overlay toggle itself or swallowed before reaching a client.
+                    if overlay_open && key_state == KeyState::Pressed {
+                        if mod_raw == keysyms::KEY_Escape && held_mask == 0 {
+                            return FilterResult::Intercept(
+                                InterceptOutcome::DismissKeybindOverlay,
+                            );
+                        }
+                        if held_mask == 0 {
+                            match mod_raw {
+                                keysyms::KEY_Right
+                                | keysyms::KEY_Page_Down
+                                | keysyms::KEY_Down
+                                | keysyms::KEY_l
+                                | keysyms::KEY_L
+                                | keysyms::KEY_j
+                                | keysyms::KEY_J
+                                | keysyms::KEY_space
+                                | keysyms::KEY_n
+                                | keysyms::KEY_N => {
+                                    return FilterResult::Intercept(
+                                        InterceptOutcome::KeybindOverlayPage(1),
+                                    );
+                                }
+                                keysyms::KEY_Left
+                                | keysyms::KEY_Page_Up
+                                | keysyms::KEY_Up
+                                | keysyms::KEY_h
+                                | keysyms::KEY_H
+                                | keysyms::KEY_k
+                                | keysyms::KEY_K
+                                | keysyms::KEY_p
+                                | keysyms::KEY_P
+                                | keysyms::KEY_BackSpace => {
+                                    return FilterResult::Intercept(
+                                        InterceptOutcome::KeybindOverlayPage(-1),
+                                    );
+                                }
+                                _ => {}
+                            }
+                        }
                     }
 
                     // A modifier pressed (or a chord re-pressed) outside the repeating chord cancels it.
@@ -1532,6 +1578,9 @@ pub fn process_keyboard_key_event(
         }
         InterceptOutcome::DismissKeybindOverlay => {
             state.handle_keybind_overlay_key(true);
+        }
+        InterceptOutcome::KeybindOverlayPage(delta) => {
+            state.step_keybind_overlay_page(delta);
         }
         InterceptOutcome::ConsumeKey => {}
         InterceptOutcome::FireAction {
@@ -2351,6 +2400,7 @@ pub fn execute_action_descriptor(
             if state.active_special_ws_id.as_ref() == Some(&sp_id) {
                 state.active_special_ws_id = None;
             } else {
+                state.sync_special_workspace_viewport(&sp_id);
                 state.active_special_ws_id = Some(sp_id.clone());
                 state.sync_workspace_geometries(&sp_id);
             }
@@ -2362,6 +2412,7 @@ pub fn execute_action_descriptor(
 
         ActionDescriptor::ScratchpadMoveWindow { name, silent } => {
             let sp_id = state.ensure_special_workspace(name.as_deref());
+            state.sync_special_workspace_viewport(&sp_id);
             let src_ws_id = state.effective_interactive_ws_id();
             if src_ws_id == sp_id {
                 let dst_ws_id = state.active_ws_id.clone();

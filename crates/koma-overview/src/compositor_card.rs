@@ -205,7 +205,7 @@ fn blit_scaled_rgba_to_argb(
 /// Minimal crisp `5x7` uppercase/digit/symbol glyph renderer (2x pixel scale -> `10x14` px)
 /// clipped strictly inside `[start_x, max_x)` so long labels never bleed into neighboring cards.
 #[allow(clippy::too_many_arguments)]
-fn draw_label_5x7(
+pub(crate) fn draw_label_5x7(
     canvas: &mut [u8],
     canvas_w: u32,
     canvas_h: u32,

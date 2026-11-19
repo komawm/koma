@@ -5,15 +5,18 @@
 //! open it owns the keyboard grab, so `Escape` and the bound chord reach the overlay instead of
 //! the focused client, and pointer buttons dismiss it without reaching clients.
 
+use std::cell::RefCell;
+
 use koma_lua::{KEYBIND_CATALOG, KEYBIND_GROUP_ORDER, merge_binds};
 use koma_model::{
     KeybindOverlayLayout, KeybindOverlayRow, KeybindOverlayTextRole, LogicalPoint, LogicalViewport,
-    layout_keybind_overlay,
+    layout_keybind_overlay_page,
 };
 use koma_render::elements::{
     KomaRenderElement, KomaRenderTarget, KomaSolidColorElement, TextPanelLine, TextPanelSpec,
-    build_text_panel_element,
+    rasterize_text_panel_buffer, render_text_panel_buffer,
 };
+use smithay::backend::renderer::element::memory::MemoryRenderBuffer;
 use smithay::utils::{Point, Rectangle, Scale, Size};
 
 use crate::state::KomaState;
@@ -28,12 +31,24 @@ const COLOR_DESCRIPTION: [u8; 4] = [139, 148, 158, 255];
 const COLOR_MORE: [u8; 4] = [210, 168, 255, 255];
 const PANEL_CORNER_RADIUS: u32 = 14;
 
-/// Open overlay state: the output it was requested on and the merged effective bindings.
+#[derive(Debug, Clone)]
+struct CachedOverlayPanel {
+    viewport_w: u32,
+    viewport_h: u32,
+    page: usize,
+    int_scale: i32,
+    panel_loc: LogicalPoint,
+    buffer: MemoryRenderBuffer,
+}
+
+/// Open overlay state: the output it was requested on, active page, and cached rasterized buffer.
 #[derive(Debug, Clone)]
 pub struct KeybindOverlay {
     /// Focused output at open time; `None` means no output was focused and every output draws it.
     pub output: Option<String>,
     pub rows: Vec<KeybindOverlayRow>,
+    pub page: usize,
+    cached_panel: RefCell<Option<CachedOverlayPanel>>,
 }
 
 impl KeybindOverlay {
@@ -91,6 +106,8 @@ impl KomaState {
                 .clone()
                 .or_else(|| self.focused_output_name()),
             rows,
+            page: 0,
+            cached_panel: RefCell::new(None),
         });
         self.keybinds.reset_scroll_trackers();
         self.queue_redraw();
@@ -127,6 +144,33 @@ impl KomaState {
         true
     }
 
+    /// Advances or rewinds the open keybind overlay page by `delta` (`+1` / `-1`), wrapping cleanly
+    /// across `total_pages`.
+    pub fn step_keybind_overlay_page(&mut self, delta: isize) -> bool {
+        let Some(overlay) = self.keybind_overlay.as_ref() else {
+            return false;
+        };
+        let rows = overlay.rows.clone();
+        let current_page = overlay.page;
+        let viewport = self
+            .focused_output()
+            .map(|o| self.viewport_for_output(&o))
+            .unwrap_or_else(|| LogicalViewport::new(1920, 1080, 1.0));
+        let total_pages = layout_keybind_overlay_page(&rows, viewport, current_page)
+            .total_pages
+            .max(1);
+        if total_pages <= 1 {
+            return false;
+        }
+        let next_page = ((current_page as isize + delta).rem_euclid(total_pages as isize)) as usize;
+        if let Some(overlay_mut) = self.keybind_overlay.as_mut() {
+            overlay_mut.page = next_page;
+            *overlay_mut.cached_panel.borrow_mut() = None;
+        }
+        self.queue_redraw();
+        true
+    }
+
     /// No-op unless the overlay is open on this output and the session is unlocked.
     #[must_use]
     pub fn keybind_overlay_layout(
@@ -141,7 +185,11 @@ impl KomaState {
         if !overlay.should_draw_on(output_name) {
             return None;
         }
-        Some(layout_keybind_overlay(&overlay.rows, viewport))
+        Some(layout_keybind_overlay_page(
+            &overlay.rows,
+            viewport,
+            overlay.page,
+        ))
     }
 }
 
@@ -175,29 +223,50 @@ where
     let Some(layout) = state.keybind_overlay_layout(output_name, viewport) else {
         return Vec::new();
     };
+    let Some(overlay) = state.keybind_overlay.as_ref() else {
+        return Vec::new();
+    };
+    let int_scale = output_scale.x.ceil().clamp(1.0, 4.0) as i32;
 
-    let mut spec = TextPanelSpec::new(layout.panel.w, layout.panel.h, PANEL_CORNER_RADIUS);
-    spec.lines = layout
-        .texts
-        .into_iter()
-        .map(|text| TextPanelLine {
-            x: text.x,
-            y: text.y,
-            text: text.text,
-            color: role_color(text.role),
-        })
-        .collect();
+    let mut cached = overlay.cached_panel.borrow_mut();
+    let cache_hit = cached.as_ref().is_some_and(|c| {
+        c.viewport_w == viewport.width
+            && c.viewport_h == viewport.height
+            && c.page == layout.page
+            && c.int_scale == int_scale
+    });
+    if !cache_hit {
+        let mut spec = TextPanelSpec::new(layout.panel.w, layout.panel.h, PANEL_CORNER_RADIUS);
+        spec.lines = layout
+            .texts
+            .into_iter()
+            .map(|text| TextPanelLine {
+                x: text.x,
+                y: text.y,
+                text: text.text,
+                color: role_color(text.role),
+            })
+            .collect();
+        if let Some(buffer) = rasterize_text_panel_buffer(&spec, output_scale) {
+            *cached = Some(CachedOverlayPanel {
+                viewport_w: viewport.width,
+                viewport_h: viewport.height,
+                page: layout.page,
+                int_scale,
+                panel_loc: LogicalPoint {
+                    x: f64::from(layout.panel.x),
+                    y: f64::from(layout.panel.y),
+                },
+                buffer,
+            });
+        }
+    }
 
     let mut elements = Vec::with_capacity(2);
-    if let Some(panel) = build_text_panel_element(
-        renderer,
-        &spec,
-        LogicalPoint {
-            x: f64::from(layout.panel.x),
-            y: f64::from(layout.panel.y),
-        },
-        output_scale,
-    ) {
+    if let Some(entry) = cached.as_ref()
+        && let Some(panel) =
+            render_text_panel_buffer(renderer, &entry.buffer, entry.panel_loc, output_scale)
+    {
         elements.push(panel);
     }
     let scrim = Rectangle::new(
@@ -354,5 +423,34 @@ mod tests {
                 .keybind_overlay_layout("HDMI-A-1", LogicalViewport::new(1920, 1080, 1.0))
                 .is_none()
         );
+    }
+
+    #[test]
+    fn issue_123_step_page_wraps_and_updates_layout_page() {
+        let mut state = state();
+        state.open_keybind_overlay();
+        assert!(state.keybind_overlay_is_open());
+        let vp = LogicalViewport::new(800, 600, 1.0);
+        let first = state.keybind_overlay_layout("DP-1", vp).unwrap();
+        assert_eq!(first.page, 0);
+        assert!(first.total_pages > 1);
+
+        // Add enough synthetic rows so `step_keybind_overlay_page` spans multiple pages even on
+        // a 1920x1080 headless output.
+        if let Some(ov) = state.keybind_overlay.as_mut() {
+            let extra: Vec<KeybindOverlayRow> = (0..220)
+                .map(|i| {
+                    KeybindOverlayRow::new("Session", format!("Mod + {i}"), format!("Act {i}"))
+                })
+                .collect();
+            ov.rows = extra;
+        }
+        assert!(state.step_keybind_overlay_page(1));
+        assert_eq!(state.keybind_overlay.as_ref().unwrap().page, 1);
+        assert!(state.step_keybind_overlay_page(-1));
+        assert_eq!(state.keybind_overlay.as_ref().unwrap().page, 0);
+        // Wrapping backward from page 0 reaches the last page.
+        assert!(state.step_keybind_overlay_page(-1));
+        assert!(state.keybind_overlay.as_ref().unwrap().page >= 1);
     }
 }

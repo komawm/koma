@@ -7297,3 +7297,238 @@ fn issue_118_fullscreen_window_is_configured_to_the_full_output_without_border_i
         "windowed configure subtracts the border inset again"
     );
 }
+
+#[test]
+fn issue_123_keybind_simulation_covers_scratchpad_overlay_paging_and_user_chords() {
+    use crate::keybind_dispatcher::process_keyboard_key_event;
+    use smithay::backend::input::{InputTime, KeyState, Keycode};
+
+    let mut env = ClientEnv::new();
+    // Apply the user's actual keybind overrides on top of inherited built-in defaults.
+    env.state
+        .lua_sandbox
+        .eval_init_lua(
+            r#"
+            koma.input({ mod_key = "Super", inherit_default_binds = true })
+            koma.workspace({ name = "special:magic", presentation = "headed", layout = "dwindle", gaps = { inner = 10, outer = 48 } })
+            koma.bind("Mod + S", koma.act.scratchpad.toggle("magic"))
+            koma.bind("Mod + Shift + S", koma.act.scratchpad.move_window("magic", false))
+            koma.bind("Mod + F", koma.act.window.maximize_toggle())
+            koma.bind("Mod + Shift + F", koma.act.window.fullscreen_toggle())
+            koma.bind("Mod + Shift + M", koma.act.window.fullscreen_toggle())
+            koma.bind("Mod + Shift + H", koma.act.window.resize({ width = -30, height = 0 }))
+            koma.bind("Mod + Shift + L", koma.act.window.resize({ width = 30, height = 0 }))
+            koma.bind("Mod + Ctrl + H", koma.act.window.move_direction("left"))
+            koma.bind("Mod + Ctrl + L", koma.act.window.move_direction("right"))
+            koma.bind("Mod + Alt + E", koma.act.dwindle.toggle_split())
+        "#,
+        )
+        .expect("reload user-style config");
+    let snap = env.state.lua_sandbox.config_snapshot();
+    env.state.keybinds = crate::keybind_dispatcher::KeybindTable::compile_with_options(
+        &snap.binds,
+        &snap.unbinds,
+        snap.input.inherit_default_binds,
+        snap.input.mod_key.as_deref(),
+    )
+    .expect("compile user keybinds");
+
+    let (_s1, _xs1, _tl1) = env.spawn_window("Term1", "com.mitchellh.ghostty");
+    let (_s2, _xs2, _tl2) = env.spawn_window("Term2", "com.mitchellh.ghostty");
+    env.pump();
+
+    let win1 = env.state.mapped_windows[0].win_id;
+    let win2 = env.state.mapped_windows[1].win_id;
+
+    // On nested/non-TTY test seat (`is_bare_metal_tty = false`), `Mod` maps to Alt (evdev 56).
+    let press = |state: &mut KomaState, mods: &[u32], evdev_key: u32, t: &mut u32| {
+        for &m in mods {
+            *t += 1;
+            process_keyboard_key_event(
+                state,
+                Keycode::from(m + 8),
+                KeyState::Pressed,
+                InputTime::from_millis(*t),
+                false,
+            );
+        }
+        *t += 1;
+        process_keyboard_key_event(
+            state,
+            Keycode::from(evdev_key + 8),
+            KeyState::Pressed,
+            InputTime::from_millis(*t),
+            false,
+        );
+        *t += 1;
+        process_keyboard_key_event(
+            state,
+            Keycode::from(evdev_key + 8),
+            KeyState::Released,
+            InputTime::from_millis(*t),
+            false,
+        );
+        for &m in mods.iter().rev() {
+            *t += 1;
+            process_keyboard_key_event(
+                state,
+                Keycode::from(m + 8),
+                KeyState::Released,
+                InputTime::from_millis(*t),
+                false,
+            );
+        }
+    };
+
+    const MOD: u32 = 125; // KEY_LEFTMETA (Super override)
+    const SHIFT: u32 = 42; // KEY_LEFTSHIFT
+    const CTRL: u32 = 29; // KEY_LEFTCTRL
+    const ALT: u32 = 56; // KEY_LEFTALT
+    const KEY_S: u32 = 31;
+    const KEY_F: u32 = 33;
+    const KEY_M: u32 = 50;
+    const KEY_H: u32 = 35;
+    const KEY_L: u32 = 38;
+    const KEY_V: u32 = 47;
+    const KEY_P: u32 = 25;
+    const KEY_E: u32 = 18;
+    const KEY_SLASH: u32 = 53;
+    const KEY_ESC: u32 = 1;
+    const KEY_RIGHT: u32 = 106;
+    const KEY_LEFT: u32 = 105;
+    const KEY_2: u32 = 3;
+
+    let mut t = 100_u32;
+
+    // 1. Mod + Shift + S moves focused window to `special:magic` and opens the scratchpad overlay.
+    let start_ws = env.state.active_ws_id.clone();
+    press(&mut env.state, &[MOD, SHIFT], KEY_S, &mut t);
+    let sp_id = env
+        .state
+        .active_special_ws_id
+        .clone()
+        .expect("scratchpad must open on non-silent move");
+    assert_eq!(env.state.workspaces[&sp_id].name, "special:magic");
+    assert_eq!(
+        (
+            env.state.workspaces[&sp_id].viewport.width,
+            env.state.workspaces[&sp_id].viewport.height,
+        ),
+        (
+            env.state.workspaces[&start_ws].viewport.width,
+            env.state.workspaces[&start_ws].viewport.height,
+        ),
+        "special:magic viewport dimensions must match output viewport"
+    );
+    assert!(
+        env.state
+            .mapped_windows
+            .iter()
+            .any(|m| m.win_id == win2 && m.ws_id == sp_id),
+        "Mod + Shift + S must move active window into special:magic"
+    );
+
+    // 2. Mod + S hides, then Mod + S shows `special:magic` again.
+    press(&mut env.state, &[MOD], KEY_S, &mut t);
+    assert!(
+        env.state.active_special_ws_id.is_none(),
+        "Mod + S must hide scratchpad"
+    );
+    press(&mut env.state, &[MOD], KEY_S, &mut t);
+    assert_eq!(
+        env.state.active_special_ws_id.as_ref(),
+        Some(&sp_id),
+        "Mod + S must show scratchpad"
+    );
+
+    // 3. Mod + Shift + S while inside `special:magic` pops the window back to the active workspace.
+    press(&mut env.state, &[MOD, SHIFT], KEY_S, &mut t);
+    assert!(
+        env.state
+            .mapped_windows
+            .iter()
+            .any(|m| m.win_id == win2 && m.ws_id == start_ws),
+        "Mod + Shift + S from scratchpad must return window to active workspace"
+    );
+    press(&mut env.state, &[MOD], KEY_S, &mut t); // hide empty overlay
+
+    // 4. Mod + F (maximize), Mod + Shift + F / Mod + Shift + M (fullscreen).
+    press(&mut env.state, &[MOD], KEY_F, &mut t);
+    assert!(
+        env.state.workspaces[&start_ws].is_maximized(win2),
+        "Mod + F maximizes"
+    );
+    press(&mut env.state, &[MOD, SHIFT], KEY_F, &mut t);
+    assert!(
+        env.state.workspaces[&start_ws].is_fullscreen(win2),
+        "Mod + Shift + F fullscreens"
+    );
+    press(&mut env.state, &[MOD, SHIFT], KEY_M, &mut t);
+    assert!(
+        !env.state.workspaces[&start_ws].is_fullscreen(win2),
+        "Mod + Shift + M unfullscreens"
+    );
+
+    // 5. Mod + Shift + H/L (resize), Mod + Ctrl + H/L (move), Mod + V (float), Mod + P (pseudo), Mod + Alt + E (split).
+    let before_w = env
+        .state
+        .mapped_windows
+        .iter()
+        .find(|m| m.win_id == win2)
+        .unwrap()
+        .rect
+        .w;
+    press(&mut env.state, &[MOD, SHIFT], KEY_L, &mut t);
+    let after_w = env
+        .state
+        .mapped_windows
+        .iter()
+        .find(|m| m.win_id == win2)
+        .unwrap()
+        .rect
+        .w;
+    assert_ne!(before_w, after_w, "Mod + Shift + L must resize split");
+
+    press(&mut env.state, &[MOD, CTRL], KEY_H, &mut t);
+    press(&mut env.state, &[MOD, ALT], KEY_E, &mut t);
+    press(&mut env.state, &[MOD], KEY_P, &mut t);
+    press(&mut env.state, &[MOD], KEY_V, &mut t);
+    assert!(
+        env.state
+            .mapped_windows
+            .iter()
+            .find(|m| m.win_id == win1 || m.win_id == win2)
+            .is_some(),
+        "windows remain mapped after user layout/float chords"
+    );
+
+    // 6. Mod + 2 switches workspace, Mod + Shift + Slash opens overlay, Right/Left flips pages, Esc closes.
+    press(&mut env.state, &[MOD], KEY_2, &mut t);
+    assert_eq!(env.state.workspaces[&env.state.active_ws_id].name, "2");
+
+    press(&mut env.state, &[MOD, SHIFT], KEY_SLASH, &mut t);
+    assert!(
+        env.state.keybind_overlay_is_open(),
+        "Mod + Shift + Slash opens keybind overlay"
+    );
+    if let Some(ov) = env.state.keybind_overlay.as_mut() {
+        ov.rows = (0..400)
+            .map(|i| {
+                koma_model::KeybindOverlayRow::new(
+                    "Session",
+                    format!("Mod + {i}"),
+                    format!("Act {i}"),
+                )
+            })
+            .collect();
+    }
+    press(&mut env.state, &[], KEY_RIGHT, &mut t);
+    assert_eq!(env.state.keybind_overlay.as_ref().unwrap().page, 1);
+    press(&mut env.state, &[], KEY_LEFT, &mut t);
+    assert_eq!(env.state.keybind_overlay.as_ref().unwrap().page, 0);
+    press(&mut env.state, &[], KEY_ESC, &mut t);
+    assert!(
+        !env.state.keybind_overlay_is_open(),
+        "Escape closes keybind overlay"
+    );
+}
