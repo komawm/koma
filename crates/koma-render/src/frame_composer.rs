@@ -13,7 +13,7 @@ use smithay::{
     backend::renderer::{
         Color32F, ImportAll, ImportMem, Renderer,
         element::{
-            Kind,
+            Element as _, Kind,
             memory::{MemoryRenderBuffer, MemoryRenderBufferRenderElement},
             surface::{WaylandSurfaceRenderElement, render_elements_from_surface_tree},
         },
@@ -782,8 +782,14 @@ where
                     Kind::Unspecified,
                 );
 
-            let needs_shader_clip =
-                item.clip_to_geometry && (inner_radius > 0.5 || eff_opacity < 0.999);
+            let inner_phys: Rectangle<i32, Physical> =
+                inner_rect.to_physical_precise_round(output_scale);
+            let needs_shader_clip = item.clip_to_geometry
+                && (inner_radius > 0.5
+                    || eff_opacity < 0.999
+                    || surface_elems
+                        .iter()
+                        .any(|el| !inner_phys.contains_rect(el.geometry(output_scale))));
             if let (true, Some(clip_prog)) = (needs_shader_clip, shaders.clipped_surface.as_ref()) {
                 for surf_el in surface_elems {
                     elements.push(KomaRenderElement::ClippedSurface(

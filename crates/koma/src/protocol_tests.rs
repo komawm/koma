@@ -6305,6 +6305,9 @@ fn session_lock_acquire_confirm_unlock_cycles_schedule_rendering() {
 #[test]
 fn split_resize_configures_tiled_clients_above_their_minimum_size() {
     let mut env = ClientEnv::new();
+    for ws in env.state.workspaces.values_mut() {
+        ws.dwindle.config.size_limits_tiled = true;
+    }
     let (_surf_a, _xs_a, toplevel_a) = env.spawn_window("Browser", "org.koma.browser");
     let browser_id = toplevel_a.id().protocol_id();
 
@@ -6381,6 +6384,200 @@ fn split_resize_configures_tiled_clients_above_their_minimum_size() {
         terminal.rect.w as i32 - border_inset,
         "unconstrained clients are still configured at their tile size"
     );
+}
+
+#[test]
+fn issue_113_default_dwindle_resizes_and_partitions_large_min_size_clients_without_overlap() {
+    let mut env = ClientEnv::new();
+    let (_surf_qq, _xs_qq, toplevel_qq) = env.spawn_window("QQ", "QQ");
+    toplevel_qq.set_min_size(1100, 600);
+    _surf_qq.commit();
+    env.pump();
+
+    let (_surf_wc, _xs_wc, toplevel_wc) = env.spawn_window("WeChat", "wechat");
+    toplevel_wc.set_min_size(1000, 600);
+    _surf_wc.commit();
+    env.pump();
+
+    let qq_id = env
+        .state
+        .mapped_windows
+        .iter()
+        .find(|m| m.app_id == "QQ")
+        .unwrap()
+        .win_id;
+    let wc_id = env
+        .state
+        .mapped_windows
+        .iter()
+        .find(|m| m.app_id == "wechat")
+        .unwrap()
+        .win_id;
+    let ws_id = env.state.active_ws_id.clone();
+    assert!(
+        env.state
+            .workspaces
+            .get_mut(&ws_id)
+            .unwrap()
+            .activate_window(qq_id, 1)
+    );
+    env.state.focus_active_deck_window();
+
+    let rect_of = |st: &KomaState, id| {
+        st.mapped_windows
+            .iter()
+            .find(|m| m.win_id == id)
+            .unwrap()
+            .rect
+    };
+    let init_qq = rect_of(&env.state, qq_id);
+    let init_wc = rect_of(&env.state, wc_id);
+    assert!(init_qq.x + init_qq.w as i32 <= init_wc.x);
+    assert!(init_qq.w < 1100 && init_wc.w < 1000);
+
+    // Resize left (`WindowResizeDelta { width: -120, height: 0 }`) shrinks QQ smoothly below min_w
+    for _ in 0..4 {
+        execute_action_descriptor(
+            &mut env.state,
+            ActionDescriptor::WindowResizeDelta {
+                width: -30,
+                height: 0,
+            },
+            false,
+        );
+    }
+    env.pump();
+    let shrunk_qq = rect_of(&env.state, qq_id);
+    let grown_wc = rect_of(&env.state, wc_id);
+    assert!(
+        shrunk_qq.w <= init_qq.w - 90,
+        "QQ failed to shrink left: {shrunk_qq:?} vs {init_qq:?}"
+    );
+    assert!(shrunk_qq.x + shrunk_qq.w as i32 <= grown_wc.x);
+
+    // Resize right (`WindowResizeDelta { width: +240, height: 0 }`) expands QQ smoothly
+    for _ in 0..8 {
+        execute_action_descriptor(
+            &mut env.state,
+            ActionDescriptor::WindowResizeDelta {
+                width: 30,
+                height: 0,
+            },
+            false,
+        );
+    }
+    env.pump();
+    let grown_qq = rect_of(&env.state, qq_id);
+    let shrunk_wc = rect_of(&env.state, wc_id);
+    assert!(
+        grown_qq.w >= init_qq.w + 90,
+        "QQ failed to grow right: {grown_qq:?} vs {init_qq:?}"
+    );
+    assert!(grown_qq.x + grown_qq.w as i32 <= shrunk_wc.x);
+}
+
+#[test]
+fn issue_113_clipped_oversized_surface_never_steals_neighbor_pointer_hits() {
+    let mut env = ClientEnv::new();
+
+    let (surf_a, _xs_a, tl_a) = env.spawn_window("Overflowing", "org.koma.overflow");
+    let qh = env.queue.handle();
+    let comp = env.client.compositor.clone().unwrap();
+    let wm = env.client.xdg_wm_base.clone().unwrap();
+    let shm = env.client.shm.clone().unwrap();
+
+    tl_a.set_min_size(1400, 600);
+    // Commit an oversized 1400x400 buffer inside the left tile (`~960 px` wide after split).
+    let fd = create_portable_shm_fd(1400 * 400 * 4, None);
+    let pool = shm.create_pool(fd.as_fd(), 1400 * 400 * 4, &qh, ());
+    let buf = pool.create_buffer(0, 1400, 400, 1400 * 4, wl_shm::Format::Argb8888, &qh, ());
+    surf_a.attach(Some(&buf), 0, 0);
+    surf_a.commit();
+    env.pump();
+
+    let (surf_b, xs_b, _tl_b) = env.spawn_window("Neighbor", "org.koma.neighbor");
+    let fd_b = create_portable_shm_fd(400 * 400 * 4, None);
+    let pool_b = shm.create_pool(fd_b.as_fd(), 400 * 400 * 4, &qh, ());
+    let buf_b = pool_b.create_buffer(0, 400, 400, 400 * 4, wl_shm::Format::Argb8888, &qh, ());
+    surf_b.attach(Some(&buf_b), 0, 0);
+    surf_b.commit();
+    env.pump();
+
+    let win_a = env
+        .state
+        .mapped_windows
+        .iter()
+        .find(|m| m.app_id == "org.koma.overflow")
+        .unwrap()
+        .win_id;
+    let win_b = env
+        .state
+        .mapped_windows
+        .iter()
+        .find(|m| m.app_id == "org.koma.neighbor")
+        .unwrap()
+        .win_id;
+    let rect_b = env
+        .state
+        .mapped_windows
+        .iter()
+        .find(|m| m.win_id == win_b)
+        .unwrap()
+        .rect;
+
+    // Focus win_a (making it later/front-most if iterated last, then click inside win_b's tile):
+    // even if win_a's committed buffer extends past x=960 into win_b's rect, hits in win_b's
+    // tile must land on win_b, never win_a!
+    let ws_id = env.state.active_ws_id.clone();
+    assert!(
+        env.state
+            .workspaces
+            .get_mut(&ws_id)
+            .unwrap()
+            .activate_window(win_a, 1)
+    );
+    let probe_b = Point::from((f64::from(rect_b.x) + 40.0, f64::from(rect_b.y) + 40.0));
+    let (hit_win, _, _) = env
+        .state
+        .surface_under_in_workspace(&ws_id, probe_b)
+        .expect("hit neighbor");
+    assert_eq!(
+        hit_win, win_b,
+        "oversized surface in left tile must not steal pointer hits inside right tile"
+    );
+
+    // Popups extending beyond a toplevel's clipped rect must remain hit-testable.
+    let pos = wm.create_positioner(&qh, ());
+    pos.set_size(120, 80);
+    pos.set_anchor_rect(-60, 10, 20, 20);
+    let pop_surf = comp.create_surface(&qh, ());
+    let pop_xdg = wm.get_xdg_surface(&pop_surf, &qh, ());
+    let _pop = pop_xdg.get_popup(Some(&xs_b), &pos, &qh, ());
+    pop_surf.commit();
+    env.pump();
+    let pop_fd = create_portable_shm_fd(120 * 80 * 4, None);
+    let pop_pool = shm.create_pool(pop_fd.as_fd(), 120 * 80 * 4, &qh, ());
+    let pop_buf = pop_pool.create_buffer(0, 120, 80, 120 * 4, wl_shm::Format::Argb8888, &qh, ());
+    pop_surf.attach(Some(&pop_buf), 0, 0);
+    pop_surf.commit();
+    env.pump();
+
+    let popup_probe = Point::from((f64::from(rect_b.x) - 20.0, f64::from(rect_b.y) + 40.0));
+    let (pop_hit_win, _, _) = env
+        .state
+        .surface_under_in_workspace(&ws_id, popup_probe)
+        .expect("hit popup");
+    assert_eq!(
+        pop_hit_win, win_b,
+        "unclipped popup overhanging neighbor tile must stay hit-testable"
+    );
+
+    pop_buf.destroy();
+    pop_pool.destroy();
+    buf_b.destroy();
+    pool_b.destroy();
+    buf.destroy();
+    pool.destroy();
 }
 
 /// Client `wl_data_device` drag-and-drop grab coverage (`komawm/koma#68`).

@@ -193,6 +193,10 @@ pub struct DwindleConfig {
     pub smart_resizing: bool,
     /// Allow `pseudotile` windows to retain their preferred floating size centered inside their tile.
     pub pseudotile: bool,
+    /// Enforce client-advertised `xdg_toplevel` `min_size` hints on tiled windows (matching
+    /// Hyprland's `misc:size_limits_tiled`; `false` by default so overflowing tiles never overlap
+    /// or lock split-ratio resizing).
+    pub size_limits_tiled: bool,
     /// Inner gap (logical px) between sibling tiles.
     pub inner_gap: u32,
     /// Outer margin (logical px) around the workspace perimeter.
@@ -210,6 +214,7 @@ impl Default for DwindleConfig {
             split_width_multiplier: 1.0,
             smart_resizing: true,
             pseudotile: true,
+            size_limits_tiled: false,
             inner_gap: 6,
             outer_gap: 10,
         }
@@ -786,7 +791,7 @@ impl DwindleTree {
             root_node.visual_box = work;
         }
         self.recalc_node_recursive(root_id, work, false, false, false, false);
-        if !self.leaf_min_sizes.is_empty() {
+        if self.config.size_limits_tiled && !self.leaf_min_sizes.is_empty() {
             // Second pass lets nested nodes settle `split_top` for their resized aspect ratio so
             // bottom-up `subtree_min_size` reads accurate child orientations.
             self.recalc_node_recursive(root_id, work, false, false, false, false);
@@ -872,8 +877,8 @@ impl DwindleTree {
         let (inset_left, inset_right, inset_top, inset_bottom) =
             self.gap_insets(gap_left, gap_right, gap_top, gap_bottom);
 
-        let vis_w = (raw_box.w as i32 - inset_left - inset_right).max(32) as u32;
-        let vis_h = (raw_box.h as i32 - inset_top - inset_bottom).max(32) as u32;
+        let vis_w = (raw_box.w as i32 - inset_left - inset_right).max(1) as u32;
+        let vis_h = (raw_box.h as i32 - inset_top - inset_bottom).max(1) as u32;
         let cell_visual =
             LogicalRect::new(raw_box.x + inset_left, raw_box.y + inset_top, vis_w, vis_h);
 
@@ -922,31 +927,27 @@ impl DwindleTree {
 
         let (is_top, ratio, [c0, c1]) = split_info;
         if !is_top {
-            let desired = ((f64::from(raw_box.w) * 0.5 * ratio).round() as i32)
-                .clamp(32, (raw_box.w as i32 - 32).max(32)) as u32;
-            let first_w = if self.leaf_min_sizes.is_empty() {
-                desired
-            } else {
+            let min_pair = if cfg.size_limits_tiled && !self.leaf_min_sizes.is_empty() {
                 let (min_w0, _) = self.subtree_min_size(c0, gap_left, true, gap_top, gap_bottom);
                 let (min_w1, _) = self.subtree_min_size(c1, true, gap_right, gap_top, gap_bottom);
-                distribute_split_axis(raw_box.w, desired, min_w0, min_w1)
+                Some((min_w0, min_w1))
+            } else {
+                None
             };
-            let second_w = raw_box.w.saturating_sub(first_w).max(32);
+            let (first_w, second_w) = partition_split_axis(raw_box.w, ratio, min_pair);
             let box0 = LogicalRect::new(raw_box.x, raw_box.y, first_w, raw_box.h);
             let box1 = LogicalRect::new(raw_box.x + first_w as i32, raw_box.y, second_w, raw_box.h);
             self.recalc_node_recursive(c0, box0, gap_left, true, gap_top, gap_bottom);
             self.recalc_node_recursive(c1, box1, true, gap_right, gap_top, gap_bottom);
         } else {
-            let desired = ((f64::from(raw_box.h) * 0.5 * ratio).round() as i32)
-                .clamp(32, (raw_box.h as i32 - 32).max(32)) as u32;
-            let first_h = if self.leaf_min_sizes.is_empty() {
-                desired
-            } else {
+            let min_pair = if cfg.size_limits_tiled && !self.leaf_min_sizes.is_empty() {
                 let (_, min_h0) = self.subtree_min_size(c0, gap_left, gap_right, gap_top, true);
                 let (_, min_h1) = self.subtree_min_size(c1, gap_left, gap_right, true, gap_bottom);
-                distribute_split_axis(raw_box.h, desired, min_h0, min_h1)
+                Some((min_h0, min_h1))
+            } else {
+                None
             };
-            let second_h = raw_box.h.saturating_sub(first_h).max(32);
+            let (first_h, second_h) = partition_split_axis(raw_box.h, ratio, min_pair);
             let box0 = LogicalRect::new(raw_box.x, raw_box.y, raw_box.w, first_h);
             let box1 = LogicalRect::new(raw_box.x, raw_box.y + first_h as i32, raw_box.w, second_h);
             self.recalc_node_recursive(c0, box0, gap_left, gap_right, gap_top, true);
@@ -1550,18 +1551,31 @@ fn point_to_rect_dist_sq(pt: LogicalPoint, r: LogicalRect) -> f64 {
     dx * dx + dy * dy
 }
 
-fn distribute_split_axis(avail: u32, desired: u32, min0: u32, min1: u32) -> u32 {
-    if avail <= 64 {
-        return (avail / 2).max(32).min(avail.max(1));
+/// Partitions `avail` exactly (`first + second == avail`) between two children so neither
+/// child can overflow the parent box. When `avail >= 64`, each child keeps a 32 px floor;
+/// when a 32 px floor cannot fit (`avail < 64`), the floor shrinks proportionally to
+/// `(avail / 2).max(1)` (or `(avail, 0)` when `avail < 2`).
+fn partition_split_axis(avail: u32, ratio: f64, min_sizes: Option<(u32, u32)>) -> (u32, u32) {
+    if avail < 2 {
+        return (avail, 0);
     }
-    let max_span = avail.saturating_sub(32).max(32);
-    let lower = min0.min(max_span).max(32);
-    let upper = avail.saturating_sub(min1).max(32).min(max_span);
-    if lower <= upper {
-        desired.clamp(lower, upper)
-    } else {
-        desired.clamp(32, max_span)
-    }
+    let floor = 32.min(avail / 2).max(1);
+    let max_first = avail - floor;
+    let desired = ((f64::from(avail) * 0.5 * ratio).round() as i32)
+        .clamp(floor as i32, max_first as i32) as u32;
+    let first = match min_sizes {
+        Some((min0, min1)) if avail > 64 => {
+            let lower = min0.min(max_first).max(floor);
+            let upper = avail.saturating_sub(min1).max(floor).min(max_first);
+            if lower <= upper {
+                desired.clamp(lower, upper)
+            } else {
+                desired
+            }
+        }
+        _ => desired,
+    };
+    (first, avail - first)
 }
 
 #[cfg(test)]
@@ -1833,5 +1847,69 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn nested_40px_split_keeps_children_inside_parent_partition() {
+        for size_limits_tiled in [false, true] {
+            for vertical in [false, true] {
+                let cfg = DwindleConfig {
+                    preserve_split: true,
+                    outer_gap: 0,
+                    inner_gap: 0,
+                    split_width_multiplier: if vertical { 10.0 } else { 0.1 },
+                    size_limits_tiled,
+                    ..DwindleConfig::default()
+                };
+                let vp_40 = LogicalViewport::new(800, 800, 1.0);
+                let mut tree = DwindleTree::new(cfg);
+                let a = WindowId::new(1, 1);
+                let b = WindowId::new(2, 1);
+                let c = WindowId::new(3, 1);
+
+                let dir = if vertical {
+                    CardinalDir::Down
+                } else {
+                    CardinalDir::Right
+                };
+                tree.insert(a, vp_40, None, None, None, None);
+                tree.insert(b, vp_40, Some(a), None, None, Some(dir));
+                tree.insert(c, vp_40, Some(a), None, None, Some(dir));
+
+                // Shrink `(A, C)` down to a 40 px nested partition (`800 * 0.5 * 0.1 = 40`).
+                if vertical {
+                    assert!(tree.resize_target(b, 0.0, 800.0, vp_40));
+                } else {
+                    assert!(tree.resize_target(b, 800.0, 0.0, vp_40));
+                }
+
+                let ra = tree.rect_of(a).expect("rect A");
+                let rc = tree.rect_of(c).expect("rect C");
+                let rb = tree.rect_of(b).expect("rect B");
+                if vertical {
+                    assert_eq!(
+                        ra.h + rc.h,
+                        40,
+                        "A/C must stay inside 40px parent: {ra:?} {rc:?}"
+                    );
+                    assert!(ra.y + ra.h as i32 <= rc.y);
+                    assert!(
+                        rc.y + rc.h as i32 <= rb.y,
+                        "C overlapped B: {rc:?} vs {rb:?}"
+                    );
+                } else {
+                    assert_eq!(
+                        ra.w + rc.w,
+                        40,
+                        "A/C must stay inside 40px parent: {ra:?} {rc:?}"
+                    );
+                    assert!(ra.x + ra.w as i32 <= rc.x);
+                    assert!(
+                        rc.x + rc.w as i32 <= rb.x,
+                        "C overlapped B: {rc:?} vs {rb:?}"
+                    );
+                }
+            }
+        }
     }
 }
