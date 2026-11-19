@@ -6,6 +6,20 @@ incubation versions; `v0.1.0` will be the first independently accepted product
 release. A `0.0.x` tag is a development prerelease and does not claim a working
 desktop, hardware support, or security guarantees.
 
+## [0.0.8] - 2026-11-19
+
+### Fixed
+
+- Fullscreen `xdg_toplevel` configure size without border inset (`komawm/koma#118`, `komawm/koma#119`):
+  stops subtracting `2 * border.width` when configuring fullscreen windows (which render with
+  no border) and zeros the fullscreen border offset in popup/IME geometry helpers so right and
+  bottom edges never expose the wallpaper.
+- `Mod+Tab` overview card header clipping, clean labels, and active workspace highlight (`komawm/koma#120`, `komawm/koma#121`):
+  clips `draw_label_5x7` strictly within `header_rect` with `...` truncation (and adds `.` to
+  `glyph_5x7`), replaces raw `E:<epoch> | <frame_tier>` noise with `format_card_title`
+  (`ACTIVE` / `AGENT` / `PREEMPT`), and initializes `grid.selected_idx` to the focused
+  workspace when opening the overview grid.
+
 ## [0.0.7] - 2026-11-19
 
 ### Changed
