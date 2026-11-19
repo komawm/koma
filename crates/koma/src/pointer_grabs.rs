@@ -132,6 +132,21 @@ pub fn start_compositor_move_grab(state: &mut KomaState, button_code: u32, seria
     true
 }
 
+fn install_resize_grab(
+    state: &mut KomaState,
+    pointer: &smithay::input::pointer::PointerHandle<KomaState>,
+    grab: ResizeWindowGrab,
+    corner: ResizeCorner,
+    serial: Serial,
+    ws_id: &WorkspaceId,
+) {
+    state.active_resize_ws = Some(ws_id.clone());
+    // Emit `xdg_toplevel::State::Resizing` before the first drag frame arrives.
+    state.sync_workspace_geometries_all_instant(ws_id);
+    pointer.set_grab(state, grab, serial, Focus::Clear);
+    state.set_cursor_status(CursorImageStatus::Named(cursor_icon_for_corner(corner)));
+}
+
 /// Initiates a compositor-bound (`Mod + MouseRight`) interactive window / split-ratio resize grab
 /// before forwarding the triggering `ButtonEvent` to `PointerHandle::button`.
 pub fn start_compositor_resize_grab(
@@ -176,12 +191,13 @@ pub fn start_compositor_resize_grab(
         location: cursor_loc,
     };
 
-    let Some((grab, corner)) = ResizeWindowGrab::new(state, start_data, win_id, ws_id, None) else {
+    let Some((grab, corner)) =
+        ResizeWindowGrab::new(state, start_data, win_id, ws_id.clone(), None)
+    else {
         return false;
     };
 
-    pointer.set_grab(state, grab, serial, Focus::Clear);
-    state.set_cursor_status(CursorImageStatus::Named(cursor_icon_for_corner(corner)));
+    install_resize_grab(state, &pointer, grab, corner, serial, &ws_id);
     true
 }
 
@@ -237,13 +253,12 @@ pub fn start_frame_edge_resize_grab(
         location: state.pointer_location,
     };
     let Some((grab, corner)) =
-        ResizeWindowGrab::new(state, start_data, win_id, ws_id, Some(corner))
+        ResizeWindowGrab::new(state, start_data, win_id, ws_id.clone(), Some(corner))
     else {
         return false;
     };
 
-    pointer.set_grab(state, grab, serial, Focus::Clear);
-    state.set_cursor_status(CursorImageStatus::Named(cursor_icon_for_corner(corner)));
+    install_resize_grab(state, &pointer, grab, corner, serial, &ws_id);
     state.frame_edge_hover = Some((win_id, corner));
     true
 }
@@ -329,14 +344,17 @@ pub fn start_csd_resize_grab(
         button: start_data.button,
         location: start_data.location,
     };
-    let Some((grab, corner)) =
-        ResizeWindowGrab::new(state, clean_start, win_id, ws_id, Some(explicit_corner))
-    else {
+    let Some((grab, corner)) = ResizeWindowGrab::new(
+        state,
+        clean_start,
+        win_id,
+        ws_id.clone(),
+        Some(explicit_corner),
+    ) else {
         return false;
     };
 
-    pointer.set_grab(state, grab, serial, Focus::Clear);
-    state.set_cursor_status(CursorImageStatus::Named(cursor_icon_for_corner(corner)));
+    install_resize_grab(state, &pointer, grab, corner, serial, &ws_id);
     true
 }
 
@@ -1002,6 +1020,12 @@ impl ResizeWindowGrab {
     fn on_ungrab(&mut self, state: &mut KomaState) {
         // Smithay runs grab callbacks with the pointer mutex held.
         let _held = crate::seat_guard::pointer_callback();
+        if state.active_resize_ws.as_ref() == Some(&self.ws_id) {
+            state.active_resize_ws = None;
+        }
+        // Clear `xdg_toplevel::State::Resizing` and flush any throttled final configure size.
+        state.sync_workspace_geometries_all_instant(&self.ws_id);
+        state.queue_redraw();
         state.set_cursor_status(CursorImageStatus::default_named());
     }
 }
