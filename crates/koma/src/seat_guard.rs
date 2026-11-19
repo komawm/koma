@@ -168,6 +168,12 @@ pub fn callback(kind: SeatHandle) -> SeatScope {
     SeatScope { kind }
 }
 
+/// Returns `true` when `kind` is already owned or inside an active Smithay callback on this thread.
+#[must_use]
+pub fn is_held(kind: SeatHandle) -> bool {
+    REGISTRY.with(|cell| cell.borrow().slots[kind.index()].depth > 0)
+}
+
 /// Convenience alias so call sites read as `let _held = seat_guard::pointer_callback();`.
 #[must_use]
 pub fn keyboard_callback() -> SeatScope {
@@ -322,5 +328,20 @@ mod tests {
     fn guard_derefs_to_the_wrapped_handle() {
         let guard = SeatHandleGuard::new(41_u32, acquire(SeatHandle::Touch).expect("scope"));
         assert_eq!(*guard + 1, 42);
+    }
+
+    #[test]
+    fn is_held_tracks_active_acquire_and_callback_scopes() {
+        assert!(!is_held(SeatHandle::Pointer));
+        {
+            let _acq = acquire(SeatHandle::Pointer).expect("outer pointer acquire");
+            assert!(is_held(SeatHandle::Pointer));
+        }
+        assert!(!is_held(SeatHandle::Pointer));
+        {
+            let _cb = pointer_callback();
+            assert!(is_held(SeatHandle::Pointer));
+        }
+        assert!(!is_held(SeatHandle::Pointer));
     }
 }

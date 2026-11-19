@@ -4303,6 +4303,7 @@ mod kom_0024_compat_tests {
         keyboard_key_events: Vec<(u32, wl_keyboard::KeyState)>,
         pointer_motions: usize,
         pointer_buttons: Vec<(u32, wl_pointer::ButtonState)>,
+        last_button_serial: Option<u32>,
         pointer_axes: Vec<(wl_pointer::Axis, f64)>,
         pointer_axis_v120: Vec<(wl_pointer::Axis, i32)>,
     }
@@ -4764,8 +4765,12 @@ mod kom_0024_compat_tests {
                 wl_pointer::Event::Button {
                     button,
                     state: WEnum::Value(btn_state),
+                    serial,
                     ..
-                } => state.pointer_buttons.push((button, btn_state)),
+                } => {
+                    state.last_button_serial = Some(serial);
+                    state.pointer_buttons.push((button, btn_state));
+                }
                 wl_pointer::Event::Axis {
                     axis: WEnum::Value(axis),
                     value,
@@ -4966,6 +4971,167 @@ mod kom_0024_compat_tests {
         pop_pool.destroy();
         bar_buf.destroy();
         bar_pool.destroy();
+    }
+
+    #[test]
+    fn issue_109_popup_grab_teardown_and_pointer_motion_never_deadlocks_and_layer_none_skips_keyboard_grab()
+     {
+        use crate::pointer_grabs::BTN_RIGHT;
+        use smithay::backend::input::ButtonState;
+
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let mut env = CompatEnv::new(false);
+            let qh = env.queue.handle();
+            let (comp, wm, shm) = env.ensure_globals();
+            let layer_shell = env.client.bind::<zwlr_layer_shell_v1::ZwlrLayerShellV1>(
+                &env.registry,
+                &qh,
+                "zwlr_layer_shell_v1",
+            );
+            let seat = env.client.seats.first().expect("wl_seat").clone();
+
+            // 1. Layer-shell surface with KeyboardInteractivity::None (e.g. Waybar)
+            let bar_surf = comp.create_surface(&qh, ());
+            let layer_surf = layer_shell.get_layer_surface(
+                &bar_surf,
+                None,
+                zwlr_layer_shell_v1::Layer::Top,
+                "waybar".to_owned(),
+                &qh,
+                (),
+            );
+            layer_surf.set_size(1920, 32);
+            layer_surf.set_anchor(
+                zwlr_layer_surface_v1::Anchor::Top
+                    | zwlr_layer_surface_v1::Anchor::Left
+                    | zwlr_layer_surface_v1::Anchor::Right,
+            );
+            layer_surf
+                .set_keyboard_interactivity(zwlr_layer_surface_v1::KeyboardInteractivity::None);
+            bar_surf.commit();
+            env.pump();
+
+            let bar_fd = create_portable_shm_fd(1920 * 32 * 4, None);
+            let bar_pool = shm.create_pool(bar_fd.as_fd(), 1920 * 32 * 4, &qh, ());
+            let bar_buf =
+                bar_pool.create_buffer(0, 1920, 32, 1920 * 4, wl_shm::Format::Argb8888, &qh, ());
+            bar_surf.attach(Some(&bar_buf), 0, 0);
+            bar_surf.commit();
+            env.pump();
+
+            env.state.handle_pointer_absolute_motion(
+                Point::from((1350.0, 15.0)),
+                InputTime::from_millis(10),
+            );
+            crate::keybind_dispatcher::process_pointer_button_event(
+                &mut env.state,
+                BTN_RIGHT,
+                ButtonState::Pressed,
+                InputTime::from_millis(20),
+                false,
+            );
+            env.pump();
+            let bar_serial = env.client.last_button_serial.expect("bar click serial");
+
+            let pos = wm.create_positioner(&qh, ());
+            pos.set_size(200, 120);
+            pos.set_anchor_rect(1300, 0, 40, 32);
+            let layer_pop_surf = comp.create_surface(&qh, ());
+            let layer_pop_xdg = wm.get_xdg_surface(&layer_pop_surf, &qh, ());
+            let layer_pop = layer_pop_xdg.get_popup(None, &pos, &qh, ());
+            layer_surf.get_popup(&layer_pop);
+            layer_pop.grab(&seat, bar_serial);
+            layer_pop_surf.commit();
+            env.pump();
+
+            assert!(
+                env.state.seat.get_pointer().unwrap().is_grabbed(),
+                "pointer popup grab must be active on layer surface popup"
+            );
+            assert!(
+                !env.state.seat.get_keyboard().unwrap().is_grabbed(),
+                "KeyboardInteractivity::None layer surface popup must not steal keyboard grab"
+            );
+
+            layer_pop.destroy();
+            layer_pop_xdg.destroy();
+            layer_pop_surf.destroy();
+            env.pump();
+            env.state.handle_pointer_absolute_motion(
+                Point::from((1325.0, 15.0)),
+                InputTime::from_millis(30),
+            );
+            crate::keybind_dispatcher::process_pointer_button_event(
+                &mut env.state,
+                BTN_RIGHT,
+                ButtonState::Released,
+                InputTime::from_millis(40),
+                false,
+            );
+            env.pump();
+            assert!(!env.state.seat.get_pointer().unwrap().is_grabbed());
+
+            // 2. Toplevel xdg_popup WITH keyboard+pointer grab: destroying popup then moving
+            //    pointer triggers `PopupPointerGrab::motion` -> `unset_keyboard_grab` -> `focus_changed`.
+            let (_win_surf, win_xdg, _win_tl, win_id) =
+                env.spawn_window("popup-parent", "popup.parent", false);
+            let win_rect = env
+                .state
+                .mapped_windows
+                .iter()
+                .find(|m| m.win_id == win_id)
+                .expect("mapped win")
+                .rect;
+            env.state.handle_pointer_absolute_motion(
+                Point::from((f64::from(win_rect.x) + 20.0, f64::from(win_rect.y) + 20.0)),
+                InputTime::from_millis(50),
+            );
+            crate::keybind_dispatcher::process_pointer_button_event(
+                &mut env.state,
+                BTN_RIGHT,
+                ButtonState::Pressed,
+                InputTime::from_millis(60),
+                false,
+            );
+            env.pump();
+            let win_serial = env
+                .client
+                .last_button_serial
+                .expect("toplevel click serial");
+
+            let win_pop_pos = wm.create_positioner(&qh, ());
+            win_pop_pos.set_size(120, 80);
+            win_pop_pos.set_anchor_rect(10, 10, 20, 20);
+            let win_pop_surf = comp.create_surface(&qh, ());
+            let win_pop_xdg = wm.get_xdg_surface(&win_pop_surf, &qh, ());
+            let win_pop = win_pop_xdg.get_popup(Some(&win_xdg), &win_pop_pos, &qh, ());
+            win_pop.grab(&seat, win_serial);
+            win_pop_surf.commit();
+            env.pump();
+            assert!(env.state.seat.get_pointer().unwrap().is_grabbed());
+            assert!(env.state.seat.get_keyboard().unwrap().is_grabbed());
+
+            win_pop.destroy();
+            win_pop_xdg.destroy();
+            win_pop_surf.destroy();
+            env.pump();
+
+            env.state.handle_pointer_absolute_motion(
+                Point::from((f64::from(win_rect.x) + 25.0, f64::from(win_rect.y) + 25.0)),
+                InputTime::from_millis(70),
+            );
+            assert!(!env.state.seat.get_pointer().unwrap().is_grabbed());
+            assert!(!env.state.seat.get_keyboard().unwrap().is_grabbed());
+            assert!(!env.state.pending_pointer_constraint_break);
+
+            bar_buf.destroy();
+            bar_pool.destroy();
+            let _ = tx.send(());
+        });
+
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("popup grab teardown and pointer motion must not deadlock the event loop");
     }
 
     #[test]

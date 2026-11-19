@@ -23,7 +23,7 @@ use smithay::{
         keyboard::{FilterResult, KeyboardSource, Keycode, Keysym, ModifiersState, keysyms, xkb},
         pointer::{AxisFrame, ButtonEvent, MotionEvent},
     },
-    utils::SERIAL_COUNTER,
+    utils::{SERIAL_COUNTER, Serial},
 };
 use tracing::{debug, info, warn};
 
@@ -997,16 +997,7 @@ pub fn process_pointer_button_event(
 
     // 1. Active PointerGrab (`MoveWindowGrab` / `ResizeWindowGrab` / Popup / DnD) owns all buttons!
     if pointer.is_grabbed() {
-        pointer.button(
-            state,
-            &ButtonEvent {
-                button: button_code,
-                state: btn_state,
-                serial,
-                time,
-            },
-        );
-        pointer.frame(state);
+        dispatch_pointer_button_and_frame(state, button_code, btn_state, serial, time);
         return;
     }
 
@@ -1025,16 +1016,7 @@ pub fn process_pointer_button_event(
         if was_suppressed {
             return;
         }
-        pointer.button(
-            state,
-            &ButtonEvent {
-                button: button_code,
-                state: btn_state,
-                serial,
-                time,
-            },
-        );
-        pointer.frame(state);
+        dispatch_pointer_button_and_frame(state, button_code, btn_state, serial, time);
         return;
     }
 
@@ -1076,31 +1058,25 @@ pub fn process_pointer_button_event(
                         if start_compositor_move_grab(state, button_code, serial) {
                             // Forward press into newly installed `MoveWindowGrab` so `current_pressed()`
                             // records `button_code` while `Focus::Clear` prevents client click leak!
-                            pointer.button(
+                            dispatch_pointer_button_and_frame(
                                 state,
-                                &ButtonEvent {
-                                    button: button_code,
-                                    state: btn_state,
-                                    serial,
-                                    time,
-                                },
+                                button_code,
+                                btn_state,
+                                serial,
+                                time,
                             );
-                            pointer.frame(state);
                             return;
                         }
                     }
                     Some(ActionDescriptor::WindowDragResize) => {
                         if start_compositor_resize_grab(state, button_code, serial) {
-                            pointer.button(
+                            dispatch_pointer_button_and_frame(
                                 state,
-                                &ButtonEvent {
-                                    button: button_code,
-                                    state: btn_state,
-                                    serial,
-                                    time,
-                                },
+                                button_code,
+                                btn_state,
+                                serial,
+                                time,
                             );
-                            pointer.frame(state);
                             return;
                         }
                     }
@@ -1130,6 +1106,27 @@ pub fn process_pointer_button_event(
         && let Some(edge) = state.frame_edge_under_pointer(state.pointer_location)
         && start_frame_edge_resize_grab(state, button_code, serial, edge)
     {
+        dispatch_pointer_button_and_frame(state, button_code, btn_state, serial, time);
+        return;
+    }
+
+    // 5. Normal unintercepted click: clear any stale suppression, apply layer/window focus, and forward!
+    state.keybinds.suppressed_buttons.remove(&button_code);
+    let cursor_pos = state.pointer_location;
+    state.handle_pointer_button_focus(cursor_pos);
+    refresh_pointer_hover_focus(state, time);
+
+    dispatch_pointer_button_and_frame(state, button_code, btn_state, serial, time);
+}
+
+fn dispatch_pointer_button_and_frame(
+    state: &mut KomaState,
+    button_code: u32,
+    btn_state: ButtonState,
+    serial: Serial,
+    time: InputTime,
+) {
+    state.with_pointer_dispatch(|state, pointer| {
         pointer.button(
             state,
             &ButtonEvent {
@@ -1140,25 +1137,7 @@ pub fn process_pointer_button_event(
             },
         );
         pointer.frame(state);
-        return;
-    }
-
-    // 5. Normal unintercepted click: clear any stale suppression, apply layer/window focus, and forward!
-    state.keybinds.suppressed_buttons.remove(&button_code);
-    let cursor_pos = state.pointer_location;
-    state.handle_pointer_button_focus(cursor_pos);
-    refresh_pointer_hover_focus(state, time);
-
-    pointer.button(
-        state,
-        &ButtonEvent {
-            button: button_code,
-            state: btn_state,
-            serial,
-            time,
-        },
-    );
-    pointer.frame(state);
+    });
 }
 
 fn find_mouse_button_bind_idx(
@@ -1241,25 +1220,30 @@ pub fn process_keyboard_key_event(
         }
         let release_act = state.keybinds.pending_releases.remove(&raw_keycode);
         if state.is_locked_or_abandoned() {
-            if let Some(((), mods_changed)) = keyboard.input_intercept(
-                smithay::input::keyboard::KeyboardSource::MAIN,
-                state,
-                keycode,
-                key_state,
-                |_, _, _| (),
-            ) {
-                keyboard.input_forward_bypassing_grab(
+            state.with_keyboard_dispatch(|state, keyboard| {
+                if let Some(((), mods_changed)) = keyboard.input_intercept(
+                    smithay::input::keyboard::KeyboardSource::MAIN,
                     state,
                     keycode,
                     key_state,
-                    serial,
-                    time,
-                    mods_changed,
-                );
-            }
+                    |_, _, _| (),
+                ) {
+                    keyboard.input_forward_bypassing_grab(
+                        state,
+                        keycode,
+                        key_state,
+                        serial,
+                        time,
+                        mods_changed,
+                    );
+                }
+            });
         } else {
-            let _ = keyboard.input::<(), _>(state, keycode, key_state, serial, time, |_, _, _| {
-                FilterResult::Forward
+            state.with_keyboard_dispatch(|state, keyboard| {
+                let _ =
+                    keyboard.input::<(), _>(state, keycode, key_state, serial, time, |_, _, _| {
+                        FilterResult::Forward
+                    });
             });
         }
         let next_mask = modifiers_mask_from_smithay(&keyboard.modifier_state());
@@ -1280,224 +1264,237 @@ pub fn process_keyboard_key_event(
         return;
     }
 
+    // Pre-read pointer grab & shortcut-inhibition status before entering `KeyboardHandle` so
+    // `input_intercept`'s filter closure never re-acquires `SeatHandle::{Keyboard, Pointer}`.
+    let pointer_grabbed = state.ptr().is_some_and(|p| p.is_grabbed());
+    let shortcuts_inhibited = state.are_shortcuts_inhibited_for_focused_surface();
+
     // 2. Evaluate Ring 0 safety chords & `KeybindTable`, bypassing any IME grab when session-locked.
-    let outcome = if let Some((filter_result, mods_changed)) = keyboard.input_intercept(
-        smithay::input::keyboard::KeyboardSource::MAIN,
-        state,
-        keycode,
-        key_state,
-        |state, modifiers, handle| {
-            let modified_sym = handle.modified_sym();
-            let mod_raw = modified_sym.raw();
-            let is_locked = state.is_locked_or_abandoned();
+    let outcome = state
+        .with_keyboard_dispatch(|state, keyboard| {
+            let (filter_result, mods_changed) = keyboard.input_intercept(
+                smithay::input::keyboard::KeyboardSource::MAIN,
+                state,
+                keycode,
+                key_state,
+                |state, modifiers, handle| {
+                    let modified_sym = handle.modified_sym();
+                    let mod_raw = modified_sym.raw();
+                    let is_locked = state.is_locked_or_abandoned();
 
-            // Gate 0a: Hardware Linux VT switch (`Ctrl + Alt + F1..F12` -> `XF86Switch_VT_1..12`)
-            if is_bare_metal_tty && let Some(vt) = parse_vt_switch_keysym(mod_raw) {
-                return FilterResult::Intercept(InterceptOutcome::SwitchVt(vt));
-            }
-
-            // Gate 0a2: Cancel active interactive Move/Resize grab on `Escape` (`niri/src/input/mod.rs` line 688)
-            if !is_locked
-                && mod_raw == keysyms::KEY_Escape
-                && state.ptr().is_some_and(|p| p.is_grabbed())
-            {
-                return FilterResult::Intercept(InterceptOutcome::CancelPointerGrab);
-            }
-
-            let held_mask = modifiers_mask_from_smithay(modifiers);
-            let phys_mod = state.keybinds.effective_mod_key(is_bare_metal_tty);
-            let overlay_open = state.keybind_overlay_is_open() && !is_locked;
-
-            // Gate 0a3: the keybind overview owns the keyboard grab. `Escape` closes it and every
-            // other chord is either the overlay toggle itself or swallowed before reaching a client.
-            if overlay_open
-                && key_state == KeyState::Pressed
-                && mod_raw == keysyms::KEY_Escape
-                && held_mask == 0
-            {
-                return FilterResult::Intercept(InterceptOutcome::DismissKeybindOverlay);
-            }
-
-            // A modifier pressed (or a chord re-pressed) outside the repeating chord cancels it.
-            if state
-                .keybinds
-                .repeat
-                .cancel_if_modifiers_changed(held_mask)
-                .is_some()
-            {
-                state.cancel_keybind_repeat("modifier_change");
-            }
-
-            // Gate 0b: Ring 0 Human Preemptive Takeover (`Mod + G`) — blocked when locked!
-            let raw_syms = handle.raw_syms();
-            let candidate_syms = std::iter::once((modified_sym, true))
-                .chain(raw_syms.iter().copied().map(|s| (s, false)));
-
-            if !is_locked && held_mask == phys_mod.bit() {
-                for (sym, _) in candidate_syms.clone() {
-                    if matches!(sym.raw(), keysyms::KEY_g | keysyms::KEY_G) {
-                        return FilterResult::Intercept(InterceptOutcome::TogglePreempt);
+                    // Gate 0a: Hardware Linux VT switch (`Ctrl + Alt + F1..F12` -> `XF86Switch_VT_1..12`)
+                    if is_bare_metal_tty && let Some(vt) = parse_vt_switch_keysym(mod_raw) {
+                        return FilterResult::Intercept(InterceptOutcome::SwitchVt(vt));
                     }
-                }
-            }
 
-            // Gate 0c: Honor active `zwp_keyboard_shortcuts_inhibit_v1` for unrestricted focused surfaces
-            // while keeping Ring-0 VT switching and `Mod + G` human preempt takeover un-inhibitable.
-            if !overlay_open && !is_locked && state.are_shortcuts_inhibited_for_focused_surface() {
-                return FilterResult::Forward;
-            }
-
-            // Gate 1: Match user-configured XKB keysym binds (`modified_sym` -> `raw_syms` fallback)
-            let active_mode = state.keybinds.active_mode.clone();
-            let is_preempted = state
-                .workspaces
-                .get(&state.active_ws_id)
-                .is_some_and(|ws| ws.lease.is_human_preempted());
-
-            let mut matched_idx: Option<usize> = None;
-            'sym_loop: for (cand_sym, is_modified_level) in candidate_syms {
-                let norm_sym = normalize_candidate_sym(cand_sym);
-                for (idx, bind) in state.keybinds.binds.iter().enumerate() {
-                    if !bind.enabled || bind.mode != active_mode {
-                        continue;
+                    // Gate 0a2: Cancel active interactive Move/Resize grab on `Escape` (`niri/src/input/mod.rs` line 688)
+                    if !is_locked && mod_raw == keysyms::KEY_Escape && pointer_grabbed {
+                        return FilterResult::Intercept(InterceptOutcome::CancelPointerGrab);
                     }
-                    if !is_keybind_allowed_for_lock_state(is_locked, bind.options.allow_when_locked)
+
+                    let held_mask = modifiers_mask_from_smithay(modifiers);
+                    let phys_mod = state.keybinds.effective_mod_key(is_bare_metal_tty);
+                    let overlay_open = state.keybind_overlay_is_open() && !is_locked;
+
+                    // Gate 0a3: the keybind overview owns the keyboard grab. `Escape` closes it and every
+                    // other chord is either the overlay toggle itself or swallowed before reaching a client.
+                    if overlay_open
+                        && key_state == KeyState::Pressed
+                        && mod_raw == keysyms::KEY_Escape
+                        && held_mask == 0
                     {
-                        continue;
-                    }
-                    if is_preempted && bind.options.when_preempted == "ignore" {
-                        continue;
-                    }
-                    let BindTrigger::Keysym {
-                        sym: bind_sym,
-                        is_pre_shifted,
-                    } = bind.chord.trigger
-                    else {
-                        continue;
-                    };
-                    if bind_sym != norm_sym {
-                        continue;
+                        return FilterResult::Intercept(InterceptOutcome::DismissKeybindOverlay);
                     }
 
-                    let required_mask = expand_bind_modifiers(bind.chord.mods, phys_mod);
-                    let mods_match = if is_modified_level && is_pre_shifted {
-                        (held_mask & !MOD_SHIFT) == (required_mask & !MOD_SHIFT)
+                    // A modifier pressed (or a chord re-pressed) outside the repeating chord cancels it.
+                    if state
+                        .keybinds
+                        .repeat
+                        .cancel_if_modifiers_changed(held_mask)
+                        .is_some()
+                    {
+                        state.cancel_keybind_repeat("modifier_change");
+                    }
+
+                    // Gate 0b: Ring 0 Human Preemptive Takeover (`Mod + G`) — blocked when locked!
+                    let raw_syms = handle.raw_syms();
+                    let candidate_syms = std::iter::once((modified_sym, true))
+                        .chain(raw_syms.iter().copied().map(|s| (s, false)));
+
+                    if !is_locked && held_mask == phys_mod.bit() {
+                        for (sym, _) in candidate_syms.clone() {
+                            if matches!(sym.raw(), keysyms::KEY_g | keysyms::KEY_G) {
+                                return FilterResult::Intercept(InterceptOutcome::TogglePreempt);
+                            }
+                        }
+                    }
+
+                    // Gate 0c: Honor active `zwp_keyboard_shortcuts_inhibit_v1` for unrestricted focused surfaces
+                    // while keeping Ring-0 VT switching and `Mod + G` human preempt takeover un-inhibitable.
+                    if !overlay_open && !is_locked && shortcuts_inhibited {
+                        return FilterResult::Forward;
+                    }
+
+                    // Gate 1: Match user-configured XKB keysym binds (`modified_sym` -> `raw_syms` fallback)
+                    let active_mode = state.keybinds.active_mode.clone();
+                    let is_preempted = state
+                        .workspaces
+                        .get(&state.active_ws_id)
+                        .is_some_and(|ws| ws.lease.is_human_preempted());
+
+                    let mut matched_idx: Option<usize> = None;
+                    'sym_loop: for (cand_sym, is_modified_level) in candidate_syms {
+                        let norm_sym = normalize_candidate_sym(cand_sym);
+                        for (idx, bind) in state.keybinds.binds.iter().enumerate() {
+                            if !bind.enabled || bind.mode != active_mode {
+                                continue;
+                            }
+                            if !is_keybind_allowed_for_lock_state(
+                                is_locked,
+                                bind.options.allow_when_locked,
+                            ) {
+                                continue;
+                            }
+                            if is_preempted && bind.options.when_preempted == "ignore" {
+                                continue;
+                            }
+                            let BindTrigger::Keysym {
+                                sym: bind_sym,
+                                is_pre_shifted,
+                            } = bind.chord.trigger
+                            else {
+                                continue;
+                            };
+                            if bind_sym != norm_sym {
+                                continue;
+                            }
+
+                            let required_mask = expand_bind_modifiers(bind.chord.mods, phys_mod);
+                            let mods_match = if is_modified_level && is_pre_shifted {
+                                (held_mask & !MOD_SHIFT) == (required_mask & !MOD_SHIFT)
+                            } else {
+                                held_mask == required_mask
+                            };
+
+                            if mods_match {
+                                matched_idx = Some(idx);
+                                break 'sym_loop;
+                            }
+                        }
+                    }
+
+                    let Some(idx) = matched_idx else {
+                        if overlay_open {
+                            return FilterResult::Intercept(InterceptOutcome::ConsumeKey);
+                        }
+                        if !is_locked
+                            && active_mode.is_some()
+                            && mod_raw == keysyms::KEY_Escape
+                            && held_mask == 0
+                        {
+                            return FilterResult::Intercept(InterceptOutcome::ExitSubmapMode);
+                        }
+                        return FilterResult::Forward;
+                    };
+
+                    let bind = &state.keybinds.binds[idx];
+                    let bind_id = bind.id;
+                    let pass_through = bind.options.pass_through;
+
+                    // Only the overlay toggle itself may fire while the overview holds the grab.
+                    if overlay_open
+                        && !matches!(
+                            bind.press_action,
+                            Some(ActionDescriptor::OverlayKeybindsToggle)
+                        )
+                    {
+                        return FilterResult::Intercept(InterceptOutcome::ConsumeKey);
+                    }
+
+                    // Enforce optional `cooldown_ms` rate-limiting (`niri/src/input/mod.rs` line 5082)
+                    if let Some(cd_ms) = bind.options.cooldown_ms
+                        && let Some(&last_ms) = state.keybinds.cooldowns_ms.get(&bind_id)
+                        && now_ms.saturating_sub(last_ms) < cd_ms
+                    {
+                        return if pass_through {
+                            FilterResult::Forward
+                        } else {
+                            FilterResult::Intercept(InterceptOutcome::FireAction {
+                                bind_id: None,
+                                action: ActionDescriptor::ModeExit,
+                                repeat: None,
+                            })
+                        };
+                    }
+
+                    let press_act = bind.press_action.clone();
+                    let release_act = bind.release_action.clone();
+                    let allow_when_locked = bind.options.allow_when_locked;
+
+                    if bind.options.cooldown_ms.is_some() {
+                        state.keybinds.cooldowns_ms.insert(bind_id, now_ms);
+                    }
+                    if let Some(rel) = release_act {
+                        state.keybinds.pending_releases.insert(
+                            raw_keycode,
+                            PendingRelease {
+                                action: rel,
+                                allow_when_locked,
+                            },
+                        );
+                    }
+
+                    if let Some(action) = press_act {
+                        if pass_through {
+                            state.pending_passthrough_actions.push(action);
+                            FilterResult::Forward
+                        } else {
+                            let repeat =
+                                state.keybinds.binds[idx].repeat_request(raw_keycode, held_mask);
+                            FilterResult::Intercept(InterceptOutcome::FireAction {
+                                bind_id: Some(bind_id),
+                                action,
+                                repeat,
+                            })
+                        }
+                    } else if pass_through {
+                        FilterResult::Forward
                     } else {
-                        held_mask == required_mask
-                    };
-
-                    if mods_match {
-                        matched_idx = Some(idx);
-                        break 'sym_loop;
+                        FilterResult::Intercept(InterceptOutcome::FireAction {
+                            bind_id: None,
+                            action: ActionDescriptor::ModeExit,
+                            repeat: None,
+                        })
                     }
+                },
+            )?;
+            match filter_result {
+                FilterResult::Intercept(val) => Some(val),
+                FilterResult::Forward => {
+                    if state.is_locked_or_abandoned() {
+                        keyboard.input_forward_bypassing_grab(
+                            state,
+                            keycode,
+                            key_state,
+                            serial,
+                            time,
+                            mods_changed,
+                        );
+                    } else {
+                        keyboard.input_forward(
+                            state,
+                            keycode,
+                            key_state,
+                            serial,
+                            time,
+                            mods_changed,
+                        );
+                    }
+                    None
                 }
             }
-
-            let Some(idx) = matched_idx else {
-                if overlay_open {
-                    return FilterResult::Intercept(InterceptOutcome::ConsumeKey);
-                }
-                if !is_locked
-                    && active_mode.is_some()
-                    && mod_raw == keysyms::KEY_Escape
-                    && held_mask == 0
-                {
-                    return FilterResult::Intercept(InterceptOutcome::ExitSubmapMode);
-                }
-                return FilterResult::Forward;
-            };
-
-            let bind = &state.keybinds.binds[idx];
-            let bind_id = bind.id;
-            let pass_through = bind.options.pass_through;
-
-            // Only the overlay toggle itself may fire while the overview holds the grab.
-            if overlay_open
-                && !matches!(
-                    bind.press_action,
-                    Some(ActionDescriptor::OverlayKeybindsToggle)
-                )
-            {
-                return FilterResult::Intercept(InterceptOutcome::ConsumeKey);
-            }
-
-            // Enforce optional `cooldown_ms` rate-limiting (`niri/src/input/mod.rs` line 5082)
-            if let Some(cd_ms) = bind.options.cooldown_ms
-                && let Some(&last_ms) = state.keybinds.cooldowns_ms.get(&bind_id)
-                && now_ms.saturating_sub(last_ms) < cd_ms
-            {
-                return if pass_through {
-                    FilterResult::Forward
-                } else {
-                    FilterResult::Intercept(InterceptOutcome::FireAction {
-                        bind_id: None,
-                        action: ActionDescriptor::ModeExit,
-                        repeat: None,
-                    })
-                };
-            }
-
-            let press_act = bind.press_action.clone();
-            let release_act = bind.release_action.clone();
-            let allow_when_locked = bind.options.allow_when_locked;
-
-            if bind.options.cooldown_ms.is_some() {
-                state.keybinds.cooldowns_ms.insert(bind_id, now_ms);
-            }
-            if let Some(rel) = release_act {
-                state.keybinds.pending_releases.insert(
-                    raw_keycode,
-                    PendingRelease {
-                        action: rel,
-                        allow_when_locked,
-                    },
-                );
-            }
-
-            if let Some(action) = press_act {
-                if pass_through {
-                    state.pending_passthrough_actions.push(action);
-                    FilterResult::Forward
-                } else {
-                    let repeat = state.keybinds.binds[idx].repeat_request(raw_keycode, held_mask);
-                    FilterResult::Intercept(InterceptOutcome::FireAction {
-                        bind_id: Some(bind_id),
-                        action,
-                        repeat,
-                    })
-                }
-            } else if pass_through {
-                FilterResult::Forward
-            } else {
-                FilterResult::Intercept(InterceptOutcome::FireAction {
-                    bind_id: None,
-                    action: ActionDescriptor::ModeExit,
-                    repeat: None,
-                })
-            }
-        },
-    ) {
-        match filter_result {
-            FilterResult::Intercept(val) => Some(val),
-            FilterResult::Forward => {
-                if state.is_locked_or_abandoned() {
-                    keyboard.input_forward_bypassing_grab(
-                        state,
-                        keycode,
-                        key_state,
-                        serial,
-                        time,
-                        mods_changed,
-                    );
-                } else {
-                    keyboard.input_forward(state, keycode, key_state, serial, time, mods_changed);
-                }
-                None
-            }
-        }
-    } else {
-        None
-    };
+        })
+        .flatten();
 
     if !state.pending_passthrough_actions.is_empty() {
         let passthrough = std::mem::take(&mut state.pending_passthrough_actions);
@@ -1815,10 +1812,10 @@ pub fn process_pointer_axis_event<B: InputBackend>(
         frame = frame.stop(Axis::Vertical);
     }
 
-    if let Some(pointer) = state.ptr() {
+    state.with_pointer_dispatch(|state, pointer| {
         pointer.axis(state, frame);
         pointer.frame(state);
-    }
+    });
 }
 
 fn find_scroll_bind_idx(
@@ -1890,31 +1887,36 @@ pub(crate) fn refresh_pointer_hover_focus(state: &mut KomaState, time: InputTime
     if state.has_active_locked_pointer_constraint() {
         return;
     }
-    let Some(pointer) = state.ptr() else {
+    let Some((grabbed, current_focus)) = state
+        .ptr()
+        .map(|pointer| (pointer.is_grabbed(), pointer.current_focus()))
+    else {
         return;
     };
-    if pointer.is_grabbed() {
+    if grabbed {
         return;
     }
     let pos = state.pointer_location;
     let under = state.surface_under(pos);
-    let current_ok = match (&under, pointer.current_focus()) {
+    let current_ok = match (&under, current_focus) {
         (Some((surf_a, _)), Some(surf_b)) => surf_a == &surf_b,
         (None, None) => true,
         _ => false,
     };
     if !current_ok {
         let serial = SERIAL_COUNTER.next_serial();
-        pointer.motion(
-            state,
-            under,
-            &MotionEvent {
-                location: pos,
-                serial,
-                time,
-            },
-        );
-        pointer.frame(state);
+        state.with_pointer_dispatch(|state, pointer| {
+            pointer.motion(
+                state,
+                under,
+                &MotionEvent {
+                    location: pos,
+                    serial,
+                    time,
+                },
+            );
+            pointer.frame(state);
+        });
     }
 }
 

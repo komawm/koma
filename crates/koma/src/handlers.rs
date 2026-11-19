@@ -471,6 +471,11 @@ impl XdgShellHandler for KomaState {
         self.queue_redraw();
     }
 
+    fn popup_destroyed(&mut self, _surface: PopupSurface) {
+        self.popups.cleanup();
+        self.queue_redraw();
+    }
+
     fn grab(&mut self, surface: PopupSurface, seat: WlSeat, serial: Serial) {
         let Some(seat) = Seat::<Self>::from_resource(&seat) else {
             return;
@@ -491,29 +496,41 @@ impl XdgShellHandler for KomaState {
         if !root_in_tree {
             return;
         }
-        if let Ok(mut grab) = self.popups.grab_popup(root, kind, &seat, serial) {
-            if let Some(keyboard) = self.kb() {
-                if keyboard.is_grabbed()
-                    && !(keyboard.has_grab(serial)
-                        || keyboard.has_grab(grab.previous_serial().unwrap_or(serial)))
-                {
-                    grab.ungrab(PopupUngrabStrategy::All);
-                    return;
-                }
-                keyboard.set_focus(self, grab.current_grab(), serial);
-                keyboard.set_grab(self, PopupKeyboardGrab::new(&grab), serial);
-            }
-            if let Some(pointer) = self.ptr() {
-                if pointer.is_grabbed()
+        if let Ok(mut grab) = self.popups.grab_popup(root.clone(), kind, &seat, serial) {
+            let pointer_grab_mismatch = self.ptr().is_some_and(|pointer| {
+                pointer.is_grabbed()
                     && !(pointer.has_grab(serial)
                         || pointer
                             .has_grab(grab.previous_serial().unwrap_or_else(|| grab.serial())))
-                {
-                    grab.ungrab(PopupUngrabStrategy::All);
-                    return;
-                }
-                pointer.set_grab(self, PopupPointerGrab::new(&grab), serial, Focus::Keep);
+            });
+            let ime_keyboard_grabbed = self.input_method().is_some_and(|im| im.keyboard_grabbed());
+            let layer_focusable = self.all_outputs().into_iter().find_map(|o| {
+                layer_map_for_output(&o)
+                    .layer_for_surface(&root, WindowSurfaceType::TOPLEVEL)
+                    .map(|layer| layer.can_receive_keyboard_focus())
+            });
+            let can_receive_keyboard_focus =
+                !ime_keyboard_grabbed && layer_focusable.unwrap_or(true);
+            let keyboard_grab_mismatch = can_receive_keyboard_focus
+                && self.kb().is_some_and(|keyboard| {
+                    keyboard.is_grabbed()
+                        && !(keyboard.has_grab(serial)
+                            || keyboard.has_grab(grab.previous_serial().unwrap_or(serial)))
+                });
+            if pointer_grab_mismatch || keyboard_grab_mismatch {
+                grab.ungrab(PopupUngrabStrategy::All);
+                return;
             }
+
+            if can_receive_keyboard_focus {
+                self.with_keyboard_dispatch(|state, keyboard| {
+                    keyboard.set_focus(state, grab.current_grab(), serial);
+                    keyboard.set_grab(state, PopupKeyboardGrab::new(&grab), serial);
+                });
+            }
+            self.with_pointer_dispatch(|state, pointer| {
+                pointer.set_grab(state, PopupPointerGrab::new(&grab), serial, Focus::Keep);
+            });
         }
     }
 
@@ -807,33 +824,12 @@ impl SeatHandler for KomaState {
             self.queue_redraw();
         }
 
-        // Smithay calls this while it holds the keyboard mutex, so the seat guard is tracking the
-        // callback scope: the pointer focus must be reduced to its root in its own acquisition
-        // scope, because `break_active_pointer_constraints` acquires the pointer again. Nesting
-        // that acquisition used to be swallowed by the guard, which also meant a focus change
-        // never actually broke a locked pointer constraint (komawm/koma#64).
-        let pointer_root = self
-            .ptr()
-            .and_then(|pointer| pointer.current_focus())
-            .map(|ptr_surf| {
-                let mut root = ptr_surf;
-                while let Some(parent) = get_parent(&root) {
-                    root = parent;
-                }
-                root
-            });
-        if let Some(ptr_root) = pointer_root {
-            let same_root = focused.is_some_and(|f| {
-                let mut kb_root = f.clone();
-                while let Some(p) = get_parent(&kb_root) {
-                    kb_root = p;
-                }
-                kb_root == ptr_root
-            });
-            if !same_root {
-                self.break_active_pointer_constraints();
-            }
-        }
+        // Smithay calls this while it holds the keyboard mutex, and it may also be entered from
+        // `PopupPointerGrab::unset` -> `unset_keyboard_grab` -> `keyboard.set_focus` while
+        // `PointerInternal` is locked (`komawm/koma#109`). Defer pointer-constraint breakage when
+        // `SeatHandle::Pointer` is held so we never re-enter `PointerInternal` or emit spurious
+        // `seat_guard` errors on normal popup teardown.
+        self.reconcile_pointer_constraints_with_keyboard_focus(focused);
         self.reconcile_keyboard_shortcuts_inhibitors_with_focus(focused);
         self.sync_foreign_toplevels();
     }
@@ -1063,24 +1059,28 @@ impl VirtualKeyboardHandler for KomaState {
                 let from_active_ime_grab = grab_client.is_some() && grab_client == device.client();
                 let serial = SERIAL_COUNTER.next_serial();
                 if from_active_ime_grab {
-                    keyboard.input_forward_bypassing_grab(
-                        self,
-                        event.key_code(),
-                        event.state(),
-                        serial,
-                        event.time(),
-                        true,
-                    );
+                    self.with_keyboard_dispatch(|state, keyboard| {
+                        keyboard.input_forward_bypassing_grab(
+                            state,
+                            event.key_code(),
+                            event.state(),
+                            serial,
+                            event.time(),
+                            true,
+                        );
+                    });
                 } else {
-                    let _ = keyboard.input_from_source(
-                        device.source(),
-                        self,
-                        event.key_code(),
-                        event.state(),
-                        serial,
-                        event.time(),
-                        |_, _, _| FilterResult::Forward::<()>,
-                    );
+                    self.with_keyboard_dispatch(|state, keyboard| {
+                        let _ = keyboard.input_from_source(
+                            device.source(),
+                            state,
+                            event.key_code(),
+                            event.state(),
+                            serial,
+                            event.time(),
+                            |_, _, _| FilterResult::Forward::<()>,
+                        );
+                    });
                 }
             }
             InputEvent::Special(VirtualKeyboardSpecialEvent::KeymapChanged { device }) => {
