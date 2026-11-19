@@ -56,8 +56,8 @@ use wayland_protocols_wlr::layer_shell::v1::client::{
 
 use crate::{
     compositor_card::{
-        ARGB_BACKDROP_DIM, CardVisualMeta, RawRgbaFrame, clear_argb8888_canvas,
-        paint_workspace_card,
+        ARGB_BACKDROP_DIM, ARGB_TEXT_PRIMARY, CardVisualMeta, RawRgbaFrame, clear_argb8888_canvas,
+        draw_label_5x7, paint_workspace_card,
     },
     grid_layout::OverviewGridState,
     hover_fsm::{
@@ -635,9 +635,6 @@ impl OverviewDaemon {
         let Some((w, h)) = self.grid_win.as_ref().and_then(|g| g.configured_size) else {
             return;
         };
-        let Some(wl_surface) = self.grid_win.as_ref().map(|g| g.wl_surface.clone()) else {
-            return;
-        };
 
         self.refresh_inventory();
         let ws_ids: Vec<WorkspaceId> = self
@@ -655,6 +652,21 @@ impl OverviewDaemon {
                 self.frame_cache.insert(slot.ws_id.clone(), frame);
             }
         }
+        self.draw_grid_from_cache();
+    }
+
+    /// Redraws the overview grid from `frame_cache` and `inventory_cache` without re-capturing
+    /// workspaces over IPC on every hover or keyboard selection step.
+    fn draw_grid_from_cache(&mut self) {
+        if !self.grid.is_open {
+            return;
+        }
+        let Some((w, h)) = self.grid_win.as_ref().and_then(|g| g.configured_size) else {
+            return;
+        };
+        let Some(wl_surface) = self.grid_win.as_ref().map(|g| g.wl_surface.clone()) else {
+            return;
+        };
 
         let Some(canvas_len) = canvas_byte_len(w, h) else {
             warn!(
@@ -666,7 +678,7 @@ impl OverviewDaemon {
         };
         let mut canvas = vec![0_u8; canvas_len];
         clear_argb8888_canvas(&mut canvas, ARGB_BACKDROP_DIM);
-        for slot in &slots_snapshot {
+        for slot in &self.grid.slots {
             let meta = self.build_card_meta(&slot.ws_id, slot.is_selected);
             paint_workspace_card(
                 &mut canvas,
@@ -679,6 +691,21 @@ impl OverviewDaemon {
                 self.frame_cache.get(&slot.ws_id),
             );
         }
+
+        let hint = "CLICK/ENTER: SWITCH  |  ARROWS/HJKL: SELECT  |  ESC: CLOSE";
+        let hint_w = (hint.chars().count() as i32) * 12;
+        let hint_x = ((w as i32 - hint_w) / 2).max(16);
+        let hint_y = (h as i32 - 28).max(8);
+        draw_label_5x7(
+            &mut canvas,
+            w,
+            h,
+            hint_x,
+            hint_y,
+            (w as i32 - 16).max(hint_x),
+            hint,
+            ARGB_TEXT_PRIMARY,
+        );
 
         self.attach_and_commit_shm(&wl_surface, w, h, &canvas);
     }
@@ -1154,28 +1181,37 @@ impl Dispatch<WlKeyboard, ()> for OverviewDaemon {
                 35 | 105 => {
                     // H or Left
                     state.grid.move_selection(-1, 0);
-                    state.capture_and_draw_grid();
+                    state.draw_grid_from_cache();
                 }
                 38 | 106 => {
                     // L or Right
                     state.grid.move_selection(1, 0);
-                    state.capture_and_draw_grid();
+                    state.draw_grid_from_cache();
                 }
                 37 | 103 => {
                     // K or Up
                     state.grid.move_selection(0, -1);
-                    state.capture_and_draw_grid();
+                    state.draw_grid_from_cache();
                 }
                 36 | 108 => {
                     // J or Down
                     state.grid.move_selection(0, 1);
-                    state.capture_and_draw_grid();
+                    state.draw_grid_from_cache();
                 }
                 28 => {
-                    // Enter -> Peek Read-Only Shield mode
+                    // Enter -> switch to normal workspace or Peek agent workspace
                     if let Some(ws_id) = state.grid.selected_workspace().cloned() {
+                        let is_agent = state.inventory_cache.iter().any(|i| {
+                            i.ws_id == ws_id
+                                && (i.frame_tier.contains("headless")
+                                    || i.name.starts_with("agent"))
+                        });
                         if let Some(ipc) = state.ensure_ipc() {
-                            let _ = ipc.set_workspace_mode(&ws_id, WorkspaceModeSpec::Peek);
+                            if is_agent {
+                                let _ = ipc.set_workspace_mode(&ws_id, WorkspaceModeSpec::Peek);
+                            } else {
+                                let _ = ipc.focus_workspace(&ws_id);
+                            }
                         }
                         state.close_fullscreen_grid();
                     }
@@ -1217,7 +1253,7 @@ impl Dispatch<WlPointer, ()> for OverviewDaemon {
                     let idx = slot.index;
                     if idx != state.grid.selected_idx {
                         state.grid.set_selected(idx);
-                        state.capture_and_draw_grid();
+                        state.draw_grid_from_cache();
                     }
                 }
             }
@@ -1228,8 +1264,16 @@ impl Dispatch<WlPointer, ()> for OverviewDaemon {
             } if state.grid.is_open => {
                 let (px, py) = state.pointer_xy;
                 if let Some(ws_id) = state.grid.hit_test(px, py).map(|s| s.ws_id.clone()) {
+                    let is_agent = state.inventory_cache.iter().any(|i| {
+                        i.ws_id == ws_id
+                            && (i.frame_tier.contains("headless") || i.name.starts_with("agent"))
+                    });
                     if let Some(ipc) = state.ensure_ipc() {
-                        let _ = ipc.set_workspace_mode(&ws_id, WorkspaceModeSpec::Peek);
+                        if is_agent {
+                            let _ = ipc.set_workspace_mode(&ws_id, WorkspaceModeSpec::Peek);
+                        } else {
+                            let _ = ipc.focus_workspace(&ws_id);
+                        }
                     }
                     state.close_fullscreen_grid();
                 } else {

@@ -2279,6 +2279,54 @@ pub fn rasterize_text_panel_argb8888(
     (pixels, w, h)
 }
 
+/// Rasterizes a [`TextPanelSpec`] into a reusable Smithay [`MemoryRenderBuffer`] at `output_scale`.
+#[must_use]
+pub fn rasterize_text_panel_buffer(
+    spec: &TextPanelSpec,
+    output_scale: Scale<f64>,
+) -> Option<MemoryRenderBuffer> {
+    if spec.width == 0 || spec.height == 0 {
+        return None;
+    }
+    let int_scale = output_scale.x.ceil().clamp(1.0, 4.0) as i32;
+    let (pixels, px_w, px_h) = rasterize_text_panel_argb8888(spec, int_scale);
+    Some(MemoryRenderBuffer::from_slice(
+        &pixels,
+        Fourcc::Argb8888,
+        (px_w as i32, px_h as i32),
+        int_scale,
+        Transform::Normal,
+        None,
+    ))
+}
+
+/// Builds a Smithay `MemoryBuffer` element from a pre-rasterized [`MemoryRenderBuffer`] at `location`.
+#[must_use]
+pub fn render_text_panel_buffer<R>(
+    renderer: &mut R,
+    buffer: &MemoryRenderBuffer,
+    location: LogicalPoint,
+    output_scale: Scale<f64>,
+) -> Option<KomaRenderElement<R>>
+where
+    R: KomaRenderTarget,
+    R::TextureId: Send + Clone + 'static,
+{
+    let loc_phys: Point<i32, Physical> =
+        Point::from((location.x, location.y)).to_physical_precise_round(output_scale);
+    MemoryRenderBufferRenderElement::from_buffer(
+        renderer,
+        loc_phys.to_f64(),
+        buffer,
+        None,
+        None,
+        None,
+        Kind::Unspecified,
+    )
+    .ok()
+    .map(KomaRenderElement::MemoryBuffer)
+}
+
 /// Builds a Smithay `MemoryBuffer` element for a [`TextPanelSpec`] at `location`.
 #[must_use]
 pub fn build_text_panel_element<R>(
@@ -2291,32 +2339,8 @@ where
     R: KomaRenderTarget,
     R::TextureId: Send + Clone + 'static,
 {
-    if spec.width == 0 || spec.height == 0 {
-        return None;
-    }
-    let int_scale = output_scale.x.ceil().clamp(1.0, 4.0) as i32;
-    let (pixels, px_w, px_h) = rasterize_text_panel_argb8888(spec, int_scale);
-    let buffer = MemoryRenderBuffer::from_slice(
-        &pixels,
-        Fourcc::Argb8888,
-        (px_w as i32, px_h as i32),
-        int_scale,
-        Transform::Normal,
-        None,
-    );
-    let loc_phys: Point<i32, Physical> =
-        Point::from((location.x, location.y)).to_physical_precise_round(output_scale);
-    MemoryRenderBufferRenderElement::from_buffer(
-        renderer,
-        loc_phys.to_f64(),
-        &buffer,
-        None,
-        None,
-        None,
-        Kind::Unspecified,
-    )
-    .ok()
-    .map(KomaRenderElement::MemoryBuffer)
+    let buffer = rasterize_text_panel_buffer(spec, output_scale)?;
+    render_text_panel_buffer(renderer, &buffer, location, output_scale)
 }
 
 #[cfg(test)]
