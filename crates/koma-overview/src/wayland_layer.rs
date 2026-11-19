@@ -486,6 +486,11 @@ impl OverviewDaemon {
         }
 
         self.grid.is_open = true;
+        self.grid.selected_idx = self
+            .inventory_cache
+            .iter()
+            .position(|i| i.focused)
+            .unwrap_or(0);
         self.grid
             .recompute_layout(self.output_size.0, self.output_size.1, &ws_ids);
         self.create_grid_surface(0);
@@ -682,7 +687,12 @@ impl OverviewDaemon {
         if let Some(item) = self.inventory_cache.iter().find(|i| &i.ws_id == ws_id) {
             let is_agent = item.frame_tier.contains("headless") || item.name.starts_with("agent");
             CardVisualMeta {
-                title_label: format!("{} | E:{} | {}", item.name, item.epoch, item.frame_tier),
+                title_label: format_card_title(
+                    &item.name,
+                    item.focused,
+                    is_agent,
+                    item.is_human_preempted,
+                ),
                 is_selected,
                 is_agent_leased: is_agent,
                 is_human_preempted: item.is_human_preempted,
@@ -1328,6 +1338,27 @@ impl Dispatch<ZwlrLayerShellV1, ()> for OverviewDaemon {
     }
 }
 
+fn format_card_title(
+    name: &str,
+    focused: bool,
+    is_agent: bool,
+    is_human_preempted: bool,
+) -> String {
+    let tag = if is_human_preempted {
+        Some("PREEMPT")
+    } else if focused {
+        Some("ACTIVE")
+    } else if is_agent {
+        Some("AGENT")
+    } else {
+        None
+    };
+    match tag {
+        Some(t) => format!("{name} | {t}"),
+        None => name.to_owned(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::io;
@@ -1436,5 +1467,23 @@ mod tests {
         assert_eq!(canvas_byte_len(0, 10), None);
         assert_eq!(canvas_byte_len(u32::MAX, u32::MAX), None);
         assert_eq!(canvas_byte_len(65_536, 65_536), None);
+    }
+
+    #[test]
+    fn issue_120_card_titles_omit_internal_epoch_and_tier_noise() {
+        assert_eq!(format_card_title("1", false, false, false), "1");
+        assert_eq!(format_card_title("3", true, false, false), "3 | ACTIVE");
+        assert_eq!(
+            format_card_title("agent:work", false, true, false),
+            "agent:work | AGENT"
+        );
+        assert_eq!(
+            format_card_title("agent:work", false, true, true),
+            "agent:work | PREEMPT"
+        );
+        assert_eq!(
+            format_card_title("special:magic", true, false, false),
+            "special:magic | ACTIVE"
+        );
     }
 }
