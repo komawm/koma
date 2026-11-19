@@ -2548,8 +2548,12 @@ impl KomaState {
                     })
                 });
                 if size_changed || float_changed || state_needs_configure {
-                    let inner_w = target_rect.w.saturating_sub(border_inset).max(48) as i32;
-                    let inner_h = target_rect.h.saturating_sub(border_inset).max(48) as i32;
+                    // A fullscreen window is drawn without a border (`frame_composer`), so it must
+                    // be configured to the full output rect; subtracting the border inset leaves a
+                    // `2 * border.width` wallpaper strip on the right and bottom edges.
+                    let inset = if is_fs { 0 } else { border_inset };
+                    let inner_w = target_rect.w.saturating_sub(inset).max(48) as i32;
+                    let inner_h = target_rect.h.saturating_sub(inset).max(48) as i32;
                     if let Some(toplevel) = mapped.window.toplevel() {
                         toplevel.with_pending_state(|st| {
                             st.size = Some(Size::from((inner_w, inner_h)));
@@ -5079,7 +5083,11 @@ impl KomaState {
 
         if let Some(m) = win_match {
             let border = self.lua_sandbox.config_snapshot().appearance.border;
-            let b_off = if border.enabled {
+            let is_fs = self
+                .workspaces
+                .get(&m.ws_id)
+                .is_some_and(|ws| ws.is_fullscreen(m.win_id));
+            let b_off = if border.enabled && !is_fs {
                 f64::from(border.width.max(0.0))
             } else {
                 0.0

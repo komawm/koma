@@ -1016,7 +1016,11 @@ impl KomaState {
         }) {
             let ws_origin = self.workspace_output_origin(&m.ws_id);
             let border = self.lua_sandbox.config_snapshot().appearance.border;
-            let b_off = if border.enabled {
+            let is_fs = self
+                .workspaces
+                .get(&m.ws_id)
+                .is_some_and(|ws| ws.is_fullscreen(m.win_id));
+            let b_off = if border.enabled && !is_fs {
                 f64::from(border.width.max(0.0))
             } else {
                 0.0
