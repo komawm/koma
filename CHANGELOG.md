@@ -6,6 +6,29 @@ incubation versions; `v0.1.0` will be the first independently accepted product
 release. A `0.0.x` tag is a development prerelease and does not claim a working
 desktop, hardware support, or security guarantees.
 
+## [0.0.7] - 2026-11-19
+
+### Changed
+
+- Default `DwindleConfig::size_limits_tiled` to `false` (`komawm/koma#113`, `komawm/koma#114`):
+  partitions Dwindle splits strictly by `split_ratio` by default so large client minimum sizes
+  neither lock side-by-side resizing nor overlap siblings, while retaining opt-in
+  sibling-slack yielding when `size_limits_tiled = true` is explicitly configured.
+
+### Fixed
+
+- Dwindle overflowing minimum sizes and oversized surface bleed (`komawm/koma#113`, `komawm/koma#114`):
+  removes `WorkspaceState::clamp_tiled_size_hints` so overflowing client minimums never push
+  or stack tiled windows over neighbors, gates initial configure min-size clamping on
+  `size_limits_tiled`, and renders oversized client buffers via `KomaClippedSurfaceElement`
+  clipped to `inner_rect`.
+- Interactive resize smoothness and floating border hit-testing (`komawm/koma#115`, `komawm/koma#116`):
+  tracks `active_resize_ws` across compositor, frame-edge, and CSD pointer resize grabs,
+  emits `xdg_toplevel::State::Resizing` during interactive drags, throttles size-only
+  `configure` bursts while prior configures remain unacknowledged or uncommitted, flushes
+  pending configures on `CompositorHandler::commit` and `ResizeWindowGrab::on_ungrab`, and
+  sorts floating windows above tiled windows in `frame_edge_under_pointer`.
+
 ## [0.0.6] - 2026-11-19
 
 ### Fixed
