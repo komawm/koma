@@ -3861,6 +3861,74 @@ fn multi_monitor_window_move_fractional_scale_and_notch_layer_shell_composition(
 }
 
 #[test]
+fn fullscreen_floating_scene_is_scoped_to_each_output_workspace() {
+    let mut env = ClientEnv::new();
+    let primary_output = env._output.clone();
+    let secondary_output = test_output("HDMI-A-1");
+    let _secondary_global = secondary_output.create_global::<KomaState>(&env.state.display_handle);
+    env.state.test_outputs.push(secondary_output.clone());
+    env.state
+        .register_or_update_output(&primary_output, Some((0, 0)), Default::default(), true);
+    env.state
+        .register_or_update_output(&secondary_output, None, Default::default(), true);
+
+    let (primary_surface, _, _) = env.spawn_window("Primary fullscreen", "org.koma.primary");
+    let primary_win = env.state.mapped_windows[0].win_id;
+    let primary_ws = env.state.active_workspace_for_output("DP-1");
+    env.state.set_window_fullscreen(primary_win, true, None);
+    let (dialog_surface, _, _) = env.spawn_window("Fullscreen dialog", "org.koma.dialog");
+    let dialog_win = env
+        .state
+        .mapped_windows
+        .iter()
+        .find(|window| window.app_id == "org.koma.dialog")
+        .expect("dialog mapped")
+        .win_id;
+    env.float_window_at(dialog_win, koma_model::LogicalRect::new(200, 160, 480, 320));
+
+    assert!(env.state.focus_output("HDMI-A-1"));
+    let (secondary_surface, _, _) = env.spawn_window("Secondary output", "org.koma.secondary");
+    let secondary_win = env
+        .state
+        .mapped_windows
+        .iter()
+        .find(|window| window.app_id == "org.koma.secondary")
+        .expect("secondary window mapped")
+        .win_id;
+    let secondary_ws = env.state.active_workspace_for_output("HDMI-A-1");
+    assert_ne!(primary_ws, secondary_ws);
+
+    let (primary_items, _) = env.state.collect_output_scene_items("DP-1");
+    assert_eq!(
+        primary_items
+            .iter()
+            .map(|item| item.win_id)
+            .collect::<Vec<_>>(),
+        vec![dialog_win, primary_win],
+        "primary output draws the floating dialog over its fullscreen window",
+    );
+    let (secondary_items, _) = env.state.collect_output_scene_items("HDMI-A-1");
+    assert_eq!(
+        secondary_items
+            .iter()
+            .map(|item| item.win_id)
+            .collect::<Vec<_>>(),
+        vec![secondary_win],
+        "secondary output keeps its own workspace scene without primary windows",
+    );
+    assert_eq!(
+        env.state.workspaces[&primary_ws].fullscreen_window(),
+        Some(primary_win)
+    );
+    assert_eq!(
+        env.state.workspaces[&secondary_ws].fullscreen_window(),
+        None
+    );
+
+    drop((primary_surface, dialog_surface, secondary_surface));
+}
+
+#[test]
 fn fullscreen_window_suppresses_top_and_overlay_layer_tiers_but_keeps_background() {
     use smithay::desktop::layer_map_for_output;
     use smithay::wayland::shell::wlr_layer::Layer;
@@ -3993,6 +4061,17 @@ fn fullscreen_window_suppresses_top_and_overlay_layer_tiers_but_keeps_background
         item.corner_radius, 0.0,
         "a fullscreen window must not be clipped to rounded corners"
     );
+
+    // Floating toplevels remain composited above the fullscreen presentation while ordinary
+    // tiled siblings remain hidden. The same workspace policy applies on every output.
+    let dialog_id = env.state.mapped_windows[1].win_id;
+    env.float_window_at(dialog_id, koma_model::LogicalRect::new(240, 180, 480, 320));
+    let fullscreen_with_dialog = env.state.collect_workspace_scene_items(&ws_id, false);
+    assert_eq!(fullscreen_with_dialog.len(), 2);
+    assert_eq!(fullscreen_with_dialog[0].win_id, dialog_id);
+    assert_eq!(fullscreen_with_dialog[1].win_id, win1);
+    assert!(fullscreen_with_dialog[0].is_floating);
+    assert!(!fullscreen_with_dialog[1].is_floating);
 
     // Leaving fullscreen restores the decorated presentation.
     env.state

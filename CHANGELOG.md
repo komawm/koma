@@ -6,6 +6,13 @@ incubation versions; `v0.1.0` will be the first independently accepted product
 release. A `0.0.x` tag is a development prerelease and does not claim a working
 desktop, hardware support, or security guarantees.
 
+## [0.0.11] - 2026-11-21
+
+### Fixed
+
+- Floating windows remain visible and interactive above a fullscreen window, while tiled siblings
+  stay suppressed. Scene geometry and output selection are verified across multiple displays.
+
 ## [0.0.10] - 2026-11-20
 
 ### Added

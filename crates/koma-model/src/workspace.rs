@@ -548,7 +548,10 @@ impl WorkspaceState {
     /// Focuses `win_id` (raising it to top if in `FloatingStack`, or scrolling/activating in Tiled).
     pub fn activate_window(&mut self, win_id: WindowId, now_ms: u64) -> bool {
         if self.floating.raise_to_top(win_id) {
-            if self.presented_window_id().is_some_and(|p| p != win_id) {
+            if self
+                .presented_window_id()
+                .is_some_and(|p| p != win_id && !self.is_fullscreen(p))
+            {
                 self.window_presentation = None;
             }
             self.focused_window = Some(win_id);
@@ -728,7 +731,16 @@ impl WorkspaceState {
     #[must_use]
     pub fn compute_animation_target_geometries(&self) -> Vec<(WindowId, LogicalRect, bool)> {
         if let Some((win_id, rect)) = self.presentation_geometry() {
-            return vec![(win_id, rect, false)];
+            let mut out = vec![(win_id, rect, false)];
+            if self.is_fullscreen(win_id) {
+                out.extend(
+                    self.floating
+                        .iter_bottom_to_top()
+                        .filter(|entry| entry.win_id != win_id)
+                        .map(|entry| (entry.win_id, entry.rect, true)),
+                );
+            }
+            return out;
         }
 
         let mut out: Vec<(WindowId, LogicalRect, bool)> = match self.layout_mode {
@@ -764,7 +776,16 @@ impl WorkspaceState {
     #[must_use]
     pub fn compute_visible_geometries_at(&self, now_ms: u64) -> Vec<(WindowId, LogicalRect, bool)> {
         if let Some((win_id, rect)) = self.presentation_geometry() {
-            return vec![(win_id, rect, false)];
+            let mut out = vec![(win_id, rect, false)];
+            if self.is_fullscreen(win_id) {
+                out.extend(
+                    self.floating
+                        .iter_bottom_to_top()
+                        .filter(|entry| entry.win_id != win_id)
+                        .map(|entry| (entry.win_id, entry.rect, true)),
+                );
+            }
+            return out;
         }
 
         let mut out: Vec<(WindowId, LogicalRect, bool)> = match self.layout_mode {
@@ -801,7 +822,16 @@ impl WorkspaceState {
     #[must_use]
     pub fn compute_visible_geometries(&self) -> Vec<(WindowId, LogicalRect, bool)> {
         if let Some((win_id, rect)) = self.presentation_geometry() {
-            return vec![(win_id, rect, false)];
+            let mut out = vec![(win_id, rect, false)];
+            if self.is_fullscreen(win_id) {
+                out.extend(
+                    self.floating
+                        .iter_bottom_to_top()
+                        .filter(|entry| entry.win_id != win_id)
+                        .map(|entry| (entry.win_id, entry.rect, true)),
+                );
+            }
+            return out;
         }
 
         let mut out: Vec<(WindowId, LogicalRect, bool)> = match self.layout_mode {
@@ -887,6 +917,118 @@ mod tests {
         assert_eq!(
             ws.compute_visible_geometries(),
             vec![(w1, LogicalRect::new(0, 0, 1920, 1080), false)]
+        );
+    }
+
+    #[test]
+    fn fullscreen_keeps_floating_windows_visible_only_in_its_workspace() {
+        let primary_output = OutputId::new("DP-1");
+        let secondary_output = OutputId::new("HDMI-A-1");
+        let viewport = LogicalViewport::new(1920, 1080, 1.0);
+        let mut primary = WorkspaceState::new(
+            WorkspaceId::new("primary"),
+            "primary",
+            SeatId::new("seat0"),
+            viewport,
+            PresentationTarget::Physical(primary_output),
+            LayoutMode::Dwindle,
+            0,
+        );
+        let mut secondary = WorkspaceState::new(
+            WorkspaceId::new("secondary"),
+            "secondary",
+            SeatId::new("seat0"),
+            viewport,
+            PresentationTarget::Physical(secondary_output),
+            LayoutMode::Dwindle,
+            0,
+        );
+
+        let fullscreen = WindowId::new(1, 1);
+        let tiled_sibling = WindowId::new(2, 1);
+        let dialog = WindowId::new(3, 1);
+        let other_output_window = WindowId::new(4, 1);
+        primary.insert_window(fullscreen, false, None, None, None, None, false, true, 0);
+        primary.insert_window(tiled_sibling, false, None, None, None, None, false, true, 1);
+        primary.set_fullscreen(fullscreen, true);
+        primary.insert_window(
+            dialog,
+            true,
+            None,
+            None,
+            Some((480, 320)),
+            None,
+            false,
+            true,
+            2,
+        );
+        secondary.insert_window(
+            other_output_window,
+            false,
+            None,
+            None,
+            None,
+            None,
+            false,
+            true,
+            0,
+        );
+
+        let expected = vec![
+            (fullscreen, LogicalRect::new(0, 0, 1920, 1080), false),
+            (
+                dialog,
+                primary.floating.rect_of(dialog).expect("dialog geometry"),
+                true,
+            ),
+        ];
+        assert_eq!(primary.compute_visible_geometries(), expected);
+        assert_eq!(primary.compute_visible_geometries_at(3), expected);
+        assert_eq!(primary.compute_animation_target_geometries(), expected);
+        assert!(primary.activate_window(dialog, 4));
+        assert_eq!(
+            primary.fullscreen_window(),
+            Some(fullscreen),
+            "activating a floating window above fullscreen must preserve the fullscreen scene",
+        );
+        assert_eq!(primary.compute_visible_geometries(), expected);
+        let mut floating_fullscreen = WorkspaceState::new(
+            WorkspaceId::new("floating-fullscreen"),
+            "floating-fullscreen",
+            SeatId::new("seat0"),
+            viewport,
+            PresentationTarget::Physical(OutputId::new("DP-2")),
+            LayoutMode::Dwindle,
+            0,
+        );
+        floating_fullscreen.insert_window(
+            fullscreen,
+            true,
+            None,
+            None,
+            Some((480, 320)),
+            None,
+            false,
+            true,
+            0,
+        );
+        floating_fullscreen.set_fullscreen(fullscreen, true);
+        assert_eq!(
+            floating_fullscreen.compute_visible_geometries(),
+            vec![(fullscreen, LogicalRect::new(0, 0, 1920, 1080), false)],
+            "a floating window promoted to fullscreen must not be drawn twice",
+        );
+        assert_eq!(
+            secondary.compute_visible_geometries(),
+            vec![(
+                other_output_window,
+                secondary
+                    .dwindle
+                    .rect_of(other_output_window)
+                    .expect("secondary output geometry"),
+                false,
+            )],
+            "fullscreen and floating presentation are scoped to their own output workspace",
         );
     }
 
