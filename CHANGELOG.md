@@ -6,6 +6,19 @@ incubation versions; `v0.1.0` will be the first independently accepted product
 release. A `0.0.x` tag is a development prerelease and does not claim a working
 desktop, hardware support, or security guarantees.
 
+## [0.0.10] - 2026-11-20
+
+### Added
+
+- Native `xdg-desktop-portal-koma` backend (`crates/koma-portal`, `komawm/koma#126`, `komawm/koma#127`):
+  implements `org.freedesktop.impl.portal.ScreenCast` (PipeWire `pw_stream` +
+  `zwlr_screencopy_manager_v1`), `org.freedesktop.impl.portal.RemoteDesktop`
+  (`zwlr_virtual_pointer_v1` + `zwp_virtual_keyboard_v1`), and
+  `org.freedesktop.impl.portal.Session` on `org.freedesktop.impl.portal.desktop.koma`,
+  together with `koma.portal`, D-Bus activation service, systemd user unit, and
+  `koma-portals.conf` routing so Wayland screen sharing and remote desktop tools (such as
+  RustDesk) work natively under Koma.
+
 ## [0.0.9] - 2026-11-20
 
 ### Added
