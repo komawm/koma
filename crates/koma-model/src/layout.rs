@@ -111,8 +111,13 @@ impl FloatingStack {
                 let scale = (f64::from(max_w) / f64::from(pw))
                     .min(f64::from(max_h) / f64::from(ph))
                     .min(1.0);
-                let scaled_w = ((f64::from(pw) * scale).round() as u32).clamp(120, max_w);
-                let scaled_h = ((f64::from(ph) * scale).round() as u32).clamp(90, max_h);
+                let (min_w, min_h) = if scale < 1.0 {
+                    (1, 1)
+                } else {
+                    (120_u32.min(max_w), 90_u32.min(max_h))
+                };
+                let scaled_w = ((f64::from(pw) * scale).round() as u32).clamp(min_w, max_w);
+                let scaled_h = ((f64::from(ph) * scale).round() as u32).clamp(min_h, max_h);
                 (scaled_w, scaled_h)
             }
             _ => {
@@ -487,6 +492,12 @@ mod tests {
         let exact_fit = stack.default_centered_rect(vp, Some((800, 600)));
         assert_eq!(exact_fit.w, 800);
         assert_eq!(exact_fit.h, 600);
+
+        // Extreme wide aspect ratio (6400x200) scales down proportionally without min-height inflation:
+        // scale = 1888 / 6400 = 0.295 -> width = 1888, height = round(200 * 1888 / 6400) = 59.
+        let ultra_wide = stack.default_centered_rect(vp, Some((6400, 200)));
+        assert_eq!(ultra_wide.w, 1888);
+        assert_eq!(ultra_wide.h, 59);
     }
 
     #[test]

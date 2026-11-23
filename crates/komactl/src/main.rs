@@ -142,11 +142,18 @@ fn main() -> io::Result<()> {
         Some("doctor") => process::exit(doctor::run(&args[1..])),
         Some("keys") => process::exit(keys::run(&args[1..])),
         Some("reload") => {
-            let explicit_path = args.get(1).map(|raw| {
-                config_probe::resolve_cli_path(raw)
-                    .to_string_lossy()
-                    .into_owned()
-            });
+            let explicit_path = args
+                .get(1)
+                .map(|raw| {
+                    let resolved = config_probe::resolve_cli_path(raw);
+                    resolved.to_str().map(str::to_owned).ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "config path is not valid UTF-8",
+                        )
+                    })
+                })
+                .transpose()?;
             let mut client = AdminClient::connect()?;
             let (val, _) = client.call_raw("config.reload", json!({ "path": explicit_path }))?;
             println!("{}", serde_json::to_string_pretty(&val).unwrap());

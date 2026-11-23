@@ -181,7 +181,22 @@ pub fn resolve_spawn_argv(
 
     let mut out = Vec::with_capacity(argv.len());
     out.push(resolved_first);
+    let mut skip_next_shell_cmd = false;
     for arg in &argv[1..] {
+        if skip_next_shell_cmd {
+            out.push(arg.clone());
+            skip_next_shell_cmd = false;
+            continue;
+        }
+        if is_interpreter
+            && arg.starts_with('-')
+            && !arg.starts_with("--")
+            && arg.chars().skip(1).any(|c| c == 'c')
+        {
+            skip_next_shell_cmd = true;
+            out.push(arg.clone());
+            continue;
+        }
         out.push(resolve_spawn_arg_token(
             arg,
             config_dir,
@@ -492,6 +507,41 @@ mod tests {
                 Some(home),
             ),
             vec!["/home/hiro/bin/tool".to_owned(), "/home/hiro".to_owned()]
+        );
+
+        assert_eq!(
+            resolve_spawn_argv(
+                &[
+                    "sh".to_owned(),
+                    "-c".to_owned(),
+                    "./run.sh ../../input.txt".to_owned(),
+                ],
+                Some(&root),
+                Some(home),
+            ),
+            vec![
+                "sh".to_owned(),
+                "-c".to_owned(),
+                "./run.sh ../../input.txt".to_owned(),
+            ]
+        );
+        assert_eq!(
+            resolve_spawn_argv(
+                &[
+                    "/bin/bash".to_owned(),
+                    "-lc".to_owned(),
+                    ".".to_owned(),
+                    "./extra-arg".to_owned(),
+                ],
+                Some(&root),
+                Some(home),
+            ),
+            vec![
+                "/bin/bash".to_owned(),
+                "-lc".to_owned(),
+                ".".to_owned(),
+                root.join("extra-arg").display().to_string(),
+            ]
         );
 
         let _ = fs::remove_dir_all(&root);

@@ -165,8 +165,7 @@ impl DoctorContext {
                     dirs.push(dir);
                 }
             }
-        }
-        if let Some(proc_path) = env::var_os("PATH") {
+        } else if let Some(proc_path) = env::var_os("PATH") {
             for dir in env::split_paths(&proc_path) {
                 if !dir.as_os_str().is_empty() && !dirs.contains(&dir) {
                     dirs.push(dir);
@@ -965,7 +964,7 @@ fn resolve_program(
     token: &str,
     path_dirs: &[PathBuf],
     bare: BareName,
-    config_root: &Path,
+    config_root: Option<&Path>,
 ) -> Resolution {
     let token = token.trim();
     if token.is_empty() {
@@ -995,10 +994,13 @@ fn resolve_program(
     };
 
     if resolved_token.contains('/') {
-        let path = koma_lua::path_resolve::resolve_config_path_from_env(
-            &resolved_token,
-            Some(config_root),
-        );
+        if !Path::new(&resolved_token).is_absolute() && config_root.is_none() {
+            return Resolution::Skip(
+                "is a relative path evaluated in the child shell's working directory".to_owned(),
+            );
+        }
+        let path =
+            koma_lua::path_resolve::resolve_config_path_from_env(&resolved_token, config_root);
         if is_executable_file(&path) {
             return Resolution::Executable(path);
         }
@@ -1260,7 +1262,7 @@ fn check_spawn_programs(
             continue;
         }
 
-        let resolution = resolve_program(program, path_dirs, BareName::Execve, config_root);
+        let resolution = resolve_program(program, path_dirs, BareName::Execve, Some(config_root));
         match &resolution {
             Resolution::Executable(path) => {
                 if COMMAND_SHELLS.contains(&name) && command_string(&spawn.argv).is_none() {
@@ -1323,7 +1325,7 @@ fn check_spawn_programs(
                 } else {
                     BareName::ShellWord
                 };
-                match resolve_program(&word, path_dirs, bare, config_root) {
+                match resolve_program(&word, path_dirs, bare, None) {
                     Resolution::Executable(_) => deep_resolved += 1,
                     Resolution::Missing(reason) => report.push(
                         "binds",
@@ -2947,31 +2949,35 @@ mod tests {
         fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod script");
 
         assert!(matches!(
-            resolve_program("/bin/sh", &[], BareName::Execve, &root),
+            resolve_program("/bin/sh", &[], BareName::Execve, Some(&root)),
             Resolution::Executable(_)
         ));
         assert!(matches!(
-            resolve_program("$TERMINAL", &[], BareName::Execve, &root),
+            resolve_program("$TERMINAL", &[], BareName::Execve, Some(&root)),
             Resolution::Skip(_)
         ));
         assert!(matches!(
-            resolve_program("fire*", &[], BareName::Execve, &root),
+            resolve_program("fire*", &[], BareName::Execve, Some(&root)),
             Resolution::Skip(_)
         ));
         assert_eq!(
-            resolve_program("./script.sh", &[], BareName::Execve, &root),
+            resolve_program("./script.sh", &[], BareName::Execve, Some(&root)),
             Resolution::Executable(script.clone())
         );
         assert!(matches!(
-            resolve_program("./absent.sh", &[], BareName::Execve, &root),
+            resolve_program("./script.sh", &[], BareName::ShellWord, None),
+            Resolution::Skip(_)
+        ));
+        assert!(matches!(
+            resolve_program("./absent.sh", &[], BareName::Execve, Some(&root)),
             Resolution::Missing(_)
         ));
         assert!(matches!(
-            resolve_program("koma-doctor-absent", &[], BareName::Execve, &root),
+            resolve_program("koma-doctor-absent", &[], BareName::Execve, Some(&root)),
             Resolution::Missing(_)
         ));
         assert!(matches!(
-            resolve_program("koma-doctor-absent", &[], BareName::FishWord, &root),
+            resolve_program("koma-doctor-absent", &[], BareName::FishWord, Some(&root)),
             Resolution::Skip(_)
         ));
 
@@ -3049,8 +3055,19 @@ mod tests {
         )
         .expect("write init.lua");
 
-        // Context with spawn_path = None so koma.env("PATH", ...) is honored!
-        let report = diagnose(&root.join("init.lua"), &offline_context());
+        // Context with spawn_path = None so koma.env("PATH", ...) is honored cleanly (replaces process PATH)!
+        let mut ctx = offline_context();
+        let registry = KomaConfigRegistry {
+            env_vars: [("PATH".to_owned(), "./custom-bin".to_owned())].into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            ctx.effective_program_paths(&registry, &root),
+            vec![root.join("custom-bin")]
+        );
+        ctx = offline_context();
+
+        let report = diagnose(&root.join("init.lua"), &ctx);
         let requires = finding(&report, "config.require");
         assert!(
             requires.iter().all(|row| row.severity == Severity::Ok),
@@ -3059,6 +3076,12 @@ mod tests {
         let warnings = spawn_warnings(&report);
         assert_eq!(warnings.len(), 1, "{warnings:#?}");
         assert!(warnings[0].message.contains("`Mod + D`"));
+        assert!(
+            finding(&report, "bind.spawn-target-deep")
+                .iter()
+                .any(|row| row.severity == Severity::Skip && row.message.contains("`Mod + C`")),
+            "deep shell relative command must be skipped rather than resolved against config_root"
+        );
 
         // Escaping require() produces a warning with access violation instead of false-missing lua/
         fs::write(root.join("init.lua"), "require(\"../outside\")\n")

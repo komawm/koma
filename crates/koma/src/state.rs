@@ -2468,10 +2468,18 @@ impl KomaState {
         if let Some(j_id) = jailed_ws {
             return j_id;
         }
-        if let Some(rule_ws_name) = initial_rules.open_on_workspace.as_deref()
-            && let Some(ws_id) = self.find_workspace_by_id_or_name(rule_ws_name)
-        {
-            return ws_id;
+        if let Some(rule_ws_name) = initial_rules.open_on_workspace.as_deref() {
+            let lookup_name = if rule_ws_name.starts_with(koma_model::SPECIAL_WORKSPACE_PREFIX) {
+                WorkspaceState::normalize_special_name(Some(rule_ws_name))
+            } else {
+                rule_ws_name.to_owned()
+            };
+            if let Some(ws_id) = self.find_workspace_by_id_or_name(&lookup_name) {
+                return ws_id;
+            }
+            if rule_ws_name.starts_with(koma_model::SPECIAL_WORKSPACE_PREFIX) {
+                return self.active_ws_id.clone();
+            }
         }
         if let Some(rule_out) = initial_rules.open_on_output.as_deref() {
             if rule_out.eq_ignore_ascii_case("primary") {
@@ -2618,6 +2626,15 @@ impl KomaState {
         };
 
         let wa = viewport.work_area_rect();
+        let scrolling_target_w = ws_cfg
+            .filter(|ws| ws.layout_mode == koma_model::LayoutMode::Scrolling)
+            .and(initial_rules.default_width)
+            .map(|dw| {
+                dw.resolve_px(f64::from(wa.w))
+                    .round()
+                    .clamp(48.0, f64::from(wa.w.max(48))) as u32
+            });
+
         let (initial_size, configure_mode) = if initial_rules.open_mode
             == Some(OpenMode::Fullscreen)
         {
@@ -2645,10 +2662,16 @@ impl KomaState {
                 None
             };
             (sz, InitialConfigureMode::Floating)
-        } else if initial_rules.open_mode.is_none() && (max_sz.0 > 0 && max_sz.1 > 0) {
+        } else if initial_rules.open_mode.is_none()
+            && scrolling_target_w.is_none()
+            && (max_sz.0 > 0 && max_sz.1 > 0)
+        {
             (None, InitialConfigureMode::Tiled)
         } else {
-            let inner_w = wa.w.saturating_sub(24).max(64);
+            let inner_w = scrolling_target_w.map_or_else(
+                || wa.w.saturating_sub(24).max(64),
+                |w| w.saturating_sub(border_inset).max(48),
+            );
             let inner_h = wa.h.saturating_sub(24).max(64);
             let base = LogicalRect::new(0, 0, inner_w, inner_h);
             let target = if size_limits_tiled {
@@ -2909,9 +2932,12 @@ impl KomaState {
             y: self.pointer_location.y - ws_origin.y,
         };
 
+        let is_active_or_special_ws =
+            ws_id == self.active_ws_id || Some(&ws_id) == self.active_special_ws_id.as_ref();
         let is_floating = if let Some(ws) = self.workspaces.get_mut(&ws_id) {
             ws.frame_clock.record_activity(now_ms);
             let _ = ws.set_size_hints(unmapped.win_id, SizeHints::from_min_max(min_sz, max_sz));
+            let prev_focused = ws.focused_window;
             let floated = ws.insert_window_with_column_width(
                 unmapped.win_id,
                 want_floating,
@@ -2924,14 +2950,19 @@ impl KomaState {
                 initial_rules.default_width,
                 now_ms,
             );
-            match initial_rules.open_mode {
-                Some(OpenMode::Fullscreen) => {
-                    ws.set_fullscreen(unmapped.win_id, true);
+            if focus_new || !is_active_or_special_ws || prev_focused.is_none() {
+                match initial_rules.open_mode {
+                    Some(OpenMode::Fullscreen) => {
+                        ws.set_fullscreen(unmapped.win_id, true);
+                    }
+                    Some(OpenMode::Maximized) => {
+                        ws.set_maximized(unmapped.win_id, true);
+                    }
+                    _ => {}
                 }
-                Some(OpenMode::Maximized) => {
-                    ws.set_maximized(unmapped.win_id, true);
+                if !focus_new && prev_focused.is_some() {
+                    ws.focused_window = prev_focused;
                 }
-                _ => {}
             }
             floated
         } else {
@@ -3029,20 +3060,65 @@ impl KomaState {
         } else if visible_anywhere {
             self.queue_redraw();
         }
-        if !final_is_agent_ws {
-            let title_redacted = if mapped_is_protected {
+        let (ev_ws_id, ev_app_id, ev_title, ev_floating, ev_is_agent_ws, ev_is_protected) =
+            if let Some(live) = self
+                .mapped_windows
+                .iter()
+                .find(|m| m.win_id == win_id_created)
+            {
+                let live_ws = self.workspaces.get(&live.ws_id);
+                let live_agent = live_ws.is_some_and(|ws| {
+                    matches!(ws.presentation, PresentationTarget::Offscreen { .. })
+                });
+                let live_protected = self
+                    .rules
+                    .resolve_dynamic(&WindowMatchContext {
+                        app_id: &live.app_id,
+                        title: &live.title,
+                        workspace: live_ws.map(|ws| ws.name.as_str()),
+                        is_floating: live.is_floating,
+                        is_focused: live_ws
+                            .is_some_and(|ws| ws.active_window() == Some(win_id_created)),
+                        is_xwayland: false,
+                        is_modal_dialog: has_parent,
+                        is_screencast_target: false,
+                        is_agent_workspace: live_agent,
+                        at_startup: now_ms <= 5_000,
+                    })
+                    .block_out_from
+                    .is_some_and(|p| p.blocks_agent_capture());
+                (
+                    live.ws_id.clone(),
+                    live.app_id.clone(),
+                    live.title.clone(),
+                    live.is_floating,
+                    live_agent,
+                    live_protected,
+                )
+            } else {
+                (
+                    ws_id.clone(),
+                    app_id,
+                    title,
+                    is_floating,
+                    final_is_agent_ws,
+                    mapped_is_protected,
+                )
+            };
+        if !ev_is_agent_ws {
+            let title_redacted = if ev_is_protected {
                 "[protected]"
             } else {
-                title.as_str()
+                ev_title.as_str()
             };
             self.emit_lua_event(
                 "window.mapped",
                 serde_json::json!({
                     "id": win_id_created.slot,
-                    "app_id": app_id,
+                    "app_id": ev_app_id,
                     "title_redacted": title_redacted,
-                    "workspace": ws_id.to_string(),
-                    "floating": is_floating,
+                    "workspace": ev_ws_id.to_string(),
+                    "floating": ev_floating,
                 }),
             );
         }
@@ -6299,8 +6375,7 @@ fn resolve_rule_floating_size(
         (Some(w), Some(h)) => (w, h),
         (Some(w), None) => {
             let h = if let Some((cw, ch)) = client_pos {
-                ((f64::from(w) * f64::from(ch) / f64::from(cw)).round() as u32)
-                    .clamp(48, wa.h.max(48))
+                ((f64::from(w) * f64::from(ch) / f64::from(cw)).round() as u32).max(48)
             } else if let Some((_, mh)) = hint_max_pos {
                 mh.clamp(48, wa.h.max(48))
             } else {
@@ -6310,8 +6385,7 @@ fn resolve_rule_floating_size(
         }
         (None, Some(h)) => {
             let w = if let Some((cw, ch)) = client_pos {
-                ((f64::from(h) * f64::from(cw) / f64::from(ch)).round() as u32)
-                    .clamp(48, wa.w.max(48))
+                ((f64::from(h) * f64::from(cw) / f64::from(ch)).round() as u32).max(48)
             } else if let Some((mw, _)) = hint_max_pos {
                 mw.clamp(48, wa.w.max(48))
             } else {
@@ -6324,8 +6398,8 @@ fn resolve_rule_floating_size(
 
     let preserve_aspect = !(def_w.is_some() && def_h.is_some()) && client_pos.is_some();
     if preserve_aspect {
-        let cap_w = max_w.unwrap_or(u32::MAX);
-        let cap_h = max_h.unwrap_or(u32::MAX);
+        let cap_w = max_w.map_or(wa.w.max(48), |mw| mw.min(wa.w.max(48)));
+        let cap_h = max_h.map_or(wa.h.max(48), |mh| mh.min(wa.h.max(48)));
         if w > cap_w || h > cap_h {
             let scale = (f64::from(cap_w) / f64::from(w.max(1)))
                 .min(f64::from(cap_h) / f64::from(h.max(1)))
@@ -7928,6 +8002,18 @@ pub(crate) mod tests {
             resolve_floating_rect(wa, size, koma_model::Anchor9::BottomRight, -20, -20)
                 .expect("bottom-right anchor resolves");
         assert_eq!(bottom_right, LogicalRect::new(580, 330, 1000, 650));
+    }
+
+    #[test]
+    fn resolve_rule_floating_size_scales_single_axis_proportionally_within_work_area() {
+        let wa = LogicalRect::new(0, 0, 1920, 1080);
+        let rules = koma_model::InitialWindowRules {
+            default_width: Some(koma_model::PresetColumnWidth::Fixed(1000)),
+            ..Default::default()
+        };
+        let (size, has_explicit) = resolve_rule_floating_size(wa, (900, 1800), (0, 0), &rules);
+        assert!(has_explicit);
+        assert_eq!(size, (540, 1080));
     }
 
     #[test]

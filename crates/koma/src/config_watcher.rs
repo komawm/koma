@@ -558,6 +558,16 @@ fn compile_window_match_spec(
     kind: &str,
     m: &LuaWindowMatchInput,
 ) -> Result<WindowMatchSpec, String> {
+    if m.tag.is_some() {
+        return Err(format!(
+            "window rule #{idx} `{kind}.tag` is not supported yet"
+        ));
+    }
+    if m.is_urgent.is_some() {
+        return Err(format!(
+            "window rule #{idx} `{kind}.is_urgent` is not supported yet"
+        ));
+    }
     let app_id = match &m.app_id {
         Some(pat) => Some(Regex::new(pat).map_err(|e| {
             format!("window rule #{idx} invalid `{kind}.app_id` regex `{pat}`: {e}")
@@ -1080,5 +1090,33 @@ mod tests {
             KomaConfigPath::resolve(Some(PathBuf::from("~/my/init.lua"))),
             KomaConfigPath::Explicit(expected_tilde)
         );
+    }
+
+    #[test]
+    fn compile_window_rule_rejects_unsupported_tag_and_is_urgent_matchers() {
+        let (_el, _disp, mut state) = crate::state::tests::make_headless_test_state();
+        for (field, src) in [
+            (
+                "tag",
+                r#"koma.rule.window({ matches = { { tag = "vip" } }, initial = { open_mode = "float" } })"#,
+            ),
+            (
+                "is_urgent",
+                r#"koma.rule.window({ matches = { { is_urgent = true } }, initial = { open_mode = "float" } })"#,
+            ),
+        ] {
+            let err = reload_from_lua_source(
+                &mut state,
+                Path::new("/tmp/init.lua"),
+                Path::new("/tmp"),
+                src,
+                false,
+            )
+            .expect_err("unsupported matcher must be rejected");
+            assert!(
+                err.contains(field) && err.contains("not supported"),
+                "unexpected error for `{field}`: {err}"
+            );
+        }
     }
 }
