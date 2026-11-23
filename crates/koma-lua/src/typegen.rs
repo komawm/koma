@@ -367,6 +367,7 @@ function MacroContext:dispatch(action) end
 ---@field spring fun(name: string, spec: { mass?: number, damping?: number, damping_ratio?: number, stiffness?: number, epsilon?: number })
 ---@field xwayland fun(spec: { enabled?: boolean, path?: string, isolate_agent_workspaces?: boolean })
 ---@field env fun(key: string, val: string)
+---@field resolve_path fun(path: string): string
 ---@field bind fun(chord: string, action: KomaAction|fun(ctx: KomaMacroContext), opts?: { desc?: string, repeat_while_held?: boolean, cooldown_ms?: integer, allow_when_locked?: boolean, pass_through?: boolean, edge?: "press"|"release"|"both", when_preempted?: "allow"|"ignore" }): KomaHandle
 ---@field unbind fun(chord: string)
 ---@field mode fun(name: string, spec: table)

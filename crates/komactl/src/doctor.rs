@@ -143,14 +143,37 @@ impl DoctorContext {
         }
     }
 
-    /// Directories searched for a bare program name.
-    fn program_paths(&self) -> Vec<PathBuf> {
-        match &self.spawn_path {
-            Some(dirs) => dirs.clone(),
-            None => env::var_os("PATH")
-                .map(|value| env::split_paths(&value).collect())
-                .unwrap_or_default(),
+    /// Directories searched for a bare program name, honoring `koma.env("PATH", ...)` when
+    /// `spawn_path` is not explicitly overridden by a test.
+    fn effective_program_paths(
+        &self,
+        registry: &KomaConfigRegistry,
+        config_root: &Path,
+    ) -> Vec<PathBuf> {
+        if let Some(dirs) = &self.spawn_path {
+            return dirs.clone();
         }
+        let mut dirs = Vec::new();
+        if let Some(cfg_path) = registry.env_vars.get("PATH") {
+            let resolved = koma_lua::path_resolve::resolve_env_value_from_env(
+                "PATH",
+                cfg_path,
+                Some(config_root),
+            );
+            for dir in env::split_paths(&resolved) {
+                if !dir.as_os_str().is_empty() && !dirs.contains(&dir) {
+                    dirs.push(dir);
+                }
+            }
+        }
+        if let Some(proc_path) = env::var_os("PATH") {
+            for dir in env::split_paths(&proc_path) {
+                if !dir.as_os_str().is_empty() && !dirs.contains(&dir) {
+                    dirs.push(dir);
+                }
+            }
+        }
+        dirs
     }
 }
 
@@ -457,12 +480,6 @@ fn check_require_targets(evaluation: &ConfigEvaluation, report: &mut Report) {
     let mut missing: Vec<String> = Vec::new();
     for (path, source) in &sources {
         for target in lua_scan::require_targets(&lua_scan::tokenize(source)) {
-            let module_path = target.module.replace('.', "/");
-            let flat = lua_root.join(format!("{module_path}.lua"));
-            let nested = lua_root.join(&module_path).join("init.lua");
-            if flat.is_file() || nested.is_file() {
-                continue;
-            }
             let label = if *path == evaluation.path {
                 "init.lua".to_owned()
             } else {
@@ -471,6 +488,25 @@ fn check_require_targets(evaluation: &ConfigEvaluation, report: &mut Report) {
                     |name| name.to_string_lossy().into_owned(),
                 )
             };
+            let module = match koma_lua::path_resolve::resolve_require_target_from_env(
+                &target.module,
+                Some(&evaluation.config_root),
+            ) {
+                Ok(resolved) => resolved,
+                Err(err) => {
+                    missing.push(format!(
+                        "`require(\"{}\")` in {label}:{}: {err}",
+                        target.module, target.line
+                    ));
+                    continue;
+                }
+            };
+            let module_path = module.replace('.', "/");
+            let flat = lua_root.join(format!("{module_path}.lua"));
+            let nested = lua_root.join(&module_path).join("init.lua");
+            if flat.is_file() || nested.is_file() {
+                continue;
+            }
             missing.push(format!(
                 "`require(\"{}\")` in {label}:{} has no lua/{module_path}.lua",
                 target.module, target.line
@@ -924,8 +960,13 @@ fn program_name(program: &str) -> &str {
     program.rsplit('/').next().unwrap_or(program)
 }
 
-/// Resolves `token` the way `execve` would, without running anything.
-fn resolve_program(token: &str, path_dirs: &[PathBuf], bare: BareName) -> Resolution {
+/// Resolves `token` the way `execve` would (plus `~` and config-relative paths), without running anything.
+fn resolve_program(
+    token: &str,
+    path_dirs: &[PathBuf],
+    bare: BareName,
+    config_root: &Path,
+) -> Resolution {
     let token = token.trim();
     if token.is_empty() {
         return Resolution::Skip("is empty".to_owned());
@@ -933,21 +974,33 @@ fn resolve_program(token: &str, path_dirs: &[PathBuf], bare: BareName) -> Resolu
     if token.starts_with('-') {
         return Resolution::Skip(format!("is the option `{token}`, not a program"));
     }
-    if let Some(ch) = token.chars().find(|ch| EXPANSION_CHARS.contains(ch)) {
-        return Resolution::Skip(format!(
-            "needs shell expansion (`{ch}`), which doctor does not perform"
-        ));
-    }
-    if token.contains('/') {
-        let path = Path::new(token);
-        if !path.is_absolute() {
+    let resolved_token = if token == "~" || token.starts_with("~/") {
+        if let Some(ch) = token[1..].chars().find(|ch| EXPANSION_CHARS.contains(ch)) {
             return Resolution::Skip(format!(
-                "is the relative path `{token}`, and the spawned process working directory is \
-                 unknown"
+                "needs shell expansion (`{ch}`), which doctor does not perform"
             ));
         }
-        if is_executable_file(path) {
-            return Resolution::Executable(path.to_path_buf());
+        let expanded = koma_lua::path_resolve::expand_tilde_from_env(token);
+        if expanded.starts_with('~') {
+            return Resolution::Skip("uses `~` and `HOME` is not set".to_owned());
+        }
+        expanded
+    } else {
+        if let Some(ch) = token.chars().find(|ch| EXPANSION_CHARS.contains(ch)) {
+            return Resolution::Skip(format!(
+                "needs shell expansion (`{ch}`), which doctor does not perform"
+            ));
+        }
+        token.to_owned()
+    };
+
+    if resolved_token.contains('/') {
+        let path = koma_lua::path_resolve::resolve_config_path_from_env(
+            &resolved_token,
+            Some(config_root),
+        );
+        if is_executable_file(&path) {
+            return Resolution::Executable(path);
         }
         if path.exists() {
             return Resolution::Missing("exists but is not executable".to_owned());
@@ -960,7 +1013,7 @@ fn resolve_program(token: &str, path_dirs: &[PathBuf], bare: BareName) -> Resolu
         if dir.as_os_str().is_empty() || !dir.is_absolute() {
             continue;
         }
-        let candidate = dir.join(token);
+        let candidate = dir.join(&resolved_token);
         if is_executable_file(&candidate) {
             return Resolution::Executable(candidate);
         }
@@ -1042,7 +1095,12 @@ fn first_shell_word(command: &str) -> ShellWord {
 }
 
 fn classify_shell_word(word: &str) -> ShellWord {
-    if let Some(ch) = word.chars().find(|ch| EXPANSION_CHARS.contains(ch)) {
+    let check_slice = if word == "~" || word.starts_with("~/") {
+        &word[1..]
+    } else {
+        word
+    };
+    if let Some(ch) = check_slice.chars().find(|ch| EXPANSION_CHARS.contains(ch)) {
         return ShellWord::Skip(if ch == '$' && word.starts_with('$') {
             format!("starts with the variable `{word}`, which doctor does not expand")
         } else if ch == '"' || ch == '\'' {
@@ -1127,6 +1185,7 @@ fn effective_spawns(
 fn check_spawn_targets(
     registry: &KomaConfigRegistry,
     config_path: &Path,
+    config_root: &Path,
     path_dirs: &[PathBuf],
     report: &mut Report,
 ) {
@@ -1160,11 +1219,16 @@ fn check_spawn_targets(
             "no `<shell> -c` command string to follow".to_owned(),
         );
     } else {
-        check_spawn_programs(&spawns, path_dirs, report);
+        check_spawn_programs(&spawns, path_dirs, config_root, report);
     }
 }
 
-fn check_spawn_programs(spawns: &[SpawnBind], path_dirs: &[PathBuf], report: &mut Report) {
+fn check_spawn_programs(
+    spawns: &[SpawnBind],
+    path_dirs: &[PathBuf],
+    config_root: &Path,
+    report: &mut Report,
+) {
     let mut resolved = 0usize;
     let mut deep_resolved = 0usize;
     for spawn in spawns {
@@ -1196,7 +1260,7 @@ fn check_spawn_programs(spawns: &[SpawnBind], path_dirs: &[PathBuf], report: &mu
             continue;
         }
 
-        let resolution = resolve_program(program, path_dirs, BareName::Execve);
+        let resolution = resolve_program(program, path_dirs, BareName::Execve, config_root);
         match &resolution {
             Resolution::Executable(path) => {
                 if COMMAND_SHELLS.contains(&name) && command_string(&spawn.argv).is_none() {
@@ -1259,7 +1323,7 @@ fn check_spawn_programs(spawns: &[SpawnBind], path_dirs: &[PathBuf], report: &mu
                 } else {
                     BareName::ShellWord
                 };
-                match resolve_program(&word, path_dirs, bare) {
+                match resolve_program(&word, path_dirs, bare, config_root) {
                     Resolution::Executable(_) => deep_resolved += 1,
                     Resolution::Missing(reason) => report.push(
                         "binds",
@@ -1801,7 +1865,14 @@ pub(crate) fn diagnose(config_path: &Path, context: &DoctorContext) -> Report {
         check_unbinds(registry, &mut report);
         check_duplicate_binds(registry, &mut report);
         check_shadowed_builtins(registry, &mut report);
-        check_spawn_targets(registry, config_path, &context.program_paths(), &mut report);
+        let effective_paths = context.effective_program_paths(registry, &evaluation.config_root);
+        check_spawn_targets(
+            registry,
+            &evaluation.path,
+            &evaluation.config_root,
+            &effective_paths,
+            &mut report,
+        );
         check_gestures(evaluation, registry, &mut report);
         check_monitors(registry, &context.outputs, &mut report);
         check_workspaces(registry, &mut report);
@@ -2048,6 +2119,7 @@ pub(crate) fn run(args: &[String]) -> i32 {
     }
     let path = parsed
         .path
+        .map(|p| config_probe::resolve_cli_path(&p.to_string_lossy()))
         .unwrap_or_else(config_probe::default_init_lua_path);
     let context = DoctorContext::detect();
     let mut report = diagnose(&path, &context);
@@ -2726,7 +2798,7 @@ mod tests {
              koma.bind(\"Mod + F\", koma.act.spawn({ \"fish\", \"-c\", \"changewp\" }))\n\
              koma.bind(\"Mod + G\", koma.act.spawn({ \"fish\", \"togglemode.fish\" }))\n\
              koma.bind(\"Mod + H\", koma.act.spawn({ \"$TERMINAL\" }))\n\
-             koma.bind(\"Mod + J\", koma.act.spawn({ \"./script.sh\" }))\n\
+             koma.bind(\"Mod + J\", koma.act.spawn({ \"~other/script.sh\" }))\n\
              koma.bind(\"Mod + K\", koma.act.spawn({ \"env\", \"FOO=1\", \"kitty\" }))\n",
         )
         .expect("write init.lua");
@@ -2790,7 +2862,8 @@ mod tests {
         assert!(
             messages
                 .iter()
-                .any(|message| message.contains("`Mod + J`") && message.contains("relative path")),
+                .any(|message| message.contains("`Mod + J`")
+                    && message.contains("shell expansion")),
             "{messages:#?}"
         );
         assert!(
@@ -2868,34 +2941,47 @@ mod tests {
 
     #[test]
     fn spawn_resolver_and_shell_word_extraction_cover_the_edge_cases() {
+        let root = temp_root("resolver-edge");
+        let script = root.join("script.sh");
+        fs::write(&script, "#!/bin/sh\nexit 0\n").expect("write script");
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod script");
+
         assert!(matches!(
-            resolve_program("/bin/sh", &[], BareName::Execve),
+            resolve_program("/bin/sh", &[], BareName::Execve, &root),
             Resolution::Executable(_)
         ));
         assert!(matches!(
-            resolve_program("$TERMINAL", &[], BareName::Execve),
+            resolve_program("$TERMINAL", &[], BareName::Execve, &root),
             Resolution::Skip(_)
         ));
         assert!(matches!(
-            resolve_program("fire*", &[], BareName::Execve),
+            resolve_program("fire*", &[], BareName::Execve, &root),
             Resolution::Skip(_)
         ));
+        assert_eq!(
+            resolve_program("./script.sh", &[], BareName::Execve, &root),
+            Resolution::Executable(script.clone())
+        );
         assert!(matches!(
-            resolve_program("./script.sh", &[], BareName::Execve),
-            Resolution::Skip(_)
-        ));
-        assert!(matches!(
-            resolve_program("koma-doctor-absent", &[], BareName::Execve),
+            resolve_program("./absent.sh", &[], BareName::Execve, &root),
             Resolution::Missing(_)
         ));
         assert!(matches!(
-            resolve_program("koma-doctor-absent", &[], BareName::FishWord),
+            resolve_program("koma-doctor-absent", &[], BareName::Execve, &root),
+            Resolution::Missing(_)
+        ));
+        assert!(matches!(
+            resolve_program("koma-doctor-absent", &[], BareName::FishWord, &root),
             Resolution::Skip(_)
         ));
 
         assert_eq!(
             first_shell_word("koma-doctor-absent --flag"),
             ShellWord::Program("koma-doctor-absent".to_owned())
+        );
+        assert_eq!(
+            first_shell_word("~/bin/my-tool --flag"),
+            ShellWord::Program("~/bin/my-tool".to_owned())
         );
         assert_eq!(
             first_shell_word("FOO=1 BAR=2 /usr/bin/kitty"),
@@ -2929,5 +3015,64 @@ mod tests {
             command_string(&["bash".to_owned(), "script.sh".to_owned()]),
             None
         );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn require_targets_and_relative_spawns_and_env_path_are_resolved() {
+        let root = temp_root("paths-doctor");
+        fs::create_dir_all(root.join("lua")).expect("create lua");
+        fs::create_dir_all(root.join("scripts")).expect("create scripts");
+        fs::create_dir_all(root.join("custom-bin")).expect("create custom-bin");
+        fs::write(root.join("lua/input.lua"), "return {}\n").expect("write lua/input.lua");
+        fs::write(root.join("lua/keys.lua"), "return {}\n").expect("write lua/keys.lua");
+        fs::write(root.join("lua/theme.lua"), "return {}\n").expect("write lua/theme.lua");
+        let local_script = root.join("scripts/launch.sh");
+        fs::write(&local_script, "#!/bin/sh\nexit 0\n").expect("write launch.sh");
+        fs::set_permissions(&local_script, fs::Permissions::from_mode(0o755))
+            .expect("chmod launch.sh");
+        std::os::unix::fs::symlink("/bin/sh", root.join("custom-bin/my-custom-tool"))
+            .expect("symlink custom tool");
+        std::os::unix::fs::symlink("/bin/sh", root.join("custom-bin/bitty"))
+            .expect("symlink bitty");
+
+        fs::write(
+            root.join("init.lua"),
+            "require(\"./lua/input\")\n\
+             require(\"./keys\")\n\
+             require(\"lua/theme\")\n\
+             koma.env(\"PATH\", \"./custom-bin:/usr/bin\")\n\
+             koma.bind(\"Mod + A\", koma.act.spawn({ \"./scripts/launch.sh\" }))\n\
+             koma.bind(\"Mod + B\", koma.act.spawn({ \"my-custom-tool\" }))\n\
+             koma.bind(\"Mod + C\", koma.act.spawn({ \"/bin/sh\", \"-c\", \"./scripts/launch.sh\" }))\n\
+             koma.bind(\"Mod + D\", koma.act.spawn({ \"./scripts/missing.sh\" }))\n",
+        )
+        .expect("write init.lua");
+
+        // Context with spawn_path = None so koma.env("PATH", ...) is honored!
+        let report = diagnose(&root.join("init.lua"), &offline_context());
+        let requires = finding(&report, "config.require");
+        assert!(
+            requires.iter().all(|row| row.severity == Severity::Ok),
+            "{requires:#?}"
+        );
+        let warnings = spawn_warnings(&report);
+        assert_eq!(warnings.len(), 1, "{warnings:#?}");
+        assert!(warnings[0].message.contains("`Mod + D`"));
+
+        // Escaping require() produces a warning with access violation instead of false-missing lua/
+        fs::write(root.join("init.lua"), "require(\"../outside\")\n")
+            .expect("write escape init.lua");
+        let escape_report = diagnose(&root.join("init.lua"), &offline_context());
+        let esc_req = finding(&escape_report, "config.require");
+        assert_eq!(esc_req.len(), 1, "{esc_req:#?}");
+        assert_eq!(esc_req[0].severity, Severity::Warn);
+        assert!(
+            esc_req[0].message.contains("access violation"),
+            "{esc_req:#?}"
+        );
+        assert!(!esc_req[0].message.contains("has no lua/"), "{esc_req:#?}");
+
+        let _ = fs::remove_dir_all(&root);
     }
 }

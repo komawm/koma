@@ -112,7 +112,7 @@ pub fn setup_primary_satellite(state: &mut KomaState) {
         return;
     }
 
-    let bin_path = expand_tilde_path(&xwl_cfg.path);
+    let bin_path = PathBuf::from(koma_lua::path_resolve::expand_tilde_from_env(&xwl_cfg.path));
     if !probe_listenfd_support(&bin_path) {
         info!(
             binary = %bin_path.display(),
@@ -182,7 +182,7 @@ pub fn ensure_workspace_satellite(state: &mut KomaState, ws_id: &WorkspaceId) ->
             .map(|s| s.display_name().to_owned());
     }
 
-    let bin_path = expand_tilde_path(&xwl_cfg.path);
+    let bin_path = PathBuf::from(koma_lua::path_resolve::expand_tilde_from_env(&xwl_cfg.path));
     if !probe_listenfd_support(&bin_path) {
         return state
             .primary_satellite
@@ -564,15 +564,6 @@ fn probe_listenfd_support(path: &Path) -> bool {
     cmd.spawn()
         .and_then(|mut child| child.wait())
         .is_ok_and(|status| status.success())
-}
-
-fn expand_tilde_path(raw: &str) -> PathBuf {
-    if let Some(rest) = raw.strip_prefix("~/")
-        && let Some(home) = std::env::var_os("HOME")
-    {
-        return PathBuf::from(home).join(rest);
-    }
-    PathBuf::from(raw)
 }
 
 #[cfg(all(test, target_os = "linux"))]

@@ -74,21 +74,34 @@ pub enum KomaConfigPath {
 }
 
 impl KomaConfigPath {
-    /// Resolves CLI override -> `$KOMA_CONFIG` -> XDG user/system default paths.
+    /// Resolves CLI override -> `$KOMA_CONFIG` -> XDG user/system default paths,
+    /// expanding `~` and resolving relative paths against `current_dir()`.
     #[must_use]
     pub fn resolve(cli_override: Option<PathBuf>) -> Self {
+        let cwd = env::current_dir().ok();
+        let home = koma_lua::path_resolve::home_dir_from_env();
         if let Some(explicit) = cli_override.or_else(|| {
             env::var_os("KOMA_CONFIG")
                 .filter(|v| !v.is_empty())
                 .map(PathBuf::from)
         }) {
-            return Self::Explicit(explicit);
+            return Self::Explicit(koma_lua::path_resolve::resolve_config_path(
+                &explicit.to_string_lossy(),
+                cwd.as_deref(),
+                home.as_deref(),
+            ));
         }
 
         let user_config_base = env::var_os("XDG_CONFIG_HOME")
             .filter(|v| !v.is_empty())
-            .map(PathBuf::from)
-            .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+            .map(|p| {
+                koma_lua::path_resolve::resolve_config_path(
+                    &p.to_string_lossy(),
+                    cwd.as_deref(),
+                    home.as_deref(),
+                )
+            })
+            .or_else(|| home.map(|h| h.join(".config")))
             .unwrap_or_else(|| PathBuf::from("/tmp"));
 
         Self::Regular {
@@ -982,6 +995,10 @@ pub fn reload_active_config_now(
     state: &mut KomaState,
     explicit_path: Option<PathBuf>,
 ) -> Result<ConfigReloadReport, String> {
+    let explicit_path = explicit_path.map(|p| {
+        let cwd = env::current_dir().ok();
+        koma_lua::path_resolve::resolve_config_path_from_env(&p.to_string_lossy(), cwd.as_deref())
+    });
     if let Some(p) = &explicit_path {
         state.config_path = KomaConfigPath::Explicit(p.clone());
         if let Some(w) = &state.config_watcher {
@@ -1044,5 +1061,21 @@ mod tests {
         );
         let claimed = state.ensure_initial_workspace_for_output(&output);
         assert_eq!(claimed, WorkspaceId::from("ws_01"));
+    }
+
+    #[test]
+    fn config_path_resolve_expands_tilde_and_relative_cli_overrides() {
+        let cwd = env::current_dir().expect("cwd");
+        assert_eq!(
+            KomaConfigPath::resolve(Some(PathBuf::from("./examples/init.lua"))),
+            KomaConfigPath::Explicit(cwd.join("examples/init.lua"))
+        );
+        let expected_tilde = PathBuf::from(koma_lua::path_resolve::expand_tilde_from_env(
+            "~/my/init.lua",
+        ));
+        assert_eq!(
+            KomaConfigPath::resolve(Some(PathBuf::from("~/my/init.lua"))),
+            KomaConfigPath::Explicit(expected_tilde)
+        );
     }
 }
