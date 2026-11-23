@@ -1,7 +1,7 @@
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
-use crate::geometry::Anchor9;
+use crate::{geometry::Anchor9, scrolling::PresetColumnWidth};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -31,16 +31,18 @@ impl BlockOutPolicy {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct WindowMatchSpec {
     pub app_id: Option<Regex>,
     pub title: Option<Regex>,
+    pub workspace: Option<String>,
     pub is_floating: Option<bool>,
     pub is_focused: Option<bool>,
     pub is_xwayland: Option<bool>,
     pub is_modal_dialog: Option<bool>,
     pub is_screencast_target: Option<bool>,
     pub is_agent_workspace: Option<bool>,
+    pub at_startup: Option<bool>,
 }
 
 impl WindowMatchSpec {
@@ -50,6 +52,10 @@ impl WindowMatchSpec {
             .as_ref()
             .is_none_or(|re| re.is_match(ctx.app_id))
             && self.title.as_ref().is_none_or(|re| re.is_match(ctx.title))
+            && self
+                .workspace
+                .as_deref()
+                .is_none_or(|ws| ctx.workspace.is_some_and(|cur| cur == ws))
             && self.is_floating.is_none_or(|v| v == ctx.is_floating)
             && self.is_focused.is_none_or(|v| v == ctx.is_focused)
             && self.is_xwayland.is_none_or(|v| v == ctx.is_xwayland)
@@ -62,26 +68,36 @@ impl WindowMatchSpec {
             && self
                 .is_agent_workspace
                 .is_none_or(|v| v == ctx.is_agent_workspace)
+            && self.at_startup.is_none_or(|v| v == ctx.at_startup)
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct WindowMatchContext<'a> {
     pub app_id: &'a str,
     pub title: &'a str,
+    pub workspace: Option<&'a str>,
     pub is_floating: bool,
     pub is_focused: bool,
     pub is_xwayland: bool,
     pub is_modal_dialog: bool,
     pub is_screencast_target: bool,
     pub is_agent_workspace: bool,
+    pub at_startup: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct InitialWindowRules {
+    pub open_on_output: Option<String>,
     pub open_on_workspace: Option<String>,
     pub open_mode: Option<OpenMode>,
     pub open_focused: Option<bool>,
+    pub default_width: Option<PresetColumnWidth>,
+    pub default_height: Option<PresetColumnWidth>,
+    pub max_width: Option<PresetColumnWidth>,
+    pub max_height: Option<PresetColumnWidth>,
+    pub min_width: Option<PresetColumnWidth>,
+    pub min_height: Option<PresetColumnWidth>,
     pub default_floating_pos: Option<(Anchor9, i32, i32)>,
 }
 
@@ -90,6 +106,7 @@ pub struct DynamicWindowRules {
     pub opacity: Option<f32>,
     pub inactive_opacity: Option<f32>,
     pub animation: Option<String>,
+    pub immediate: Option<bool>,
     pub no_blur: Option<bool>,
     pub no_shadow: Option<bool>,
     pub border_color: Option<String>,
@@ -171,6 +188,9 @@ impl WindowRuleEngine {
             if !rule.applies_to(ctx) {
                 continue;
             }
+            if let Some(ref output) = rule.initial.open_on_output {
+                out.open_on_output = Some(output.clone());
+            }
             if let Some(ref ws) = rule.initial.open_on_workspace {
                 out.open_on_workspace = Some(ws.clone());
             }
@@ -179,6 +199,24 @@ impl WindowRuleEngine {
             }
             if let Some(focused) = rule.initial.open_focused {
                 out.open_focused = Some(focused);
+            }
+            if let Some(w) = rule.initial.default_width {
+                out.default_width = Some(w);
+            }
+            if let Some(h) = rule.initial.default_height {
+                out.default_height = Some(h);
+            }
+            if let Some(w) = rule.initial.max_width {
+                out.max_width = Some(w);
+            }
+            if let Some(h) = rule.initial.max_height {
+                out.max_height = Some(h);
+            }
+            if let Some(w) = rule.initial.min_width {
+                out.min_width = Some(w);
+            }
+            if let Some(h) = rule.initial.min_height {
+                out.min_height = Some(h);
             }
             if let Some(pos) = rule.initial.default_floating_pos {
                 out.default_floating_pos = Some(pos);
@@ -202,6 +240,9 @@ impl WindowRuleEngine {
             }
             if let Some(v) = rule.dynamic.animation.as_ref() {
                 out.animation = Some(v.clone());
+            }
+            if let Some(v) = rule.dynamic.immediate {
+                out.immediate = Some(v);
             }
             if let Some(v) = rule.dynamic.no_blur {
                 out.no_blur = Some(v);
@@ -291,5 +332,78 @@ mod waydroid_rule_tests {
             "waydroid.com.android.settings"
         ));
         assert!(is_waydroid_multiwindow_app_id("WAYDROID.org.fdroid.fdroid"));
+    }
+
+    #[test]
+    fn resolves_workspace_and_at_startup_matches_and_merges_launch_rules() {
+        use regex::Regex;
+
+        use super::{
+            DynamicWindowRules, InitialWindowRules, OpenMode, PresetColumnWidth,
+            WindowMatchContext, WindowMatchSpec, WindowRuleEngine, WindowRuleEntry,
+        };
+
+        let mut engine = WindowRuleEngine::new();
+        engine.push_rule(WindowRuleEntry {
+            id: 1,
+            name: Some("startup-fm".to_owned()),
+            enabled: true,
+            matches: vec![WindowMatchSpec {
+                app_id: Some(Regex::new("^thunar$").unwrap()),
+                workspace: Some("1".to_owned()),
+                at_startup: Some(true),
+                ..Default::default()
+            }],
+            excludes: Vec::new(),
+            initial: InitialWindowRules {
+                open_on_output: Some("DP-1".to_owned()),
+                open_mode: Some(OpenMode::Float),
+                default_width: Some(PresetColumnWidth::Fixed(960)),
+                default_height: Some(PresetColumnWidth::Fixed(640)),
+                max_width: Some(PresetColumnWidth::Proportion(0.8)),
+                max_height: Some(PresetColumnWidth::Proportion(0.8)),
+                min_width: Some(PresetColumnWidth::Fixed(320)),
+                min_height: Some(PresetColumnWidth::Fixed(240)),
+                ..Default::default()
+            },
+            dynamic: DynamicWindowRules {
+                immediate: Some(true),
+                suppress_maximize: Some(true),
+                ..Default::default()
+            },
+        });
+
+        let matching_ctx = WindowMatchContext {
+            app_id: "thunar",
+            title: "Home",
+            workspace: Some("1"),
+            at_startup: true,
+            ..Default::default()
+        };
+        let initial = engine.resolve_initial(&matching_ctx);
+        assert_eq!(initial.open_on_output.as_deref(), Some("DP-1"));
+        assert_eq!(initial.open_mode, Some(OpenMode::Float));
+        assert_eq!(initial.default_width, Some(PresetColumnWidth::Fixed(960)));
+        assert_eq!(initial.default_height, Some(PresetColumnWidth::Fixed(640)));
+        assert_eq!(initial.max_width, Some(PresetColumnWidth::Proportion(0.8)));
+        assert_eq!(initial.max_height, Some(PresetColumnWidth::Proportion(0.8)));
+        assert_eq!(initial.min_width, Some(PresetColumnWidth::Fixed(320)));
+        assert_eq!(initial.min_height, Some(PresetColumnWidth::Fixed(240)));
+
+        let dyn_rules = engine.resolve_dynamic(&matching_ctx);
+        assert_eq!(dyn_rules.immediate, Some(true));
+        assert_eq!(dyn_rules.suppress_maximize, Some(true));
+
+        let non_startup_ctx = WindowMatchContext {
+            at_startup: false,
+            ..matching_ctx
+        };
+        assert_eq!(engine.resolve_initial(&non_startup_ctx).open_mode, None);
+
+        let wrong_ws_ctx = WindowMatchContext {
+            workspace: Some("2"),
+            ..matching_ctx
+        };
+        assert_eq!(engine.resolve_initial(&wrong_ws_ctx).open_mode, None);
     }
 }

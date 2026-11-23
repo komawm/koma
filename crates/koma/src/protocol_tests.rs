@@ -4130,7 +4130,14 @@ fn fullscreen_window_suppresses_top_and_overlay_layer_tiers_but_keeps_background
     let ws = env.state.workspaces.get(&ws_id).expect("DP-1 workspace");
     assert_eq!(
         ws.compute_visible_geometries(),
-        vec![(win1, maximized, false)]
+        vec![
+            (win1, maximized, false),
+            (
+                dialog_id,
+                koma_model::LogicalRect::new(240, 180, 480, 320),
+                true,
+            ),
+        ]
     );
 
     bar_layer.destroy();
@@ -8207,4 +8214,349 @@ fn issue_130_multi_output_fullscreen_suppresses_only_its_own_output_foreground_l
     secondary_bar_layer.destroy();
     sbar_buf.destroy();
     sbar_pool.destroy();
+}
+
+fn spawn_unmapped_toplevel(
+    env: &mut ClientEnv,
+    title: &str,
+    app_id: &str,
+) -> (
+    wl_surface::WlSurface,
+    xdg_surface::XdgSurface,
+    xdg_toplevel::XdgToplevel,
+) {
+    let qh = env.queue.handle();
+    let compositor = env.client.compositor.clone().unwrap_or_else(|| {
+        env.client
+            .bind::<wl_compositor::WlCompositor>(&env.registry, &qh, "wl_compositor")
+    });
+    env.client.compositor = Some(compositor.clone());
+    let wm_base = env.client.xdg_wm_base.clone().unwrap_or_else(|| {
+        env.client
+            .bind::<xdg_wm_base::XdgWmBase>(&env.registry, &qh, "xdg_wm_base")
+    });
+    env.client.xdg_wm_base = Some(wm_base.clone());
+
+    let surface = compositor.create_surface(&qh, ());
+    let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
+    let toplevel = xdg_surface.get_toplevel(&qh, ());
+    toplevel.set_title(title.to_owned());
+    toplevel.set_app_id(app_id.to_owned());
+    surface.commit();
+    env.pump();
+    (surface, xdg_surface, toplevel)
+}
+
+fn attach_shm_buffer_and_commit(
+    env: &mut ClientEnv,
+    surface: &wl_surface::WlSurface,
+    w: i32,
+    h: i32,
+) {
+    let qh = env.queue.handle();
+    let shm = env.client.shm.clone().unwrap_or_else(|| {
+        env.client
+            .bind::<wl_shm::WlShm>(&env.registry, &qh, "wl_shm")
+    });
+    env.client.shm = Some(shm.clone());
+    let byte_len = (w * h * 4) as usize;
+    let shm_fd = create_portable_shm_fd(byte_len, None);
+    let pool = shm.create_pool(shm_fd.as_fd(), byte_len as i32, &qh, ());
+    let buffer = pool.create_buffer(0, w, h, w * 4, wl_shm::Format::Argb8888, &qh, ());
+    surface.attach(Some(&buffer), 0, 0);
+    surface.commit();
+    env.pump();
+    buffer.destroy();
+    pool.destroy();
+}
+
+#[test]
+fn floating_windows_remain_visible_and_interactive_above_maximized_window() {
+    let mut env = ClientEnv::new();
+    let ws_id = env.state.active_ws_id.clone();
+
+    let (_s1, _xs1, _tl1) = env.spawn_window("Editor", "org.koma.editor");
+    let (s2, _xs2, _tl2) = env.spawn_window("FloatingTool", "org.koma.tool");
+    let tiled1 = env.state.mapped_windows[0].win_id;
+    let float1 = env.state.mapped_windows[1].win_id;
+    let float1_rect = koma_model::LogicalRect::new(240, 180, 480, 320);
+    env.float_window_at(float1, float1_rect);
+    attach_shm_buffer_and_commit(&mut env, &s2, 480, 320);
+
+    env.state.toggle_window_maximized(tiled1);
+    env.pump();
+    assert!(env.state.is_window_maximized(tiled1));
+
+    // Existing floating window remains visible above the maximized window in the scene list.
+    let items = env.state.collect_workspace_scene_items(&ws_id, false);
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0].win_id, float1);
+    assert!(items[0].is_floating);
+    assert_eq!(items[1].win_id, tiled1);
+    assert!(!items[1].is_floating);
+
+    // Opening a new floating window while `tiled1` is maximized keeps it visible on top.
+    let lua_src = r#"
+        koma.rule.window({
+            name = "float-popup",
+            matches = { { app_id = "^org\\.koma\\.popup$" } },
+            initial = {
+                open_mode = "float",
+                default_width = 400,
+                default_height = 260,
+                default_floating_pos = { anchor = "top-left", x = 900, y = 200 },
+            },
+        })
+    "#;
+    crate::config_watcher::reload_from_lua_source(
+        &mut env.state,
+        std::path::Path::new("/tmp/init.lua"),
+        std::path::Path::new("/tmp"),
+        lua_src,
+        false,
+    )
+    .expect("apply float-popup rule");
+    let (_s3, _xs3, _tl3) = env.spawn_window("Popup", "org.koma.popup");
+    let float2 = env
+        .state
+        .mapped_windows
+        .iter()
+        .find(|m| m.app_id == "org.koma.popup")
+        .expect("float2 mapped")
+        .win_id;
+    assert!(env.state.is_window_maximized(tiled1));
+
+    let items_with_new = env.state.collect_workspace_scene_items(&ws_id, false);
+    assert_eq!(items_with_new.len(), 3);
+    assert_eq!(items_with_new[0].win_id, float2);
+    assert_eq!(items_with_new[1].win_id, float1);
+    assert_eq!(items_with_new[2].win_id, tiled1);
+
+    // Clicking `float1` focuses & raises it while preserving `tiled1`'s maximized state underneath.
+    env.state.focus_window_at_point(Point::from((360.0, 260.0)));
+    assert_eq!(env.state.focused_window_id(), Some(float1));
+    assert!(
+        env.state.is_window_maximized(tiled1),
+        "focusing a floating window above a maximized window must not un-maximize it"
+    );
+    let items_after_click = env.state.collect_workspace_scene_items(&ws_id, false);
+    assert_eq!(items_after_click[0].win_id, float1);
+    assert_eq!(items_after_click[1].win_id, float2);
+    assert_eq!(items_after_click[2].win_id, tiled1);
+}
+
+#[test]
+fn window_rule_floating_explicit_size_and_pos_initial_configure_and_mapping() {
+    let mut env = ClientEnv::new();
+    let lua_src = r#"
+        koma.rule.window({
+            name = "fixed-float",
+            matches = { { app_id = "^org\\.koma\\.fixed_float$" } },
+            initial = {
+                open_mode = "float",
+                default_width = 960,
+                default_height = 640,
+                default_floating_pos = { anchor = "top-left", x = 30, y = 50 },
+            },
+        })
+        koma.rule.window({
+            name = "prop-float",
+            matches = { { app_id = "^org\\.koma\\.prop_float$" } },
+            initial = {
+                open_mode = "float",
+                default_width = 0.5,
+                default_height = 0.5,
+            },
+        })
+    "#;
+    crate::config_watcher::reload_from_lua_source(
+        &mut env.state,
+        std::path::Path::new("/tmp/init.lua"),
+        std::path::Path::new("/tmp"),
+        lua_src,
+        false,
+    )
+    .expect("apply floating size rules");
+
+    let border_cfg = env.state.lua_sandbox.config_snapshot().appearance.border;
+    let border_inset = if border_cfg.enabled {
+        (border_cfg.width.max(0.0) * 2.0).round() as i32
+    } else {
+        0
+    };
+
+    // 1. Explicit px size + top-left floating position
+    let (s1, _xs1, tl1) = spawn_unmapped_toplevel(&mut env, "FixedFloat", "org.koma.fixed_float");
+    let tl1_id = tl1.id().protocol_id();
+    assert_eq!(
+        env.client.toplevel_configures[&tl1_id][0],
+        (960 - border_inset, 640 - border_inset)
+    );
+    let init_states1 = &env.client.toplevel_states[&tl1_id][0];
+    assert!(
+        !init_states1.contains(&(xdg_toplevel::State::TiledLeft as u32)),
+        "floating initial configure must not set TILED_TOPLEVEL_STATES"
+    );
+
+    attach_shm_buffer_and_commit(&mut env, &s1, 64, 64);
+    let m1 = env
+        .state
+        .mapped_windows
+        .iter()
+        .find(|m| m.app_id == "org.koma.fixed_float")
+        .expect("fixed_float mapped");
+    assert!(m1.is_floating);
+    assert_eq!(m1.rect, koma_model::LogicalRect::new(30, 50, 960, 640));
+
+    // 2. Proportional default_width / default_height centered without cascade via centered_exact_rect
+    let (s2, _xs2, tl2) = spawn_unmapped_toplevel(&mut env, "PropFloat", "org.koma.prop_float");
+    let tl2_id = tl2.id().protocol_id();
+    assert_eq!(
+        env.client.toplevel_configures[&tl2_id][0],
+        (960 - border_inset, 540 - border_inset)
+    );
+    attach_shm_buffer_and_commit(&mut env, &s2, 64, 64);
+    let m2 = env
+        .state
+        .mapped_windows
+        .iter()
+        .find(|m| m.app_id == "org.koma.prop_float")
+        .expect("prop_float mapped");
+    assert!(m2.is_floating);
+    assert_eq!(m2.rect, koma_model::LogicalRect::new(480, 270, 960, 540));
+}
+
+#[test]
+fn window_rule_floating_natural_aspect_ratio_satty_flow() {
+    let mut env = ClientEnv::new();
+    let lua_src = r#"
+        koma.rule.window({
+            name = "satty-natural",
+            matches = { { app_id = "^com\\.gabm\\.satty$" } },
+            initial = { open_mode = "float" },
+        })
+    "#;
+    crate::config_watcher::reload_from_lua_source(
+        &mut env.state,
+        std::path::Path::new("/tmp/init.lua"),
+        std::path::Path::new("/tmp"),
+        lua_src,
+        false,
+    )
+    .expect("apply satty rule");
+
+    // Before first buffer, initial configure must send (0, 0) (`state.size = None`) and no tiled states.
+    let (surf, _xs, tl) = spawn_unmapped_toplevel(&mut env, "Satty", "com.gabm.satty");
+    let tl_id = tl.id().protocol_id();
+    assert_eq!(env.client.toplevel_configures[&tl_id][0], (0, 0));
+    assert!(
+        !env.client.toplevel_states[&tl_id][0].contains(&(xdg_toplevel::State::TiledLeft as u32))
+    );
+
+    // Satty attaches an oversized 3840x2160 screenshot buffer; Koma scales it proportionally
+    // to fit (1920 - 32) x (1080 - 32) = 1888x1048 -> 1863x1048.
+    attach_shm_buffer_and_commit(&mut env, &surf, 3840, 2160);
+    let mapped = env
+        .state
+        .mapped_windows
+        .iter()
+        .find(|m| m.app_id == "com.gabm.satty")
+        .expect("satty mapped");
+    assert!(mapped.is_floating);
+    assert_eq!(mapped.rect.w, 1863);
+    assert_eq!(mapped.rect.h, 1048);
+}
+
+#[test]
+fn window_rule_maximized_output_immediate_and_suppress_maximize() {
+    let mut env = ClientEnv::new();
+    let hdmi = test_output("HDMI-A-1");
+    let _hdmi_global = hdmi.create_global::<KomaState>(&env.state.display_handle);
+    env.state.test_outputs.push(hdmi);
+    let ws2 = env.state.ensure_workspace_by_name_or_id("2");
+    env.state
+        .output_workspaces
+        .insert("HDMI-A-1".to_owned(), ws2.clone());
+
+    let lua_src = r#"
+        koma.rule.window({
+            name = "max-on-hdmi",
+            matches = { { app_id = "^org\\.koma\\.max_on_hdmi$" } },
+            initial = {
+                open_on_output = "HDMI-A-1",
+                open_mode = "maximized",
+            },
+            immediate = true,
+        })
+        koma.rule.window({
+            name = "suppress-max",
+            matches = { { app_id = "^org\\.koma\\.no_max$" } },
+            suppress_events = { "maximize" },
+        })
+    "#;
+    crate::config_watcher::reload_from_lua_source(
+        &mut env.state,
+        std::path::Path::new("/tmp/init.lua"),
+        std::path::Path::new("/tmp"),
+        lua_src,
+        false,
+    )
+    .expect("apply maximized/output/suppress rules");
+
+    let border_cfg = env.state.lua_sandbox.config_snapshot().appearance.border;
+    let border_inset = if border_cfg.enabled {
+        (border_cfg.width.max(0.0) * 2.0).round() as i32
+    } else {
+        0
+    };
+    let expected_max_rect = env.state.workspaces[&ws2].maximized_rect();
+
+    let (s1, _xs1, tl1) = spawn_unmapped_toplevel(&mut env, "MaxHdmi", "org.koma.max_on_hdmi");
+    let tl1_id = tl1.id().protocol_id();
+    assert_eq!(
+        env.client.toplevel_configures[&tl1_id][0],
+        (
+            expected_max_rect.w as i32 - border_inset,
+            expected_max_rect.h as i32 - border_inset
+        )
+    );
+    assert!(
+        env.client.toplevel_states[&tl1_id][0].contains(&(xdg_toplevel::State::Maximized as u32)),
+        "open_mode = maximized must set State::Maximized on initial configure"
+    );
+
+    attach_shm_buffer_and_commit(&mut env, &s1, 64, 64);
+    let m1 = env
+        .state
+        .mapped_windows
+        .iter()
+        .find(|m| m.app_id == "org.koma.max_on_hdmi")
+        .expect("max_on_hdmi mapped");
+    let m1_id = m1.win_id;
+    assert_eq!(m1.ws_id, ws2);
+    assert!(env.state.is_window_maximized(m1_id));
+
+    let sampled = env.state.window_animations.borrow_mut().sample_visual(
+        m1_id,
+        expected_max_rect,
+        env.state.elapsed_ms(),
+    );
+    assert_eq!(sampled.opacity_multiplier, 1.0);
+    assert_eq!(sampled.rect, expected_max_rect);
+
+    // suppress_events = { "maximize" } blocks client maximize requests.
+    let (_s2, _xs2, tl2) = env.spawn_window("NoMax", "org.koma.no_max");
+    let m2_id = env
+        .state
+        .mapped_windows
+        .iter()
+        .find(|m| m.app_id == "org.koma.no_max")
+        .expect("no_max mapped")
+        .win_id;
+    tl2.set_maximized();
+    env.pump();
+    assert!(
+        !env.state.is_window_maximized(m2_id),
+        "suppress_events = {{ 'maximize' }} must reject client maximize_request"
+    );
 }

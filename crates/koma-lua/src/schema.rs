@@ -4,7 +4,8 @@ use koma_model::{
     AgentCursorConfig, Anchor9, AnchorPoint, AnimationConfig, BlockOutPolicy, BlurConfig,
     BorderConfig, CubicBezier, CurveSpec, DimConfig, DwindleConfig, FocusRingConfig,
     FrameClockConfig, HookeSpringParams, LayoutMode, LogicalViewport, OpenMode, OutputTransform,
-    PathSplineKind, PointerTrajectorySpec, SafeAreaInsets, ScrollingConfig, ShadowConfig,
+    PathSplineKind, PointerTrajectorySpec, PresetColumnWidth, SafeAreaInsets, ScrollingConfig,
+    ShadowConfig,
 };
 use koma_proto::{KinematicProfileKind, MacroId, OutputId, TextInjectStrategy};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -1056,6 +1057,14 @@ pub struct LuaInitialWindowRuleInput {
     pub open_on_workspace: Option<String>,
     pub open_mode: Option<OpenMode>,
     pub open_focused: Option<bool>,
+    #[serde(alias = "width")]
+    pub default_width: Option<PresetColumnWidth>,
+    #[serde(alias = "height")]
+    pub default_height: Option<PresetColumnWidth>,
+    pub max_width: Option<PresetColumnWidth>,
+    pub max_height: Option<PresetColumnWidth>,
+    pub min_width: Option<PresetColumnWidth>,
+    pub min_height: Option<PresetColumnWidth>,
     pub default_floating_pos: Option<FloatingPosInput>,
 }
 
@@ -1071,6 +1080,7 @@ pub struct LuaWindowRuleSpec {
     pub opacity: Option<f32>,
     pub inactive_opacity: Option<f32>,
     pub animation: Option<String>,
+    pub immediate: Option<bool>,
     pub no_blur: Option<bool>,
     pub no_shadow: Option<bool>,
     pub border_color: Option<String>,
@@ -2051,5 +2061,48 @@ mod tests {
         assert_eq!(fixed_spec.scale.resolve(1920, 1080, 0, 0), 1.5);
         assert_eq!(fixed_spec.resolved_position(), Some((-1920, 120)));
         assert!(!fixed_spec.allow_non_desktop);
+    }
+
+    #[test]
+    fn window_rule_spec_deserializes_initial_launch_dimensions_aliases_and_immediate() {
+        let json = serde_json::json!({
+            "name": "file-manager-float",
+            "matches": [{ "app_id": "^thunar$", "workspace": "2", "at_startup": true }],
+            "initial": {
+                "open_on_output": "DP-1",
+                "open_mode": "float",
+                "width": 960,
+                "height": 0.6,
+                "max_width": { "proportion": 0.85 },
+                "max_height": { "fixed": 900 },
+                "min_width": 400,
+                "min_height": 300
+            },
+            "immediate": true,
+            "suppress_events": ["maximize"]
+        });
+        let spec: LuaWindowRuleSpec =
+            serde_json::from_value(json).expect("valid LuaWindowRuleSpec");
+        assert_eq!(spec.matches[0].workspace.as_deref(), Some("2"));
+        assert_eq!(spec.matches[0].at_startup, Some(true));
+        assert_eq!(spec.initial.open_on_output.as_deref(), Some("DP-1"));
+        assert_eq!(spec.initial.open_mode, Some(OpenMode::Float));
+        assert_eq!(
+            spec.initial.default_width,
+            Some(PresetColumnWidth::Fixed(960))
+        );
+        assert_eq!(
+            spec.initial.default_height,
+            Some(PresetColumnWidth::Proportion(0.6))
+        );
+        assert_eq!(
+            spec.initial.max_width,
+            Some(PresetColumnWidth::Proportion(0.85))
+        );
+        assert_eq!(spec.initial.max_height, Some(PresetColumnWidth::Fixed(900)));
+        assert_eq!(spec.initial.min_width, Some(PresetColumnWidth::Fixed(400)));
+        assert_eq!(spec.initial.min_height, Some(PresetColumnWidth::Fixed(300)));
+        assert_eq!(spec.immediate, Some(true));
+        assert_eq!(spec.suppress_events, vec!["maximize"]);
     }
 }

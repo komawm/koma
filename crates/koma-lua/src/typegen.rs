@@ -10,6 +10,7 @@ pub fn generate_luals_stubs() -> String {
 ---@alias KomaColumnDisplay "normal"|"tabbed"
 ---@alias KomaTabIndicatorPosition "left"|"right"|"top"|"bottom"
 ---@alias KomaPresetColumnWidth number|{ proportion: number }|{ fixed: integer }
+---@alias KomaOpenMode "tile"|"float"|"fullscreen"|"maximized"|"deck_top"|"stash_background"
 ---@alias KomaBlockOut "agent_capture"|"screencast"|"screencopy"|"all"
 ---@alias KomaAnimationSolverKind "spring"|"hooke"|"hooke_spring"|"analytical_spring"|"analytical"
 ---@alias KomaKinematicProfile "instant"|"minimum_jerk"|"spring"|"hooke"|"hooke_spring"|"bezier"
@@ -116,14 +117,49 @@ pub fn generate_luals_stubs() -> String {
 ---@field border? KomaAnimationChannelSpec
 ---@field workspaces? KomaAnimationChannelSpec
 
+---@class KomaFloatingPosSpec
+---@field x integer
+---@field y integer
+---@field anchor? KomaAnchorName
+
+---@class KomaWindowMatchSpec
+---@field app_id? string
+---@field title? string
+---@field tag? string
+---@field workspace? string
+---@field is_floating? boolean
+---@field is_focused? boolean
+---@field is_urgent? boolean
+---@field is_modal_dialog? boolean
+---@field is_xwayland? boolean
+---@field is_screencast_target? boolean
+---@field is_agent_workspace? boolean
+---@field at_startup? boolean
+
+---@class KomaInitialWindowRuleSpec
+---@field open_on_output? string
+---@field open_on_workspace? string
+---@field open_mode? KomaOpenMode
+---@field open_focused? boolean
+---@field default_width? KomaPresetColumnWidth
+---@field width? KomaPresetColumnWidth
+---@field default_height? KomaPresetColumnWidth
+---@field height? KomaPresetColumnWidth
+---@field max_width? KomaPresetColumnWidth
+---@field max_height? KomaPresetColumnWidth
+---@field min_width? KomaPresetColumnWidth
+---@field min_height? KomaPresetColumnWidth
+---@field default_floating_pos? KomaFloatingPosSpec
+
 ---@class KomaWindowRuleSpec
 ---@field name? string
----@field matches? table[]
----@field excludes? table[]
----@field initial? table
+---@field matches? KomaWindowMatchSpec[]
+---@field excludes? KomaWindowMatchSpec[]
+---@field initial? KomaInitialWindowRuleSpec
 ---@field opacity? number
 ---@field inactive_opacity? number
 ---@field animation? string
+---@field immediate? boolean
 ---@field no_blur? boolean
 ---@field no_shadow? boolean
 ---@field border_color? string

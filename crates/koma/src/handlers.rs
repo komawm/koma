@@ -633,9 +633,15 @@ impl XdgShellHandler for KomaState {
     fn maximize_request(&mut self, surface: ToplevelSurface) {
         let wl_surface = surface.wl_surface();
         if let Some(win_id) = find_mapped_window_id(self, wl_surface) {
-            self.set_window_maximized(win_id, true);
+            if self.is_maximize_suppressed_for_mapped(win_id) {
+                surface.send_configure();
+            } else {
+                self.set_window_maximized(win_id, true);
+            }
         } else {
-            surface.with_pending_state(|s| s.states.set(xdg_toplevel::State::Maximized));
+            if !self.is_maximize_suppressed_for_unmapped(&surface) {
+                surface.with_pending_state(|s| s.states.set(xdg_toplevel::State::Maximized));
+            }
             surface.send_configure();
         }
     }

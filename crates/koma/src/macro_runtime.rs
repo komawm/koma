@@ -635,17 +635,20 @@ pub(crate) fn verify_action_epoch_and_protection_result(
     // Protected Surface Guard: block input into Polkit / credential vaults & emit security alert
     if let Some(mapped) = active_window_in_ws(state, ws_id) {
         let win_id = mapped.win_id;
+        let ws_name = state.workspaces.get(ws_id).map(|ws| ws.name.as_str());
         let is_protected = state
             .rules
             .resolve_dynamic(&WindowMatchContext {
                 app_id: &mapped.app_id,
                 title: &mapped.title,
+                workspace: ws_name,
                 is_floating: mapped.is_floating,
                 is_focused: true,
                 is_xwayland: false,
                 is_modal_dialog: false,
                 is_screencast_target: false,
                 is_agent_workspace: true,
+                at_startup: state.elapsed_ms() <= 5_000,
             })
             .block_out_from
             .is_some_and(|p| p.blocks_agent_capture());
