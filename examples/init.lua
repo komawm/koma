@@ -254,5 +254,20 @@ koma.rule.window({
     clip_to_geometry = true,
 })
 
+-- Optional floating launch rules:
+-- 1) Fixed-size centered floating file manager with instant appearance:
+-- koma.rule.window({
+--     name = "floating-file-manager",
+--     matches = { { app_id = "^(thunar|org\\.gnome\\.Nautilus)$" } },
+--     initial = { open_mode = "float", default_width = 1100, default_height = 720 },
+--     immediate = true,
+-- })
+-- 2) Natural-aspect floating launch (e.g. satty screenshot viewer scales proportionally to fit):
+-- koma.rule.window({
+--     name = "satty-natural-aspect",
+--     matches = { { app_id = "^com\\.gabm\\.satty$" } },
+--     initial = { open_mode = "float" },
+-- })
+
 
 koma.bind("Mod + W", koma.act.scrolling.toggle_column_tabbed_display(), { desc = "Toggle Scrolling column Tabbed / Split mode" })
