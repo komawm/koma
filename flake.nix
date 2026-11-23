@@ -1,6 +1,15 @@
 {
   description = "Koma - agent-native Wayland tiling compositor workspace";
 
+  nixConfig = {
+    extra-substituters = [
+      "https://komawm.cachix.org"
+    ];
+    extra-trusted-public-keys = [
+      "komawm.cachix.org-1:7wdl1Turej+CDmCxfK7pOzKASNDzKDQjWMQUbEp5Csg="
+    ];
+  };
+
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
     flake-utils.url = "github:numtide/flake-utils";

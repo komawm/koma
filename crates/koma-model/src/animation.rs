@@ -1713,7 +1713,7 @@ impl WindowOpenStyle {
             }
             "gnomed" | "gnome" => Some(Self::Gnomed),
             "fade" => Some(Self::Fade),
-            "none" | "off" => Some(Self::None),
+            "none" | "off" | "instant" => Some(Self::None),
             _ => None,
         }
     }
@@ -2560,6 +2560,10 @@ mod tests {
             Some(WindowOpenStyle::Gnomed)
         );
         assert_eq!(WindowOpenStyle::parse("fade"), Some(WindowOpenStyle::Fade));
+        assert_eq!(
+            WindowOpenStyle::parse("instant"),
+            Some(WindowOpenStyle::None)
+        );
 
         let mut cfg = AnimationConfig::default();
         cfg.windows_open.style = Some("slide left".to_owned());

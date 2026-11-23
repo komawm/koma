@@ -18,11 +18,12 @@ use koma_lua::{
     LuaWorkspaceInfo, TrampolineScheduler, phodopus_bridge::PhodopusSandbox,
 };
 use koma_model::{
-    AgentCursorConfig, AgentCursorFrameSnapshot, AgentCursorVisualDynamics, CurveSpec, LayoutMode,
-    LogicalPoint, LogicalRect, LogicalViewport, OpenMode, OutputLayout, OutputTransform,
-    PresentationTarget, ResizeCorner, SafeAreaInsets, SavedOutputConfig, SizeHints,
-    WindowAnimationTable, WindowMatchContext, WindowOpenStyle, WindowRuleEngine,
-    WorkspaceLeaseState, WorkspaceState, WorkspaceTransitionTable, is_waydroid_app_id,
+    AgentCursorConfig, AgentCursorFrameSnapshot, AgentCursorVisualDynamics, CurveSpec,
+    InitialWindowRules, LayoutMode, LogicalPoint, LogicalRect, LogicalViewport, OpenMode,
+    OutputLayout, OutputTransform, PresentationTarget, ResizeCorner, SafeAreaInsets,
+    SavedOutputConfig, SizeHints, WindowAnimationTable, WindowMatchContext, WindowOpenStyle,
+    WindowRuleEngine, WorkspaceLeaseState, WorkspaceState, WorkspaceTransitionTable,
+    is_waydroid_app_id,
 };
 use koma_proto::{
     CapabilityToken, Epoch, EventTopic, OutputId, SeatId, TokenClaims, WindowId, WorkspaceEvent,
@@ -2457,25 +2458,220 @@ impl KomaState {
         self.start_time.elapsed().as_millis() as u64
     }
 
-    /// Sends the initial `xdg_toplevel.configure(w, h)` scoped to the client's target workspace.
-    pub fn send_initial_configure(&mut self, toplevel: &ToplevelSurface) {
-        let target_ws_id = resolve_surface_jailed_workspace(self, toplevel.wl_surface())
-            .filter(|ws_id| self.workspaces.contains_key(ws_id))
+    /// Resolves the target workspace for a newly opening window (`jail` > `open_on_workspace` >
+    /// `open_on_output` > `effective_interactive_ws_id()`).
+    fn resolve_initial_target_workspace(
+        &self,
+        jailed_ws: Option<WorkspaceId>,
+        initial_rules: &InitialWindowRules,
+    ) -> WorkspaceId {
+        if let Some(j_id) = jailed_ws {
+            return j_id;
+        }
+        if let Some(rule_ws_name) = initial_rules.open_on_workspace.as_deref() {
+            let lookup_name = if rule_ws_name.starts_with(koma_model::SPECIAL_WORKSPACE_PREFIX) {
+                WorkspaceState::normalize_special_name(Some(rule_ws_name))
+            } else {
+                rule_ws_name.to_owned()
+            };
+            if let Some(ws_id) = self.find_workspace_by_id_or_name(&lookup_name) {
+                return ws_id;
+            }
+            if rule_ws_name.starts_with(koma_model::SPECIAL_WORKSPACE_PREFIX) {
+                return self.active_ws_id.clone();
+            }
+        }
+        if let Some(rule_out) = initial_rules.open_on_output.as_deref() {
+            if rule_out.eq_ignore_ascii_case("primary") {
+                if let Some(primary) = self
+                    .primary_output()
+                    .or_else(|| self.all_outputs().into_iter().next())
+                {
+                    return self.active_workspace_for_output(&primary.name());
+                }
+            } else if self.output_workspaces.contains_key(rule_out)
+                || self.all_outputs().iter().any(|o| o.name() == rule_out)
+            {
+                return self.active_workspace_for_output(rule_out);
+            }
+        }
+        self.effective_interactive_ws_id()
+    }
+
+    pub(crate) fn is_maximize_suppressed_for_mapped(&self, win_id: WindowId) -> bool {
+        let Some(mapped) = self.mapped_windows.iter().find(|m| m.win_id == win_id) else {
+            return false;
+        };
+        let ws = self.workspaces.get(&mapped.ws_id);
+        let is_agent_ws =
+            ws.is_some_and(|w| matches!(w.presentation, PresentationTarget::Offscreen { .. }));
+        let is_focused = ws.is_some_and(|w| w.active_window() == Some(win_id));
+        let ws_name = ws.map(|w| w.name.as_str());
+        let has_parent = mapped
+            .window
+            .toplevel()
+            .is_some_and(|t| t.parent().is_some());
+        self.rules
+            .resolve_dynamic(&WindowMatchContext {
+                app_id: &mapped.app_id,
+                title: &mapped.title,
+                workspace: ws_name,
+                is_floating: mapped.is_floating,
+                is_focused,
+                is_xwayland: false,
+                is_modal_dialog: has_parent,
+                is_screencast_target: false,
+                is_agent_workspace: is_agent_ws,
+                at_startup: self.elapsed_ms() <= 5_000,
+            })
+            .suppress_maximize
+            .unwrap_or(false)
+    }
+
+    pub(crate) fn is_maximize_suppressed_for_unmapped(&self, toplevel: &ToplevelSurface) -> bool {
+        let wl_surface = toplevel.wl_surface();
+        let (app_id, title) = read_toplevel_metadata(wl_surface);
+        let has_parent = toplevel.parent().is_some();
+        let ws_id = resolve_surface_jailed_workspace(self, wl_surface)
+            .filter(|id| self.workspaces.contains_key(id))
             .unwrap_or_else(|| self.effective_interactive_ws_id());
+        let ws = self.workspaces.get(&ws_id);
+        let is_agent_ws =
+            ws.is_some_and(|w| matches!(w.presentation, PresentationTarget::Offscreen { .. }));
+        let ws_name = ws.map(|w| w.name.as_str());
+        self.rules
+            .resolve_dynamic(&WindowMatchContext {
+                app_id: &app_id,
+                title: &title,
+                workspace: ws_name,
+                is_floating: has_parent,
+                is_focused: true,
+                is_xwayland: false,
+                is_modal_dialog: has_parent,
+                is_screencast_target: false,
+                is_agent_workspace: is_agent_ws,
+                at_startup: self.elapsed_ms() <= 5_000,
+            })
+            .suppress_maximize
+            .unwrap_or(false)
+    }
+
+    /// Sends the initial `xdg_toplevel.configure(w, h)` scoped to the client's target workspace
+    /// and matching initial window rules (`open_mode`, `default_width`/`default_height`, etc.).
+    pub fn send_initial_configure(&mut self, toplevel: &ToplevelSurface) {
+        enum InitialConfigureMode {
+            Fullscreen,
+            Maximized,
+            Floating,
+            Tiled,
+        }
+
+        let wl_surface = toplevel.wl_surface().clone();
+        let jailed_ws = resolve_surface_jailed_workspace(self, &wl_surface)
+            .filter(|ws_id| self.workspaces.contains_key(ws_id));
+        let (app_id, title) = read_toplevel_metadata(&wl_surface);
+        let has_parent = toplevel.parent().is_some();
+        let (min_sz, max_sz) = read_toplevel_min_max_size(&wl_surface);
+        let now_ms = self.elapsed_ms();
+
+        let provisional_ws_id = jailed_ws
+            .clone()
+            .unwrap_or_else(|| self.effective_interactive_ws_id());
+        let provisional_ws = self.workspaces.get(&provisional_ws_id);
+        let provisional_is_agent = provisional_ws
+            .is_some_and(|ws| matches!(ws.presentation, PresentationTarget::Offscreen { .. }));
+        let provisional_ws_name = provisional_ws.map(|ws| ws.name.as_str());
+
+        let match_ctx = WindowMatchContext {
+            app_id: &app_id,
+            title: &title,
+            workspace: provisional_ws_name,
+            is_floating: has_parent,
+            is_focused: true,
+            is_xwayland: false,
+            is_modal_dialog: has_parent,
+            is_screencast_target: false,
+            is_agent_workspace: provisional_is_agent,
+            at_startup: now_ms <= 5_000,
+        };
+        let initial_rules = self.rules.resolve_initial(&match_ctx);
+        let target_ws_id = self.resolve_initial_target_workspace(jailed_ws, &initial_rules);
 
         let ws_cfg = self.workspaces.get(&target_ws_id);
         let viewport = ws_cfg.map(|ws| ws.viewport).unwrap_or_default();
+        let maximized_rect = ws_cfg
+            .map(WorkspaceState::maximized_rect)
+            .unwrap_or_else(|| viewport.work_area_rect());
         let size_limits_tiled = ws_cfg.is_some_and(|ws| ws.dwindle.config.size_limits_tiled);
 
-        // If `xdg_toplevel` already has a parent or explicit fixed `max_size`, don't force full-screen size
-        let (min_sz, max_sz) = read_toplevel_min_max_size(toplevel.wl_surface());
-        let hints = SizeHints::from_min_max(min_sz, max_sz);
-        let has_parent = toplevel.parent().is_some();
-        let initial_size = if has_parent || (max_sz.0 > 0 && max_sz.1 > 0) {
-            None
+        let appearance = self.lua_sandbox.config_snapshot().appearance;
+        let border_inset = if appearance.border.enabled {
+            (appearance.border.width.max(0.0) * 2.0).round() as u32
         } else {
-            let wa = viewport.work_area_rect();
-            let inner_w = wa.w.saturating_sub(24).max(64);
+            0
+        };
+
+        let hints = SizeHints::from_min_max(min_sz, max_sz);
+        let fixed_min_eq_max = max_sz.0 > 0 && max_sz.1 > 0 && min_sz == max_sz;
+        let resolves_to_float = match initial_rules.open_mode {
+            Some(OpenMode::Float) => true,
+            Some(OpenMode::Tile) => has_parent,
+            Some(
+                OpenMode::Fullscreen
+                | OpenMode::Maximized
+                | OpenMode::DeckTop
+                | OpenMode::StashBackground,
+            ) => false,
+            None => has_parent || fixed_min_eq_max,
+        };
+
+        let wa = viewport.work_area_rect();
+        let scrolling_target_w = ws_cfg
+            .filter(|ws| ws.layout_mode == koma_model::LayoutMode::Scrolling)
+            .and(initial_rules.default_width)
+            .map(|dw| {
+                dw.resolve_px(f64::from(wa.w))
+                    .round()
+                    .clamp(48.0, f64::from(wa.w.max(48))) as u32
+            });
+
+        let (initial_size, configure_mode) = if initial_rules.open_mode
+            == Some(OpenMode::Fullscreen)
+        {
+            (
+                Some(Size::from((viewport.width as i32, viewport.height as i32))),
+                InitialConfigureMode::Fullscreen,
+            )
+        } else if initial_rules.open_mode == Some(OpenMode::Maximized) {
+            let inner_w = maximized_rect.w.saturating_sub(border_inset).max(48) as i32;
+            let inner_h = maximized_rect.h.saturating_sub(border_inset).max(48) as i32;
+            (
+                Some(Size::from((inner_w, inner_h))),
+                InitialConfigureMode::Maximized,
+            )
+        } else if resolves_to_float {
+            let has_default_size =
+                initial_rules.default_width.is_some() || initial_rules.default_height.is_some();
+            let sz = if has_default_size {
+                let ((w, h), _) = resolve_rule_floating_size(wa, (0, 0), max_sz, &initial_rules);
+                Some(Size::from((
+                    w.saturating_sub(border_inset).max(48) as i32,
+                    h.saturating_sub(border_inset).max(48) as i32,
+                )))
+            } else {
+                None
+            };
+            (sz, InitialConfigureMode::Floating)
+        } else if initial_rules.open_mode.is_none()
+            && scrolling_target_w.is_none()
+            && (max_sz.0 > 0 && max_sz.1 > 0)
+        {
+            (None, InitialConfigureMode::Tiled)
+        } else {
+            let inner_w = scrolling_target_w.map_or_else(
+                || wa.w.saturating_sub(24).max(64),
+                |w| w.saturating_sub(border_inset).max(48),
+            );
             let inner_h = wa.h.saturating_sub(24).max(64);
             let base = LogicalRect::new(0, 0, inner_w, inner_h);
             let target = if size_limits_tiled {
@@ -2483,15 +2679,29 @@ impl KomaState {
             } else {
                 base
             };
-            Some(Size::from((target.w as i32, target.h as i32)))
+            (
+                Some(Size::from((target.w as i32, target.h as i32))),
+                InitialConfigureMode::Tiled,
+            )
         };
 
         toplevel.with_pending_state(|state| {
             state.size = initial_size;
             state.states.set(xdg_toplevel::State::Activated);
-            if initial_size.is_some() {
-                for tiled_state in TILED_TOPLEVEL_STATES {
-                    state.states.set(tiled_state);
+            match configure_mode {
+                InitialConfigureMode::Fullscreen => {
+                    state.states.set(xdg_toplevel::State::Fullscreen);
+                }
+                InitialConfigureMode::Maximized => {
+                    state.states.set(xdg_toplevel::State::Maximized);
+                }
+                InitialConfigureMode::Floating => {}
+                InitialConfigureMode::Tiled => {
+                    if initial_size.is_some() {
+                        for tiled_state in TILED_TOPLEVEL_STATES {
+                            state.states.set(tiled_state);
+                        }
+                    }
                 }
             }
         });
@@ -2643,38 +2853,34 @@ impl KomaState {
         let provisional_ws_id = jailed_ws
             .clone()
             .unwrap_or_else(|| self.effective_interactive_ws_id());
-        let is_agent_ws = self
-            .workspaces
-            .get(&provisional_ws_id)
+        let provisional_ws = self.workspaces.get(&provisional_ws_id);
+        let is_agent_ws = provisional_ws
             .is_some_and(|ws| matches!(ws.presentation, PresentationTarget::Offscreen { .. }));
+        let provisional_ws_name = provisional_ws.map(|ws| ws.name.as_str());
+        let now_ms = self.elapsed_ms();
 
         let match_ctx = WindowMatchContext {
             app_id: &app_id,
             title: &title,
+            workspace: provisional_ws_name,
             is_floating: has_parent,
             is_focused: true,
             is_xwayland: false,
             is_modal_dialog: has_parent,
             is_screencast_target: false,
             is_agent_workspace: is_agent_ws,
+            at_startup: now_ms <= 5_000,
         };
         let initial_rules = self.rules.resolve_initial(&match_ctx);
 
         // Resolve target workspace (`jail` strictly overrides user rules!)
-        let ws_id = if let Some(j_id) = jailed_ws {
-            j_id
-        } else if let Some(rule_ws_name) = initial_rules.open_on_workspace.as_deref() {
-            if rule_ws_name.starts_with(koma_model::SPECIAL_WORKSPACE_PREFIX) {
-                self.ensure_special_workspace(Some(rule_ws_name))
-            } else {
-                self.workspaces
-                    .iter()
-                    .find(|(id, ws)| id.as_str() == rule_ws_name || ws.name == rule_ws_name)
-                    .map(|(id, _)| id.clone())
-                    .unwrap_or(provisional_ws_id)
-            }
+        let ws_id = if jailed_ws.is_none()
+            && let Some(rule_ws_name) = initial_rules.open_on_workspace.as_deref()
+            && rule_ws_name.starts_with(koma_model::SPECIAL_WORKSPACE_PREFIX)
+        {
+            self.ensure_special_workspace(Some(rule_ws_name))
         } else {
-            provisional_ws_id
+            self.resolve_initial_target_workspace(jailed_ws, &initial_rules)
         };
 
         let viewport = self
@@ -2684,25 +2890,40 @@ impl KomaState {
             .unwrap_or_default();
 
         let fixed_min_eq_max = max_sz.0 > 0 && max_sz.1 > 0 && min_sz == max_sz;
-        let want_floating = has_parent
-            || fixed_min_eq_max
-            || matches!(initial_rules.open_mode, Some(OpenMode::Float));
+        let want_floating = match initial_rules.open_mode {
+            Some(OpenMode::Float) => true,
+            Some(OpenMode::Tile) => has_parent,
+            Some(
+                OpenMode::Fullscreen
+                | OpenMode::Maximized
+                | OpenMode::DeckTop
+                | OpenMode::StashBackground,
+            ) => false,
+            None => has_parent || fixed_min_eq_max,
+        };
         let open_in_stash = matches!(initial_rules.open_mode, Some(OpenMode::StashBackground));
         let focus_new = initial_rules.open_focused.unwrap_or(true);
 
         let geom_bbox = unmapped.window.geometry();
         let wa = viewport.work_area_rect();
-        let preferred_size = if geom_bbox.size.w > 0 && geom_bbox.size.h > 0 {
-            (geom_bbox.size.w as u32, geom_bbox.size.h as u32)
-        } else if max_sz.0 > 0 && max_sz.1 > 0 {
-            max_sz
-        } else {
-            ((wa.w * 3 / 5).max(360), (wa.h * 3 / 5).max(260))
-        };
+        let (preferred_size, has_explicit_size) = resolve_rule_floating_size(
+            wa,
+            (geom_bbox.size.w, geom_bbox.size.h),
+            max_sz,
+            &initial_rules,
+        );
 
-        let explicit_float_rect = initial_rules
-            .default_floating_pos
-            .and_then(|(anchor, dx, dy)| resolve_floating_rect(wa, preferred_size, anchor, dx, dy));
+        let explicit_float_rect = if let Some((anchor, dx, dy)) = initial_rules.default_floating_pos
+        {
+            resolve_floating_rect(wa, preferred_size, anchor, dx, dy)
+        } else if want_floating && has_explicit_size {
+            Some(koma_model::FloatingStack::centered_exact_rect(
+                viewport,
+                preferred_size,
+            ))
+        } else {
+            None
+        };
 
         let opt_max_size = (max_sz.0 > 0 || max_sz.1 > 0).then_some(max_sz);
         let ws_origin = self.workspace_output_origin(&ws_id);
@@ -2711,11 +2932,13 @@ impl KomaState {
             y: self.pointer_location.y - ws_origin.y,
         };
 
-        let now_ms = self.elapsed_ms();
+        let is_active_or_special_ws =
+            ws_id == self.active_ws_id || Some(&ws_id) == self.active_special_ws_id.as_ref();
         let is_floating = if let Some(ws) = self.workspaces.get_mut(&ws_id) {
             ws.frame_clock.record_activity(now_ms);
             let _ = ws.set_size_hints(unmapped.win_id, SizeHints::from_min_max(min_sz, max_sz));
-            let floated = ws.insert_window(
+            let prev_focused = ws.focused_window;
+            let floated = ws.insert_window_with_column_width(
                 unmapped.win_id,
                 want_floating,
                 explicit_float_rect,
@@ -2724,10 +2947,22 @@ impl KomaState {
                 Some(cursor_logical),
                 open_in_stash,
                 focus_new,
+                initial_rules.default_width,
                 now_ms,
             );
-            if matches!(initial_rules.open_mode, Some(OpenMode::Fullscreen)) {
-                ws.toggle_fullscreen(unmapped.win_id);
+            if focus_new || !is_active_or_special_ws || prev_focused.is_none() {
+                match initial_rules.open_mode {
+                    Some(OpenMode::Fullscreen) => {
+                        ws.set_fullscreen(unmapped.win_id, true);
+                    }
+                    Some(OpenMode::Maximized) => {
+                        ws.set_maximized(unmapped.win_id, true);
+                    }
+                    _ => {}
+                }
+                if !focus_new && prev_focused.is_some() {
+                    ws.focused_window = prev_focused;
+                }
             }
             floated
         } else {
@@ -2758,33 +2993,34 @@ impl KomaState {
             "promoted Wayland toplevel into workspace Space"
         );
         let win_id_created = mapped.win_id;
-        let mapped_is_protected = self
-            .rules
-            .resolve_dynamic(&WindowMatchContext {
-                app_id: &app_id,
-                title: &title,
-                is_floating,
-                is_focused: true,
-                is_xwayland: false,
-                is_modal_dialog: false,
-                is_screencast_target: false,
-                is_agent_workspace: is_agent_ws,
-            })
+        let final_ws = self.workspaces.get(&ws_id);
+        let final_is_agent_ws = final_ws
+            .is_some_and(|ws| matches!(ws.presentation, PresentationTarget::Offscreen { .. }));
+        let final_ws_name = final_ws.map(|ws| ws.name.as_str());
+        let dyn_rules = self.rules.resolve_dynamic(&WindowMatchContext {
+            app_id: &app_id,
+            title: &title,
+            workspace: final_ws_name,
+            is_floating,
+            is_focused: true,
+            is_xwayland: false,
+            is_modal_dialog: has_parent,
+            is_screencast_target: false,
+            is_agent_workspace: final_is_agent_ws,
+            at_startup: now_ms <= 5_000,
+        });
+        let mapped_is_protected = dyn_rules
             .block_out_from
             .is_some_and(|p| p.blocks_agent_capture());
-        let anim_style_override = self
-            .rules
-            .resolve_dynamic(&WindowMatchContext {
-                app_id: &app_id,
-                title: &title,
-                is_floating,
-                is_focused: true,
-                is_xwayland: false,
-                is_modal_dialog: false,
-                is_screencast_target: false,
-                is_agent_workspace: is_agent_ws,
-            })
-            .animation;
+        let anim_style_override = dyn_rules.animation;
+        let instant_bypass = final_is_agent_ws
+            || dyn_rules.immediate.unwrap_or(false)
+            || anim_style_override.as_deref().is_some_and(|s| {
+                matches!(
+                    s.trim().to_ascii_lowercase().as_str(),
+                    "none" | "off" | "instant"
+                )
+            });
         let ws_viewport = self
             .workspaces
             .get(&ws_id)
@@ -2811,7 +3047,7 @@ impl KomaState {
                 now_ms,
                 &anim_cfg,
                 anim_style_override.as_deref(),
-                is_agent_ws,
+                instant_bypass,
             );
         }
 
@@ -2824,20 +3060,65 @@ impl KomaState {
         } else if visible_anywhere {
             self.queue_redraw();
         }
-        if !is_agent_ws {
-            let title_redacted = if mapped_is_protected {
+        let (ev_ws_id, ev_app_id, ev_title, ev_floating, ev_is_agent_ws, ev_is_protected) =
+            if let Some(live) = self
+                .mapped_windows
+                .iter()
+                .find(|m| m.win_id == win_id_created)
+            {
+                let live_ws = self.workspaces.get(&live.ws_id);
+                let live_agent = live_ws.is_some_and(|ws| {
+                    matches!(ws.presentation, PresentationTarget::Offscreen { .. })
+                });
+                let live_protected = self
+                    .rules
+                    .resolve_dynamic(&WindowMatchContext {
+                        app_id: &live.app_id,
+                        title: &live.title,
+                        workspace: live_ws.map(|ws| ws.name.as_str()),
+                        is_floating: live.is_floating,
+                        is_focused: live_ws
+                            .is_some_and(|ws| ws.active_window() == Some(win_id_created)),
+                        is_xwayland: false,
+                        is_modal_dialog: has_parent,
+                        is_screencast_target: false,
+                        is_agent_workspace: live_agent,
+                        at_startup: now_ms <= 5_000,
+                    })
+                    .block_out_from
+                    .is_some_and(|p| p.blocks_agent_capture());
+                (
+                    live.ws_id.clone(),
+                    live.app_id.clone(),
+                    live.title.clone(),
+                    live.is_floating,
+                    live_agent,
+                    live_protected,
+                )
+            } else {
+                (
+                    ws_id.clone(),
+                    app_id,
+                    title,
+                    is_floating,
+                    final_is_agent_ws,
+                    mapped_is_protected,
+                )
+            };
+        if !ev_is_agent_ws {
+            let title_redacted = if ev_is_protected {
                 "[protected]"
             } else {
-                title.as_str()
+                ev_title.as_str()
             };
             self.emit_lua_event(
                 "window.mapped",
                 serde_json::json!({
                     "id": win_id_created.slot,
-                    "app_id": app_id,
+                    "app_id": ev_app_id,
                     "title_redacted": title_redacted,
-                    "workspace": ws_id.to_string(),
-                    "floating": is_floating,
+                    "workspace": ev_ws_id.to_string(),
+                    "floating": ev_floating,
                 }),
             );
         }
@@ -3216,6 +3497,9 @@ impl KomaState {
                          output_origin: Point<f64, Logical>,
                          output_local: Point<f64, Logical>|
          -> Option<PointerHitTarget> {
+            if !layer.alive() {
+                return None;
+            }
             let layer_geo = map.layer_geometry(layer)?;
             let layer_loc = layer_geo.loc.to_f64();
             let (surf, offset) =
@@ -3231,8 +3515,23 @@ impl KomaState {
         for output in self.all_outputs() {
             let output_origin = output.current_location().to_f64();
             let output_local = global_pos - output_origin;
+            let (out_w, out_h, _) = output_logical_viewport(&output);
+            if output_local.x < 0.0
+                || output_local.y < 0.0
+                || output_local.x >= f64::from(out_w)
+                || output_local.y >= f64::from(out_h)
+            {
+                continue;
+            }
+            let out_ws_id = self.active_workspace_for_output(&output.name());
+            let layer_tiers = self.output_layer_tiers(&out_ws_id);
             let map = layer_map_for_output(&output);
             for tier in tiers {
+                if !layer_tiers.above_toplevels.contains(&tier)
+                    && !layer_tiers.below_toplevels.contains(&tier)
+                {
+                    continue;
+                }
                 if let Some(top_layer) = map.layer_under(tier, output_local)
                     && let Some(hit) = hit_layer(top_layer, &map, output_origin, output_local)
                 {
@@ -3283,8 +3582,7 @@ impl KomaState {
             return None;
         }
 
-        if let Some(hit) = self.layer_surface_under_tiers(global_pos, [Layer::Overlay, Layer::Top])
-        {
+        if let Some(hit) = self.layer_surface_under_tiers(global_pos, FOREGROUND_LAYER_TIERS) {
             return Some(hit);
         }
 
@@ -3297,7 +3595,7 @@ impl KomaState {
             });
         }
 
-        self.layer_surface_under_tiers(global_pos, [Layer::Bottom, Layer::Background])
+        self.layer_surface_under_tiers(global_pos, BACKGROUND_LAYER_TIERS)
     }
 
     /// Unified surface hit-test returning the focused Wayland surface and logical origin.
@@ -3396,10 +3694,9 @@ impl KomaState {
         let focused_id = ws.active_window();
         let fullscreen_id = ws.fullscreen_window();
         let is_agent_ws = matches!(ws.presentation, PresentationTarget::Offscreen { .. });
-        for (win_id, rect, is_floating) in ws
-            .compute_visible_geometries_at(self.elapsed_ms())
-            .into_iter()
-            .rev()
+        let now_ms = self.elapsed_ms();
+        for (win_id, rect, is_floating) in
+            ws.compute_visible_geometries_at(now_ms).into_iter().rev()
         {
             let Some(mapped) = self.mapped_windows.iter().find(|m| m.win_id == win_id) else {
                 continue;
@@ -3430,12 +3727,14 @@ impl KomaState {
             let dyn_rules = self.rules.resolve_dynamic(&WindowMatchContext {
                 app_id: &mapped.app_id,
                 title: &mapped.title,
+                workspace: Some(ws.name.as_str()),
                 is_floating,
                 is_focused: Some(win_id) == focused_id,
                 is_xwayland: false,
                 is_modal_dialog: false,
                 is_screencast_target: false,
                 is_agent_workspace: is_agent_ws,
+                at_startup: now_ms <= 5_000,
             });
             let eff_clip_to_geometry =
                 dyn_rules.clip_to_geometry.unwrap_or(true) && !is_waydroid_click_through;
@@ -3731,7 +4030,7 @@ impl KomaState {
             layer_root,
             interactivity,
             ..
-        }) = self.layer_surface_under_tiers(global_pos, [Layer::Overlay, Layer::Top])
+        }) = self.layer_surface_under_tiers(global_pos, FOREGROUND_LAYER_TIERS)
         {
             self.apply_layer_click_interactivity(layer_root, interactivity);
             return;
@@ -3748,7 +4047,7 @@ impl KomaState {
             layer_root,
             interactivity,
             ..
-        }) = self.layer_surface_under_tiers(global_pos, [Layer::Bottom, Layer::Background])
+        }) = self.layer_surface_under_tiers(global_pos, BACKGROUND_LAYER_TIERS)
         {
             self.apply_layer_click_interactivity(layer_root, interactivity);
             return;
@@ -4337,12 +4636,14 @@ impl KomaState {
                 let dyn_rules = self.rules.resolve_dynamic(&WindowMatchContext {
                     app_id: &mapped.app_id,
                     title: &mapped.title,
+                    workspace: Some(ws.name.as_str()),
                     is_floating,
                     is_focused,
                     is_xwayland: false,
                     is_modal_dialog: false,
                     is_screencast_target: is_screencast_or_agent_capture,
                     is_agent_workspace: is_agent_ws,
+                    at_startup: now_ms <= 5_000,
                 });
                 let is_protected = dyn_rules
                     .block_out_from
@@ -5545,12 +5846,14 @@ impl KomaState {
                 .resolve_dynamic(&WindowMatchContext {
                     app_id: &mapped.app_id,
                     title: &mapped.title,
+                    workspace: Some(ws.name.as_str()),
                     is_floating: mapped.is_floating,
                     is_focused,
                     is_xwayland: false,
                     is_modal_dialog: false,
                     is_screencast_target: false,
                     is_agent_workspace: is_offscreen,
+                    at_startup: self.elapsed_ms() <= 5_000,
                 })
                 .block_out_from
                 .is_some_and(|p| p.blocks_agent_capture());
@@ -6026,6 +6329,103 @@ fn resolve_floating_rect(
         size.0,
         size.1,
     ))
+}
+
+/// Resolves the initial floating size `(w, h)` from `InitialWindowRules`, preserving client
+/// aspect ratio when only one axis or `max_width`/`max_height` constrains a client surface,
+/// and reports whether the rule explicitly specified size constraints (`has_explicit_size`).
+fn resolve_rule_floating_size(
+    wa: LogicalRect,
+    client_geom: (i32, i32),
+    max_sz: (u32, u32),
+    rules: &InitialWindowRules,
+) -> ((u32, u32), bool) {
+    let def_w = rules
+        .default_width
+        .map(|w| w.resolve_px(f64::from(wa.w)).round() as u32);
+    let def_h = rules
+        .default_height
+        .map(|h| h.resolve_px(f64::from(wa.h)).round() as u32);
+    let min_w = rules
+        .min_width
+        .map(|w| w.resolve_px(f64::from(wa.w)).round() as u32);
+    let min_h = rules
+        .min_height
+        .map(|h| h.resolve_px(f64::from(wa.h)).round() as u32);
+    let max_w = rules
+        .max_width
+        .map(|w| w.resolve_px(f64::from(wa.w)).round() as u32);
+    let max_h = rules
+        .max_height
+        .map(|h| h.resolve_px(f64::from(wa.h)).round() as u32);
+
+    let has_explicit_size = def_w.is_some()
+        || def_h.is_some()
+        || max_w.is_some()
+        || max_h.is_some()
+        || min_w.is_some()
+        || min_h.is_some();
+
+    let client_pos = (client_geom.0 > 0 && client_geom.1 > 0)
+        .then_some((client_geom.0 as u32, client_geom.1 as u32));
+    let hint_max_pos = (max_sz.0 > 0 && max_sz.1 > 0).then_some(max_sz);
+    let fallback = ((wa.w * 3 / 5).max(360), (wa.h * 3 / 5).max(260));
+
+    let (mut w, mut h) = match (def_w, def_h) {
+        (Some(w), Some(h)) => (w, h),
+        (Some(w), None) => {
+            let h = if let Some((cw, ch)) = client_pos {
+                ((f64::from(w) * f64::from(ch) / f64::from(cw)).round() as u32).max(48)
+            } else if let Some((_, mh)) = hint_max_pos {
+                mh.clamp(48, wa.h.max(48))
+            } else {
+                fallback.1
+            };
+            (w, h)
+        }
+        (None, Some(h)) => {
+            let w = if let Some((cw, ch)) = client_pos {
+                ((f64::from(h) * f64::from(cw) / f64::from(ch)).round() as u32).max(48)
+            } else if let Some((mw, _)) = hint_max_pos {
+                mw.clamp(48, wa.w.max(48))
+            } else {
+                fallback.0
+            };
+            (w, h)
+        }
+        (None, None) => client_pos.or(hint_max_pos).unwrap_or(fallback),
+    };
+
+    let preserve_aspect = !(def_w.is_some() && def_h.is_some()) && client_pos.is_some();
+    if preserve_aspect {
+        let cap_w = max_w.map_or(wa.w.max(48), |mw| mw.min(wa.w.max(48)));
+        let cap_h = max_h.map_or(wa.h.max(48), |mh| mh.min(wa.h.max(48)));
+        if w > cap_w || h > cap_h {
+            let scale = (f64::from(cap_w) / f64::from(w.max(1)))
+                .min(f64::from(cap_h) / f64::from(h.max(1)))
+                .min(1.0);
+            w = ((f64::from(w) * scale).round() as u32).max(48);
+            h = ((f64::from(h) * scale).round() as u32).max(48);
+        }
+    } else {
+        if let Some(mw) = max_w {
+            w = w.min(mw);
+        }
+        if let Some(mh) = max_h {
+            h = h.min(mh);
+        }
+    }
+
+    if let Some(mw) = min_w {
+        let eff_min_w = max_w.map_or(mw, |mx| mw.min(mx));
+        w = w.max(eff_min_w);
+    }
+    if let Some(mh) = min_h {
+        let eff_min_h = max_h.map_or(mh, |mx| mh.min(mx));
+        h = h.max(eff_min_h);
+    }
+
+    ((w.max(48), h.max(48)), has_explicit_size)
 }
 
 #[cfg(test)]
@@ -7602,6 +8002,18 @@ pub(crate) mod tests {
             resolve_floating_rect(wa, size, koma_model::Anchor9::BottomRight, -20, -20)
                 .expect("bottom-right anchor resolves");
         assert_eq!(bottom_right, LogicalRect::new(580, 330, 1000, 650));
+    }
+
+    #[test]
+    fn resolve_rule_floating_size_scales_single_axis_proportionally_within_work_area() {
+        let wa = LogicalRect::new(0, 0, 1920, 1080);
+        let rules = koma_model::InitialWindowRules {
+            default_width: Some(koma_model::PresetColumnWidth::Fixed(1000)),
+            ..Default::default()
+        };
+        let (size, has_explicit) = resolve_rule_floating_size(wa, (900, 1800), (0, 0), &rules);
+        assert!(has_explicit);
+        assert_eq!(size, (540, 1080));
     }
 
     #[test]

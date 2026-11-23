@@ -12,7 +12,7 @@ use crate::{
     geometry::{LogicalPoint, LogicalRect, LogicalViewport, SizeHints},
     layout::{DeckStashStack, FloatingStack, LayoutMode},
     lease::WorkspaceLease,
-    scrolling::{ScrollingConfig, ScrollingStrip},
+    scrolling::{PresetColumnWidth, ScrollingConfig, ScrollingStrip},
 };
 
 pub const SPECIAL_WORKSPACE_PREFIX: &str = "special:";
@@ -190,6 +190,35 @@ impl WorkspaceState {
         focus_new: bool,
         now_ms: u64,
     ) -> bool {
+        self.insert_window_with_column_width(
+            win_id,
+            want_floating,
+            explicit_float_rect,
+            max_size,
+            preferred_size,
+            cursor_pos,
+            open_in_stash,
+            focus_new,
+            None,
+            now_ms,
+        )
+    }
+
+    /// Inserts a newly mapped window with an optional explicit `Scrolling` column width override.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_window_with_column_width(
+        &mut self,
+        win_id: WindowId,
+        want_floating: bool,
+        explicit_float_rect: Option<LogicalRect>,
+        max_size: Option<(u32, u32)>,
+        preferred_size: Option<(u32, u32)>,
+        cursor_pos: Option<LogicalPoint>,
+        open_in_stash: bool,
+        focus_new: bool,
+        default_column_width: Option<PresetColumnWidth>,
+        now_ms: u64,
+    ) -> bool {
         if want_floating {
             let rect = explicit_float_rect.unwrap_or_else(|| {
                 self.floating
@@ -230,7 +259,7 @@ impl WorkspaceState {
             }
             LayoutMode::Scrolling => {
                 self.scrolling
-                    .insert_column(win_id, None, self.viewport, now_ms);
+                    .insert_column(win_id, default_column_width, self.viewport, now_ms);
                 self.deck.push_deck_top(win_id);
                 if focus_new || self.focused_window.is_none() {
                     self.focused_window = Some(win_id);
@@ -548,12 +577,8 @@ impl WorkspaceState {
     /// Focuses `win_id` (raising it to top if in `FloatingStack`, or scrolling/activating in Tiled).
     pub fn activate_window(&mut self, win_id: WindowId, now_ms: u64) -> bool {
         if self.floating.raise_to_top(win_id) {
-            if self
-                .presented_window_id()
-                .is_some_and(|p| p != win_id && !self.is_fullscreen(p))
-            {
-                self.window_presentation = None;
-            }
+            // Keep underlying `Fullscreen` / `Maximized` presentation intact so interacting with
+            // a floating window above it does not un-maximize or un-fullscreen the presented tile.
             self.focused_window = Some(win_id);
             return true;
         }
@@ -723,6 +748,22 @@ impl WorkspaceState {
         self.floating.clamp_to_viewport(self.viewport);
     }
 
+    fn presentation_with_floating(
+        &self,
+        win_id: WindowId,
+        rect: LogicalRect,
+    ) -> Vec<(WindowId, LogicalRect, bool)> {
+        let mut out = Vec::with_capacity(1 + self.floating.len());
+        out.push((win_id, rect, false));
+        out.extend(
+            self.floating
+                .iter_bottom_to_top()
+                .filter(|entry| entry.win_id != win_id)
+                .map(|entry| (entry.win_id, entry.rect, true)),
+        );
+        out
+    }
+
     /// Returns layout-space target geometries (`(WindowId, LogicalRect, is_floating)`) for
     /// synchronizing `WindowAnimationTable` and `xdg_toplevel.configure` sizes.
     ///
@@ -731,16 +772,7 @@ impl WorkspaceState {
     #[must_use]
     pub fn compute_animation_target_geometries(&self) -> Vec<(WindowId, LogicalRect, bool)> {
         if let Some((win_id, rect)) = self.presentation_geometry() {
-            let mut out = vec![(win_id, rect, false)];
-            if self.is_fullscreen(win_id) {
-                out.extend(
-                    self.floating
-                        .iter_bottom_to_top()
-                        .filter(|entry| entry.win_id != win_id)
-                        .map(|entry| (entry.win_id, entry.rect, true)),
-                );
-            }
-            return out;
+            return self.presentation_with_floating(win_id, rect);
         }
 
         let mut out: Vec<(WindowId, LogicalRect, bool)> = match self.layout_mode {
@@ -776,16 +808,7 @@ impl WorkspaceState {
     #[must_use]
     pub fn compute_visible_geometries_at(&self, now_ms: u64) -> Vec<(WindowId, LogicalRect, bool)> {
         if let Some((win_id, rect)) = self.presentation_geometry() {
-            let mut out = vec![(win_id, rect, false)];
-            if self.is_fullscreen(win_id) {
-                out.extend(
-                    self.floating
-                        .iter_bottom_to_top()
-                        .filter(|entry| entry.win_id != win_id)
-                        .map(|entry| (entry.win_id, entry.rect, true)),
-                );
-            }
-            return out;
+            return self.presentation_with_floating(win_id, rect);
         }
 
         let mut out: Vec<(WindowId, LogicalRect, bool)> = match self.layout_mode {
@@ -822,16 +845,7 @@ impl WorkspaceState {
     #[must_use]
     pub fn compute_visible_geometries(&self) -> Vec<(WindowId, LogicalRect, bool)> {
         if let Some((win_id, rect)) = self.presentation_geometry() {
-            let mut out = vec![(win_id, rect, false)];
-            if self.is_fullscreen(win_id) {
-                out.extend(
-                    self.floating
-                        .iter_bottom_to_top()
-                        .filter(|entry| entry.win_id != win_id)
-                        .map(|entry| (entry.win_id, entry.rect, true)),
-                );
-            }
-            return out;
+            return self.presentation_with_floating(win_id, rect);
         }
 
         let mut out: Vec<(WindowId, LogicalRect, bool)> = match self.layout_mode {
@@ -1464,5 +1478,127 @@ mod tests {
         let next = ws.focus_direction(CardinalDir::Left, 5);
         assert_eq!(ws.fullscreen_window(), None);
         assert!(next.is_some_and(|w| w != float_win));
+    }
+
+    #[test]
+    fn floating_windows_stay_visible_and_interactive_above_maximized_window() {
+        let vp = LogicalViewport::new(1920, 1080, 1.0).with_work_area_zone(0, 40, 1920, 1040);
+        let mut ws = WorkspaceState::new(
+            WorkspaceId::new("ws_01"),
+            "1",
+            SeatId::new("seat0"),
+            vp,
+            PresentationTarget::Physical(OutputId::new("DP-1")),
+            LayoutMode::Dwindle,
+            0,
+        );
+        ws.dwindle.config.outer_gap = 8;
+
+        let tiled1 = WindowId::new(1, 1);
+        let tiled2 = WindowId::new(2, 1);
+        let float_existing = WindowId::new(3, 1);
+        ws.insert_window(tiled1, false, None, None, None, None, false, true, 0);
+        ws.insert_window(tiled2, false, None, None, None, None, false, true, 1);
+        let existing_rect = LogicalRect::new(200, 200, 500, 400);
+        ws.insert_window(
+            float_existing,
+            true,
+            Some(existing_rect),
+            None,
+            None,
+            None,
+            false,
+            true,
+            2,
+        );
+
+        assert!(ws.toggle_maximized(tiled1));
+        assert!(ws.is_maximized(tiled1));
+        let max_rect = ws.maximized_rect();
+
+        let expected = vec![
+            (tiled1, max_rect, false),
+            (float_existing, existing_rect, true),
+        ];
+        assert_eq!(ws.compute_animation_target_geometries(), expected);
+        assert_eq!(ws.compute_visible_geometries(), expected);
+        assert_eq!(ws.compute_visible_geometries_at(10), expected);
+
+        // Opening a new floating window while `tiled1` is maximized keeps it visible on top.
+        let float_new = WindowId::new(4, 1);
+        let new_rect = LogicalRect::new(400, 300, 600, 360);
+        ws.insert_window(
+            float_new,
+            true,
+            Some(new_rect),
+            None,
+            None,
+            None,
+            false,
+            true,
+            11,
+        );
+        assert!(ws.is_maximized(tiled1));
+        assert_eq!(
+            ws.compute_visible_geometries(),
+            vec![
+                (tiled1, max_rect, false),
+                (float_existing, existing_rect, true),
+                (float_new, new_rect, true),
+            ]
+        );
+
+        // Activating/clicking the lower floating window raises it and preserves `Maximized` underneath.
+        assert!(ws.activate_window(float_existing, 12));
+        assert_eq!(ws.active_window(), Some(float_existing));
+        assert!(ws.is_maximized(tiled1));
+        assert_eq!(
+            ws.compute_visible_geometries(),
+            vec![
+                (tiled1, max_rect, false),
+                (float_new, new_rect, true),
+                (float_existing, existing_rect, true),
+            ]
+        );
+
+        // Activating a tiled sibling clears `Maximized`.
+        assert!(ws.activate_window(tiled2, 13));
+        assert!(!ws.is_maximized(tiled1));
+        assert_eq!(ws.maximized_window(), None);
+        assert_eq!(ws.active_window(), Some(tiled2));
+    }
+
+    #[test]
+    fn scrolling_insert_window_with_column_width_honors_default_width() {
+        let vp = LogicalViewport::new(1600, 900, 1.0).with_work_area_zone(0, 0, 1600, 900);
+        let mut ws = WorkspaceState::new(
+            WorkspaceId::new("ws_01"),
+            "1",
+            SeatId::new("seat0"),
+            vp,
+            PresentationTarget::Physical(OutputId::new("DP-1")),
+            LayoutMode::Scrolling,
+            0,
+        );
+        ws.scrolling.config.outer_gap = 0;
+        ws.scrolling.config.inner_gap = 0;
+
+        let win = WindowId::new(1, 1);
+        let floated = ws.insert_window_with_column_width(
+            win,
+            false,
+            None,
+            None,
+            None,
+            None,
+            false,
+            true,
+            Some(PresetColumnWidth::Fixed(720)),
+            0,
+        );
+        assert!(!floated);
+        let targets = ws.compute_animation_target_geometries();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].1.w, 720);
     }
 }

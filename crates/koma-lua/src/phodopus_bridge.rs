@@ -13,7 +13,7 @@ use std::{
     cell::{Cell, RefCell},
     collections::{BTreeMap, VecDeque},
     fs,
-    path::Path,
+    path::{Path, PathBuf},
     rc::Rc,
 };
 
@@ -137,6 +137,7 @@ struct SandboxInner {
     now_ms: u64,
     in_declarative_load: bool,
     event_dispatch_depth: u8,
+    config_dir: Option<PathBuf>,
     pub desktop_snapshot: DesktopQuerySnapshot,
     pub config: KomaConfigRegistry,
     pub bind_callbacks: BTreeMap<BindHandleId, StashedFunction>,
@@ -246,7 +247,17 @@ impl PhodopusSandbox {
         let mut lua = builder.build();
         lua.load_serde();
 
-        let state: SharedState = Rc::new(RefCell::new(SandboxInner::default()));
+        let normalized_config_dir = config_dir.map(|dir| {
+            if dir.as_os_str().is_empty() {
+                PathBuf::from(".")
+            } else {
+                dir.to_path_buf()
+            }
+        });
+        let state: SharedState = Rc::new(RefCell::new(SandboxInner {
+            config_dir: normalized_config_dir,
+            ..SandboxInner::default()
+        }));
         let clock_ms = Rc::new(Cell::new(0_u64));
 
         {
@@ -917,7 +928,7 @@ fn install_koma_globals<'gc>(ctx: Context<'gc>, state: SharedState) -> Result<()
     let koma = Table::new(&ctx);
     let handle_mt = build_handle_metatable(ctx, state.clone());
 
-    // 1. koma.env(key, value) & koma.notify(message)
+    // 1. koma.env(key, value), koma.resolve_path(path) & koma.notify(message)
     {
         let st = state.clone();
         koma.set_field(
@@ -925,7 +936,29 @@ fn install_koma_globals<'gc>(ctx: Context<'gc>, state: SharedState) -> Result<()
             "env",
             Callback::from_fn(&ctx, move |ctx, _, mut stack| {
                 let (k, v): (std::string::String, std::string::String) = stack.consume(ctx)?;
-                st.borrow_mut().config.env_vars.insert(k, v);
+                let mut inner = st.borrow_mut();
+                let resolved = crate::path_resolve::resolve_env_value_from_env(
+                    &k,
+                    &v,
+                    inner.config_dir.as_deref(),
+                );
+                inner.config.env_vars.insert(k, resolved);
+                Ok(CallbackReturn::Return)
+            }),
+        );
+    }
+    {
+        let st = state.clone();
+        koma.set_field(
+            ctx,
+            "resolve_path",
+            Callback::from_fn(&ctx, move |ctx, _, mut stack| {
+                let raw: std::string::String = stack.consume(ctx)?;
+                let resolved = crate::path_resolve::resolve_config_path_from_env(
+                    &raw,
+                    st.borrow().config_dir.as_deref(),
+                );
+                stack.replace(ctx, resolved.to_string_lossy().into_owned());
                 Ok(CallbackReturn::Return)
             }),
         );
@@ -1231,8 +1264,17 @@ fn install_koma_globals<'gc>(ctx: Context<'gc>, state: SharedState) -> Result<()
             "xwayland",
             Callback::from_fn(&ctx, move |ctx, _, mut stack| {
                 let val: Value = stack.consume(ctx)?;
-                let spec: XwaylandConfigSpec = from_value(val).map_err(RuntimeError::new)?;
-                st.borrow_mut().config.xwayland = spec;
+                let mut spec: XwaylandConfigSpec = from_value(val).map_err(RuntimeError::new)?;
+                let mut inner = st.borrow_mut();
+                if spec.path == "~" || spec.path.starts_with("~/") || spec.path.contains('/') {
+                    spec.path = crate::path_resolve::resolve_config_path_from_env(
+                        &spec.path,
+                        inner.config_dir.as_deref(),
+                    )
+                    .to_string_lossy()
+                    .into_owned();
+                }
+                inner.config.xwayland = spec;
                 Ok(CallbackReturn::Return)
             }),
         );
@@ -1416,7 +1458,7 @@ fn install_koma_globals<'gc>(ctx: Context<'gc>, state: SharedState) -> Result<()
     }
 
     // 7. koma.act.* pre-compiled fast-path action descriptor constructors
-    koma.set_field(ctx, "act", build_act_namespace(ctx)?);
+    koma.set_field(ctx, "act", build_act_namespace(ctx, state.clone())?);
 
     // 8. koma.rule.{ window, layer }
     let rule_ns = Table::new(&ctx);
@@ -1485,7 +1527,7 @@ fn install_koma_globals<'gc>(ctx: Context<'gc>, state: SharedState) -> Result<()
     // 9. koma.macro.{ define }
     let macro_ns = Table::new(&ctx);
     {
-        let st = state;
+        let st = state.clone();
         macro_ns.set_field(
             ctx,
             "define",
@@ -1542,6 +1584,34 @@ fn install_koma_globals<'gc>(ctx: Context<'gc>, state: SharedState) -> Result<()
         );
     }
     koma.set_field(ctx, "macro", macro_ns);
+
+    // Wrap global `require` so path-like targets (`./lua/input`, `./input`, `~/.config/koma/lua/input`)
+    // resolve inside `<config_dir>/lua` while preserving Phodopus's `RequireSequence`, `package.loaded`,
+    // fuel metering, and symlink jail.
+    if let Value::Function(orig_require) = ctx.globals().get_value(ctx, "require") {
+        let st = state;
+        ctx.set_global(
+            "require",
+            Callback::from_fn_with(
+                &ctx,
+                orig_require,
+                move |&orig_require, ctx, _, mut stack| {
+                    let name: std::string::String = stack.consume(ctx)?;
+                    let config_dir = st.borrow().config_dir.clone();
+                    let resolved = crate::path_resolve::resolve_require_target_from_env(
+                        &name,
+                        config_dir.as_deref(),
+                    )
+                    .map_err(runtime_err)?;
+                    stack.replace(ctx, resolved);
+                    Ok(CallbackReturn::Call {
+                        function: orig_require,
+                        then: None,
+                    })
+                },
+            ),
+        );
+    }
 
     ctx.set_global("koma", koma);
     Ok(())
@@ -1680,19 +1750,26 @@ fn populate_scrolling_ns<'gc>(ctx: Context<'gc>, tbl: &Table<'gc>) {
     );
 }
 
-fn build_act_namespace<'gc>(ctx: Context<'gc>) -> Result<Table<'gc>, LuaError<'gc>> {
+fn build_act_namespace<'gc>(
+    ctx: Context<'gc>,
+    state: SharedState,
+) -> Result<Table<'gc>, LuaError<'gc>> {
     let act = Table::new(&ctx);
 
     // koma.act.spawn({ "ghostty", ... })
     act.set_field(
         ctx,
         "spawn",
-        Callback::from_fn(&ctx, |ctx, _, mut stack| {
+        Callback::from_fn(&ctx, move |ctx, _, mut stack| {
             let val: Value = stack.consume(ctx)?;
             let argv: Vec<std::string::String> = from_value(val).map_err(RuntimeError::new)?;
             if argv.is_empty() {
                 return Err(runtime_err("koma.act.spawn requires non-empty argv array"));
             }
+            let argv = crate::path_resolve::resolve_spawn_argv_from_env(
+                &argv,
+                state.borrow().config_dir.as_deref(),
+            );
             stack.replace(
                 ctx,
                 UserData::new_static(&ctx, ActionDescriptor::Spawn { argv }),
@@ -2198,8 +2275,12 @@ fn create_macro_context_userdata<'gc>(
             let sc = ud
                 .downcast_static::<MacroExecScope>()
                 .map_err(RuntimeError::new)?;
-            sc.state
-                .borrow_mut()
+            let mut inner = sc.state.borrow_mut();
+            let argv = crate::path_resolve::resolve_spawn_argv_from_env(
+                &argv,
+                inner.config_dir.as_deref(),
+            );
+            inner
                 .host_actions
                 .push_back(QueuedHostAction::SpawnProcess { argv });
             Ok(CallbackReturn::Return)
@@ -3914,5 +3995,167 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn sandbox_resolves_paths_in_env_spawn_xwayland_resolve_path_and_require() {
+        let base = std::path::Path::new("/tmp/koma");
+        fs::create_dir_all(base).expect("create /tmp/koma");
+        let cfg_dir = base.join(format!("bridge-paths-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&cfg_dir);
+        fs::create_dir_all(cfg_dir.join("lua/sub")).expect("create lua/sub");
+        fs::create_dir_all(cfg_dir.join("scripts")).expect("create scripts");
+        fs::write(cfg_dir.join("scripts/helper.py"), "print('ok')\n").expect("write helper");
+        fs::write(
+            cfg_dir.join("lua/input.lua"),
+            "return { mod_key = 'Super' }\n",
+        )
+        .expect("write lua/input.lua");
+        fs::write(
+            cfg_dir.join("lua/sub/init.lua"),
+            "return { name = 'sub' }\n",
+        )
+        .expect("write lua/sub/init.lua");
+        fs::write(cfg_dir.join("secret.lua"), "return { secret = true }\n")
+            .expect("write secret.lua");
+
+        let mut sandbox =
+            PhodopusSandbox::new(DEFAULT_HEAP_LIMIT_BYTES, Some(&cfg_dir)).expect("sandbox init");
+        let script = r#"
+            local a = require("input")
+            local b = require("./lua/input")
+            local c = require("./input")
+            local d = require("./lua/sub/init.lua")
+            assert(a == b and b == c, "require variants must share package.loaded cache")
+            assert(d.name == "sub")
+
+            koma.env("PATH", "~/.local/bin:./bin:../tools:/usr/bin")
+            koma.env("SCRIPTS_DIR", "./scripts")
+            koma.env("RESOLVED_CHECK", koma.resolve_path("./scripts/helper.py"))
+            koma.env("TILDE_CHECK", koma.resolve_path("~/notes"))
+
+            koma.xwayland({ enabled = true, path = "./bin/xwayland-satellite" })
+
+            koma.bind("Mod + 1", koma.act.spawn({ "./scripts/run.sh", "~/doc", "--cfg=./app.conf" }))
+            koma.bind("Mod + 2", koma.act.spawn({ "bitty" }))
+            koma.bind("Mod + 3", koma.act.spawn({ "python3", "scripts/helper.py" }))
+
+            koma.macro.define({
+                id = "test.spawn_paths",
+                app_id = ".*",
+                run = function(ctx)
+                    ctx:spawn({ "./scripts/macro.sh", "./arg.txt" })
+                end,
+            })
+        "#;
+        let reg = sandbox.eval_init_lua(script).expect("eval init.lua");
+
+        let expected_tilde_bin = crate::path_resolve::expand_tilde_from_env("~/.local/bin");
+        assert_eq!(
+            reg.env_vars.get("PATH").map(String::as_str),
+            Some(
+                format!(
+                    "{expected_tilde_bin}:{}:{}:/usr/bin",
+                    cfg_dir.join("bin").display(),
+                    cfg_dir.parent().unwrap().join("tools").display(),
+                )
+                .as_str()
+            )
+        );
+        assert_eq!(
+            reg.env_vars.get("SCRIPTS_DIR").map(String::as_str),
+            Some(cfg_dir.join("scripts").to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            reg.env_vars.get("RESOLVED_CHECK").map(String::as_str),
+            Some(cfg_dir.join("scripts/helper.py").to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            reg.env_vars.get("TILDE_CHECK").map(String::as_str),
+            Some(crate::path_resolve::expand_tilde_from_env("~/notes").as_str())
+        );
+        assert_eq!(
+            reg.xwayland.path,
+            cfg_dir.join("bin/xwayland-satellite").to_string_lossy()
+        );
+
+        match &reg.binds[0].action {
+            ActionDescriptor::Spawn { argv } => {
+                assert_eq!(
+                    argv,
+                    &vec![
+                        cfg_dir.join("scripts/run.sh").display().to_string(),
+                        crate::path_resolve::expand_tilde_from_env("~/doc"),
+                        format!("--cfg={}", cfg_dir.join("app.conf").display()),
+                    ]
+                );
+            }
+            other => panic!("expected Spawn, got {other:?}"),
+        }
+        match &reg.binds[1].action {
+            ActionDescriptor::Spawn { argv } => assert_eq!(argv, &vec!["bitty".to_owned()]),
+            other => panic!("expected Spawn, got {other:?}"),
+        }
+        match &reg.binds[2].action {
+            ActionDescriptor::Spawn { argv } => assert_eq!(
+                argv,
+                &vec![
+                    "python3".to_owned(),
+                    cfg_dir.join("scripts/helper.py").display().to_string(),
+                ]
+            ),
+            other => panic!("expected Spawn, got {other:?}"),
+        }
+
+        // Bare xwayland path stays intact
+        let mut bare_xwl =
+            PhodopusSandbox::new(DEFAULT_HEAP_LIMIT_BYTES, Some(&cfg_dir)).expect("sandbox");
+        let bare_reg = bare_xwl
+            .eval_init_lua("koma.xwayland({ path = \"xwayland-satellite\" })")
+            .expect("eval bare xwayland");
+        assert_eq!(bare_reg.xwayland.path, "xwayland-satellite");
+
+        // Lua typegen stub includes resolve_path
+        let stubs = crate::generate_luals_stubs();
+        assert!(stubs.contains("---@field resolve_path fun(path: string): string"));
+
+        // Escaping require() paths are refused with access violation
+        for bad in [
+            "require(\"../secret\")",
+            "require(\"/etc/passwd\")",
+            "require(\"~/secret.lua\")",
+            "require(\"./secret\")",
+        ] {
+            let mut bad_sb =
+                PhodopusSandbox::new(DEFAULT_HEAP_LIMIT_BYTES, Some(&cfg_dir)).expect("sandbox");
+            let err = bad_sb
+                .eval_init_lua(bad)
+                .expect_err(&format!("`{bad}` must fail"));
+            assert!(
+                err.contains("access violation") && err.contains("escapes jailed lua directory"),
+                "unexpected error for `{bad}`: {err}"
+            );
+        }
+
+        // Macro ctx:spawn resolves paths too
+        sandbox
+            .start_macro_tx(
+                WorkspaceId::new("ws-1"),
+                Epoch(1),
+                &MacroId::new("test.spawn_paths"),
+                &serde_json::json!({}),
+                0,
+            )
+            .expect("start macro");
+        let actions = sandbox.drain_queued_actions();
+        assert!(matches!(
+            actions.first(),
+            Some(QueuedHostAction::SpawnProcess { argv })
+                if argv == &vec![
+                    cfg_dir.join("scripts/macro.sh").display().to_string(),
+                    cfg_dir.join("arg.txt").display().to_string(),
+                ]
+        ));
+        let _ = fs::remove_dir_all(&cfg_dir);
     }
 }

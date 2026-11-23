@@ -38,7 +38,7 @@ use std::{
 use calloop::channel::{Event as ChannelEvent, SyncSender, sync_channel};
 use koma_lua::{
     DEFAULT_HEAP_LIMIT_BYTES, KomaConfigRegistry, LuaWindowRuleSpec,
-    phodopus_bridge::PhodopusSandbox,
+    phodopus_bridge::PhodopusSandbox, schema::LuaWindowMatchInput,
 };
 use koma_model::{
     DynamicWindowRules, InitialWindowRules, LayoutMode, PresentationTarget, WindowMatchSpec,
@@ -74,21 +74,34 @@ pub enum KomaConfigPath {
 }
 
 impl KomaConfigPath {
-    /// Resolves CLI override -> `$KOMA_CONFIG` -> XDG user/system default paths.
+    /// Resolves CLI override -> `$KOMA_CONFIG` -> XDG user/system default paths,
+    /// expanding `~` and resolving relative paths against `current_dir()`.
     #[must_use]
     pub fn resolve(cli_override: Option<PathBuf>) -> Self {
+        let cwd = env::current_dir().ok();
+        let home = koma_lua::path_resolve::home_dir_from_env();
         if let Some(explicit) = cli_override.or_else(|| {
             env::var_os("KOMA_CONFIG")
                 .filter(|v| !v.is_empty())
                 .map(PathBuf::from)
         }) {
-            return Self::Explicit(explicit);
+            return Self::Explicit(koma_lua::path_resolve::resolve_config_path(
+                &explicit.to_string_lossy(),
+                cwd.as_deref(),
+                home.as_deref(),
+            ));
         }
 
         let user_config_base = env::var_os("XDG_CONFIG_HOME")
             .filter(|v| !v.is_empty())
-            .map(PathBuf::from)
-            .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+            .map(|p| {
+                koma_lua::path_resolve::resolve_config_path(
+                    &p.to_string_lossy(),
+                    cwd.as_deref(),
+                    home.as_deref(),
+                )
+            })
+            .or_else(|| home.map(|h| h.join(".config")))
             .unwrap_or_else(|| PathBuf::from("/tmp"));
 
         Self::Regular {
@@ -540,60 +553,65 @@ pub fn build_validated_shadow_sandbox(
     ))
 }
 
+fn compile_window_match_spec(
+    idx: usize,
+    kind: &str,
+    m: &LuaWindowMatchInput,
+) -> Result<WindowMatchSpec, String> {
+    if m.tag.is_some() {
+        return Err(format!(
+            "window rule #{idx} `{kind}.tag` is not supported yet"
+        ));
+    }
+    if m.is_urgent.is_some() {
+        return Err(format!(
+            "window rule #{idx} `{kind}.is_urgent` is not supported yet"
+        ));
+    }
+    let app_id = match &m.app_id {
+        Some(pat) => Some(Regex::new(pat).map_err(|e| {
+            format!("window rule #{idx} invalid `{kind}.app_id` regex `{pat}`: {e}")
+        })?),
+        None => None,
+    };
+    let title = match &m.title {
+        Some(pat) => Some(Regex::new(pat).map_err(|e| {
+            format!("window rule #{idx} invalid `{kind}.title` regex `{pat}`: {e}")
+        })?),
+        None => None,
+    };
+    Ok(WindowMatchSpec {
+        app_id,
+        title,
+        workspace: m.workspace.clone(),
+        is_floating: m.is_floating,
+        is_focused: m.is_focused,
+        is_xwayland: m.is_xwayland,
+        is_modal_dialog: m.is_modal_dialog,
+        is_screencast_target: m.is_screencast_target,
+        is_agent_workspace: m.is_agent_workspace,
+        at_startup: m.at_startup,
+    })
+}
+
 fn compile_window_rule_specs(specs: &[LuaWindowRuleSpec]) -> Result<Vec<WindowRuleEntry>, String> {
     let mut entries = Vec::with_capacity(specs.len());
     for (idx, spec) in specs.iter().enumerate() {
         let mut matches = Vec::with_capacity(spec.matches.len());
         for m in &spec.matches {
-            let app_id = match &m.app_id {
-                Some(pat) => Some(Regex::new(pat).map_err(|e| {
-                    format!("window rule #{idx} invalid `matches.app_id` regex `{pat}`: {e}")
-                })?),
-                None => None,
-            };
-            let title = match &m.title {
-                Some(pat) => Some(Regex::new(pat).map_err(|e| {
-                    format!("window rule #{idx} invalid `matches.title` regex `{pat}`: {e}")
-                })?),
-                None => None,
-            };
-            matches.push(WindowMatchSpec {
-                app_id,
-                title,
-                is_floating: m.is_floating,
-                is_focused: m.is_focused,
-                is_xwayland: m.is_xwayland,
-                is_modal_dialog: m.is_modal_dialog,
-                is_screencast_target: m.is_screencast_target,
-                is_agent_workspace: m.is_agent_workspace,
-            });
+            matches.push(compile_window_match_spec(idx, "matches", m)?);
         }
 
         let mut excludes = Vec::with_capacity(spec.excludes.len());
         for ex in &spec.excludes {
-            let app_id = match &ex.app_id {
-                Some(pat) => Some(Regex::new(pat).map_err(|e| {
-                    format!("window rule #{idx} invalid `excludes.app_id` regex `{pat}`: {e}")
-                })?),
-                None => None,
-            };
-            let title = match &ex.title {
-                Some(pat) => Some(Regex::new(pat).map_err(|e| {
-                    format!("window rule #{idx} invalid `excludes.title` regex `{pat}`: {e}")
-                })?),
-                None => None,
-            };
-            excludes.push(WindowMatchSpec {
-                app_id,
-                title,
-                is_floating: ex.is_floating,
-                is_focused: ex.is_focused,
-                is_xwayland: ex.is_xwayland,
-                is_modal_dialog: ex.is_modal_dialog,
-                is_screencast_target: ex.is_screencast_target,
-                is_agent_workspace: ex.is_agent_workspace,
-            });
+            excludes.push(compile_window_match_spec(idx, "excludes", ex)?);
         }
+
+        let suppress_maximize = spec
+            .suppress_events
+            .iter()
+            .any(|ev| ev.trim().eq_ignore_ascii_case("maximize"))
+            .then_some(true);
 
         entries.push(WindowRuleEntry {
             id: spec.id.map_or((idx + 1) as u64, |r| r.0),
@@ -602,9 +620,16 @@ fn compile_window_rule_specs(specs: &[LuaWindowRuleSpec]) -> Result<Vec<WindowRu
             matches,
             excludes,
             initial: InitialWindowRules {
+                open_on_output: spec.initial.open_on_output.clone(),
                 open_on_workspace: spec.initial.open_on_workspace.clone(),
                 open_mode: spec.initial.open_mode,
                 open_focused: spec.initial.open_focused,
+                default_width: spec.initial.default_width,
+                default_height: spec.initial.default_height,
+                max_width: spec.initial.max_width,
+                max_height: spec.initial.max_height,
+                min_width: spec.initial.min_width,
+                min_height: spec.initial.min_height,
                 default_floating_pos: spec
                     .initial
                     .default_floating_pos
@@ -615,13 +640,14 @@ fn compile_window_rule_specs(specs: &[LuaWindowRuleSpec]) -> Result<Vec<WindowRu
                 opacity: spec.opacity,
                 inactive_opacity: spec.inactive_opacity,
                 animation: spec.animation.clone(),
+                immediate: spec.immediate,
                 no_blur: spec.no_blur,
                 no_shadow: spec.no_shadow,
                 border_color: spec.border_color.clone(),
                 corner_radius: spec.corner_radius,
                 clip_to_geometry: spec.clip_to_geometry,
                 focusable: spec.focusable,
-                suppress_maximize: None,
+                suppress_maximize,
                 block_out_from: spec.block_out_from,
             },
         });
@@ -982,6 +1008,10 @@ pub fn reload_active_config_now(
     state: &mut KomaState,
     explicit_path: Option<PathBuf>,
 ) -> Result<ConfigReloadReport, String> {
+    let explicit_path = explicit_path.map(|p| {
+        let cwd = env::current_dir().ok();
+        koma_lua::path_resolve::resolve_config_path_from_env(&p.to_string_lossy(), cwd.as_deref())
+    });
     if let Some(p) = &explicit_path {
         state.config_path = KomaConfigPath::Explicit(p.clone());
         if let Some(w) = &state.config_watcher {
@@ -1044,5 +1074,49 @@ mod tests {
         );
         let claimed = state.ensure_initial_workspace_for_output(&output);
         assert_eq!(claimed, WorkspaceId::from("ws_01"));
+    }
+
+    #[test]
+    fn config_path_resolve_expands_tilde_and_relative_cli_overrides() {
+        let cwd = env::current_dir().expect("cwd");
+        assert_eq!(
+            KomaConfigPath::resolve(Some(PathBuf::from("./examples/init.lua"))),
+            KomaConfigPath::Explicit(cwd.join("examples/init.lua"))
+        );
+        let expected_tilde = PathBuf::from(koma_lua::path_resolve::expand_tilde_from_env(
+            "~/my/init.lua",
+        ));
+        assert_eq!(
+            KomaConfigPath::resolve(Some(PathBuf::from("~/my/init.lua"))),
+            KomaConfigPath::Explicit(expected_tilde)
+        );
+    }
+
+    #[test]
+    fn compile_window_rule_rejects_unsupported_tag_and_is_urgent_matchers() {
+        let (_el, _disp, mut state) = crate::state::tests::make_headless_test_state();
+        for (field, src) in [
+            (
+                "tag",
+                r#"koma.rule.window({ matches = { { tag = "vip" } }, initial = { open_mode = "float" } })"#,
+            ),
+            (
+                "is_urgent",
+                r#"koma.rule.window({ matches = { { is_urgent = true } }, initial = { open_mode = "float" } })"#,
+            ),
+        ] {
+            let err = reload_from_lua_source(
+                &mut state,
+                Path::new("/tmp/init.lua"),
+                Path::new("/tmp"),
+                src,
+                false,
+            )
+            .expect_err("unsupported matcher must be rejected");
+            assert!(
+                err.contains(field) && err.contains("not supported"),
+                "unexpected error for `{field}`: {err}"
+            );
+        }
     }
 }

@@ -6,6 +6,24 @@ incubation versions; `v0.1.0` will be the first independently accepted product
 release. A `0.0.x` tag is a development prerelease and does not claim a working
 desktop, hardware support, or security guarantees.
 
+## [0.0.12] - 2026-11-23
+
+### Added
+
+- **Home (`~`) and config-relative paths in Lua configuration & CLI** (`crates/koma-lua/src/path_resolve.rs`, `phodopus_bridge.rs`, `komactl`):
+  resolves `~` / `~/...` against `$HOME` and relative paths (`./...`, `../...`, `scripts/...`) against the configuration directory across `koma.act.spawn`, `ctx:spawn`, `koma.env` (including colon-separated `PATH` entries), `koma.xwayland({ path = ... })`, `koma.resolve_path(path)`, jailed `require(...)` aliases under `lua/`, and `komactl doctor`, and expands `~` / cwd-relative paths for `--config` and `$KOMA_CONFIG`.
+- **Customizable window launch rules & natural-aspect floating launch** (`crates/koma-model`, `koma-lua`, `koma`):
+  implements `initial.default_width` / `default_height` (fixed pixels or work-area proportions, with `width`/`height` aliases), `min_width` / `min_height` / `max_width` / `max_height`, `open_on_output`, `open_mode = "maximized"` / `"tile"` / `"float"` / `"fullscreen"` / `"deck_top"` / `"stash_background"`, `immediate = true` (and `animation = "instant"`), `suppress_events = { "maximize" }`, and `workspace` / `at_startup` match predicates; sends rule-aware `send_initial_configure` (`size = None` for floating rules without explicit default dimensions) and scales oversized floating windows proportionally to preserve natural aspect ratios (e.g. `satty` screenshots).
+- **Nix binary cache (`komawm.cachix.org`)** (`komawm/koma#129`):
+  adds `nixConfig` (`extra-substituters` and `extra-trusted-public-keys`) to `flake.nix`, adds a `nix` CI verification job, adds a tag-gated `publish-nix` Cachix push job in `release.yml`, and documents NixOS flake + binary cache configuration in `README.md`.
+
+### Fixed
+
+- **Fullscreen pointer hit-testing over suppressed foreground layers** (`komawm/koma#130`):
+  aligns `layer_surface_under_tiers` (used by `hit_test_target` and `handle_pointer_button_focus`) with `output_layer_tiers` and per-output viewport bounds so suppressed `Layer::Top` / `Layer::Overlay` surfaces (such as `waybar`) on an output with an active fullscreen window no longer intercept pointer clicks.
+- **Floating windows remain visible and interactive above maximized windows**:
+  keeps floating windows on top of `WindowPresentation::Maximized` (matching `Fullscreen`) in `WorkspaceState` geometry and activation queries so `Mod + F` maximize no longer hides floating dialogs or tools until un-maximized.
+
 ## [0.0.11] - 2026-11-21
 
 ### Fixed

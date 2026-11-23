@@ -95,7 +95,8 @@ impl FloatingStack {
     }
 
     /// Computes a centered cascade rectangle inside `viewport` when floating a window without an
-    /// explicit rule position.
+    /// explicit rule position. Oversized `preferred_size` hints are scaled proportionally so
+    /// media/screenshot viewers (e.g. `satty`) preserve their natural aspect ratio.
     #[must_use]
     pub fn default_centered_rect(
         &self,
@@ -103,9 +104,28 @@ impl FloatingStack {
         preferred_size: Option<(u32, u32)>,
     ) -> LogicalRect {
         let wa = viewport.work_area_rect();
-        let (pw, ph) = preferred_size.unwrap_or(((wa.w * 3 / 5).max(320), (wa.h * 3 / 5).max(240)));
-        let w = pw.clamp(120, wa.w.saturating_sub(32).max(120));
-        let h = ph.clamp(90, wa.h.saturating_sub(32).max(90));
+        let max_w = wa.w.saturating_sub(32).max(120);
+        let max_h = wa.h.saturating_sub(32).max(90);
+        let (w, h) = match preferred_size {
+            Some((pw, ph)) if pw > 0 && ph > 0 => {
+                let scale = (f64::from(max_w) / f64::from(pw))
+                    .min(f64::from(max_h) / f64::from(ph))
+                    .min(1.0);
+                let (min_w, min_h) = if scale < 1.0 {
+                    (1, 1)
+                } else {
+                    (120_u32.min(max_w), 90_u32.min(max_h))
+                };
+                let scaled_w = ((f64::from(pw) * scale).round() as u32).clamp(min_w, max_w);
+                let scaled_h = ((f64::from(ph) * scale).round() as u32).clamp(min_h, max_h);
+                (scaled_w, scaled_h)
+            }
+            _ => {
+                let pw = (wa.w * 3 / 5).max(320);
+                let ph = (wa.h * 3 / 5).max(240);
+                (pw.clamp(120, max_w), ph.clamp(90, max_h))
+            }
+        };
         let cascade = ((self.entries.len() % 5) as i32) * 24;
         let base_x = wa.x + ((wa.w.saturating_sub(w)) / 2) as i32;
         let base_y = wa.y + ((wa.h.saturating_sub(h)) / 2) as i32;
@@ -119,6 +139,18 @@ impl FloatingStack {
             w,
             h,
         )
+    }
+
+    /// Computes an exact centered rectangle inside `viewport` without cascade offset, clamping
+    /// `(w, h)` only to the full work area `(wa.w, wa.h)`, for rules with explicit dimensions.
+    #[must_use]
+    pub fn centered_exact_rect(viewport: LogicalViewport, size: (u32, u32)) -> LogicalRect {
+        let wa = viewport.work_area_rect();
+        let w = size.0.clamp(1, wa.w.max(1));
+        let h = size.1.clamp(1, wa.h.max(1));
+        let x = wa.x + ((wa.w.saturating_sub(w)) / 2) as i32;
+        let y = wa.y + ((wa.h.saturating_sub(h)) / 2) as i32;
+        LogicalRect::new(x, y, w, h)
     }
 
     /// Computes the detached floating drag card rectangle when untiling a `Dwindle`/`Scrolling`
@@ -438,5 +470,49 @@ mod tests {
         for mode in [LayoutMode::Dwindle, LayoutMode::Scrolling, LayoutMode::Deck] {
             assert!(mode.supports_frame_edge_resize(true), "{mode:?}");
         }
+    }
+
+    #[test]
+    fn default_centered_rect_scales_oversized_preferred_size_proportionally() {
+        let vp = LogicalViewport::new(1920, 1080, 1.0).with_work_area_zone(0, 0, 1920, 1080);
+        let stack = FloatingStack::default();
+
+        // 4K 16:9 image (3840x2160) must scale proportionally to fit 1888x1048 (wa - 32),
+        // giving height = 1048 and width = round(3840 * 1048 / 2160) = 1863.
+        let scaled_16_9 = stack.default_centered_rect(vp, Some((3840, 2160)));
+        assert_eq!(scaled_16_9.h, 1048);
+        assert_eq!(scaled_16_9.w, 1863);
+
+        // Tall portrait image (1000x3000) scales by height: 1048 tall, round(1000 * 1048 / 3000) = 349 wide.
+        let scaled_portrait = stack.default_centered_rect(vp, Some((1000, 3000)));
+        assert_eq!(scaled_portrait.h, 1048);
+        assert_eq!(scaled_portrait.w, 349);
+
+        // Fits comfortably within work area - 32 -> exact size preserved.
+        let exact_fit = stack.default_centered_rect(vp, Some((800, 600)));
+        assert_eq!(exact_fit.w, 800);
+        assert_eq!(exact_fit.h, 600);
+
+        // Extreme wide aspect ratio (6400x200) scales down proportionally without min-height inflation:
+        // scale = 1888 / 6400 = 0.295 -> width = 1888, height = round(200 * 1888 / 6400) = 59.
+        let ultra_wide = stack.default_centered_rect(vp, Some((6400, 200)));
+        assert_eq!(ultra_wide.w, 1888);
+        assert_eq!(ultra_wide.h, 59);
+    }
+
+    #[test]
+    fn centered_exact_rect_centers_without_cascade_and_clamps_only_to_work_area() {
+        let vp = LogicalViewport::new(1920, 1080, 1.0).with_work_area_zone(0, 40, 1920, 1040);
+        // Size equal to work area is NOT shrunk by 32 px.
+        let full_wa = FloatingStack::centered_exact_rect(vp, (1920, 1040));
+        assert_eq!(full_wa, LogicalRect::new(0, 40, 1920, 1040));
+
+        // Oversized clamps to wa, centered cleanly.
+        let clamped = FloatingStack::centered_exact_rect(vp, (2500, 1500));
+        assert_eq!(clamped, LogicalRect::new(0, 40, 1920, 1040));
+
+        // Explicit 1000x700 centers cleanly at ((1920-1000)/2, 40 + (1040-700)/2) = (460, 210).
+        let centered = FloatingStack::centered_exact_rect(vp, (1000, 700));
+        assert_eq!(centered, LogicalRect::new(460, 210, 1000, 700));
     }
 }

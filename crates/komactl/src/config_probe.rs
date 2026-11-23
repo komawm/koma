@@ -130,19 +130,35 @@ pub(crate) fn summary_of(registry: &KomaConfigRegistry) -> ValidationSummary {
     }
 }
 
+/// Expands `~` / `~/...` and resolves relative CLI paths against the current working directory.
+#[must_use]
+pub(crate) fn resolve_cli_path(raw: &str) -> PathBuf {
+    let cwd = env::current_dir().ok();
+    koma_lua::path_resolve::resolve_config_path_from_env(raw, cwd.as_deref())
+}
+
 /// Resolves the implicit configuration path: `$KOMA_CONFIG`, `$XDG_CONFIG_HOME/koma/init.lua`,
 /// `~/.config/koma/init.lua`, then `/etc/xdg/koma/init.lua`.
 #[must_use]
 pub(crate) fn default_init_lua_path() -> PathBuf {
-    env::var_os("KOMA_CONFIG")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| {
-            env::var_os("XDG_CONFIG_HOME")
-                .filter(|v| !v.is_empty())
-                .map(|p| PathBuf::from(p).join("koma/init.lua"))
-        })
-        .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".config/koma/init.lua")))
+    let cwd = env::current_dir().ok();
+    let home = koma_lua::path_resolve::home_dir_from_env();
+    if let Some(explicit) = env::var_os("KOMA_CONFIG").filter(|v| !v.is_empty()) {
+        return koma_lua::path_resolve::resolve_config_path(
+            &explicit.to_string_lossy(),
+            cwd.as_deref(),
+            home.as_deref(),
+        );
+    }
+    if let Some(xdg) = env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
+        return koma_lua::path_resolve::resolve_config_path(
+            &xdg.to_string_lossy(),
+            cwd.as_deref(),
+            home.as_deref(),
+        )
+        .join("koma/init.lua");
+    }
+    home.map(|h| h.join(".config/koma/init.lua"))
         .unwrap_or_else(|| PathBuf::from("/etc/xdg/koma/init.lua"))
 }
 
@@ -176,7 +192,8 @@ pub(crate) fn template_report_at(init_lua: &Path) -> Value {
 
 /// Reads and evaluates `path` in a jailed shadow VM without touching the running compositor.
 pub(crate) fn evaluate(path: &Path) -> Result<ConfigEvaluation, String> {
-    let source = fs::read_to_string(path)
+    let path = resolve_cli_path(&path.to_string_lossy());
+    let source = fs::read_to_string(&path)
         .map_err(|e| format!("failed reading `{}`: {e}", path.display()))?;
     let config_root = path
         .parent()
@@ -192,7 +209,7 @@ pub(crate) fn evaluate(path: &Path) -> Result<ConfigEvaluation, String> {
         .map(semantic_issues_of)
         .unwrap_or_default();
     Ok(ConfigEvaluation {
-        path: path.to_path_buf(),
+        path,
         config_root,
         source,
         registry,

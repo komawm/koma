@@ -120,7 +120,7 @@ fn main() -> io::Result<()> {
         Some("validate") => {
             let target = args
                 .get(1)
-                .map(PathBuf::from)
+                .map(|raw| config_probe::resolve_cli_path(raw))
                 .unwrap_or_else(config_probe::default_init_lua_path);
             match validate_init_lua_offline(&target) {
                 Ok(summary) => println!(
@@ -142,7 +142,18 @@ fn main() -> io::Result<()> {
         Some("doctor") => process::exit(doctor::run(&args[1..])),
         Some("keys") => process::exit(keys::run(&args[1..])),
         Some("reload") => {
-            let explicit_path = args.get(1).cloned();
+            let explicit_path = args
+                .get(1)
+                .map(|raw| {
+                    let resolved = config_probe::resolve_cli_path(raw);
+                    resolved.to_str().map(str::to_owned).ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "config path is not valid UTF-8",
+                        )
+                    })
+                })
+                .transpose()?;
             let mut client = AdminClient::connect()?;
             let (val, _) = client.call_raw("config.reload", json!({ "path": explicit_path }))?;
             println!("{}", serde_json::to_string_pretty(&val).unwrap());
@@ -186,7 +197,7 @@ fn main() -> io::Result<()> {
                         );
                         process::exit(USAGE_EXIT_CODE);
                     }
-                    other => target_dir = Some(PathBuf::from(other)),
+                    other => target_dir = Some(config_probe::resolve_cli_path(other)),
                 }
             }
             let root = target_dir.unwrap_or_else(|| {

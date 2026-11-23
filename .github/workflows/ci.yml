@@ -121,3 +121,25 @@ jobs:
           tool: cargo-deny@0.20.2
       - name: Check dependencies (advisories, bans, licenses, sources)
         run: just deny
+
+  nix:
+    name: Nix flake (x86_64-linux)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: cachix/install-nix-action@3dc140bfc76c49fbd4dd958429132e3746bcb086 # v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+      - uses: cachix/cachix-action@38b082610b782e7e93e209c35fd730d399dee866 # v17
+        with:
+          name: komawm
+          skipPush: true
+      - name: Evaluate and build Nix package
+        run: |
+          nix eval --no-write-lock-file --raw .#packages.x86_64-linux.koma.drvPath
+          printf '\n'
+          nix eval --no-write-lock-file --raw .#packages.aarch64-linux.koma.drvPath
+          printf '\n'
+          nix build --no-write-lock-file -L .#packages.x86_64-linux.koma

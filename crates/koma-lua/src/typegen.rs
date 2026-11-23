@@ -10,6 +10,7 @@ pub fn generate_luals_stubs() -> String {
 ---@alias KomaColumnDisplay "normal"|"tabbed"
 ---@alias KomaTabIndicatorPosition "left"|"right"|"top"|"bottom"
 ---@alias KomaPresetColumnWidth number|{ proportion: number }|{ fixed: integer }
+---@alias KomaOpenMode "tile"|"float"|"fullscreen"|"maximized"|"deck_top"|"stash_background"
 ---@alias KomaBlockOut "agent_capture"|"screencast"|"screencopy"|"all"
 ---@alias KomaAnimationSolverKind "spring"|"hooke"|"hooke_spring"|"analytical_spring"|"analytical"
 ---@alias KomaKinematicProfile "instant"|"minimum_jerk"|"spring"|"hooke"|"hooke_spring"|"bezier"
@@ -116,14 +117,47 @@ pub fn generate_luals_stubs() -> String {
 ---@field border? KomaAnimationChannelSpec
 ---@field workspaces? KomaAnimationChannelSpec
 
+---@class KomaFloatingPosSpec
+---@field x integer
+---@field y integer
+---@field anchor? KomaAnchorName
+
+---@class KomaWindowMatchSpec
+---@field app_id? string
+---@field title? string
+---@field workspace? string
+---@field is_floating? boolean
+---@field is_focused? boolean
+---@field is_modal_dialog? boolean
+---@field is_xwayland? boolean
+---@field is_screencast_target? boolean
+---@field is_agent_workspace? boolean
+---@field at_startup? boolean
+
+---@class KomaInitialWindowRuleSpec
+---@field open_on_output? string
+---@field open_on_workspace? string
+---@field open_mode? KomaOpenMode
+---@field open_focused? boolean
+---@field default_width? KomaPresetColumnWidth
+---@field width? KomaPresetColumnWidth
+---@field default_height? KomaPresetColumnWidth
+---@field height? KomaPresetColumnWidth
+---@field max_width? KomaPresetColumnWidth
+---@field max_height? KomaPresetColumnWidth
+---@field min_width? KomaPresetColumnWidth
+---@field min_height? KomaPresetColumnWidth
+---@field default_floating_pos? KomaFloatingPosSpec
+
 ---@class KomaWindowRuleSpec
 ---@field name? string
----@field matches? table[]
----@field excludes? table[]
----@field initial? table
+---@field matches? KomaWindowMatchSpec[]
+---@field excludes? KomaWindowMatchSpec[]
+---@field initial? KomaInitialWindowRuleSpec
 ---@field opacity? number
 ---@field inactive_opacity? number
 ---@field animation? string
+---@field immediate? boolean
 ---@field no_blur? boolean
 ---@field no_shadow? boolean
 ---@field border_color? string
@@ -367,6 +401,7 @@ function MacroContext:dispatch(action) end
 ---@field spring fun(name: string, spec: { mass?: number, damping?: number, damping_ratio?: number, stiffness?: number, epsilon?: number })
 ---@field xwayland fun(spec: { enabled?: boolean, path?: string, isolate_agent_workspaces?: boolean })
 ---@field env fun(key: string, val: string)
+---@field resolve_path fun(path: string): string
 ---@field bind fun(chord: string, action: KomaAction|fun(ctx: KomaMacroContext), opts?: { desc?: string, repeat_while_held?: boolean, cooldown_ms?: integer, allow_when_locked?: boolean, pass_through?: boolean, edge?: "press"|"release"|"both", when_preempted?: "allow"|"ignore" }): KomaHandle
 ---@field unbind fun(chord: string)
 ---@field mode fun(name: string, spec: table)
