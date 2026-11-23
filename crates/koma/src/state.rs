@@ -3216,6 +3216,9 @@ impl KomaState {
                          output_origin: Point<f64, Logical>,
                          output_local: Point<f64, Logical>|
          -> Option<PointerHitTarget> {
+            if !layer.alive() {
+                return None;
+            }
             let layer_geo = map.layer_geometry(layer)?;
             let layer_loc = layer_geo.loc.to_f64();
             let (surf, offset) =
@@ -3231,8 +3234,23 @@ impl KomaState {
         for output in self.all_outputs() {
             let output_origin = output.current_location().to_f64();
             let output_local = global_pos - output_origin;
+            let (out_w, out_h, _) = output_logical_viewport(&output);
+            if output_local.x < 0.0
+                || output_local.y < 0.0
+                || output_local.x >= f64::from(out_w)
+                || output_local.y >= f64::from(out_h)
+            {
+                continue;
+            }
+            let out_ws_id = self.active_workspace_for_output(&output.name());
+            let layer_tiers = self.output_layer_tiers(&out_ws_id);
             let map = layer_map_for_output(&output);
             for tier in tiers {
+                if !layer_tiers.above_toplevels.contains(&tier)
+                    && !layer_tiers.below_toplevels.contains(&tier)
+                {
+                    continue;
+                }
                 if let Some(top_layer) = map.layer_under(tier, output_local)
                     && let Some(hit) = hit_layer(top_layer, &map, output_origin, output_local)
                 {
@@ -3283,8 +3301,7 @@ impl KomaState {
             return None;
         }
 
-        if let Some(hit) = self.layer_surface_under_tiers(global_pos, [Layer::Overlay, Layer::Top])
-        {
+        if let Some(hit) = self.layer_surface_under_tiers(global_pos, FOREGROUND_LAYER_TIERS) {
             return Some(hit);
         }
 
@@ -3297,7 +3314,7 @@ impl KomaState {
             });
         }
 
-        self.layer_surface_under_tiers(global_pos, [Layer::Bottom, Layer::Background])
+        self.layer_surface_under_tiers(global_pos, BACKGROUND_LAYER_TIERS)
     }
 
     /// Unified surface hit-test returning the focused Wayland surface and logical origin.
@@ -3731,7 +3748,7 @@ impl KomaState {
             layer_root,
             interactivity,
             ..
-        }) = self.layer_surface_under_tiers(global_pos, [Layer::Overlay, Layer::Top])
+        }) = self.layer_surface_under_tiers(global_pos, FOREGROUND_LAYER_TIERS)
         {
             self.apply_layer_click_interactivity(layer_root, interactivity);
             return;
@@ -3748,7 +3765,7 @@ impl KomaState {
             layer_root,
             interactivity,
             ..
-        }) = self.layer_surface_under_tiers(global_pos, [Layer::Bottom, Layer::Background])
+        }) = self.layer_surface_under_tiers(global_pos, BACKGROUND_LAYER_TIERS)
         {
             self.apply_layer_click_interactivity(layer_root, interactivity);
             return;

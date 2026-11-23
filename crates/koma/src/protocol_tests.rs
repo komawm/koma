@@ -7832,3 +7832,379 @@ fn issue_123_scrolling_and_deck_layout_modes_and_chords_work_end_to_end() {
         LayoutMode::Dwindle
     );
 }
+
+#[test]
+fn issue_130_fullscreen_window_ignores_suppressed_top_layer_in_pointer_hit_test() {
+    use crate::state::PointerHitTarget;
+
+    let mut env = ClientEnv::new();
+    let qh = env.queue.handle();
+    let compositor =
+        env.client
+            .bind::<wl_compositor::WlCompositor>(&env.registry, &qh, "wl_compositor");
+    let layer_shell = env.client.bind::<zwlr_layer_shell_v1::ZwlrLayerShellV1>(
+        &env.registry,
+        &qh,
+        "zwlr_layer_shell_v1",
+    );
+    let shm = env
+        .client
+        .bind::<wl_shm::WlShm>(&env.registry, &qh, "wl_shm");
+    env.client.compositor = Some(compositor.clone());
+    env.client.shm = Some(shm.clone());
+
+    let wl_out = env.client.outputs[0].clone();
+
+    // Background wallpaper covering the full output behind everything.
+    let bg_surf = compositor.create_surface(&qh, ());
+    let bg_layer = layer_shell.get_layer_surface(
+        &bg_surf,
+        Some(&wl_out),
+        zwlr_layer_shell_v1::Layer::Background,
+        "koma-bg".to_owned(),
+        &qh,
+        (),
+    );
+    bg_layer.set_size(1920, 1080);
+    bg_layer.set_anchor(
+        zwlr_layer_surface_v1::Anchor::Top
+            | zwlr_layer_surface_v1::Anchor::Bottom
+            | zwlr_layer_surface_v1::Anchor::Left
+            | zwlr_layer_surface_v1::Anchor::Right,
+    );
+    bg_layer.set_exclusive_zone(-1);
+    bg_surf.commit();
+    env.pump();
+    let bg_fd = create_portable_shm_fd(1920 * 1080 * 4, None);
+    let bg_pool = shm.create_pool(bg_fd.as_fd(), 1920 * 1080 * 4, &qh, ());
+    let bg_buf = bg_pool.create_buffer(0, 1920, 1080, 1920 * 4, wl_shm::Format::Argb8888, &qh, ());
+    bg_surf.attach(Some(&bg_buf), 0, 0);
+    bg_surf.commit();
+    env.pump();
+
+    // Top bar with `OnDemand` interactivity so clicking it steals keyboard focus when visible.
+    let bar_surf = compositor.create_surface(&qh, ());
+    let bar_layer = layer_shell.get_layer_surface(
+        &bar_surf,
+        Some(&wl_out),
+        zwlr_layer_shell_v1::Layer::Top,
+        "koma-bar".to_owned(),
+        &qh,
+        (),
+    );
+    bar_layer.set_size(1920, 24);
+    bar_layer.set_anchor(zwlr_layer_surface_v1::Anchor::Top);
+    bar_layer.set_exclusive_zone(24);
+    bar_layer.set_keyboard_interactivity(zwlr_layer_surface_v1::KeyboardInteractivity::OnDemand);
+    bar_surf.commit();
+    env.pump();
+    let bar_fd = create_portable_shm_fd(1920 * 24 * 4, None);
+    let bar_pool = shm.create_pool(bar_fd.as_fd(), 1920 * 24 * 4, &qh, ());
+    let bar_buf = bar_pool.create_buffer(0, 1920, 24, 1920 * 4, wl_shm::Format::Argb8888, &qh, ());
+    bar_surf.attach(Some(&bar_buf), 0, 0);
+    bar_surf.commit();
+    env.pump();
+
+    let (win_surf, _xs, _tl) = env.spawn_window("Player", "org.koma.player");
+    let win_id = env.state.mapped_windows[0].win_id;
+    let server_win_surf = env.state.mapped_windows[0]
+        .window
+        .toplevel()
+        .expect("toplevel")
+        .wl_surface()
+        .clone();
+    let server_bar_surf = {
+        let map = smithay::desktop::layer_map_for_output(&env._output);
+        map.layers_on(smithay::wayland::shell::wlr_layer::Layer::Top)
+            .next()
+            .expect("top bar layer")
+            .wl_surface()
+            .clone()
+    };
+    let server_bg_surf = {
+        let map = smithay::desktop::layer_map_for_output(&env._output);
+        map.layers_on(smithay::wayland::shell::wlr_layer::Layer::Background)
+            .next()
+            .expect("background layer")
+            .wl_surface()
+            .clone()
+    };
+
+    let bar_pt = Point::from((100.0, 12.0));
+
+    // 1. Before fullscreen: hitting (100, 12) targets `Layer::Top` and focuses the bar.
+    match env.state.hit_test_target(bar_pt) {
+        Some(PointerHitTarget::Layer { layer_root, .. }) => {
+            assert_eq!(layer_root, server_bar_surf);
+        }
+        other => panic!("expected Top layer hit before fullscreen, got {other:?}"),
+    }
+    env.state.handle_pointer_button_focus(bar_pt);
+    assert_eq!(
+        env.state.focused_ondemand_layer,
+        Some(server_bar_surf.clone())
+    );
+    assert_eq!(
+        env.state.kb().and_then(|kb| kb.current_focus()),
+        Some(server_bar_surf.clone()),
+        "clicking OnDemand Top bar before fullscreen must move keyboard focus to the bar"
+    );
+
+    // 2. Enter fullscreen and commit a full-output 1920x1080 buffer for the window.
+    env.state.set_window_fullscreen(win_id, true, None);
+    env.pump();
+    let full_fd = create_portable_shm_fd(1920 * 1080 * 4, None);
+    let full_pool = shm.create_pool(full_fd.as_fd(), 1920 * 1080 * 4, &qh, ());
+    let full_buf =
+        full_pool.create_buffer(0, 1920, 1080, 1920 * 4, wl_shm::Format::Argb8888, &qh, ());
+    win_surf.attach(Some(&full_buf), 0, 0);
+    win_surf.commit();
+    env.pump();
+
+    // During fullscreen: (100, 12) hits the fullscreen window, NOT the suppressed Top bar,
+    // and click-focus keeps keyboard focus on the fullscreen window.
+    match env.state.hit_test_target(bar_pt) {
+        Some(PointerHitTarget::Window {
+            win_id: hit_win, ..
+        }) => {
+            assert_eq!(hit_win, win_id);
+        }
+        other => panic!("expected fullscreen window hit at (100, 12), got {other:?}"),
+    }
+    env.state.handle_pointer_button_focus(bar_pt);
+    assert!(env.state.focused_ondemand_layer.is_none());
+    assert_eq!(
+        env.state.kb().and_then(|kb| kb.current_focus()),
+        Some(server_win_surf.clone()),
+        "clicking (100, 12) during fullscreen must keep keyboard focus on the fullscreen window"
+    );
+
+    // 3. If part of the fullscreen window does not accept input, Top remains suppressed while
+    // Background/Bottom underneath remains hit-testable.
+    let partial_region = compositor.create_region(&qh, ());
+    partial_region.add(0, 0, 800, 600);
+    win_surf.set_input_region(Some(&partial_region));
+    partial_region.destroy();
+    win_surf.commit();
+    env.pump();
+
+    match env.state.hit_test_target(Point::from((1200.0, 12.0))) {
+        Some(PointerHitTarget::Layer { layer_root, .. }) => {
+            assert_eq!(
+                layer_root, server_bg_surf,
+                "suppressed Top bar must not capture uncovered bar-strip clicks; Background must"
+            );
+        }
+        other => panic!("expected Background hit at uncovered (1200, 12), got {other:?}"),
+    }
+    match env.state.hit_test_target(Point::from((1200.0, 500.0))) {
+        Some(PointerHitTarget::Layer { layer_root, .. }) => {
+            assert_eq!(layer_root, server_bg_surf);
+        }
+        other => panic!("expected Background hit at uncovered (1200, 500), got {other:?}"),
+    }
+    win_surf.set_input_region(None);
+    win_surf.commit();
+    env.pump();
+
+    // 4. Leaving fullscreen restores Top bar pointer hit-testing and click-focus.
+    env.state.set_window_fullscreen(win_id, false, None);
+    env.pump();
+    match env.state.hit_test_target(bar_pt) {
+        Some(PointerHitTarget::Layer { layer_root, .. }) => {
+            assert_eq!(layer_root, server_bar_surf);
+        }
+        other => panic!("expected Top layer hit after leaving fullscreen, got {other:?}"),
+    }
+    env.state.handle_pointer_button_focus(bar_pt);
+    assert_eq!(
+        env.state.kb().and_then(|kb| kb.current_focus()),
+        Some(server_bar_surf),
+        "leaving fullscreen must restore Top bar click-focus"
+    );
+
+    full_buf.destroy();
+    full_pool.destroy();
+    bar_layer.destroy();
+    bar_buf.destroy();
+    bar_pool.destroy();
+    bg_layer.destroy();
+    bg_buf.destroy();
+    bg_pool.destroy();
+}
+
+#[test]
+fn issue_130_multi_output_fullscreen_suppresses_only_its_own_output_foreground_layers() {
+    use crate::state::PointerHitTarget;
+
+    let mut env = ClientEnv::new();
+    let primary_output = env._output.clone();
+    let secondary_output = test_output("HDMI-A-1");
+    let _secondary_global = secondary_output.create_global::<KomaState>(&env.state.display_handle);
+    env.state.test_outputs.push(secondary_output.clone());
+    env.state
+        .register_or_update_output(&primary_output, Some((0, 0)), Default::default(), true);
+    env.state
+        .register_or_update_output(&secondary_output, None, Default::default(), true);
+    env.pump();
+
+    let qh = env.queue.handle();
+    let compositor =
+        env.client
+            .bind::<wl_compositor::WlCompositor>(&env.registry, &qh, "wl_compositor");
+    let layer_shell = env.client.bind::<zwlr_layer_shell_v1::ZwlrLayerShellV1>(
+        &env.registry,
+        &qh,
+        "zwlr_layer_shell_v1",
+    );
+    let shm = env
+        .client
+        .bind::<wl_shm::WlShm>(&env.registry, &qh, "wl_shm");
+    env.client.compositor = Some(compositor.clone());
+    env.client.shm = Some(shm.clone());
+
+    let wl_out_primary = env.client.outputs[0].clone();
+    let wl_out_secondary = env.client.outputs[1].clone();
+
+    // Primary output bar (with an oversized 2560px buffer to verify output-bounds isolation).
+    let primary_bar_surf = compositor.create_surface(&qh, ());
+    let primary_bar_layer = layer_shell.get_layer_surface(
+        &primary_bar_surf,
+        Some(&wl_out_primary),
+        zwlr_layer_shell_v1::Layer::Top,
+        "koma-bar-dp1".to_owned(),
+        &qh,
+        (),
+    );
+    primary_bar_layer.set_size(1920, 24);
+    primary_bar_layer.set_anchor(zwlr_layer_surface_v1::Anchor::Top);
+    primary_bar_layer.set_exclusive_zone(24);
+    primary_bar_surf.commit();
+    env.pump();
+    let pbar_fd = create_portable_shm_fd(2560 * 24 * 4, None);
+    let pbar_pool = shm.create_pool(pbar_fd.as_fd(), 2560 * 24 * 4, &qh, ());
+    let pbar_buf =
+        pbar_pool.create_buffer(0, 2560, 24, 2560 * 4, wl_shm::Format::Argb8888, &qh, ());
+    primary_bar_surf.attach(Some(&pbar_buf), 0, 0);
+    primary_bar_surf.commit();
+    env.pump();
+
+    // Secondary output bar (`OnDemand` to verify click-focus on output 2).
+    let secondary_bar_surf = compositor.create_surface(&qh, ());
+    let secondary_bar_layer = layer_shell.get_layer_surface(
+        &secondary_bar_surf,
+        Some(&wl_out_secondary),
+        zwlr_layer_shell_v1::Layer::Top,
+        "koma-bar-hdmi".to_owned(),
+        &qh,
+        (),
+    );
+    secondary_bar_layer.set_size(1920, 24);
+    secondary_bar_layer.set_anchor(zwlr_layer_surface_v1::Anchor::Top);
+    secondary_bar_layer.set_exclusive_zone(24);
+    secondary_bar_layer
+        .set_keyboard_interactivity(zwlr_layer_surface_v1::KeyboardInteractivity::OnDemand);
+    secondary_bar_surf.commit();
+    env.pump();
+    let sbar_fd = create_portable_shm_fd(1920 * 24 * 4, None);
+    let sbar_pool = shm.create_pool(sbar_fd.as_fd(), 1920 * 24 * 4, &qh, ());
+    let sbar_buf =
+        sbar_pool.create_buffer(0, 1920, 24, 1920 * 4, wl_shm::Format::Argb8888, &qh, ());
+    secondary_bar_surf.attach(Some(&sbar_buf), 0, 0);
+    secondary_bar_surf.commit();
+    env.pump();
+
+    let server_secondary_bar = {
+        let map = smithay::desktop::layer_map_for_output(&secondary_output);
+        map.layers_on(smithay::wayland::shell::wlr_layer::Layer::Top)
+            .next()
+            .expect("secondary top bar")
+            .wl_surface()
+            .clone()
+    };
+
+    // Fullscreen window on output 1 (`DP-1`).
+    let (win1_surf, _xs1, _tl1) = env.spawn_window("PrimaryFull", "org.koma.primary");
+    let win1 = env.state.mapped_windows[0].win_id;
+    env.state.set_window_fullscreen(win1, true, None);
+    env.pump();
+    let full1_fd = create_portable_shm_fd(1920 * 1080 * 4, None);
+    let full1_pool = shm.create_pool(full1_fd.as_fd(), 1920 * 1080 * 4, &qh, ());
+    let full1_buf =
+        full1_pool.create_buffer(0, 1920, 1080, 1920 * 4, wl_shm::Format::Argb8888, &qh, ());
+    win1_surf.attach(Some(&full1_buf), 0, 0);
+    win1_surf.commit();
+    env.pump();
+
+    // Output 2 (`HDMI-A-1`) has a normal (non-fullscreen) window.
+    assert!(env.state.focus_output("HDMI-A-1"));
+    let (win2_surf, _xs2, _tl2) = env.spawn_window("SecondaryNormal", "org.koma.secondary");
+    let win2 = env
+        .state
+        .mapped_windows
+        .iter()
+        .find(|m| m.app_id == "org.koma.secondary")
+        .expect("secondary window")
+        .win_id;
+
+    let secondary_origin = secondary_output.current_location().to_f64();
+    let primary_bar_pt = Point::from((100.0, 12.0));
+    let secondary_bar_pt = Point::from((secondary_origin.x + 100.0, secondary_origin.y + 12.0));
+
+    // Output 1's Top bar is suppressed, so (100, 12) hits win1.
+    match env.state.hit_test_target(primary_bar_pt) {
+        Some(PointerHitTarget::Window {
+            win_id: hit_win, ..
+        }) => assert_eq!(hit_win, win1),
+        other => panic!("expected fullscreen window on DP-1, got {other:?}"),
+    }
+
+    // Output 2's Top bar is NOT suppressed and receives pointer hit-testing and click-focus.
+    match env.state.hit_test_target(secondary_bar_pt) {
+        Some(PointerHitTarget::Layer { layer_root, .. }) => {
+            assert_eq!(layer_root, server_secondary_bar);
+        }
+        other => panic!("expected secondary Top bar on HDMI-A-1, got {other:?}"),
+    }
+    env.state.handle_pointer_button_focus(secondary_bar_pt);
+    assert_eq!(
+        env.state.kb().and_then(|kb| kb.current_focus()),
+        Some(server_secondary_bar),
+        "secondary Top bar must still be clickable while primary output is fullscreen"
+    );
+
+    // Flip fullscreen: unfullscreen output 1, fullscreen output 2.
+    // Even with output 1's oversized 2560px Top bar buffer, clicks on output 2 at x=2020 must
+    // NOT leak to output 1's Top bar and must hit output 2's fullscreen window instead.
+    env.state.set_window_fullscreen(win1, false, None);
+    env.state.set_window_fullscreen(win2, true, None);
+    env.pump();
+    let full2_fd = create_portable_shm_fd(1920 * 1080 * 4, None);
+    let full2_pool = shm.create_pool(full2_fd.as_fd(), 1920 * 1080 * 4, &qh, ());
+    let full2_buf =
+        full2_pool.create_buffer(0, 1920, 1080, 1920 * 4, wl_shm::Format::Argb8888, &qh, ());
+    win2_surf.attach(Some(&full2_buf), 0, 0);
+    win2_surf.commit();
+    env.pump();
+
+    match env.state.hit_test_target(secondary_bar_pt) {
+        Some(PointerHitTarget::Window {
+            win_id: hit_win, ..
+        }) => assert_eq!(
+            hit_win, win2,
+            "DP-1 oversized Top bar must not capture clicks on HDMI-A-1"
+        ),
+        other => panic!("expected fullscreen win2 on HDMI-A-1, got {other:?}"),
+    }
+
+    full1_buf.destroy();
+    full1_pool.destroy();
+    full2_buf.destroy();
+    full2_pool.destroy();
+    primary_bar_layer.destroy();
+    pbar_buf.destroy();
+    pbar_pool.destroy();
+    secondary_bar_layer.destroy();
+    sbar_buf.destroy();
+    sbar_pool.destroy();
+}
