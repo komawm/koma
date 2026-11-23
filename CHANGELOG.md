@@ -6,6 +6,13 @@ incubation versions; `v0.1.0` will be the first independently accepted product
 release. A `0.0.x` tag is a development prerelease and does not claim a working
 desktop, hardware support, or security guarantees.
 
+## [0.0.13] - 2026-11-23
+
+### Fixed
+
+- **Scratchpad overlay renders GUI across TTY, Winit, and Screencopy** (`komawm/koma#132`):
+  falls back in `KomaState::focused_output_name` to tracked `focused_output_name` (and the first enabled `output_layout` entry) when `all_outputs()` is empty while `state.backend` is temporarily `.take()`-n during frame rendering (`backend_tty`, `backend_winit`, `screencopy`), preventing `special_overlay` and `step_agent_cursor_for_output` from always evaluating as unfocused (`None`) and skipping Scratchpad rendering while input still reached the overlay; also aligns `frame_edge_under_pointer` with the open Scratchpad workspace.
+
 ## [0.0.12] - 2026-11-23
 
 ### Added

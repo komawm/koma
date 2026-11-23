@@ -8560,3 +8560,95 @@ fn window_rule_maximized_output_immediate_and_suppress_maximize() {
         "suppress_events = {{ 'maximize' }} must reject client maximize_request"
     );
 }
+
+#[test]
+fn issue_132_scratchpad_scene_remains_visible_while_backend_is_taken_for_render() {
+    use koma_lua::ActionDescriptor;
+
+    let mut env = ClientEnv::new();
+    let out = env._output.clone();
+    env.state
+        .register_or_update_output(&out, Some((0, 0)), Default::default(), true);
+    let out_name = env
+        .state
+        .focused_output_name()
+        .expect("ClientEnv starts with a primary output");
+    let (_s1, _xs1, _tl1) = env.spawn_window("BaseWin", "org.koma.base");
+    let (_s2, _xs2, _tl2) = env.spawn_window("PadWin", "org.koma.pad");
+    env.pump();
+
+    let pad_win_id = env.state.mapped_windows[1].win_id;
+
+    // Move `PadWin` into `special:magic` (`silent = false` opens the scratchpad overlay).
+    crate::keybind_dispatcher::execute_action_descriptor(
+        &mut env.state,
+        ActionDescriptor::ScratchpadMoveWindow {
+            name: None,
+            silent: false,
+        },
+        false,
+    );
+    env.pump();
+
+    let sp_id = env
+        .state
+        .active_special_ws_id
+        .clone()
+        .expect("Mod + Shift + S opens special:magic");
+
+    // While the scratchpad overlay is open, frame-edge resize hover targets the scratchpad
+    // window rather than the dimmed workspace beneath it.
+    let pad_rect = env
+        .state
+        .mapped_windows
+        .iter()
+        .find(|m| m.win_id == pad_win_id)
+        .expect("pad window mapped")
+        .rect;
+    let edge_hit = env
+        .state
+        .frame_edge_under_pointer(Point::from((f64::from(pad_rect.x), f64::from(pad_rect.y))));
+    assert_eq!(
+        edge_hit.map(|(w, ws, _)| (w, ws)),
+        Some((pad_win_id, sp_id.clone())),
+        "frame_edge_under_pointer must target the open scratchpad window"
+    );
+
+    // Simulate the `.take()` render window where `state.backend` is temporarily `None`
+    // (`render_pending_tty_outputs`, `render_winit_frame`, `screencopy`).
+    let saved_test_outputs = std::mem::take(&mut env.state.test_outputs);
+    assert_eq!(
+        env.state.focused_output_name().as_deref(),
+        Some(out_name.as_str()),
+        "focused_output_name must still resolve while backend is taken for rendering"
+    );
+    let (base_items, special_overlay) = env.state.collect_output_scene_items(&out_name);
+    assert_eq!(base_items.len(), 1, "base workspace still holds BaseWin");
+    let (_sp_lease, sp_items) = special_overlay
+        .expect("special_overlay must be collected when backend is taken for render");
+    assert_eq!(sp_items.len(), 1);
+    assert_eq!(sp_items[0].win_id, pad_win_id);
+
+    // Restore outputs, toggle off (`Mod + S`) and back on (`Mod + S`), and verify again.
+    env.state.test_outputs = saved_test_outputs;
+    crate::keybind_dispatcher::execute_action_descriptor(
+        &mut env.state,
+        ActionDescriptor::ScratchpadToggle(None),
+        false,
+    );
+    assert!(env.state.active_special_ws_id.is_none());
+    crate::keybind_dispatcher::execute_action_descriptor(
+        &mut env.state,
+        ActionDescriptor::ScratchpadToggle(None),
+        false,
+    );
+    assert_eq!(env.state.active_special_ws_id.as_ref(), Some(&sp_id));
+
+    let saved_test_outputs = std::mem::take(&mut env.state.test_outputs);
+    let (_base_items2, special_overlay2) = env.state.collect_output_scene_items(&out_name);
+    let (_sp_lease2, sp_items2) =
+        special_overlay2.expect("Mod + S toggle-on must also render while backend is taken");
+    assert_eq!(sp_items2.len(), 1);
+    assert_eq!(sp_items2[0].win_id, pad_win_id);
+    env.state.test_outputs = saved_test_outputs;
+}
