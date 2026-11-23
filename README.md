@@ -53,6 +53,51 @@ The target development toolchain is Rust `1.100.0`, with Rust 2024 edition. The 
 
 Tags matching `v0.0.x` publish **development prereleases** to [GitHub Releases](https://github.com/komawm/koma/releases) through the [release workflow](https://github.com/komawm/koma/blob/main/.github/workflows/release.yml) after the same gates as CI pass. Each release attaches `koma-<version>-x86_64-unknown-linux-gnu.tar.gz` and `SHA256SUMS`. The archive contains `bin/` (`koma`, `komactl`, `koma-overview`, `xdg-desktop-portal-koma`), `resources/`, `examples/`, `LICENSE`, `README.md`, `CHANGELOG.md`, and `RELEASE-MANIFEST.toml` (version, git revision, toolchain, build date and per-binary SHA-256). Verify a download with `sha256sum -c SHA256SUMS` in the directory holding both files. Build the same archive locally with `just package-release 0.0.1`. See the [changelog](https://github.com/komawm/koma/blob/main/CHANGELOG.md) for contents and known limits. These prereleases carry no hardware, DRM/KMS, security or desktop-support claims; `v0.1.0` remains the first accepted release, as defined in the [release plan](https://github.com/komawm/.github/blob/main/docs/releases.md).
 
+## NixOS / Flake & Binary Cache
+
+Koma ships a Nix flake (`flake.nix`) providing packages for `x86_64-linux` and `aarch64-linux` as well as a NixOS module (`nixosModules.koma`).
+
+Add Koma to your system flake inputs and enable `programs.koma`:
+
+```nix
+{
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+    koma.url = "github:komawm/koma";
+  };
+
+  outputs = { nixpkgs, koma, ... }: {
+    nixosConfigurations.my-host = nixpkgs.lib.nixosSystem {
+      system = "x86_64-linux";
+      modules = [
+        koma.nixosModules.koma
+        {
+          programs.koma.enable = true;
+        }
+      ];
+    };
+  };
+}
+```
+
+### Binary cache (`komawm.cachix.org`)
+
+Pre-built closures are served from the `komawm` Cachix cache:
+
+- **Substituter**: `https://komawm.cachix.org`
+- **Public key**: `komawm.cachix.org-1:7wdl1Turej+CDmCxfK7pOzKASNDzKDQjWMQUbEp5Csg=`
+
+`flake.nix` declares top-level `nixConfig` (`extra-substituters` and `extra-trusted-public-keys`) so `nix build` / `nix develop` prompts trusted users to accept the cache (or applies automatically with `--accept-flake-config`). On NixOS, you can configure the cache permanently in `configuration.nix`:
+
+```nix
+nix.settings = {
+  extra-substituters = [ "https://komawm.cachix.org" ];
+  extra-trusted-public-keys = [
+    "komawm.cachix.org-1:7wdl1Turej+CDmCxfK7pOzKASNDzKDQjWMQUbEp5Csg="
+  ];
+};
+```
+
 ## Development
 
 Use the pinned Rust toolchain and the repository [justfile](https://github.com/komawm/koma/blob/main/justfile). Run commands from the Koma checkout:
