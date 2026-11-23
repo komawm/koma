@@ -1526,7 +1526,21 @@ impl KomaState {
 
     #[must_use]
     pub fn focused_output_name(&self) -> Option<String> {
-        self.focused_output().map(|o| o.name())
+        self.focused_output().map(|o| o.name()).or_else(|| {
+            // Render paths (`render_pending_tty_outputs`, `render_winit_frame`, `screencopy`)
+            // temporarily `.take()` `state.backend`, leaving `all_outputs()` empty; preserve the
+            // tracked focused output name so `special:<name>` Scratchpad overlays still render.
+            if self.all_outputs().is_empty() {
+                self.focused_output_name.clone().or_else(|| {
+                    self.output_layout
+                        .enabled_entries()
+                        .next()
+                        .map(|e| e.name.clone())
+                })
+            } else {
+                None
+            }
+        })
     }
 
     #[must_use]
@@ -3828,10 +3842,18 @@ impl KomaState {
             (_, Some(out)) => out.name(),
             (false, None) => self.focused_output_name.clone().unwrap_or_default(),
         };
-        let ws_id = self.active_workspace_for_output(&output_name);
-        let origin = self.workspace_output_origin(&ws_id);
-
+        let is_focused_output = if has_outputs {
+            self.focused_output_name().as_deref() == Some(output_name.as_str())
+        } else {
+            true
+        };
         // A `special:<name>` Scratchpad sits above the workspace and owns the pointer while open.
+        let ws_id = if is_focused_output && let Some(sp_id) = &self.active_special_ws_id {
+            sp_id.clone()
+        } else {
+            self.active_workspace_for_output(&output_name)
+        };
+        let origin = self.workspace_output_origin(&ws_id);
         let mut candidates: Vec<&MappedWindow> = self
             .mapped_windows
             .iter()
@@ -8043,5 +8065,26 @@ pub(crate) mod tests {
         assert_eq!(json["p95_bucket"], "8-16ms");
         assert_eq!(json["buckets"]["lt_1ms"], 9);
         assert_eq!(json["buckets"]["ms_8_16"], 1);
+    }
+
+    #[test]
+    fn issue_132_focused_output_name_survives_taken_backend_during_render() {
+        let (_el, _disp, mut state) = make_headless_test_state();
+        let edp = test_output("eDP-1");
+        state.test_outputs = vec![edp.clone()];
+        state.register_or_update_output(&edp, Some((0, 0)), SafeAreaInsets::default(), true);
+        assert_eq!(state.focused_output_name().as_deref(), Some("eDP-1"));
+
+        // Simulate `state.backend.take()` during TTY/Winit/Screencopy render passes.
+        state.test_outputs.clear();
+        assert_eq!(state.focused_output_name().as_deref(), Some("eDP-1"));
+
+        // Even if `focused_output_name` was temporarily unset, enabled layout entries still resolve.
+        state.focused_output_name = None;
+        assert_eq!(state.focused_output_name().as_deref(), Some("eDP-1"));
+
+        // Unregistering the output clears both tracked focus and layout entry.
+        state.unregister_output(&edp);
+        assert_eq!(state.focused_output_name(), None);
     }
 }
