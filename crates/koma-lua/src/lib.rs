@@ -8,6 +8,7 @@
 pub mod effective_keymap;
 pub mod host_abi;
 pub mod keybind_catalog;
+pub mod path_resolve;
 pub mod recorder;
 pub mod scaffold;
 pub mod schema;
