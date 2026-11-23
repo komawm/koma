@@ -2618,47 +2618,49 @@ impl KomaState {
         };
 
         let wa = viewport.work_area_rect();
-        let (initial_size, configure_mode) =
-            if initial_rules.open_mode == Some(OpenMode::Fullscreen) {
-                (
-                    Some(Size::from((viewport.width as i32, viewport.height as i32))),
-                    InitialConfigureMode::Fullscreen,
-                )
-            } else if initial_rules.open_mode == Some(OpenMode::Maximized) {
-                let inner_w = maximized_rect.w.saturating_sub(border_inset).max(48) as i32;
-                let inner_h = maximized_rect.h.saturating_sub(border_inset).max(48) as i32;
-                (
-                    Some(Size::from((inner_w, inner_h))),
-                    InitialConfigureMode::Maximized,
-                )
-            } else if resolves_to_float {
-                let ((w, h), has_explicit_size) =
-                    resolve_rule_floating_size(wa, (0, 0), max_sz, &initial_rules);
-                let sz = if has_explicit_size {
-                    Some(Size::from((
-                        w.saturating_sub(border_inset).max(48) as i32,
-                        h.saturating_sub(border_inset).max(48) as i32,
-                    )))
-                } else {
-                    None
-                };
-                (sz, InitialConfigureMode::Floating)
-            } else if initial_rules.open_mode.is_none() && (max_sz.0 > 0 && max_sz.1 > 0) {
-                (None, InitialConfigureMode::Tiled)
+        let (initial_size, configure_mode) = if initial_rules.open_mode
+            == Some(OpenMode::Fullscreen)
+        {
+            (
+                Some(Size::from((viewport.width as i32, viewport.height as i32))),
+                InitialConfigureMode::Fullscreen,
+            )
+        } else if initial_rules.open_mode == Some(OpenMode::Maximized) {
+            let inner_w = maximized_rect.w.saturating_sub(border_inset).max(48) as i32;
+            let inner_h = maximized_rect.h.saturating_sub(border_inset).max(48) as i32;
+            (
+                Some(Size::from((inner_w, inner_h))),
+                InitialConfigureMode::Maximized,
+            )
+        } else if resolves_to_float {
+            let has_default_size =
+                initial_rules.default_width.is_some() || initial_rules.default_height.is_some();
+            let sz = if has_default_size {
+                let ((w, h), _) = resolve_rule_floating_size(wa, (0, 0), max_sz, &initial_rules);
+                Some(Size::from((
+                    w.saturating_sub(border_inset).max(48) as i32,
+                    h.saturating_sub(border_inset).max(48) as i32,
+                )))
             } else {
-                let inner_w = wa.w.saturating_sub(24).max(64);
-                let inner_h = wa.h.saturating_sub(24).max(64);
-                let base = LogicalRect::new(0, 0, inner_w, inner_h);
-                let target = if size_limits_tiled {
-                    hints.clamp_rect(base)
-                } else {
-                    base
-                };
-                (
-                    Some(Size::from((target.w as i32, target.h as i32))),
-                    InitialConfigureMode::Tiled,
-                )
+                None
             };
+            (sz, InitialConfigureMode::Floating)
+        } else if initial_rules.open_mode.is_none() && (max_sz.0 > 0 && max_sz.1 > 0) {
+            (None, InitialConfigureMode::Tiled)
+        } else {
+            let inner_w = wa.w.saturating_sub(24).max(64);
+            let inner_h = wa.h.saturating_sub(24).max(64);
+            let base = LogicalRect::new(0, 0, inner_w, inner_h);
+            let target = if size_limits_tiled {
+                hints.clamp_rect(base)
+            } else {
+                base
+            };
+            (
+                Some(Size::from((target.w as i32, target.h as i32))),
+                InitialConfigureMode::Tiled,
+            )
+        };
 
         toplevel.with_pending_state(|state| {
             state.size = initial_size;
