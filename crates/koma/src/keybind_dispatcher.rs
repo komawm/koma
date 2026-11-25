@@ -33,7 +33,9 @@ use crate::{
     macro_runtime::{execute_queued_host_actions, rearm_trampoline_timer},
     pointer_grabs::{
         BTN_EXTRA, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, BTN_SIDE, cancel_active_pointer_grab,
-        start_compositor_move_grab, start_compositor_resize_grab, start_frame_edge_resize_grab,
+        has_explicit_pointer_grab, start_compositor_move_grab,
+        start_compositor_move_grab_with_chord, start_compositor_resize_grab,
+        start_compositor_resize_grab_with_chord, start_frame_edge_resize_grab,
     },
     state::KomaState,
 };
@@ -129,7 +131,6 @@ impl MouseButtonTrigger {
     }
 
     #[must_use]
-    #[allow(dead_code)] // Public evdev button code accessor retained for mouse-bind introspection.
     pub const fn button_code(self) -> u32 {
         match self {
             Self::Left => BTN_LEFT,
@@ -138,6 +139,32 @@ impl MouseButtonTrigger {
             Self::Back => BTN_SIDE,
             Self::Forward => BTN_EXTRA,
         }
+    }
+
+    #[must_use]
+    pub const fn bit(self) -> u8 {
+        match self {
+            Self::Left => 1 << 0,
+            Self::Right => 1 << 1,
+            Self::Middle => 1 << 2,
+            Self::Back => 1 << 3,
+            Self::Forward => 1 << 4,
+        }
+    }
+
+    #[must_use]
+    pub fn button_codes_from_mask(mask: u8) -> Vec<u32> {
+        const ALL: [MouseButtonTrigger; 5] = [
+            MouseButtonTrigger::Left,
+            MouseButtonTrigger::Right,
+            MouseButtonTrigger::Middle,
+            MouseButtonTrigger::Back,
+            MouseButtonTrigger::Forward,
+        ];
+        ALL.into_iter()
+            .filter(|btn| (mask & btn.bit()) != 0)
+            .map(Self::button_code)
+            .collect()
     }
 }
 
@@ -192,6 +219,7 @@ pub enum BindTrigger {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompiledChord {
     pub mods: u8,
+    pub mouse_mods: u8,
     pub trigger: BindTrigger,
 }
 
@@ -324,6 +352,7 @@ pub struct KeybindTable {
     pub pending_releases: HashMap<u32, PendingRelease>,
     pub pending_mouse_releases: HashMap<u32, PendingRelease>,
     pub suppressed_buttons: HashSet<u32>,
+    pub pressed_buttons: HashSet<u32>,
     /// Repeat-while-held state shared by every keyboard bind (`komawm/koma#76`).
     pub repeat: KeyRepeatState,
     pub horizontal_wheel_tracker: ScrollTracker,
@@ -588,6 +617,7 @@ impl KeybindTable {
             pending_releases: HashMap::new(),
             pending_mouse_releases: HashMap::new(),
             suppressed_buttons: HashSet::new(),
+            pressed_buttons: HashSet::new(),
             repeat: KeyRepeatState::default(),
             horizontal_wheel_tracker: ScrollTracker::new(WHEEL_V120_TICK),
             vertical_wheel_tracker: ScrollTracker::new(WHEEL_V120_TICK),
@@ -700,6 +730,7 @@ impl KeybindTable {
         // `Mod + MouseRight` resize available unless explicitly unbound or rebound!
         let lmb_chord = CompiledChord {
             mods: MOD_COMPOSITOR,
+            mouse_mods: 0,
             trigger: BindTrigger::MouseButton(MouseButtonTrigger::Left),
         };
         let lmb_unbound = parsed_unbinds
@@ -725,6 +756,7 @@ impl KeybindTable {
 
         let rmb_chord = CompiledChord {
             mods: MOD_COMPOSITOR,
+            mouse_mods: 0,
             trigger: BindTrigger::MouseButton(MouseButtonTrigger::Right),
         };
         let rmb_unbound = parsed_unbinds
@@ -756,12 +788,27 @@ impl KeybindTable {
             pending_releases: HashMap::new(),
             pending_mouse_releases: HashMap::new(),
             suppressed_buttons: HashSet::new(),
+            pressed_buttons: HashSet::new(),
             repeat: KeyRepeatState::default(),
             horizontal_wheel_tracker: ScrollTracker::new(WHEEL_V120_TICK),
             vertical_wheel_tracker: ScrollTracker::new(WHEEL_V120_TICK),
             horizontal_finger_tracker: ScrollTracker::new(TOUCHPAD_SCROLL_TICK),
             vertical_finger_tracker: ScrollTracker::new(TOUCHPAD_SCROLL_TICK),
         })
+    }
+
+    #[must_use]
+    pub fn pressed_mouse_buttons_mask(&self, exclude_button: Option<u32>) -> u8 {
+        let mut mask = 0_u8;
+        for &code in &self.pressed_buttons {
+            if Some(code) == exclude_button {
+                continue;
+            }
+            if let Some(btn) = MouseButtonTrigger::from_button_code(code) {
+                mask |= btn.bit();
+            }
+        }
+        mask
     }
 
     #[must_use]
@@ -797,6 +844,7 @@ pub fn parse_chord_spec(raw_chord: &str) -> Result<CompiledChord, String> {
     };
 
     let mut mods: u8 = 0;
+    let mut mouse_mods: u8 = 0;
     for &m in mod_tokens {
         match m.to_ascii_lowercase().as_str() {
             "mod" => mods |= MOD_COMPOSITOR,
@@ -806,14 +854,24 @@ pub fn parse_chord_spec(raw_chord: &str) -> Result<CompiledChord, String> {
             "super" | "win" | "logo" | "meta" | "mod4" => mods |= MOD_LOGO,
             "mod5" | "altgr" | "iso_level3_shift" => mods |= MOD_ISO_LEVEL3,
             other => {
-                return Err(format!(
-                    "unknown modifier `{other}` (valid: Mod, Super, Alt, Ctrl, Shift, Mod5)"
-                ));
+                if let Some(mouse_btn) = MouseButtonTrigger::try_parse(other) {
+                    if (mouse_mods & mouse_btn.bit()) != 0 {
+                        return Err(format!("duplicate mouse button `{m}` in chord"));
+                    }
+                    mouse_mods |= mouse_btn.bit();
+                } else {
+                    return Err(format!(
+                        "unknown modifier `{other}` (valid: Mod, Super, Alt, Ctrl, Shift, Mod5, or MouseLeft/Right/Middle/Back/Forward)"
+                    ));
+                }
             }
         }
     }
 
     let trigger = if let Some(mouse_btn) = MouseButtonTrigger::try_parse(trigger_tok) {
+        if (mouse_mods & mouse_btn.bit()) != 0 {
+            return Err(format!("duplicate mouse button `{trigger_tok}` in chord"));
+        }
         BindTrigger::MouseButton(mouse_btn)
     } else if let Some(scroll_kind) = ScrollTriggerKind::try_parse(trigger_tok) {
         BindTrigger::Scroll(scroll_kind)
@@ -825,7 +883,11 @@ pub fn parse_chord_spec(raw_chord: &str) -> Result<CompiledChord, String> {
         }
     };
 
-    Ok(CompiledChord { mods, trigger })
+    Ok(CompiledChord {
+        mods,
+        mouse_mods,
+        trigger,
+    })
 }
 
 fn resolve_xkb_keysym_token(token: &str) -> Result<(Keysym, bool), String> {
@@ -943,16 +1005,23 @@ fn chords_match_under_mod_override(
     b: CompiledChord,
     mod_key_override: Option<PhysicalModKey>,
 ) -> bool {
-    if a.trigger != b.trigger {
+    let kb_mods_match = if a.mods == b.mods {
+        true
+    } else if let Some(phys) = mod_key_override {
+        expand_bind_modifiers(a.mods, phys) == expand_bind_modifiers(b.mods, phys)
+    } else {
+        false
+    };
+    if !kb_mods_match {
         return false;
     }
-    if a.mods == b.mods {
-        return true;
+
+    match (a.trigger, b.trigger) {
+        (BindTrigger::MouseButton(btn_a), BindTrigger::MouseButton(btn_b)) => {
+            (a.mouse_mods | btn_a.bit()) == (b.mouse_mods | btn_b.bit())
+        }
+        _ => a.trigger == b.trigger && a.mouse_mods == b.mouse_mods,
     }
-    if let Some(phys) = mod_key_override {
-        return expand_bind_modifiers(a.mods, phys) == expand_bind_modifiers(b.mods, phys);
-    }
-    false
 }
 
 /// Unified `PointerButton` handler shared by `backend_winit.rs` and `backend_tty.rs`
@@ -976,6 +1045,15 @@ pub fn process_pointer_button_event(
     state.reconcile_session_lock();
     state.notify_user_activity();
 
+    match btn_state {
+        ButtonState::Pressed => {
+            state.keybinds.pressed_buttons.insert(button_code);
+        }
+        ButtonState::Released => {
+            state.keybinds.pressed_buttons.remove(&button_code);
+        }
+    }
+
     // The keybind overview consumes every pointer button: a press dismisses it and is not
     // forwarded to the client below the scrim.
     if state.keybind_overlay_is_open() && !state.is_locked_or_abandoned() {
@@ -995,8 +1073,13 @@ pub fn process_pointer_button_event(
         return;
     };
 
-    // 1. Active PointerGrab (`MoveWindowGrab` / `ResizeWindowGrab` / Popup / DnD) owns all buttons!
-    if pointer.is_grabbed() {
+    // 1. Active explicit PointerGrab (`MoveWindowGrab` / `ResizeWindowGrab` / Popup / DnD) owns all buttons!
+    //    (Smithay's implicit `ClickGrab` while a client button is held still allows multi-button chords
+    //     such as `MouseLeft + MouseRight` to match on the second button's press.)
+    if has_explicit_pointer_grab(state, &pointer) {
+        if btn_state == ButtonState::Released {
+            state.keybinds.suppressed_buttons.remove(&button_code);
+        }
         dispatch_pointer_button_and_frame(state, button_code, btn_state, serial, time);
         return;
     }
@@ -1014,21 +1097,28 @@ pub fn process_pointer_button_event(
             execute_action_descriptor(state, rel.action, is_bare_metal_tty);
         }
         if was_suppressed {
+            if pointer.current_focus().is_none() {
+                dispatch_pointer_button_and_frame(state, button_code, btn_state, serial, time);
+            }
             return;
         }
         dispatch_pointer_button_and_frame(state, button_code, btn_state, serial, time);
         return;
     }
 
-    // 3. ButtonState::Pressed while ungrabbed: check mouse-button binds (`Mod + MouseLeft/Right/...`)
+    // 3. ButtonState::Pressed while ungrabbed: check mouse-button binds (`Mod + MouseLeft/Right/...`,
+    //    or multi-button chords such as `MouseLeft + MouseRight`)
     if let Some(btn_trigger) = MouseButtonTrigger::from_button_code(button_code) {
         let held_mask = state
             .kb()
             .map(|kb| modifiers_mask_from_smithay(&kb.modifier_state()))
             .unwrap_or(0);
+        let held_mouse_mask = state.keybinds.pressed_mouse_buttons_mask(Some(button_code));
         let phys_mod = state.keybinds.effective_mod_key(is_bare_metal_tty);
 
-        if let Some(idx) = find_mouse_button_bind_idx(state, btn_trigger, held_mask, phys_mod) {
+        if let Some(idx) =
+            find_mouse_button_bind_idx(state, btn_trigger, held_mask, held_mouse_mask, phys_mod)
+        {
             let bind = state.keybinds.binds[idx].clone();
             let now_ms = state.elapsed_ms();
             let cooling_down = bind.options.cooldown_ms.is_some_and(|cd| {
@@ -1053,9 +1143,25 @@ pub fn process_pointer_button_event(
                     );
                 }
 
+                let chord_buttons = if bind.chord.mouse_mods != 0 {
+                    let trigger_bit = match bind.chord.trigger {
+                        BindTrigger::MouseButton(b) => b.bit(),
+                        _ => btn_trigger.bit(),
+                    };
+                    MouseButtonTrigger::button_codes_from_mask(bind.chord.mouse_mods | trigger_bit)
+                } else {
+                    vec![button_code]
+                };
+
                 match bind.press_action {
                     Some(ActionDescriptor::WindowDragMove) => {
-                        if start_compositor_move_grab(state, button_code, serial) {
+                        if start_compositor_move_grab_with_chord(
+                            state,
+                            button_code,
+                            chord_buttons,
+                            serial,
+                        ) {
+                            state.keybinds.suppressed_buttons.insert(button_code);
                             // Forward press into newly installed `MoveWindowGrab` so `current_pressed()`
                             // records `button_code` while `Focus::Clear` prevents client click leak!
                             dispatch_pointer_button_and_frame(
@@ -1069,7 +1175,13 @@ pub fn process_pointer_button_event(
                         }
                     }
                     Some(ActionDescriptor::WindowDragResize) => {
-                        if start_compositor_resize_grab(state, button_code, serial) {
+                        if start_compositor_resize_grab_with_chord(
+                            state,
+                            button_code,
+                            chord_buttons,
+                            serial,
+                        ) {
+                            state.keybinds.suppressed_buttons.insert(button_code);
                             dispatch_pointer_button_and_frame(
                                 state,
                                 button_code,
@@ -1144,6 +1256,7 @@ fn find_mouse_button_bind_idx(
     state: &KomaState,
     btn: MouseButtonTrigger,
     held_mask: u8,
+    held_mouse_mask: u8,
     phys_mod: PhysicalModKey,
 ) -> Option<usize> {
     let active_mode = &state.keybinds.active_mode;
@@ -1153,19 +1266,33 @@ fn find_mouse_button_bind_idx(
         .get(&state.active_ws_id)
         .is_some_and(|ws| ws.lease.is_human_preempted());
 
-    state.keybinds.binds.iter().position(|bind| {
+    let mut single_match = None;
+    for (idx, bind) in state.keybinds.binds.iter().enumerate() {
         if !bind.enabled || &bind.mode != active_mode {
-            return false;
+            continue;
         }
         if !is_keybind_allowed_for_lock_state(is_locked, bind.options.allow_when_locked) {
-            return false;
+            continue;
         }
         if is_preempted && bind.options.when_preempted == "ignore" {
-            return false;
+            continue;
         }
-        bind.chord.trigger == BindTrigger::MouseButton(btn)
-            && expand_bind_modifiers(bind.chord.mods, phys_mod) == held_mask
-    })
+        let BindTrigger::MouseButton(bind_btn) = bind.chord.trigger else {
+            continue;
+        };
+        if expand_bind_modifiers(bind.chord.mods, phys_mod) != held_mask {
+            continue;
+        }
+        if bind.chord.mouse_mods != 0 {
+            let chord_mask = bind.chord.mouse_mods | bind_btn.bit();
+            if (chord_mask & btn.bit()) != 0 && (held_mouse_mask | btn.bit()) == chord_mask {
+                return Some(idx);
+            }
+        } else if bind_btn == btn && single_match.is_none() {
+            single_match = Some(idx);
+        }
+    }
+    single_match
 }
 
 /// Unified keyboard event entry point shared by both `backend_winit.rs` and `backend_tty.rs`.
@@ -1421,8 +1548,14 @@ pub fn process_keyboard_key_event(
                             } else {
                                 held_mask == required_mask
                             };
+                            let mouse_mods_match = if bind.chord.mouse_mods != 0 {
+                                state.keybinds.pressed_mouse_buttons_mask(None)
+                                    == bind.chord.mouse_mods
+                            } else {
+                                true
+                            };
 
-                            if mods_match {
+                            if mods_match && mouse_mods_match {
                                 matched_idx = Some(idx);
                                 break 'sym_loop;
                             }
@@ -1880,19 +2013,32 @@ fn find_scroll_bind_idx(
         .get(&state.active_ws_id)
         .is_some_and(|ws| ws.lease.is_human_preempted());
 
-    state.keybinds.binds.iter().position(|bind| {
+    let held_mouse_mask = state.keybinds.pressed_mouse_buttons_mask(None);
+    let mut plain_match = None;
+    for (idx, bind) in state.keybinds.binds.iter().enumerate() {
         if !bind.enabled || &bind.mode != active_mode {
-            return false;
+            continue;
         }
         if !is_keybind_allowed_for_lock_state(is_locked, bind.options.allow_when_locked) {
-            return false;
+            continue;
         }
         if is_preempted && bind.options.when_preempted == "ignore" {
-            return false;
+            continue;
         }
-        bind.chord.trigger == BindTrigger::Scroll(kind)
-            && expand_bind_modifiers(bind.chord.mods, phys_mod) == held_mask
-    })
+        if bind.chord.trigger != BindTrigger::Scroll(kind)
+            || expand_bind_modifiers(bind.chord.mods, phys_mod) != held_mask
+        {
+            continue;
+        }
+        if bind.chord.mouse_mods != 0 {
+            if held_mouse_mask == bind.chord.mouse_mods {
+                return Some(idx);
+            }
+        } else if plain_match.is_none() {
+            plain_match = Some(idx);
+        }
+    }
+    plain_match
 }
 
 fn bind_consumes_axis(state: &KomaState, idx: Option<usize>) -> bool {
@@ -3324,5 +3470,64 @@ mod tests {
                 bind.raw_chord
             );
         }
+    }
+
+    #[test]
+    fn parses_multi_mouse_button_chords_and_rejects_duplicates() {
+        let lr = parse_chord_spec("MouseLeft + MouseRight").expect("MouseLeft + MouseRight");
+        assert_eq!(lr.mods, 0);
+        assert_eq!(lr.mouse_mods, MouseButtonTrigger::Left.bit());
+        assert_eq!(
+            lr.trigger,
+            BindTrigger::MouseButton(MouseButtonTrigger::Right)
+        );
+
+        let rl = parse_chord_spec("MouseRight + MouseLeft").expect("MouseRight + MouseLeft");
+        assert_eq!(rl.mods, 0);
+        assert_eq!(rl.mouse_mods, MouseButtonTrigger::Right.bit());
+        assert_eq!(
+            rl.trigger,
+            BindTrigger::MouseButton(MouseButtonTrigger::Left)
+        );
+        assert!(chords_match_under_mod_override(lr, rl, None));
+
+        let mod_lr =
+            parse_chord_spec("Mod + MouseLeft + MouseRight").expect("Mod + MouseLeft + MouseRight");
+        assert_eq!(mod_lr.mods, MOD_COMPOSITOR);
+        assert_eq!(mod_lr.mouse_mods, MouseButtonTrigger::Left.bit());
+        assert_eq!(
+            mod_lr.trigger,
+            BindTrigger::MouseButton(MouseButtonTrigger::Right)
+        );
+        assert!(!chords_match_under_mod_override(lr, mod_lr, None));
+
+        assert!(parse_chord_spec("MouseLeft + MouseLeft").is_err());
+        assert!(parse_chord_spec("MouseLeft + MouseLeft + MouseRight").is_err());
+    }
+
+    #[test]
+    fn override_matches_order_independent_multi_mouse_button_chord() {
+        let first = BindSpec {
+            id: BindHandleId(950),
+            mode: None,
+            enabled: true,
+            chord: "MouseLeft + MouseRight".to_owned(),
+            action: ActionDescriptor::WindowDragMove,
+            release_action: None,
+            options: BindOptions::default(),
+        };
+        let second = BindSpec {
+            id: BindHandleId(951),
+            mode: None,
+            enabled: true,
+            chord: "MouseRight + MouseLeft".to_owned(),
+            action: ActionDescriptor::WindowDragResize,
+            release_action: None,
+            options: BindOptions::default(),
+        };
+        let table = KeybindTable::compile_with_options(&[first, second], &[], false, None)
+            .expect("compile");
+        assert!(table.binds.iter().any(|b| b.id == BindHandleId(951)));
+        assert!(!table.binds.iter().any(|b| b.id == BindHandleId(950)));
     }
 }

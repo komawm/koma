@@ -8652,3 +8652,205 @@ fn issue_132_scratchpad_scene_remains_visible_while_backend_is_taken_for_render(
     assert_eq!(sp_items2[0].win_id, pad_win_id);
     env.state.test_outputs = saved_test_outputs;
 }
+
+#[test]
+fn multi_mouse_button_chord_triggers_move_grab_order_independently_and_releases_cleanly() {
+    use crate::pointer_grabs::{BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, BTN_SIDE};
+    use smithay::backend::input::ButtonState;
+
+    let mut env = ClientEnv::new();
+    let (_surf, _xdg, _tl) = env.spawn_window("chord-drag", "chord.drag");
+    env.pump();
+    let mapped = env.state.mapped_windows.last().expect("mapped window");
+    let win_id = mapped.win_id;
+    let win_rect = mapped.rect;
+
+    let specs = vec![
+        koma_lua::BindSpec {
+            id: koma_lua::BindHandleId(1),
+            mode: None,
+            enabled: true,
+            chord: "MouseLeft + MouseRight".to_owned(),
+            action: koma_lua::ActionDescriptor::WindowDragMove,
+            release_action: None,
+            options: koma_lua::BindOptions::default(),
+        },
+        koma_lua::BindSpec {
+            id: koma_lua::BindHandleId(2),
+            mode: None,
+            enabled: true,
+            chord: "MouseMiddle + MouseBack".to_owned(),
+            action: koma_lua::ActionDescriptor::WindowFloatToggle,
+            release_action: None,
+            options: koma_lua::BindOptions::default(),
+        },
+    ];
+    env.state.keybinds =
+        crate::keybind_dispatcher::KeybindTable::compile_with_options(&specs, &[], false, None)
+            .expect("compile multi-mouse-button binds");
+
+    let inside = Point::from((f64::from(win_rect.x) + 20.0, f64::from(win_rect.y) + 20.0));
+    env.state
+        .handle_pointer_absolute_motion(inside, InputTime::from_millis(10));
+    env.pump();
+
+    // 1. Single-button click does not trigger the multi-button grab.
+    crate::keybind_dispatcher::process_pointer_button_event(
+        &mut env.state,
+        BTN_LEFT,
+        ButtonState::Pressed,
+        InputTime::from_millis(20),
+        false,
+    );
+    assert!(
+        !crate::pointer_grabs::has_explicit_pointer_grab(
+            &env.state,
+            &env.state.seat.get_pointer().unwrap(),
+        ),
+        "single-button press must not start an explicit compositor grab"
+    );
+    crate::keybind_dispatcher::process_pointer_button_event(
+        &mut env.state,
+        BTN_LEFT,
+        ButtonState::Released,
+        InputTime::from_millis(30),
+        false,
+    );
+    assert!(!env.state.seat.get_pointer().unwrap().is_grabbed());
+    assert!(env.state.keybinds.pressed_buttons.is_empty());
+
+    // 2. Order A: Hold MouseLeft, press MouseRight -> MoveWindowGrab starts.
+    // Releasing MouseLeft first (the non-trigger button) must cleanly end the grab!
+    crate::keybind_dispatcher::process_pointer_button_event(
+        &mut env.state,
+        BTN_LEFT,
+        ButtonState::Pressed,
+        InputTime::from_millis(40),
+        false,
+    );
+    assert!(!crate::pointer_grabs::has_explicit_pointer_grab(
+        &env.state,
+        &env.state.seat.get_pointer().unwrap()
+    ));
+    crate::keybind_dispatcher::process_pointer_button_event(
+        &mut env.state,
+        BTN_RIGHT,
+        ButtonState::Pressed,
+        InputTime::from_millis(50),
+        false,
+    );
+    assert_eq!(
+        env.state
+            .seat
+            .get_pointer()
+            .unwrap()
+            .with_grab(|_, grab| grab.is::<crate::pointer_grabs::MoveWindowGrab>()),
+        Some(true),
+        "MouseLeft + MouseRight must start MoveWindowGrab"
+    );
+    crate::keybind_dispatcher::process_pointer_button_event(
+        &mut env.state,
+        BTN_LEFT,
+        ButtonState::Released,
+        InputTime::from_millis(60),
+        false,
+    );
+    assert!(
+        !env.state.seat.get_pointer().unwrap().is_grabbed(),
+        "releasing MouseLeft first must end MoveWindowGrab"
+    );
+    crate::keybind_dispatcher::process_pointer_button_event(
+        &mut env.state,
+        BTN_RIGHT,
+        ButtonState::Released,
+        InputTime::from_millis(70),
+        false,
+    );
+    assert!(env.state.keybinds.pressed_buttons.is_empty());
+    assert!(env.state.keybinds.suppressed_buttons.is_empty());
+
+    // 3. Order B: Hold MouseRight, press MouseLeft -> MoveWindowGrab starts order-independently.
+    // Releasing MouseRight first must also cleanly end the grab!
+    crate::keybind_dispatcher::process_pointer_button_event(
+        &mut env.state,
+        BTN_RIGHT,
+        ButtonState::Pressed,
+        InputTime::from_millis(80),
+        false,
+    );
+    assert!(!crate::pointer_grabs::has_explicit_pointer_grab(
+        &env.state,
+        &env.state.seat.get_pointer().unwrap()
+    ));
+    crate::keybind_dispatcher::process_pointer_button_event(
+        &mut env.state,
+        BTN_LEFT,
+        ButtonState::Pressed,
+        InputTime::from_millis(90),
+        false,
+    );
+    assert_eq!(
+        env.state
+            .seat
+            .get_pointer()
+            .unwrap()
+            .with_grab(|_, grab| grab.is::<crate::pointer_grabs::MoveWindowGrab>()),
+        Some(true),
+        "MouseRight + MouseLeft must start MoveWindowGrab order-independently"
+    );
+    crate::keybind_dispatcher::process_pointer_button_event(
+        &mut env.state,
+        BTN_RIGHT,
+        ButtonState::Released,
+        InputTime::from_millis(100),
+        false,
+    );
+    assert!(
+        !env.state.seat.get_pointer().unwrap().is_grabbed(),
+        "releasing MouseRight first must end MoveWindowGrab"
+    );
+    crate::keybind_dispatcher::process_pointer_button_event(
+        &mut env.state,
+        BTN_LEFT,
+        ButtonState::Released,
+        InputTime::from_millis(110),
+        false,
+    );
+    assert!(env.state.keybinds.pressed_buttons.is_empty());
+    assert!(env.state.keybinds.suppressed_buttons.is_empty());
+
+    // 4. Custom non-grab action: MouseMiddle + MouseBack toggles floating.
+    let ws_id = env.state.active_ws_id.clone();
+    assert!(!env.state.workspaces[&ws_id].floating.contains(win_id));
+    crate::keybind_dispatcher::process_pointer_button_event(
+        &mut env.state,
+        BTN_MIDDLE,
+        ButtonState::Pressed,
+        InputTime::from_millis(120),
+        false,
+    );
+    crate::keybind_dispatcher::process_pointer_button_event(
+        &mut env.state,
+        BTN_SIDE,
+        ButtonState::Pressed,
+        InputTime::from_millis(130),
+        false,
+    );
+    assert!(env.state.workspaces[&ws_id].floating.contains(win_id));
+    crate::keybind_dispatcher::process_pointer_button_event(
+        &mut env.state,
+        BTN_SIDE,
+        ButtonState::Released,
+        InputTime::from_millis(140),
+        false,
+    );
+    crate::keybind_dispatcher::process_pointer_button_event(
+        &mut env.state,
+        BTN_MIDDLE,
+        ButtonState::Released,
+        InputTime::from_millis(150),
+        false,
+    );
+    assert!(env.state.keybinds.pressed_buttons.is_empty());
+    assert!(env.state.keybinds.suppressed_buttons.is_empty());
+}
