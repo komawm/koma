@@ -58,7 +58,7 @@ use smithay::wayland::seat::WaylandFocus as _;
 use wayland_client::protocol::{
     wl_buffer, wl_callback, wl_compositor, wl_data_device, wl_data_device_manager,
     wl_data_offer, wl_data_source, wl_keyboard, wl_output, wl_pointer, wl_region, wl_registry,
-    wl_seat, wl_shm, wl_shm_pool, wl_surface,
+    wl_seat, wl_shm, wl_shm_pool, wl_surface, wl_touch,
 };
 use wayland_client::{
     Connection, Dispatch, EventQueue, Proxy as _, WEnum, delegate_noop, event_created_child,
@@ -214,18 +214,43 @@ struct CapturedDataSource {
     targets: Vec<Option<String>>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+enum CapturedTouchEvent {
+    Down {
+        id: i32,
+        x: f64,
+        y: f64,
+        serial: u32,
+    },
+    Motion {
+        id: i32,
+        x: f64,
+        y: f64,
+    },
+    Up {
+        id: i32,
+        serial: u32,
+    },
+    Frame,
+    Cancel,
+}
+
 #[derive(Default)]
 struct ClientHarness {
     sync_done: bool,
     globals: BTreeMap<String, (u32, u32)>,
     outputs: Vec<wl_output::WlOutput>,
     seats: Vec<wl_seat::WlSeat>,
+    seat_capabilities: Vec<wl_seat::Capability>,
     pointers: Vec<wl_pointer::WlPointer>,
+    touches: Vec<wl_touch::WlTouch>,
+    touch_events: Vec<CapturedTouchEvent>,
     /// Surface-local `wl_pointer.motion` coordinates recorded per delivered motion event.
     pointer_motion_coords: Vec<(f64, f64)>,
 
     /// `wl_pointer.button` events with the server serial that clients use for `start_drag`.
     pointer_buttons: Vec<(u32, wl_pointer::ButtonState, u32)>,
+    pointer_axis_events: usize,
     data_device: Option<wl_data_device::WlDataDevice>,
     data_source_events: BTreeMap<u32, CapturedDataSource>,
     data_offer_mimes: BTreeMap<u32, Vec<String>>,
@@ -634,6 +659,8 @@ impl Dispatch<wl_registry::WlRegistry, ()> for ClientHarness {
                         registry.bind::<wl_seat::WlSeat, (), Self>(name, version.min(9), qh, ());
                     let pointer = seat.get_pointer(qh, ());
                     state.pointers.push(pointer);
+                    let touch = seat.get_touch(qh, ());
+                    state.touches.push(touch);
                     state.seats.push(seat);
                 }
                 _ => {}
@@ -1219,7 +1246,55 @@ delegate_noop!(ClientHarness: ignore wl_shm::WlShm);
 delegate_noop!(ClientHarness: ignore wl_shm_pool::WlShmPool);
 delegate_noop!(ClientHarness: ignore wl_buffer::WlBuffer);
 delegate_noop!(ClientHarness: ignore wl_output::WlOutput);
-delegate_noop!(ClientHarness: ignore wl_seat::WlSeat);
+impl Dispatch<wl_seat::WlSeat, ()> for ClientHarness {
+    fn event(
+        state: &mut Self,
+        _: &wl_seat::WlSeat,
+        event: wl_seat::Event,
+        _: &(),
+        _: &Connection,
+        _: &wayland_client::QueueHandle<Self>,
+    ) {
+        if let wl_seat::Event::Capabilities {
+            capabilities: WEnum::Value(caps),
+        } = event
+        {
+            state.seat_capabilities.push(caps);
+        }
+    }
+}
+
+impl Dispatch<wl_touch::WlTouch, ()> for ClientHarness {
+    fn event(
+        state: &mut Self,
+        _: &wl_touch::WlTouch,
+        event: wl_touch::Event,
+        _: &(),
+        _: &Connection,
+        _: &wayland_client::QueueHandle<Self>,
+    ) {
+        match event {
+            wl_touch::Event::Down {
+                serial, id, x, y, ..
+            } => state
+                .touch_events
+                .push(CapturedTouchEvent::Down { id, x, y, serial }),
+            wl_touch::Event::Motion { id, x, y, .. } => {
+                state
+                    .touch_events
+                    .push(CapturedTouchEvent::Motion { id, x, y });
+            }
+            wl_touch::Event::Up { serial, id, .. } => {
+                state
+                    .touch_events
+                    .push(CapturedTouchEvent::Up { id, serial });
+            }
+            wl_touch::Event::Frame => state.touch_events.push(CapturedTouchEvent::Frame),
+            wl_touch::Event::Cancel => state.touch_events.push(CapturedTouchEvent::Cancel),
+            _ => {}
+        }
+    }
+}
 delegate_noop!(ClientHarness: ignore xdg_popup::XdgPopup);
 delegate_noop!(ClientHarness: ignore xdg_positioner::XdgPositioner);
 
@@ -1263,6 +1338,9 @@ impl Dispatch<wl_pointer::WlPointer, ()> for ClientHarness {
                 serial,
                 ..
             } => state.pointer_buttons.push((button, btn_state, serial)),
+            wl_pointer::Event::Axis { .. } | wl_pointer::Event::AxisDiscrete { .. } => {
+                state.pointer_axis_events += 1;
+            }
             _ => {}
         }
     }
@@ -8651,4 +8729,388 @@ fn issue_132_scratchpad_scene_remains_visible_while_backend_is_taken_for_render(
     assert_eq!(sp_items2.len(), 1);
     assert_eq!(sp_items2[0].win_id, pad_win_id);
     env.state.test_outputs = saved_test_outputs;
+}
+
+/// Pointer-to-touch (`wl_touch`) emulation protocol tests (`komawm/koma#135`).
+mod pointer_to_touch_emulation_tests {
+    use super::*;
+    use crate::pointer_grabs::{BTN_LEFT, BTN_RIGHT};
+    use smithay::backend::input::{
+        Axis, AxisRelativeDirection, AxisSource, ButtonState, InputBackend, InputTime, UnusedEvent,
+    };
+
+    struct TestAxisBackend;
+
+    #[derive(Debug)]
+    struct TestAxisEvent {
+        vertical: f64,
+        v120: i32,
+        time: InputTime,
+    }
+
+    impl smithay::backend::input::Event<TestAxisBackend> for TestAxisEvent {
+        fn time(&self) -> InputTime {
+            self.time
+        }
+        fn device(&self) -> smithay::backend::winit::WinitVirtualDevice {
+            unreachable!("TestAxisEvent::device is not called")
+        }
+    }
+
+    impl smithay::backend::input::PointerAxisEvent<TestAxisBackend> for TestAxisEvent {
+        fn amount(&self, axis: Axis) -> Option<f64> {
+            match axis {
+                Axis::Vertical => Some(self.vertical),
+                Axis::Horizontal => Some(0.0),
+            }
+        }
+        fn amount_v120(&self, axis: Axis) -> Option<f64> {
+            match axis {
+                Axis::Vertical => Some(f64::from(self.v120)),
+                Axis::Horizontal => Some(0.0),
+            }
+        }
+        fn source(&self) -> AxisSource {
+            AxisSource::Wheel
+        }
+        fn relative_direction(&self, _: Axis) -> AxisRelativeDirection {
+            AxisRelativeDirection::Identical
+        }
+    }
+
+    impl InputBackend for TestAxisBackend {
+        type Device = smithay::backend::winit::WinitVirtualDevice;
+        type KeyboardKeyEvent = UnusedEvent;
+        type PointerAxisEvent = TestAxisEvent;
+        type PointerButtonEvent = UnusedEvent;
+        type PointerMotionEvent = UnusedEvent;
+        type PointerMotionAbsoluteEvent = UnusedEvent;
+        type TouchDownEvent = UnusedEvent;
+        type TouchUpEvent = UnusedEvent;
+        type TouchMotionEvent = UnusedEvent;
+        type TouchCancelEvent = UnusedEvent;
+        type TouchFrameEvent = UnusedEvent;
+        type TabletToolAxisEvent = UnusedEvent;
+        type TabletToolProximityEvent = UnusedEvent;
+        type TabletToolTipEvent = UnusedEvent;
+        type TabletToolButtonEvent = UnusedEvent;
+        type GestureSwipeBeginEvent = UnusedEvent;
+        type GestureSwipeUpdateEvent = UnusedEvent;
+        type GestureSwipeEndEvent = UnusedEvent;
+        type GesturePinchBeginEvent = UnusedEvent;
+        type GesturePinchUpdateEvent = UnusedEvent;
+        type GesturePinchEndEvent = UnusedEvent;
+        type GestureHoldBeginEvent = UnusedEvent;
+        type GestureHoldEndEvent = UnusedEvent;
+        type SwitchToggleEvent = UnusedEvent;
+        type SpecialEvent = UnusedEvent;
+    }
+
+    #[test]
+    fn wl_seat_advertises_touch_capability() {
+        let mut env = ClientEnv::new();
+        env.pump();
+        assert!(
+            env.client
+                .seat_capabilities
+                .iter()
+                .any(|c| c.contains(wl_seat::Capability::Touch)),
+            "wl_seat must advertise Capability::Touch, got {:?}",
+            env.client.seat_capabilities
+        );
+        assert!(
+            !env.client.touches.is_empty(),
+            "client must be able to bind wl_touch"
+        );
+    }
+
+    #[test]
+    fn emulate_touch_rule_translates_left_drag_and_passes_right_and_scroll() {
+        let mut env = ClientEnv::new();
+        let lua_src = r#"
+            koma.rule.window({
+                name = "waydroid-touch",
+                matches = { { app_id = "^Waydroid$" } },
+                emulate_touch = true,
+            })
+        "#;
+        crate::config_watcher::reload_from_lua_source(
+            &mut env.state,
+            std::path::Path::new("/tmp/init.lua"),
+            std::path::Path::new("/tmp"),
+            lua_src,
+            false,
+        )
+        .expect("apply emulate_touch rule");
+
+        let (surf, _xs, _tl) = spawn_unmapped_toplevel(&mut env, "Waydroid", "Waydroid");
+        attach_shm_buffer_and_commit(&mut env, &surf, 600, 400);
+
+        let mapped_rect = env
+            .state
+            .mapped_windows
+            .iter()
+            .find(|m| m.app_id == "Waydroid")
+            .expect("Waydroid mapped")
+            .rect;
+        let inside_x = f64::from(mapped_rect.x) + 40.0;
+        let inside_y = f64::from(mapped_rect.y) + 50.0;
+
+        // Hover motion before pressing BTN_LEFT still emits wl_pointer.motion
+        // (first motion establishes wl_pointer.enter, second emits wl_pointer.motion).
+        env.state.handle_pointer_absolute_motion(
+            Point::from((inside_x - 1.0, inside_y - 1.0)),
+            InputTime::from_millis(9),
+        );
+        env.state.handle_pointer_absolute_motion(
+            Point::from((inside_x, inside_y)),
+            InputTime::from_millis(10),
+        );
+        env.pump();
+        assert!(
+            !env.client.pointer_motion_coords.is_empty(),
+            "hover motion must still deliver wl_pointer.motion"
+        );
+
+        env.client.pointer_motion_coords.clear();
+        env.client.pointer_buttons.clear();
+        env.client.touch_events.clear();
+        env.client.pointer_axis_events = 0;
+
+        // BTN_LEFT press -> wl_touch.down(id=0) + wl_touch.frame, wl_pointer.button suppressed.
+        crate::keybind_dispatcher::process_pointer_button_event(
+            &mut env.state,
+            BTN_LEFT,
+            ButtonState::Pressed,
+            InputTime::from_millis(20),
+            false,
+        );
+        env.pump();
+        assert!(
+            env.client.pointer_buttons.is_empty(),
+            "BTN_LEFT press must be suppressed from wl_pointer.button"
+        );
+        assert!(
+            matches!(
+                env.client.touch_events.as_slice(),
+                [
+                    CapturedTouchEvent::Down { id: 0, .. },
+                    CapturedTouchEvent::Frame
+                ]
+            ),
+            "expected wl_touch.down + frame, got {:?}",
+            env.client.touch_events
+        );
+
+        // Motion while BTN_LEFT held -> wl_touch.motion + frame (clamped), no wl_pointer.motion.
+        env.client.touch_events.clear();
+        env.state.handle_pointer_absolute_motion(
+            Point::from((inside_x + 30.0, inside_y + 20.0)),
+            InputTime::from_millis(25),
+        );
+        env.state.handle_pointer_absolute_motion(
+            Point::from((
+                f64::from(mapped_rect.x) + f64::from(mapped_rect.w) + 500.0,
+                f64::from(mapped_rect.y) + f64::from(mapped_rect.h) + 500.0,
+            )),
+            InputTime::from_millis(30),
+        );
+        env.pump();
+        assert!(
+            env.client.pointer_motion_coords.is_empty(),
+            "pointer motion must be suppressed during active touch emulation"
+        );
+        let motions: Vec<(f64, f64)> = env
+            .client
+            .touch_events
+            .iter()
+            .filter_map(|e| match e {
+                CapturedTouchEvent::Motion { id: 0, x, y } => Some((*x, *y)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(motions.len(), 2);
+        assert!(
+            motions[1].0 <= f64::from(mapped_rect.w) && motions[1].1 <= f64::from(mapped_rect.h),
+            "out-of-bounds motion must be clamped to surface bounds, got {:?}",
+            motions[1]
+        );
+
+        // BTN_LEFT release -> wl_touch.up(id=0) + wl_touch.frame, wl_pointer.button suppressed.
+        env.client.touch_events.clear();
+        crate::keybind_dispatcher::process_pointer_button_event(
+            &mut env.state,
+            BTN_LEFT,
+            ButtonState::Released,
+            InputTime::from_millis(35),
+            false,
+        );
+        env.pump();
+        assert!(env.client.pointer_buttons.is_empty());
+        assert!(
+            matches!(
+                env.client.touch_events.as_slice(),
+                [
+                    CapturedTouchEvent::Up { id: 0, .. },
+                    CapturedTouchEvent::Frame
+                ]
+            ),
+            "expected wl_touch.up + frame, got {:?}",
+            env.client.touch_events
+        );
+
+        // BTN_RIGHT and wheel scroll still pass through as wl_pointer events.
+        env.client.touch_events.clear();
+        env.state.handle_pointer_absolute_motion(
+            Point::from((inside_x, inside_y)),
+            InputTime::from_millis(38),
+        );
+        crate::keybind_dispatcher::process_pointer_button_event(
+            &mut env.state,
+            BTN_RIGHT,
+            ButtonState::Pressed,
+            InputTime::from_millis(40),
+            false,
+        );
+        crate::keybind_dispatcher::process_pointer_button_event(
+            &mut env.state,
+            BTN_RIGHT,
+            ButtonState::Released,
+            InputTime::from_millis(45),
+            false,
+        );
+        crate::keybind_dispatcher::process_pointer_axis_event::<TestAxisBackend>(
+            &mut env.state,
+            &TestAxisEvent {
+                vertical: 15.0,
+                v120: 120,
+                time: InputTime::from_millis(50),
+            },
+            false,
+        );
+        env.pump();
+        assert!(
+            env.client.touch_events.is_empty(),
+            "BTN_RIGHT and scroll must not emit wl_touch events"
+        );
+        assert_eq!(env.client.pointer_buttons.len(), 2);
+        assert_eq!(env.client.pointer_buttons[0].0, BTN_RIGHT);
+        assert_eq!(
+            env.client.pointer_buttons[0].1,
+            wl_pointer::ButtonState::Pressed
+        );
+        assert_eq!(
+            env.client.pointer_buttons[1].1,
+            wl_pointer::ButtonState::Released
+        );
+        assert!(
+            env.client.pointer_axis_events > 0,
+            "wheel scroll must still emit wl_pointer.axis"
+        );
+    }
+
+    #[test]
+    fn touch_emulation_cancels_on_runtime_toggle_and_surface_unmap() {
+        let mut env = ClientEnv::new();
+        let (surf, xs, tl) = spawn_unmapped_toplevel(&mut env, "Term", "app.term");
+        attach_shm_buffer_and_commit(&mut env, &surf, 600, 400);
+
+        let mapped_rect = env
+            .state
+            .mapped_windows
+            .iter()
+            .find(|m| m.app_id == "app.term")
+            .expect("term mapped")
+            .rect;
+        let pt = Point::from((
+            f64::from(mapped_rect.x) + 40.0,
+            f64::from(mapped_rect.y) + 40.0,
+        ));
+        env.state
+            .handle_pointer_absolute_motion(pt, InputTime::from_millis(10));
+        env.pump();
+
+        // Toggle touch emulation ON at runtime.
+        crate::keybind_dispatcher::execute_action_descriptor(
+            &mut env.state,
+            koma_lua::ActionDescriptor::WindowToggleTouchEmulation,
+            false,
+        );
+        env.client.touch_events.clear();
+        env.client.pointer_buttons.clear();
+
+        // Press BTN_LEFT -> starts touch emulation.
+        crate::keybind_dispatcher::process_pointer_button_event(
+            &mut env.state,
+            BTN_LEFT,
+            ButtonState::Pressed,
+            InputTime::from_millis(20),
+            false,
+        );
+        env.pump();
+        assert!(matches!(
+            env.client.touch_events.first(),
+            Some(CapturedTouchEvent::Down { id: 0, .. })
+        ));
+
+        // Toggle touch emulation OFF mid-drag -> emits wl_touch.cancel and swallows release.
+        env.client.touch_events.clear();
+        crate::keybind_dispatcher::execute_action_descriptor(
+            &mut env.state,
+            koma_lua::ActionDescriptor::WindowToggleTouchEmulation,
+            false,
+        );
+        crate::keybind_dispatcher::process_pointer_button_event(
+            &mut env.state,
+            BTN_LEFT,
+            ButtonState::Released,
+            InputTime::from_millis(25),
+            false,
+        );
+        env.pump();
+        assert!(
+            env.client
+                .touch_events
+                .contains(&CapturedTouchEvent::Cancel),
+            "toggling off mid-drag must emit wl_touch.cancel, got {:?}",
+            env.client.touch_events
+        );
+        assert!(
+            env.client.pointer_buttons.is_empty(),
+            "orphan BTN_LEFT release after cancel must be swallowed"
+        );
+
+        // Toggle back ON, start drag, then unmap/destroy surface -> emits wl_touch.cancel.
+        crate::keybind_dispatcher::execute_action_descriptor(
+            &mut env.state,
+            koma_lua::ActionDescriptor::WindowToggleTouchEmulation,
+            false,
+        );
+        env.client.touch_events.clear();
+        crate::keybind_dispatcher::process_pointer_button_event(
+            &mut env.state,
+            BTN_LEFT,
+            ButtonState::Pressed,
+            InputTime::from_millis(30),
+            false,
+        );
+        env.pump();
+        assert!(matches!(
+            env.client.touch_events.first(),
+            Some(CapturedTouchEvent::Down { id: 0, .. })
+        ));
+
+        env.client.touch_events.clear();
+        tl.destroy();
+        xs.destroy();
+        surf.destroy();
+        env.pump();
+        assert!(
+            env.client
+                .touch_events
+                .contains(&CapturedTouchEvent::Cancel),
+            "destroying/unmapping surface mid-drag must emit wl_touch.cancel, got {:?}",
+            env.client.touch_events
+        );
+    }
 }

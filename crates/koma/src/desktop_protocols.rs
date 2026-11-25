@@ -9,8 +9,12 @@
 use std::time::{Duration, Instant};
 
 use smithay::{
+    backend::input::TouchSlot,
     desktop::layer_map_for_output,
-    input::pointer::{PointerHandle, RelativeMotionEvent},
+    input::{
+        pointer::{PointerHandle, RelativeMotionEvent},
+        touch::MotionEvent as TouchMotionPayload,
+    },
     reexports::{
         wayland_protocols::xdg::{
             decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode,
@@ -762,10 +766,47 @@ impl KomaState {
         // The keybind overview owns the pointer too: track the cursor for its own frame but never
         // forward motion or focus changes to the clients behind the scrim.
         if self.keybind_overlay_is_open() && !self.is_locked_or_abandoned() {
+            self.cancel_touch_emulation("keybind_overlay");
             self.pointer_location = self.clamp_pointer_to_outputs(candidate_pos);
             self.with_pointer_dispatch(|state, pointer| pointer.frame(state));
             self.queue_redraw();
             return;
+        }
+
+        if self.is_locked_or_abandoned() || pointer.is_grabbed() {
+            self.cancel_touch_emulation("locked_or_grabbed");
+        } else if let Some(active) = self.active_touch_emulation.clone() {
+            if !self.window_emulates_touch(active.win_id) {
+                self.cancel_touch_emulation("window_unmapped_or_disabled");
+            } else {
+                let clamped = self.clamp_pointer_to_outputs(candidate_pos);
+                self.pointer_location = clamped;
+                let origin = self
+                    .surface_global_origin(&active.surface)
+                    .unwrap_or(active.origin);
+                let min_x = active.surface_bounds.loc.x;
+                let max_x = min_x + active.surface_bounds.size.w.max(0.0);
+                let min_y = active.surface_bounds.loc.y;
+                let max_y = min_y + active.surface_bounds.size.h.max(0.0);
+                let local = clamped - origin;
+                let clamped_local: Point<f64, Logical> =
+                    (local.x.clamp(min_x, max_x), local.y.clamp(min_y, max_y)).into();
+                let touch_global = origin + clamped_local;
+                if let Some(touch) = self.touch() {
+                    touch.motion(
+                        self,
+                        Some((active.surface, origin)),
+                        &TouchMotionPayload {
+                            slot: TouchSlot::from(Some(0)),
+                            location: touch_global,
+                            time,
+                        },
+                    );
+                    touch.frame(self);
+                }
+                self.queue_redraw();
+                return;
+            }
         }
 
         let rel_event = RelativeMotionEvent {

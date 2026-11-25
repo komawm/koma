@@ -776,6 +776,7 @@ pub fn render_winit_frame(state: &mut KomaState) -> anyhow::Result<()> {
 /// bumps `Epoch`, flushes held `VirtualSeat` keys/buttons in < 1 ms, cancels active Phodopus
 /// macro coroutines, and broadcasts `WorkspaceEvent::Preempted` / `Resumed`.
 pub(crate) fn toggle_ring0_preempt_takeover(state: &mut KomaState, trigger_label: &str) {
+    state.cancel_touch_emulation("human_preempt");
     let now = state.elapsed_ms();
     let ws_id = state.active_ws_id.clone();
     let mut maybe_broadcast = None;

@@ -17,13 +17,14 @@ use koma_proto::WorkspaceId;
 use smithay::{
     backend::input::{
         Axis, AxisSource, ButtonState, Event as _, InputBackend, InputTime, KeyState,
-        PointerAxisEvent as _,
+        PointerAxisEvent as _, TouchSlot,
     },
     input::{
         keyboard::{FilterResult, KeyboardSource, Keycode, Keysym, ModifiersState, keysyms, xkb},
         pointer::{AxisFrame, ButtonEvent, MotionEvent},
+        touch::{DownEvent as TouchDownPayload, UpEvent as TouchUpPayload},
     },
-    utils::{SERIAL_COUNTER, Serial},
+    utils::{Rectangle, SERIAL_COUNTER, Serial},
 };
 use tracing::{debug, info, warn};
 
@@ -35,7 +36,7 @@ use crate::{
         BTN_EXTRA, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, BTN_SIDE, cancel_active_pointer_grab,
         start_compositor_move_grab, start_compositor_resize_grab, start_frame_edge_resize_grab,
     },
-    state::KomaState,
+    state::{ActiveTouchEmulation, KomaState, PointerHitTarget},
 };
 
 pub(crate) const MOD_CTRL: u8 = 1 << 0;
@@ -997,7 +998,27 @@ pub fn process_pointer_button_event(
 
     // 1. Active PointerGrab (`MoveWindowGrab` / `ResizeWindowGrab` / Popup / DnD) owns all buttons!
     if pointer.is_grabbed() {
+        state.cancel_touch_emulation("pointer_grabbed");
         dispatch_pointer_button_and_frame(state, button_code, btn_state, serial, time);
+        return;
+    }
+
+    // 1b. Complete active pointer-to-touch emulation on BTN_LEFT release.
+    if btn_state == ButtonState::Released
+        && button_code == BTN_LEFT
+        && state.active_touch_emulation.take().is_some()
+    {
+        if let Some(touch) = state.touch() {
+            touch.up(
+                state,
+                &TouchUpPayload {
+                    slot: TouchSlot::from(Some(0)),
+                    serial,
+                    time,
+                },
+            );
+            touch.frame(state);
+        }
         return;
     }
 
@@ -1115,6 +1136,58 @@ pub fn process_pointer_button_event(
     let cursor_pos = state.pointer_location;
     state.handle_pointer_button_focus(cursor_pos);
     refresh_pointer_hover_focus(state, time);
+
+    if button_code == BTN_LEFT
+        && !state.is_locked_or_abandoned()
+        && let Some(PointerHitTarget::Window {
+            surface,
+            origin,
+            win_id,
+            ..
+        }) = state.hit_test_target(cursor_pos)
+        && state.window_emulates_touch(win_id)
+    {
+        let bounds = crate::desktop_protocols::surface_logical_bounds(&surface)
+            .map(|r| {
+                Rectangle::new(
+                    (f64::from(r.loc.x), f64::from(r.loc.y)).into(),
+                    (f64::from(r.size.w.max(1)), f64::from(r.size.h.max(1))).into(),
+                )
+            })
+            .unwrap_or_else(|| {
+                state
+                    .mapped_windows
+                    .iter()
+                    .find(|m| m.win_id == win_id)
+                    .map(|m| {
+                        Rectangle::new(
+                            (0.0, 0.0).into(),
+                            (f64::from(m.rect.w.max(1)), f64::from(m.rect.h.max(1))).into(),
+                        )
+                    })
+                    .unwrap_or_else(|| Rectangle::from_size((1.0, 1.0).into()))
+            });
+        state.active_touch_emulation = Some(ActiveTouchEmulation {
+            win_id,
+            surface: surface.clone(),
+            origin,
+            surface_bounds: bounds,
+        });
+        if let Some(touch) = state.touch() {
+            touch.down(
+                state,
+                Some((surface, origin)),
+                &TouchDownPayload {
+                    slot: TouchSlot::from(Some(0)),
+                    location: cursor_pos,
+                    serial,
+                    time,
+                },
+            );
+            touch.frame(state);
+        }
+        return;
+    }
 
     dispatch_pointer_button_and_frame(state, button_code, btn_state, serial, time);
 }
@@ -2072,6 +2145,29 @@ pub fn execute_action_descriptor(
             }
             state.sync_workspace_geometries(&ws_id);
             state.queue_redraw();
+        }
+
+        ActionDescriptor::WindowToggleTouchEmulation => {
+            let ws_id = state.effective_interactive_ws_id();
+            let active_id = state
+                .workspaces
+                .get(&ws_id)
+                .and_then(WorkspaceState::active_window);
+            let Some(win_id) = active_id else {
+                return;
+            };
+            let next = !state.window_emulates_touch(win_id);
+            if let Some(mapped) = state.mapped_windows.iter_mut().find(|m| m.win_id == win_id) {
+                mapped.emulate_touch_override = Some(next);
+            }
+            if !next
+                && state
+                    .active_touch_emulation
+                    .as_ref()
+                    .is_some_and(|a| a.win_id == win_id)
+            {
+                state.cancel_touch_emulation("toggled_off");
+            }
         }
 
         ActionDescriptor::WindowFullscreenToggle => {

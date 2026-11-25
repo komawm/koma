@@ -648,6 +648,7 @@ fn compile_window_rule_specs(specs: &[LuaWindowRuleSpec]) -> Result<Vec<WindowRu
                 clip_to_geometry: spec.clip_to_geometry,
                 focusable: spec.focusable,
                 suppress_maximize,
+                emulate_touch: spec.emulate_touch,
                 block_out_from: spec.block_out_from,
             },
         });
