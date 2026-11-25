@@ -2380,6 +2380,7 @@ fn on_session_event_callback(state: &mut KomaState, event: SessionEvent) {
                 SERIAL_COUNTER.next_serial(),
                 smithay::backend::input::InputTime::now(),
             );
+            state.cancel_touch_emulation("vt_switch");
             state.pointer_animations.clear();
             let now_ms = state.elapsed_ms();
             for ac in state.agent_cursors.values_mut() {

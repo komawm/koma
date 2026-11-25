@@ -277,6 +277,13 @@ impl CompositorHandler for KomaState {
         }) {
             if surface == &root_surface && !is_surface_mapped(&root_surface) {
                 let removed = self.mapped_windows.remove(idx);
+                if self
+                    .active_touch_emulation
+                    .as_ref()
+                    .is_some_and(|a| a.win_id == removed.win_id)
+                {
+                    self.cancel_touch_emulation("surface_unmapped");
+                }
                 crate::foreign_toplevel::close_foreign_toplevel(self, removed.win_id);
                 // The client already released its buffer on the unmap commit, so this only keeps
                 // a fading frame when a snapshot is still possible; otherwise state is freed now.
@@ -707,6 +714,13 @@ impl XdgShellHandler for KomaState {
                 .is_some_and(|t| t.wl_surface() == wl_surface)
         }) {
             let removed = self.mapped_windows.remove(pos);
+            if self
+                .active_touch_emulation
+                .as_ref()
+                .is_some_and(|a| a.win_id == removed.win_id)
+            {
+                self.cancel_touch_emulation("toplevel_destroyed");
+            }
             crate::foreign_toplevel::close_foreign_toplevel(self, removed.win_id);
             // Smithay dispatches `toplevel_destroyed` before it clears the surface's cached state,
             // so the client's last committed buffer can still be captured here.

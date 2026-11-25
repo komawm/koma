@@ -83,9 +83,50 @@ pub const fn resize_corner_from_xdg_edge(edge: xdg_toplevel::ResizeEdge) -> Opti
     }
 }
 
-/// Initiates a compositor-bound (`Mod + MouseLeft`) interactive window move grab before
-/// forwarding the triggering `ButtonEvent` to `PointerHandle::button`.
+/// Returns `true` when `pointer` is held by an explicit compositor or protocol grab
+/// (`MoveWindowGrab`, `ResizeWindowGrab`, `PopupPointerGrab`, or `DnDGrab`), as opposed to
+/// Smithay's implicit `ClickGrab` installed when a client button is held.
+#[must_use]
+pub fn has_explicit_pointer_grab(
+    state: &KomaState,
+    pointer: &smithay::input::pointer::PointerHandle<KomaState>,
+) -> bool {
+    if state.dnd_drag.is_some() {
+        return true;
+    }
+    pointer
+        .with_grab(|_, grab| {
+            grab.is::<MoveWindowGrab>()
+                || grab.is::<ResizeWindowGrab>()
+                || grab.is::<smithay::desktop::PopupPointerGrab<KomaState>>()
+        })
+        .unwrap_or(false)
+}
+
+#[must_use]
+pub fn is_popup_grab_active(
+    _state: &KomaState,
+    pointer: &smithay::input::pointer::PointerHandle<KomaState>,
+) -> bool {
+    pointer
+        .with_grab(|_, grab| grab.is::<smithay::desktop::PopupPointerGrab<KomaState>>())
+        .unwrap_or(false)
+}
+
+/// Initiates a compositor-bound (`Mod + MouseLeft` or multi-button chord) interactive window
+/// move grab before forwarding the triggering `ButtonEvent` to `PointerHandle::button`.
 pub fn start_compositor_move_grab(state: &mut KomaState, button_code: u32, serial: Serial) -> bool {
+    start_compositor_move_grab_with_chord(state, button_code, vec![button_code], serial)
+}
+
+/// Initiates a compositor-bound interactive window move grab where releasing any button in
+/// `chord_buttons` ends the grab.
+pub fn start_compositor_move_grab_with_chord(
+    state: &mut KomaState,
+    button_code: u32,
+    chord_buttons: Vec<u32>,
+    serial: Serial,
+) -> bool {
     state.reconcile_session_lock();
     if state.is_locked_or_abandoned() {
         return false;
@@ -93,11 +134,16 @@ pub fn start_compositor_move_grab(state: &mut KomaState, button_code: u32, seria
     // An interactive grab owns the pointer for the whole gesture: stop a pending keybind
     // repeat so the held chord cannot keep moving windows behind the user's back.
     state.cancel_keybind_repeat("pointer_grab");
+    state.cancel_touch_emulation("compositor_grab");
     state.break_active_pointer_constraints();
     let Some(pointer) = state.ptr() else {
         return false;
     };
-    if pointer.is_grabbed() {
+    if if chord_buttons.len() > 1 {
+        has_explicit_pointer_grab(state, &pointer)
+    } else {
+        pointer.is_grabbed()
+    } {
         return false;
     }
 
@@ -123,9 +169,12 @@ pub fn start_compositor_move_grab(state: &mut KomaState, button_code: u32, seria
         location: cursor_loc,
     };
 
-    let Some(grab) = MoveWindowGrab::new(state, start_data, win_id, ws_id) else {
+    let Some(mut grab) = MoveWindowGrab::new(state, start_data, win_id, ws_id) else {
         return false;
     };
+    if !chord_buttons.is_empty() {
+        grab.chord_buttons = chord_buttons;
+    }
 
     pointer.set_grab(state, grab, serial, Focus::Clear);
     state.set_cursor_status(CursorImageStatus::Named(CursorIcon::Grabbing));
@@ -147,11 +196,22 @@ fn install_resize_grab(
     state.set_cursor_status(CursorImageStatus::Named(cursor_icon_for_corner(corner)));
 }
 
-/// Initiates a compositor-bound (`Mod + MouseRight`) interactive window / split-ratio resize grab
-/// before forwarding the triggering `ButtonEvent` to `PointerHandle::button`.
+/// Initiates a compositor-bound (`Mod + MouseRight` or multi-button chord) interactive window /
+/// split-ratio resize grab before forwarding the triggering `ButtonEvent` to `PointerHandle::button`.
 pub fn start_compositor_resize_grab(
     state: &mut KomaState,
     button_code: u32,
+    serial: Serial,
+) -> bool {
+    start_compositor_resize_grab_with_chord(state, button_code, vec![button_code], serial)
+}
+
+/// Initiates a compositor-bound interactive window resize grab where releasing any button in
+/// `chord_buttons` ends the grab.
+pub fn start_compositor_resize_grab_with_chord(
+    state: &mut KomaState,
+    button_code: u32,
+    chord_buttons: Vec<u32>,
     serial: Serial,
 ) -> bool {
     state.reconcile_session_lock();
@@ -161,11 +221,16 @@ pub fn start_compositor_resize_grab(
     // An interactive grab owns the pointer for the whole gesture: stop a pending keybind
     // repeat so the held chord cannot keep moving windows behind the user's back.
     state.cancel_keybind_repeat("pointer_grab");
+    state.cancel_touch_emulation("compositor_grab");
     state.break_active_pointer_constraints();
     let Some(pointer) = state.ptr() else {
         return false;
     };
-    if pointer.is_grabbed() {
+    if if chord_buttons.len() > 1 {
+        has_explicit_pointer_grab(state, &pointer)
+    } else {
+        pointer.is_grabbed()
+    } {
         return false;
     }
 
@@ -191,11 +256,14 @@ pub fn start_compositor_resize_grab(
         location: cursor_loc,
     };
 
-    let Some((grab, corner)) =
+    let Some((mut grab, corner)) =
         ResizeWindowGrab::new(state, start_data, win_id, ws_id.clone(), None)
     else {
         return false;
     };
+    if !chord_buttons.is_empty() {
+        grab.chord_buttons = chord_buttons;
+    }
 
     install_resize_grab(state, &pointer, grab, corner, serial, &ws_id);
     true
@@ -220,6 +288,7 @@ pub fn start_frame_edge_resize_grab(
     // An interactive grab owns the pointer for the whole gesture: stop a pending keybind
     // repeat so the held chord cannot keep moving windows behind the user's back.
     state.cancel_keybind_repeat("pointer_grab");
+    state.cancel_touch_emulation("compositor_grab");
     state.break_active_pointer_constraints();
     let Some(pointer) = state.ptr() else {
         return false;
@@ -360,6 +429,7 @@ pub fn start_csd_resize_grab(
 
 /// Cancels any active pointer grab on `Escape` press (`niri/src/input/mod.rs` lines 688-699).
 pub fn cancel_active_pointer_grab(state: &mut KomaState, serial: Serial, time: InputTime) -> bool {
+    state.cancel_touch_emulation("compositor_grab_cancel");
     let Some(pointer) = state.ptr() else {
         return false;
     };
@@ -369,6 +439,9 @@ pub fn cancel_active_pointer_grab(state: &mut KomaState, serial: Serial, time: I
     pointer.unset_grab(state, serial, time);
     state.keybinds.suppressed_buttons.insert(BTN_LEFT);
     state.keybinds.suppressed_buttons.insert(BTN_RIGHT);
+    for &btn in &state.keybinds.pressed_buttons {
+        state.keybinds.suppressed_buttons.insert(btn);
+    }
     state.active_drop_preview = None;
     state.active_drag_edge_scroll = None;
     state.edge_scroll_keep_alive = false;
@@ -383,6 +456,7 @@ pub fn cancel_active_pointer_grab(state: &mut KomaState, serial: Serial, time: I
 /// `Dwindle` / `Scrolling` / `Deck` windows.
 pub struct MoveWindowGrab {
     start_data: PointerGrabStartData<KomaState>,
+    chord_buttons: Vec<u32>,
     win_id: WindowId,
     ws_id: WorkspaceId,
     // Initial floating state retained on grab for move diagnostics.
@@ -432,6 +506,7 @@ impl MoveWindowGrab {
 
         Some(Self {
             current_location: start_data.location,
+            chord_buttons: vec![start_data.button],
             start_data,
             win_id,
             ws_id,
@@ -720,7 +795,11 @@ impl PointerGrab<KomaState> for MoveWindowGrab {
     ) {
         handle.button(data, event);
 
-        if !handle.current_pressed().contains(&self.start_data.button) {
+        if !self
+            .chord_buttons
+            .iter()
+            .all(|btn| data.keybinds.pressed_buttons.contains(btn))
+        {
             handle.unset_grab(self, data, event.serial, event.time, true);
             return;
         }
@@ -734,6 +813,7 @@ impl PointerGrab<KomaState> for MoveWindowGrab {
         };
         if event.state == ButtonState::Pressed
             && event.button == toggle_floating_btn
+            && !self.chord_buttons.contains(&event.button)
             && !self.on_toggle_floating_mid_drag(data)
         {
             handle.unset_grab(self, data, event.serial, event.time, true);
@@ -846,6 +926,7 @@ impl PointerGrab<KomaState> for MoveWindowGrab {
 /// Interactive window & `Dwindle` split-ratio resize grab (`Mod + MouseRight` & `xdg_toplevel.resize`).
 pub struct ResizeWindowGrab {
     start_data: PointerGrabStartData<KomaState>,
+    chord_buttons: Vec<u32>,
     win_id: WindowId,
     ws_id: WorkspaceId,
     is_floating: bool,
@@ -896,6 +977,7 @@ impl ResizeWindowGrab {
         let loc = start_data.location;
         Some((
             Self {
+                chord_buttons: vec![start_data.button],
                 start_data,
                 win_id,
                 ws_id,
@@ -1066,8 +1148,10 @@ impl PointerGrab<KomaState> for ResizeWindowGrab {
     ) {
         handle.button(data, event);
 
-        if !handle.current_pressed().contains(&self.start_data.button)
-            || handle.current_pressed().is_empty()
+        if !self
+            .chord_buttons
+            .iter()
+            .all(|btn| data.keybinds.pressed_buttons.contains(btn))
         {
             handle.unset_grab(self, data, event.serial, event.time, true);
         }

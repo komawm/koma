@@ -58,7 +58,7 @@ use smithay::wayland::seat::WaylandFocus as _;
 use wayland_client::protocol::{
     wl_buffer, wl_callback, wl_compositor, wl_data_device, wl_data_device_manager,
     wl_data_offer, wl_data_source, wl_keyboard, wl_output, wl_pointer, wl_region, wl_registry,
-    wl_seat, wl_shm, wl_shm_pool, wl_surface,
+    wl_seat, wl_shm, wl_shm_pool, wl_surface, wl_touch,
 };
 use wayland_client::{
     Connection, Dispatch, EventQueue, Proxy as _, WEnum, delegate_noop, event_created_child,
@@ -214,18 +214,43 @@ struct CapturedDataSource {
     targets: Vec<Option<String>>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+enum CapturedTouchEvent {
+    Down {
+        id: i32,
+        x: f64,
+        y: f64,
+        serial: u32,
+    },
+    Motion {
+        id: i32,
+        x: f64,
+        y: f64,
+    },
+    Up {
+        id: i32,
+        serial: u32,
+    },
+    Frame,
+    Cancel,
+}
+
 #[derive(Default)]
 struct ClientHarness {
     sync_done: bool,
     globals: BTreeMap<String, (u32, u32)>,
     outputs: Vec<wl_output::WlOutput>,
     seats: Vec<wl_seat::WlSeat>,
+    seat_capabilities: Vec<wl_seat::Capability>,
     pointers: Vec<wl_pointer::WlPointer>,
+    touches: Vec<wl_touch::WlTouch>,
+    touch_events: Vec<CapturedTouchEvent>,
     /// Surface-local `wl_pointer.motion` coordinates recorded per delivered motion event.
     pointer_motion_coords: Vec<(f64, f64)>,
 
     /// `wl_pointer.button` events with the server serial that clients use for `start_drag`.
     pointer_buttons: Vec<(u32, wl_pointer::ButtonState, u32)>,
+    pointer_axis_events: usize,
     data_device: Option<wl_data_device::WlDataDevice>,
     data_source_events: BTreeMap<u32, CapturedDataSource>,
     data_offer_mimes: BTreeMap<u32, Vec<String>>,
@@ -634,6 +659,8 @@ impl Dispatch<wl_registry::WlRegistry, ()> for ClientHarness {
                         registry.bind::<wl_seat::WlSeat, (), Self>(name, version.min(9), qh, ());
                     let pointer = seat.get_pointer(qh, ());
                     state.pointers.push(pointer);
+                    let touch = seat.get_touch(qh, ());
+                    state.touches.push(touch);
                     state.seats.push(seat);
                 }
                 _ => {}
@@ -1219,7 +1246,55 @@ delegate_noop!(ClientHarness: ignore wl_shm::WlShm);
 delegate_noop!(ClientHarness: ignore wl_shm_pool::WlShmPool);
 delegate_noop!(ClientHarness: ignore wl_buffer::WlBuffer);
 delegate_noop!(ClientHarness: ignore wl_output::WlOutput);
-delegate_noop!(ClientHarness: ignore wl_seat::WlSeat);
+impl Dispatch<wl_seat::WlSeat, ()> for ClientHarness {
+    fn event(
+        state: &mut Self,
+        _: &wl_seat::WlSeat,
+        event: wl_seat::Event,
+        _: &(),
+        _: &Connection,
+        _: &wayland_client::QueueHandle<Self>,
+    ) {
+        if let wl_seat::Event::Capabilities {
+            capabilities: WEnum::Value(caps),
+        } = event
+        {
+            state.seat_capabilities.push(caps);
+        }
+    }
+}
+
+impl Dispatch<wl_touch::WlTouch, ()> for ClientHarness {
+    fn event(
+        state: &mut Self,
+        _: &wl_touch::WlTouch,
+        event: wl_touch::Event,
+        _: &(),
+        _: &Connection,
+        _: &wayland_client::QueueHandle<Self>,
+    ) {
+        match event {
+            wl_touch::Event::Down {
+                serial, id, x, y, ..
+            } => state
+                .touch_events
+                .push(CapturedTouchEvent::Down { id, x, y, serial }),
+            wl_touch::Event::Motion { id, x, y, .. } => {
+                state
+                    .touch_events
+                    .push(CapturedTouchEvent::Motion { id, x, y });
+            }
+            wl_touch::Event::Up { serial, id, .. } => {
+                state
+                    .touch_events
+                    .push(CapturedTouchEvent::Up { id, serial });
+            }
+            wl_touch::Event::Frame => state.touch_events.push(CapturedTouchEvent::Frame),
+            wl_touch::Event::Cancel => state.touch_events.push(CapturedTouchEvent::Cancel),
+            _ => {}
+        }
+    }
+}
 delegate_noop!(ClientHarness: ignore xdg_popup::XdgPopup);
 delegate_noop!(ClientHarness: ignore xdg_positioner::XdgPositioner);
 
@@ -1263,6 +1338,9 @@ impl Dispatch<wl_pointer::WlPointer, ()> for ClientHarness {
                 serial,
                 ..
             } => state.pointer_buttons.push((button, btn_state, serial)),
+            wl_pointer::Event::Axis { .. } | wl_pointer::Event::AxisDiscrete { .. } => {
+                state.pointer_axis_events += 1;
+            }
             _ => {}
         }
     }
@@ -8651,4 +8729,756 @@ fn issue_132_scratchpad_scene_remains_visible_while_backend_is_taken_for_render(
     assert_eq!(sp_items2.len(), 1);
     assert_eq!(sp_items2[0].win_id, pad_win_id);
     env.state.test_outputs = saved_test_outputs;
+}
+
+#[test]
+fn multi_mouse_button_chord_triggers_move_grab_order_independently_and_releases_cleanly() {
+    use crate::pointer_grabs::{BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, BTN_SIDE};
+    use smithay::backend::input::ButtonState;
+
+    let mut env = ClientEnv::new();
+    let (_surf, _xdg, _tl) = env.spawn_window("chord-drag", "chord.drag");
+    env.pump();
+    let mapped = env.state.mapped_windows.last().expect("mapped window");
+    let win_id = mapped.win_id;
+    let win_rect = mapped.rect;
+
+    let specs = vec![
+        koma_lua::BindSpec {
+            id: koma_lua::BindHandleId(1),
+            mode: None,
+            enabled: true,
+            chord: "MouseLeft + MouseRight".to_owned(),
+            action: koma_lua::ActionDescriptor::WindowDragMove,
+            release_action: None,
+            options: koma_lua::BindOptions::default(),
+        },
+        koma_lua::BindSpec {
+            id: koma_lua::BindHandleId(2),
+            mode: None,
+            enabled: true,
+            chord: "MouseMiddle + MouseBack".to_owned(),
+            action: koma_lua::ActionDescriptor::WindowFloatToggle,
+            release_action: None,
+            options: koma_lua::BindOptions::default(),
+        },
+    ];
+    env.state.keybinds =
+        crate::keybind_dispatcher::KeybindTable::compile_with_options(&specs, &[], false, None)
+            .expect("compile multi-mouse-button binds");
+
+    let inside = Point::from((f64::from(win_rect.x) + 20.0, f64::from(win_rect.y) + 20.0));
+    env.state
+        .handle_pointer_absolute_motion(inside, InputTime::from_millis(10));
+    env.pump();
+
+    // 1. Single-button click does not trigger the multi-button grab.
+    crate::keybind_dispatcher::process_pointer_button_event(
+        &mut env.state,
+        BTN_LEFT,
+        ButtonState::Pressed,
+        InputTime::from_millis(20),
+        false,
+    );
+    assert!(
+        !crate::pointer_grabs::has_explicit_pointer_grab(
+            &env.state,
+            &env.state.seat.get_pointer().unwrap(),
+        ),
+        "single-button press must not start an explicit compositor grab"
+    );
+    crate::keybind_dispatcher::process_pointer_button_event(
+        &mut env.state,
+        BTN_LEFT,
+        ButtonState::Released,
+        InputTime::from_millis(30),
+        false,
+    );
+    assert!(!env.state.seat.get_pointer().unwrap().is_grabbed());
+    assert!(env.state.keybinds.pressed_buttons.is_empty());
+
+    // 2. Order A: Hold MouseLeft, press MouseRight -> MoveWindowGrab starts.
+    // Releasing MouseLeft first (the non-trigger button) must cleanly end the grab!
+    crate::keybind_dispatcher::process_pointer_button_event(
+        &mut env.state,
+        BTN_LEFT,
+        ButtonState::Pressed,
+        InputTime::from_millis(40),
+        false,
+    );
+    assert!(!crate::pointer_grabs::has_explicit_pointer_grab(
+        &env.state,
+        &env.state.seat.get_pointer().unwrap()
+    ));
+    crate::keybind_dispatcher::process_pointer_button_event(
+        &mut env.state,
+        BTN_RIGHT,
+        ButtonState::Pressed,
+        InputTime::from_millis(50),
+        false,
+    );
+    assert_eq!(
+        env.state
+            .seat
+            .get_pointer()
+            .unwrap()
+            .with_grab(|_, grab| grab.is::<crate::pointer_grabs::MoveWindowGrab>()),
+        Some(true),
+        "MouseLeft + MouseRight must start MoveWindowGrab"
+    );
+    crate::keybind_dispatcher::process_pointer_button_event(
+        &mut env.state,
+        BTN_LEFT,
+        ButtonState::Released,
+        InputTime::from_millis(60),
+        false,
+    );
+    assert!(
+        !env.state.seat.get_pointer().unwrap().is_grabbed(),
+        "releasing MouseLeft first must end MoveWindowGrab"
+    );
+    crate::keybind_dispatcher::process_pointer_button_event(
+        &mut env.state,
+        BTN_RIGHT,
+        ButtonState::Released,
+        InputTime::from_millis(70),
+        false,
+    );
+    assert!(env.state.keybinds.pressed_buttons.is_empty());
+    assert!(env.state.keybinds.suppressed_buttons.is_empty());
+
+    // 3. Order B: Hold MouseRight, press MouseLeft -> MoveWindowGrab starts order-independently.
+    // Releasing MouseRight first must also cleanly end the grab!
+    crate::keybind_dispatcher::process_pointer_button_event(
+        &mut env.state,
+        BTN_RIGHT,
+        ButtonState::Pressed,
+        InputTime::from_millis(80),
+        false,
+    );
+    assert!(!crate::pointer_grabs::has_explicit_pointer_grab(
+        &env.state,
+        &env.state.seat.get_pointer().unwrap()
+    ));
+    crate::keybind_dispatcher::process_pointer_button_event(
+        &mut env.state,
+        BTN_LEFT,
+        ButtonState::Pressed,
+        InputTime::from_millis(90),
+        false,
+    );
+    assert_eq!(
+        env.state
+            .seat
+            .get_pointer()
+            .unwrap()
+            .with_grab(|_, grab| grab.is::<crate::pointer_grabs::MoveWindowGrab>()),
+        Some(true),
+        "MouseRight + MouseLeft must start MoveWindowGrab order-independently"
+    );
+    crate::keybind_dispatcher::process_pointer_button_event(
+        &mut env.state,
+        BTN_RIGHT,
+        ButtonState::Released,
+        InputTime::from_millis(100),
+        false,
+    );
+    assert!(
+        !env.state.seat.get_pointer().unwrap().is_grabbed(),
+        "releasing MouseRight first must end MoveWindowGrab"
+    );
+    crate::keybind_dispatcher::process_pointer_button_event(
+        &mut env.state,
+        BTN_LEFT,
+        ButtonState::Released,
+        InputTime::from_millis(110),
+        false,
+    );
+    assert!(env.state.keybinds.pressed_buttons.is_empty());
+    assert!(env.state.keybinds.suppressed_buttons.is_empty());
+
+    // 4. Custom non-grab action: MouseMiddle + MouseBack toggles floating.
+    let ws_id = env.state.active_ws_id.clone();
+    assert!(!env.state.workspaces[&ws_id].floating.contains(win_id));
+    crate::keybind_dispatcher::process_pointer_button_event(
+        &mut env.state,
+        BTN_MIDDLE,
+        ButtonState::Pressed,
+        InputTime::from_millis(120),
+        false,
+    );
+    crate::keybind_dispatcher::process_pointer_button_event(
+        &mut env.state,
+        BTN_SIDE,
+        ButtonState::Pressed,
+        InputTime::from_millis(130),
+        false,
+    );
+    assert!(env.state.workspaces[&ws_id].floating.contains(win_id));
+    crate::keybind_dispatcher::process_pointer_button_event(
+        &mut env.state,
+        BTN_SIDE,
+        ButtonState::Released,
+        InputTime::from_millis(140),
+        false,
+    );
+    crate::keybind_dispatcher::process_pointer_button_event(
+        &mut env.state,
+        BTN_MIDDLE,
+        ButtonState::Released,
+        InputTime::from_millis(150),
+        false,
+    );
+    assert!(env.state.keybinds.pressed_buttons.is_empty());
+    assert!(env.state.keybinds.suppressed_buttons.is_empty());
+}
+
+/// Pointer-to-touch (`wl_touch`) emulation protocol tests (`komawm/koma#135`).
+mod pointer_to_touch_emulation_tests {
+    use super::*;
+    use crate::pointer_grabs::{BTN_LEFT, BTN_RIGHT};
+    use smithay::backend::input::{
+        Axis, AxisRelativeDirection, AxisSource, ButtonState, InputBackend, InputTime, UnusedEvent,
+    };
+
+    struct TestAxisBackend;
+
+    #[derive(Debug)]
+    struct TestAxisEvent {
+        vertical: f64,
+        v120: i32,
+        time: InputTime,
+    }
+
+    impl smithay::backend::input::Event<TestAxisBackend> for TestAxisEvent {
+        fn time(&self) -> InputTime {
+            self.time
+        }
+        fn device(&self) -> smithay::backend::winit::WinitVirtualDevice {
+            unreachable!("TestAxisEvent::device is not called")
+        }
+    }
+
+    impl smithay::backend::input::PointerAxisEvent<TestAxisBackend> for TestAxisEvent {
+        fn amount(&self, axis: Axis) -> Option<f64> {
+            match axis {
+                Axis::Vertical => Some(self.vertical),
+                Axis::Horizontal => Some(0.0),
+            }
+        }
+        fn amount_v120(&self, axis: Axis) -> Option<f64> {
+            match axis {
+                Axis::Vertical => Some(f64::from(self.v120)),
+                Axis::Horizontal => Some(0.0),
+            }
+        }
+        fn source(&self) -> AxisSource {
+            AxisSource::Wheel
+        }
+        fn relative_direction(&self, _: Axis) -> AxisRelativeDirection {
+            AxisRelativeDirection::Identical
+        }
+    }
+
+    impl InputBackend for TestAxisBackend {
+        type Device = smithay::backend::winit::WinitVirtualDevice;
+        type KeyboardKeyEvent = UnusedEvent;
+        type PointerAxisEvent = TestAxisEvent;
+        type PointerButtonEvent = UnusedEvent;
+        type PointerMotionEvent = UnusedEvent;
+        type PointerMotionAbsoluteEvent = UnusedEvent;
+        type TouchDownEvent = UnusedEvent;
+        type TouchUpEvent = UnusedEvent;
+        type TouchMotionEvent = UnusedEvent;
+        type TouchCancelEvent = UnusedEvent;
+        type TouchFrameEvent = UnusedEvent;
+        type TabletToolAxisEvent = UnusedEvent;
+        type TabletToolProximityEvent = UnusedEvent;
+        type TabletToolTipEvent = UnusedEvent;
+        type TabletToolButtonEvent = UnusedEvent;
+        type GestureSwipeBeginEvent = UnusedEvent;
+        type GestureSwipeUpdateEvent = UnusedEvent;
+        type GestureSwipeEndEvent = UnusedEvent;
+        type GesturePinchBeginEvent = UnusedEvent;
+        type GesturePinchUpdateEvent = UnusedEvent;
+        type GesturePinchEndEvent = UnusedEvent;
+        type GestureHoldBeginEvent = UnusedEvent;
+        type GestureHoldEndEvent = UnusedEvent;
+        type SwitchToggleEvent = UnusedEvent;
+        type SpecialEvent = UnusedEvent;
+    }
+
+    #[test]
+    fn wl_seat_advertises_touch_capability() {
+        let mut env = ClientEnv::new();
+        env.pump();
+        assert!(
+            env.client
+                .seat_capabilities
+                .iter()
+                .any(|c| c.contains(wl_seat::Capability::Touch)),
+            "wl_seat must advertise Capability::Touch, got {:?}",
+            env.client.seat_capabilities
+        );
+        assert!(
+            !env.client.touches.is_empty(),
+            "client must be able to bind wl_touch"
+        );
+    }
+
+    #[test]
+    fn emulate_touch_rule_translates_left_drag_and_passes_right_and_scroll() {
+        let mut env = ClientEnv::new();
+        let lua_src = r#"
+            koma.rule.window({
+                name = "waydroid-touch",
+                matches = { { app_id = "^Waydroid$" } },
+                emulate_touch = true,
+            })
+        "#;
+        crate::config_watcher::reload_from_lua_source(
+            &mut env.state,
+            std::path::Path::new("/tmp/init.lua"),
+            std::path::Path::new("/tmp"),
+            lua_src,
+            false,
+        )
+        .expect("apply emulate_touch rule");
+
+        let (surf, _xs, _tl) = spawn_unmapped_toplevel(&mut env, "Waydroid", "Waydroid");
+        attach_shm_buffer_and_commit(&mut env, &surf, 600, 400);
+
+        let mapped_rect = env
+            .state
+            .mapped_windows
+            .iter()
+            .find(|m| m.app_id == "Waydroid")
+            .expect("Waydroid mapped")
+            .rect;
+        let inside_x = f64::from(mapped_rect.x) + 40.0;
+        let inside_y = f64::from(mapped_rect.y) + 50.0;
+
+        // Hover motion before pressing BTN_LEFT still emits wl_pointer.motion
+        // (first motion establishes wl_pointer.enter, second emits wl_pointer.motion).
+        env.state.handle_pointer_absolute_motion(
+            Point::from((inside_x - 1.0, inside_y - 1.0)),
+            InputTime::from_millis(9),
+        );
+        env.state.handle_pointer_absolute_motion(
+            Point::from((inside_x, inside_y)),
+            InputTime::from_millis(10),
+        );
+        env.pump();
+        assert!(
+            !env.client.pointer_motion_coords.is_empty(),
+            "hover motion must still deliver wl_pointer.motion"
+        );
+
+        env.client.pointer_motion_coords.clear();
+        env.client.pointer_buttons.clear();
+        env.client.touch_events.clear();
+        env.client.pointer_axis_events = 0;
+
+        // BTN_LEFT press -> wl_touch.down(id=0) + wl_touch.frame, wl_pointer.button suppressed.
+        crate::keybind_dispatcher::process_pointer_button_event(
+            &mut env.state,
+            BTN_LEFT,
+            ButtonState::Pressed,
+            InputTime::from_millis(20),
+            false,
+        );
+        env.pump();
+        assert!(
+            env.client.pointer_buttons.is_empty(),
+            "BTN_LEFT press must be suppressed from wl_pointer.button"
+        );
+        assert!(
+            matches!(
+                env.client.touch_events.as_slice(),
+                [
+                    CapturedTouchEvent::Down { id: 0, .. },
+                    CapturedTouchEvent::Frame
+                ]
+            ),
+            "expected wl_touch.down + frame, got {:?}",
+            env.client.touch_events
+        );
+
+        // Motion while BTN_LEFT held -> wl_touch.motion + frame (clamped), no wl_pointer.motion.
+        env.client.touch_events.clear();
+        env.state.handle_pointer_absolute_motion(
+            Point::from((inside_x + 30.0, inside_y + 20.0)),
+            InputTime::from_millis(25),
+        );
+        env.state.handle_pointer_absolute_motion(
+            Point::from((
+                f64::from(mapped_rect.x) + f64::from(mapped_rect.w) + 500.0,
+                f64::from(mapped_rect.y) + f64::from(mapped_rect.h) + 500.0,
+            )),
+            InputTime::from_millis(30),
+        );
+        env.pump();
+        assert!(
+            env.client.pointer_motion_coords.is_empty(),
+            "pointer motion must be suppressed during active touch emulation"
+        );
+        let motions: Vec<(f64, f64)> = env
+            .client
+            .touch_events
+            .iter()
+            .filter_map(|e| match e {
+                CapturedTouchEvent::Motion { id: 0, x, y } => Some((*x, *y)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(motions.len(), 2);
+        assert!(
+            motions[1].0 <= f64::from(mapped_rect.w) && motions[1].1 <= f64::from(mapped_rect.h),
+            "out-of-bounds motion must be clamped to surface bounds, got {:?}",
+            motions[1]
+        );
+
+        // BTN_LEFT release -> wl_touch.up(id=0) + wl_touch.frame, wl_pointer.button suppressed.
+        env.client.touch_events.clear();
+        crate::keybind_dispatcher::process_pointer_button_event(
+            &mut env.state,
+            BTN_LEFT,
+            ButtonState::Released,
+            InputTime::from_millis(35),
+            false,
+        );
+        env.pump();
+        assert!(env.client.pointer_buttons.is_empty());
+        assert!(
+            matches!(
+                env.client.touch_events.as_slice(),
+                [
+                    CapturedTouchEvent::Up { id: 0, .. },
+                    CapturedTouchEvent::Frame
+                ]
+            ),
+            "expected wl_touch.up + frame, got {:?}",
+            env.client.touch_events
+        );
+
+        // BTN_RIGHT and wheel scroll still pass through as wl_pointer events.
+        env.client.touch_events.clear();
+        env.state.handle_pointer_absolute_motion(
+            Point::from((inside_x, inside_y)),
+            InputTime::from_millis(38),
+        );
+        crate::keybind_dispatcher::process_pointer_button_event(
+            &mut env.state,
+            BTN_RIGHT,
+            ButtonState::Pressed,
+            InputTime::from_millis(40),
+            false,
+        );
+        crate::keybind_dispatcher::process_pointer_button_event(
+            &mut env.state,
+            BTN_RIGHT,
+            ButtonState::Released,
+            InputTime::from_millis(45),
+            false,
+        );
+        crate::keybind_dispatcher::process_pointer_axis_event::<TestAxisBackend>(
+            &mut env.state,
+            &TestAxisEvent {
+                vertical: 15.0,
+                v120: 120,
+                time: InputTime::from_millis(50),
+            },
+            false,
+        );
+        env.pump();
+        assert!(
+            env.client.touch_events.is_empty(),
+            "BTN_RIGHT and scroll must not emit wl_touch events"
+        );
+        assert_eq!(env.client.pointer_buttons.len(), 2);
+        assert_eq!(env.client.pointer_buttons[0].0, BTN_RIGHT);
+        assert_eq!(
+            env.client.pointer_buttons[0].1,
+            wl_pointer::ButtonState::Pressed
+        );
+        assert_eq!(
+            env.client.pointer_buttons[1].1,
+            wl_pointer::ButtonState::Released
+        );
+        assert!(
+            env.client.pointer_axis_events > 0,
+            "wheel scroll must still emit wl_pointer.axis"
+        );
+    }
+
+    #[test]
+    fn touch_emulation_cancels_on_runtime_toggle_and_surface_unmap() {
+        let mut env = ClientEnv::new();
+        let (surf, xs, tl) = spawn_unmapped_toplevel(&mut env, "Term", "app.term");
+        attach_shm_buffer_and_commit(&mut env, &surf, 600, 400);
+
+        let mapped_rect = env
+            .state
+            .mapped_windows
+            .iter()
+            .find(|m| m.app_id == "app.term")
+            .expect("term mapped")
+            .rect;
+        let pt = Point::from((
+            f64::from(mapped_rect.x) + 40.0,
+            f64::from(mapped_rect.y) + 40.0,
+        ));
+        env.state
+            .handle_pointer_absolute_motion(pt, InputTime::from_millis(10));
+        env.pump();
+
+        // Toggle touch emulation ON at runtime.
+        crate::keybind_dispatcher::execute_action_descriptor(
+            &mut env.state,
+            koma_lua::ActionDescriptor::WindowToggleTouchEmulation,
+            false,
+        );
+        env.client.touch_events.clear();
+        env.client.pointer_buttons.clear();
+
+        // Press BTN_LEFT -> starts touch emulation.
+        crate::keybind_dispatcher::process_pointer_button_event(
+            &mut env.state,
+            BTN_LEFT,
+            ButtonState::Pressed,
+            InputTime::from_millis(20),
+            false,
+        );
+        env.pump();
+        assert!(matches!(
+            env.client.touch_events.first(),
+            Some(CapturedTouchEvent::Down { id: 0, .. })
+        ));
+
+        // Toggle touch emulation OFF mid-drag -> emits wl_touch.cancel and swallows release.
+        env.client.touch_events.clear();
+        crate::keybind_dispatcher::execute_action_descriptor(
+            &mut env.state,
+            koma_lua::ActionDescriptor::WindowToggleTouchEmulation,
+            false,
+        );
+        crate::keybind_dispatcher::process_pointer_button_event(
+            &mut env.state,
+            BTN_LEFT,
+            ButtonState::Released,
+            InputTime::from_millis(25),
+            false,
+        );
+        env.pump();
+        assert!(
+            env.client
+                .touch_events
+                .contains(&CapturedTouchEvent::Cancel),
+            "toggling off mid-drag must emit wl_touch.cancel, got {:?}",
+            env.client.touch_events
+        );
+        assert!(
+            env.client.pointer_buttons.is_empty(),
+            "orphan BTN_LEFT release after cancel must be swallowed"
+        );
+
+        // Toggle back ON, start drag, then unmap/destroy surface -> emits wl_touch.cancel.
+        crate::keybind_dispatcher::execute_action_descriptor(
+            &mut env.state,
+            koma_lua::ActionDescriptor::WindowToggleTouchEmulation,
+            false,
+        );
+        env.client.touch_events.clear();
+        crate::keybind_dispatcher::process_pointer_button_event(
+            &mut env.state,
+            BTN_LEFT,
+            ButtonState::Pressed,
+            InputTime::from_millis(30),
+            false,
+        );
+        env.pump();
+        assert!(matches!(
+            env.client.touch_events.first(),
+            Some(CapturedTouchEvent::Down { id: 0, .. })
+        ));
+
+        env.client.touch_events.clear();
+        tl.destroy();
+        xs.destroy();
+        surf.destroy();
+        env.pump();
+        assert!(
+            env.client
+                .touch_events
+                .contains(&CapturedTouchEvent::Cancel),
+            "destroying/unmapping surface mid-drag must emit wl_touch.cancel, got {:?}",
+            env.client.touch_events
+        );
+    }
+
+    #[test]
+    fn mouse_qualified_keyboard_bind_takes_precedence_and_stops_repeat_on_button_release() {
+        use crate::keybind_dispatcher::{process_keyboard_key_event, process_pointer_button_event};
+        use crate::pointer_grabs::BTN_LEFT;
+        use smithay::backend::input::{ButtonState, KeyState, Keycode};
+
+        let mut env = ClientEnv::new();
+        env.state
+            .lua_sandbox
+            .eval_init_lua(
+                r#"
+                koma.input({ mod_key = "Super", inherit_default_binds = true })
+                koma.bind("MouseLeft + Mod + H", koma.act.workspace.focus("9"))
+                koma.bind("MouseLeft + Mod + J", koma.act.focus.left())
+                "#,
+            )
+            .expect("eval config");
+        let snap = env.state.lua_sandbox.config_snapshot();
+        env.state.keybinds = crate::keybind_dispatcher::KeybindTable::compile_with_options(
+            &snap.binds,
+            &snap.unbinds,
+            snap.input.inherit_default_binds,
+            snap.input.mod_key.as_deref(),
+        )
+        .expect("compile keybinds");
+
+        let start_ws = env.state.active_ws_id.clone();
+        process_pointer_button_event(
+            &mut env.state,
+            BTN_LEFT,
+            ButtonState::Pressed,
+            InputTime::from_millis(10),
+            false,
+        );
+        process_keyboard_key_event(
+            &mut env.state,
+            Keycode::from(125_u32 + 8), // Super
+            KeyState::Pressed,
+            InputTime::from_millis(11),
+            false,
+        );
+        process_keyboard_key_event(
+            &mut env.state,
+            Keycode::from(35_u32 + 8), // KEY_H
+            KeyState::Pressed,
+            InputTime::from_millis(12),
+            false,
+        );
+        assert_ne!(
+            env.state.active_ws_id, start_ws,
+            "MouseLeft + Mod + H must take precedence over plain Mod + H"
+        );
+        assert_eq!(env.state.workspaces[&env.state.active_ws_id].name, "9");
+
+        // Trigger a repeating mouse-qualified bind and verify releasing MouseLeft stops it.
+        process_keyboard_key_event(
+            &mut env.state,
+            Keycode::from(35_u32 + 8), // KEY_H released
+            KeyState::Released,
+            InputTime::from_millis(13),
+            false,
+        );
+        process_keyboard_key_event(
+            &mut env.state,
+            Keycode::from(36_u32 + 8), // KEY_J (WhileHeld focus.left)
+            KeyState::Pressed,
+            InputTime::from_millis(14),
+            false,
+        );
+        assert!(
+            env.state.keybinds.repeat.is_active(),
+            "MouseLeft + Mod + J should arm keybind repeat while held"
+        );
+        process_pointer_button_event(
+            &mut env.state,
+            BTN_LEFT,
+            ButtonState::Released,
+            InputTime::from_millis(15),
+            false,
+        );
+        assert!(
+            !env.state.keybinds.repeat.is_active(),
+            "releasing MouseLeft must cancel active mouse-qualified repeat"
+        );
+    }
+
+    #[test]
+    fn left_first_multi_button_chord_works_over_touch_emulated_window_and_uses_disjoint_slot() {
+        use crate::keybind_dispatcher::process_pointer_button_event;
+        use crate::pointer_grabs::has_explicit_pointer_grab;
+        use smithay::backend::input::ButtonState;
+
+        let mut env = ClientEnv::new();
+        crate::config_watcher::reload_from_lua_source(
+            &mut env.state,
+            std::path::Path::new("/tmp/init.lua"),
+            std::path::Path::new("/tmp"),
+            r#"
+            koma.bind("MouseLeft + MouseRight", koma.act.window.drag_move())
+            koma.rule.window({
+                name = "touch-win",
+                matches = { { app_id = "^touch\\.chord$" } },
+                emulate_touch = true,
+            })
+            "#,
+            false,
+        )
+        .expect("apply config");
+
+        let (_surf, _xdg, _tl) = env.spawn_window("TouchChord", "touch.chord");
+        env.pump();
+        let rect = env.state.mapped_windows.last().expect("mapped").rect;
+        env.state.pointer_location =
+            Point::from((f64::from(rect.x) + 40.0, f64::from(rect.y) + 40.0));
+
+        // Simulate physical touch holding slot 0 before pointer touch emulation begins.
+        env.state.active_physical_touch_slots.insert(0);
+        process_pointer_button_event(
+            &mut env.state,
+            BTN_LEFT,
+            ButtonState::Pressed,
+            InputTime::from_millis(100),
+            false,
+        );
+        let active_emul = env
+            .state
+            .active_touch_emulation
+            .as_ref()
+            .expect("touch emulation active");
+        assert_ne!(
+            active_emul.slot_id, 0,
+            "emulated slot must not collide with active physical slot 0"
+        );
+
+        // Pressing MouseRight completes MouseLeft + MouseRight -> starts MoveWindowGrab cleanly.
+        process_pointer_button_event(
+            &mut env.state,
+            BTN_RIGHT,
+            ButtonState::Pressed,
+            InputTime::from_millis(110),
+            false,
+        );
+        let ptr = env.state.pointer_handle().expect("pointer");
+        assert!(
+            has_explicit_pointer_grab(&env.state, &ptr),
+            "left-first MouseLeft + MouseRight must hold MoveWindowGrab over touch-emulated window"
+        );
+
+        // Releasing MouseLeft ends the grab cleanly.
+        process_pointer_button_event(
+            &mut env.state,
+            BTN_LEFT,
+            ButtonState::Released,
+            InputTime::from_millis(120),
+            false,
+        );
+        assert!(!has_explicit_pointer_grab(&env.state, &ptr));
+        process_pointer_button_event(
+            &mut env.state,
+            BTN_RIGHT,
+            ButtonState::Released,
+            InputTime::from_millis(130),
+            false,
+        );
+    }
 }

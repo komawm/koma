@@ -43,6 +43,7 @@ pub enum ActionDescriptor {
     WindowMaximizeToggle,
     WindowFloatToggle,
     WindowPseudotileToggle,
+    WindowToggleTouchEmulation,
     WindowDragMove,
     WindowDragResize,
     WindowResizeDelta {
@@ -1088,6 +1089,7 @@ pub struct LuaWindowRuleSpec {
     pub clip_to_geometry: Option<bool>,
     pub focusable: Option<bool>,
     pub pin_on_output: Option<bool>,
+    pub emulate_touch: Option<bool>,
     pub suppress_events: Vec<String>,
     pub block_out_from: Option<BlockOutPolicy>,
 }
@@ -2079,6 +2081,7 @@ mod tests {
                 "min_height": 300
             },
             "immediate": true,
+            "emulate_touch": true,
             "suppress_events": ["maximize"]
         });
         let spec: LuaWindowRuleSpec =
@@ -2103,6 +2106,7 @@ mod tests {
         assert_eq!(spec.initial.min_width, Some(PresetColumnWidth::Fixed(400)));
         assert_eq!(spec.initial.min_height, Some(PresetColumnWidth::Fixed(300)));
         assert_eq!(spec.immediate, Some(true));
+        assert_eq!(spec.emulate_touch, Some(true));
         assert_eq!(spec.suppress_events, vec!["maximize"]);
     }
 }

@@ -73,7 +73,19 @@ pub struct EffectiveBind {
     pub repeat: bool,
 }
 
-const MODIFIER_ORDER: &[&str] = &["Mod", "Ctrl", "Shift", "Alt", "Super", "Mod5"];
+const MODIFIER_ORDER: &[&str] = &[
+    "Mod",
+    "Ctrl",
+    "Shift",
+    "Alt",
+    "Super",
+    "Mod5",
+    "MouseLeft",
+    "MouseRight",
+    "MouseMiddle",
+    "MouseBack",
+    "MouseForward",
+];
 
 fn canonical_modifier(token: &str) -> Option<&'static str> {
     match token.trim().to_ascii_lowercase().as_str() {
@@ -85,6 +97,25 @@ fn canonical_modifier(token: &str) -> Option<&'static str> {
         "mod5" | "altgr" | "iso_level3_shift" => Some("Mod5"),
         _ => None,
     }
+}
+
+/// Returns `true` if `token` is a recognized keyboard modifier (`Mod`, `Ctrl`, `Shift`, `Alt`, `Super`, `Mod5`).
+#[must_use]
+pub fn is_keyboard_modifier(token: &str) -> bool {
+    canonical_modifier(token).is_some()
+}
+
+/// Returns `true` if `token` is valid in the modifier position of a chord (either a keyboard
+/// modifier or a held mouse button such as `MouseLeft` / `MouseRight`).
+#[must_use]
+pub fn is_valid_chord_modifier(token: &str) -> bool {
+    canonical_modifier(token).is_some() || canonical_mouse_button_modifier(token).is_some()
+}
+
+fn canonical_mouse_button_modifier(token: &str) -> Option<&'static str> {
+    canonical_pointer_trigger(token)
+        .filter(|(_, kind)| *kind == ChordKind::PointerButton)
+        .map(|(name, _)| name)
 }
 
 fn canonical_pointer_trigger(token: &str) -> Option<(&'static str, ChordKind)> {
@@ -202,7 +233,10 @@ fn canonical_parts(raw: &str) -> (Vec<String>, String, ChordKind) {
     };
     let mut mods: Vec<String> = Vec::new();
     for token in modifiers {
-        let name = canonical_modifier(token).unwrap_or(token.trim()).to_owned();
+        let name = canonical_modifier(token)
+            .or_else(|| canonical_mouse_button_modifier(token))
+            .unwrap_or(token.trim())
+            .to_owned();
         if !mods.contains(&name) {
             mods.push(name);
         }
@@ -214,6 +248,35 @@ fn canonical_parts(raw: &str) -> (Vec<String>, String, ChordKind) {
             .unwrap_or(MODIFIER_ORDER.len())
     });
     if let Some((name, kind)) = canonical_pointer_trigger(trigger) {
+        if kind == ChordKind::PointerButton
+            && mods
+                .iter()
+                .any(|m| canonical_mouse_button_modifier(m).is_some())
+        {
+            // Order-independent canonicalization for multi-mouse-button chords (e.g.
+            // `MouseRight + MouseLeft` -> `MouseLeft + MouseRight`).
+            let mut kb_mods = Vec::new();
+            let mut mouse_btns = vec![name.to_owned()];
+            for m in mods {
+                if let Some(mb) = canonical_mouse_button_modifier(&m) {
+                    let mb_owned = mb.to_owned();
+                    if !mouse_btns.contains(&mb_owned) {
+                        mouse_btns.push(mb_owned);
+                    }
+                } else {
+                    kb_mods.push(m);
+                }
+            }
+            mouse_btns.sort_by_key(|b| {
+                MODIFIER_ORDER
+                    .iter()
+                    .position(|known| known == b)
+                    .unwrap_or(MODIFIER_ORDER.len())
+            });
+            let canon_trigger = mouse_btns.pop().expect("non-empty mouse_btns");
+            kb_mods.extend(mouse_btns);
+            return (kb_mods, canon_trigger, kind);
+        }
         (mods, name.to_owned(), kind)
     } else {
         (mods, canonical_key_trigger(trigger), ChordKind::Key)
@@ -303,6 +366,9 @@ pub fn describe_action(action: &ActionDescriptor) -> String {
         ActionDescriptor::WindowFloatToggle => "koma.act.window.float_toggle()".to_owned(),
         ActionDescriptor::WindowPseudotileToggle => {
             "koma.act.window.pseudotile_toggle()".to_owned()
+        }
+        ActionDescriptor::WindowToggleTouchEmulation => {
+            "koma.act.window.toggle_touch_emulation()".to_owned()
         }
         ActionDescriptor::WindowDragMove => "koma.act.window.drag_move()".to_owned(),
         ActionDescriptor::WindowDragResize => "koma.act.window.drag_resize()".to_owned(),
@@ -464,6 +530,7 @@ pub fn group_for_action(action: &ActionDescriptor) -> &'static str {
         | ActionDescriptor::WindowMaximizeToggle
         | ActionDescriptor::WindowFloatToggle
         | ActionDescriptor::WindowPseudotileToggle
+        | ActionDescriptor::WindowToggleTouchEmulation
         | ActionDescriptor::WindowDragMove
         | ActionDescriptor::WindowDragResize
         | ActionDescriptor::WindowResizeDelta { .. } => GROUP_WINDOWS,
@@ -833,6 +900,40 @@ mod tests {
                 .filter(|row| row.overridden_builtin && row.chord == "Super + Q")
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn multi_mouse_button_chords_canonicalize_and_share_identity() {
+        assert_eq!(
+            format_chord("MouseRight + MouseLeft"),
+            "MouseLeft + MouseRight"
+        );
+        assert_eq!(
+            format_chord("mod + mouse:273 + mouse:272"),
+            "Mod + MouseLeft + MouseRight"
+        );
+        assert_eq!(
+            chord_kind("MouseLeft + MouseRight"),
+            ChordKind::PointerButton
+        );
+        assert_eq!(
+            chord_identity("MouseRight + MouseLeft", None),
+            chord_identity("MouseLeft + MouseRight", None)
+        );
+        assert!(is_valid_chord_modifier("MouseLeft"));
+        assert!(!is_keyboard_modifier("MouseLeft"));
+    }
+
+    #[test]
+    fn describes_toggle_touch_emulation_action() {
+        assert_eq!(
+            describe_action(&ActionDescriptor::WindowToggleTouchEmulation),
+            "koma.act.window.toggle_touch_emulation()"
+        );
+        assert_eq!(
+            group_for_action(&ActionDescriptor::WindowToggleTouchEmulation),
+            GROUP_WINDOWS
         );
     }
 }

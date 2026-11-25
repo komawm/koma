@@ -68,6 +68,7 @@ pub struct RepeatRequest {
     pub bind_id: BindHandleId,
     pub keycode: u32,
     pub mods: u8,
+    pub mouse_mods: u8,
     pub action: ActionDescriptor,
     pub allow_when_locked: bool,
 }
@@ -112,6 +113,15 @@ impl KeyRepeatState {
     /// Stops repeating and returns the chord that was active, if any.
     pub fn cancel(&mut self) -> Option<RepeatRequest> {
         self.active.take().map(|active| active.request)
+    }
+
+    /// Stops repeating if the active chord requires the released mouse button bit.
+    pub fn cancel_if_mouse_button_released(&mut self, button_bit: u8) -> Option<RepeatRequest> {
+        let matches = self
+            .active
+            .as_ref()
+            .is_some_and(|active| (active.request.mouse_mods & button_bit) != 0);
+        if matches { self.cancel() } else { None }
     }
 
     /// Cancels because focus, workspace, grab, lock or configuration changed outside the
@@ -276,6 +286,7 @@ mod tests {
             bind_id: BindHandleId(7),
             keycode,
             mods,
+            mouse_mods: 0,
             action,
             allow_when_locked: false,
         }

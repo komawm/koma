@@ -14,14 +14,20 @@ mod linux_pw {
     use pipewire::core::CoreRc;
     use pipewire::main_loop::MainLoopRc;
     use pipewire::properties::PropertiesBox;
+    use pipewire::spa::buffer::DataType;
     use pipewire::spa::param::ParamType;
     use pipewire::spa::param::format::{FormatProperties, MediaSubtype, MediaType};
     use pipewire::spa::param::video::VideoFormat;
     use pipewire::spa::pod::deserialize::PodDeserializer;
     use pipewire::spa::pod::serialize::PodSerializer;
-    use pipewire::spa::pod::{self, Pod, Value};
-    use pipewire::spa::sys::{SPA_DATA_MemPtr, SPA_ID_INVALID};
-    use pipewire::spa::utils::{Direction, Fraction, Rectangle, SpaTypes};
+    use pipewire::spa::pod::{self, ChoiceValue, Pod, Value};
+    use pipewire::spa::sys::{
+        SPA_ID_INVALID, SPA_PARAM_BUFFERS_blocks, SPA_PARAM_BUFFERS_buffers,
+        SPA_PARAM_BUFFERS_dataType, SPA_PARAM_BUFFERS_size, SPA_PARAM_BUFFERS_stride,
+    };
+    use pipewire::spa::utils::{
+        Choice, ChoiceEnum, ChoiceFlags, Direction, Fraction, Rectangle, SpaTypes,
+    };
     use pipewire::stream::{StreamFlags, StreamListener, StreamRc, StreamState};
 
     use crate::wayland_bridge::WaylandBridge;
@@ -88,8 +94,8 @@ mod linux_pw {
                 })
                 .map_err(|_| anyhow::anyhow!("pipewire channel closed"))?;
             reply_rx
-                .recv()
-                .context("pipewire thread dropped StartStream reply")?
+                .recv_timeout(Duration::from_secs(5))
+                .map_err(|err| anyhow::anyhow!("pipewire StartStream timed out or closed: {err}"))?
         }
 
         pub fn stop_stream(&self, node_id: u32) {
@@ -307,38 +313,14 @@ mod linux_pw {
                     return;
                 }
                 let guard = inner_param.borrow();
-                let stride = guard.width * 4;
-                let size = stride * guard.height;
-                let buffers_obj = pod::Object {
-                    type_: SpaTypes::ObjectParamBuffers.as_raw(),
-                    id: ParamType::Buffers.as_raw(),
-                    properties: vec![
-                        pod::Property::new(
-                            pipewire::spa::sys::SPA_PARAM_BUFFERS_buffers,
-                            pod::Value::Int(4),
-                        ),
-                        pod::Property::new(
-                            pipewire::spa::sys::SPA_PARAM_BUFFERS_blocks,
-                            pod::Value::Int(1),
-                        ),
-                        pod::Property::new(
-                            pipewire::spa::sys::SPA_PARAM_BUFFERS_size,
-                            pod::Value::Int(size as i32),
-                        ),
-                        pod::Property::new(
-                            pipewire::spa::sys::SPA_PARAM_BUFFERS_stride,
-                            pod::Value::Int(stride as i32),
-                        ),
-                        pod::Property::new(
-                            pipewire::spa::sys::SPA_PARAM_BUFFERS_dataType,
-                            pod::Value::Int(1 << SPA_DATA_MemPtr),
-                        ),
-                    ],
-                };
-                let buf_bytes = serialize_pod_object(buffers_obj);
-                if let Some(pod) = Pod::from_bytes(&buf_bytes) {
-                    let mut params = [pod];
-                    let _ = stream.update_params(&mut params);
+                let stride = (guard.width * 4) as i32;
+                let size = stride * guard.height as i32;
+                let buf_bytes = build_buffers_pod_bytes(size, stride);
+                if let Some(buf_pod) = Pod::from_bytes(&buf_bytes) {
+                    let mut params = [buf_pod];
+                    if let Err(err) = stream.update_params(&mut params) {
+                        tracing::warn!(error = ?err, "failed to update PipeWire buffer params");
+                    }
                 }
             })
             .register()
@@ -363,6 +345,38 @@ mod linux_pw {
             inner,
         });
         Ok(())
+    }
+
+    fn build_buffers_pod_bytes(size: i32, stride: i32) -> Vec<u8> {
+        let buffers_obj = pod::object!(
+            SpaTypes::ObjectParamBuffers,
+            ParamType::Buffers,
+            pod::Property::new(
+                SPA_PARAM_BUFFERS_buffers,
+                Value::Choice(ChoiceValue::Int(Choice(
+                    ChoiceFlags::empty(),
+                    ChoiceEnum::Range {
+                        default: 4,
+                        min: 2,
+                        max: 16,
+                    },
+                ))),
+            ),
+            pod::Property::new(SPA_PARAM_BUFFERS_blocks, Value::Int(1)),
+            pod::Property::new(SPA_PARAM_BUFFERS_size, Value::Int(size)),
+            pod::Property::new(SPA_PARAM_BUFFERS_stride, Value::Int(stride)),
+            pod::Property::new(
+                SPA_PARAM_BUFFERS_dataType,
+                Value::Choice(ChoiceValue::Int(Choice(
+                    ChoiceFlags::empty(),
+                    ChoiceEnum::Flags {
+                        default: 1 << DataType::MemFd.as_raw(),
+                        flags: vec![1 << DataType::MemFd.as_raw()],
+                    },
+                ))),
+            ),
+        );
+        serialize_pod_object(buffers_obj)
     }
 
     fn build_format_pod_bytes(width: u32, height: u32) -> Vec<u8> {
@@ -400,6 +414,205 @@ mod linux_pw {
         // Validate roundtrip when deserializing in debug builds.
         debug_assert!(PodDeserializer::deserialize_any_from(&buf).is_ok());
         buf
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::wayland_bridge::{CapturedFrame, WaylandCommand};
+        use pipewire::spa::sys::SPA_DATA_MemPtr;
+
+        #[test]
+        fn buffers_pod_uses_memfd_flags_and_range() {
+            let stride = 2560 * 4;
+            let size = stride * 1600;
+            let bytes = build_buffers_pod_bytes(size, stride);
+            let (_, val) =
+                PodDeserializer::deserialize_any_from(&bytes).expect("valid buffers POD");
+            let Value::Object(obj) = val else {
+                panic!("expected Object POD, got {val:?}");
+            };
+            assert_eq!(obj.type_, SpaTypes::ObjectParamBuffers.as_raw());
+            assert_eq!(obj.id, ParamType::Buffers.as_raw());
+
+            let prop = |key: u32| -> &Value {
+                &obj.properties
+                    .iter()
+                    .find(|p| p.key == key)
+                    .unwrap_or_else(|| panic!("missing property {key}"))
+                    .value
+            };
+
+            assert_eq!(
+                prop(SPA_PARAM_BUFFERS_buffers),
+                &Value::Choice(ChoiceValue::Int(Choice(
+                    ChoiceFlags::empty(),
+                    ChoiceEnum::Range {
+                        default: 4,
+                        min: 2,
+                        max: 16,
+                    },
+                )))
+            );
+            assert_eq!(prop(SPA_PARAM_BUFFERS_blocks), &Value::Int(1));
+            assert_eq!(prop(SPA_PARAM_BUFFERS_size), &Value::Int(size));
+            assert_eq!(prop(SPA_PARAM_BUFFERS_stride), &Value::Int(stride));
+            assert_eq!(
+                prop(SPA_PARAM_BUFFERS_dataType),
+                &Value::Choice(ChoiceValue::Int(Choice(
+                    ChoiceFlags::empty(),
+                    ChoiceEnum::Flags {
+                        default: 1 << DataType::MemFd.as_raw(),
+                        flags: vec![1 << DataType::MemFd.as_raw()],
+                    },
+                )))
+            );
+            assert_ne!(
+                prop(SPA_PARAM_BUFFERS_dataType),
+                &Value::Int(1 << SPA_DATA_MemPtr)
+            );
+        }
+
+        #[test]
+        fn format_pod_serializes_raw_video_bgra_and_bgrx() {
+            let bytes = build_format_pod_bytes(1920, 1080);
+            let (_, val) = PodDeserializer::deserialize_any_from(&bytes).expect("valid format POD");
+            let Value::Object(obj) = val else {
+                panic!("expected Object POD, got {val:?}");
+            };
+            assert_eq!(obj.type_, SpaTypes::ObjectParamFormat.as_raw());
+            assert_eq!(obj.id, ParamType::EnumFormat.as_raw());
+            assert!(
+                obj.properties
+                    .iter()
+                    .any(|p| p.key == FormatProperties::VideoSize.as_raw()
+                        && p.value
+                            == Value::Rectangle(Rectangle {
+                                width: 1920,
+                                height: 1080
+                            }))
+            );
+            assert!(
+                obj.properties
+                    .iter()
+                    .any(|p| p.key == FormatProperties::VideoFramerate.as_raw()
+                        && p.value == Value::Fraction(Fraction { num: 30, denom: 1 }))
+            );
+        }
+
+        #[test]
+        fn live_pipewire_consumer_negotiates_memfd_and_receives_frame() {
+            let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR") else {
+                return;
+            };
+            if !std::path::Path::new(&runtime_dir)
+                .join("pipewire-0")
+                .exists()
+            {
+                return;
+            }
+
+            let (wayland, rx) = WaylandBridge::for_test();
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let stop_wl = std::sync::Arc::clone(&stop);
+            let wayland_thread = std::thread::spawn(move || {
+                while !stop_wl.load(std::sync::atomic::Ordering::Relaxed) {
+                    match rx.recv_timeout(Duration::from_millis(50)) {
+                        Ok(WaylandCommand::CaptureFrame { reply, .. }) => {
+                            let w = 64u32;
+                            let h = 64u32;
+                            let stride = w * 4;
+                            let pixels = vec![0x42u8; (stride * h) as usize];
+                            let _ = reply.send(Ok(CapturedFrame {
+                                width: w,
+                                height: h,
+                                stride,
+                                format: 0,
+                                pixels,
+                            }));
+                        }
+                        Ok(_) => {}
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
+                }
+            });
+
+            let Ok(mgr) = PipeWireManager::start(wayland) else {
+                return;
+            };
+            let node_id = mgr
+                .start_stream("TEST-1".to_owned(), 64, 64, false)
+                .expect("start_stream");
+
+            let (done_tx, done_rx) = mpsc::channel();
+            let consumer_thread = std::thread::spawn(move || {
+                pipewire::init();
+                let main_loop = MainLoopRc::new(None).expect("consumer main loop");
+                let context = ContextRc::new(&main_loop, None).expect("consumer context");
+                let core = context.connect_rc(None).expect("consumer core");
+                let stream = StreamRc::new(core, "koma-portal-test-consumer", PropertiesBox::new())
+                    .expect("consumer stream");
+
+                let ml_quit = main_loop.clone();
+                let ml_err = main_loop.clone();
+                let tx_frame = done_tx.clone();
+                let tx_err = done_tx;
+                let _listener = stream
+                    .add_local_listener_with_user_data(())
+                    .state_changed(move |_, _, _, new| {
+                        if let StreamState::Error(msg) = new {
+                            let _ = tx_err.send(Err(format!("consumer stream error: {msg}")));
+                            ml_err.quit();
+                        }
+                    })
+                    .process(move |stream, _| {
+                        if let Some(mut buf) = stream.dequeue_buffer()
+                            && let Some(data) = buf.datas_mut().first_mut()
+                        {
+                            let chunk_size = data.chunk().size();
+                            let has_data = data.data().is_some_and(|s| !s.is_empty());
+                            if chunk_size > 0 && has_data {
+                                let _ = tx_frame.send(Ok(chunk_size));
+                                ml_quit.quit();
+                            }
+                        }
+                    })
+                    .register()
+                    .expect("consumer listener");
+
+                let fmt_bytes = build_format_pod_bytes(64, 64);
+                let fmt_pod = Pod::from_bytes(&fmt_bytes).expect("consumer format pod");
+                let mut params = [fmt_pod];
+                stream
+                    .connect(
+                        Direction::Input,
+                        Some(node_id),
+                        StreamFlags::AUTOCONNECT | StreamFlags::MAP_BUFFERS,
+                        &mut params,
+                    )
+                    .expect("consumer connect");
+
+                let ml_timeout = main_loop.clone();
+                let timer = main_loop.loop_().add_timer(move |_| {
+                    ml_timeout.quit();
+                });
+                let _ = timer.update_timer(Some(Duration::from_secs(5)), None);
+                main_loop.run();
+            });
+
+            let result = done_rx
+                .recv_timeout(Duration::from_secs(6))
+                .expect("consumer should report frame or error");
+            mgr.stop_stream(node_id);
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            drop(mgr);
+            let _ = consumer_thread.join();
+            let _ = wayland_thread.join();
+
+            let chunk_size = result.expect("PipeWire consumer must negotiate MemFd without error");
+            assert_eq!(chunk_size, 64 * 64 * 4);
+        }
     }
 }
 
