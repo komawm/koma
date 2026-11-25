@@ -649,13 +649,15 @@ pub struct MappedWindow {
     pub emulate_touch_override: Option<bool>,
 }
 
-/// Active pointer-to-touch (`BTN_LEFT` -> `wl_touch` slot 0) emulation state.
+/// Active pointer-to-touch (`BTN_LEFT` -> `wl_touch`) emulation state.
 #[derive(Debug, Clone)]
 pub struct ActiveTouchEmulation {
     pub win_id: WindowId,
     pub surface: WlSurface,
     pub origin: Point<f64, Logical>,
+    pub subsurface_offset: Point<f64, Logical>,
     pub surface_bounds: Rectangle<f64, Logical>,
+    pub slot_id: u32,
 }
 
 /// A toplevel that left the layout while its `windows_close` spring is still settling: only its
@@ -920,6 +922,8 @@ pub struct KomaState {
     pub dnd_drag: Option<ActiveDnd>,
     /// Active pointer-to-touch (`BTN_LEFT` -> `wl_touch`) emulation session.
     pub active_touch_emulation: Option<ActiveTouchEmulation>,
+    /// Physical touch slots currently pressed on `seat0`, kept disjoint from emulated slots.
+    pub active_physical_touch_slots: std::collections::BTreeSet<u32>,
     /// Set when `SeatHandler::focus_changed` runs while `SeatHandle::Pointer` is locked
     /// (e.g. `PopupPointerGrab::unset` -> `unset_keyboard_grab` -> `keyboard.set_focus`) so
     /// pointer constraint reconciliation runs immediately once the outer pointer call exits.
@@ -1198,6 +1202,7 @@ impl KomaState {
             cursor_anim_generation: 0,
             dnd_drag: None,
             active_touch_emulation: None,
+            active_physical_touch_slots: std::collections::BTreeSet::new(),
             pending_pointer_constraint_break: false,
             output_layout: OutputLayout::new(),
             output_workspaces: HashMap::new(),
@@ -2592,6 +2597,7 @@ impl KomaState {
         if let Some(touch) = self.touch() {
             let origin = self
                 .surface_global_origin(&active.surface)
+                .map(|root| root + active.subsurface_offset)
                 .unwrap_or(active.origin);
             // Smithay's `TouchHandle::cancel` is a no-op unless `pending_frame` is populated by an
             // in-progress touch event, so prime the frame before cancelling the active slot.
@@ -2599,7 +2605,7 @@ impl KomaState {
                 self,
                 Some((active.surface, origin)),
                 &TouchMotionPayload {
-                    slot: smithay::backend::input::TouchSlot::from(Some(0)),
+                    slot: smithay::backend::input::TouchSlot::from(Some(active.slot_id)),
                     location: self.pointer_location,
                     time: smithay::backend::input::InputTime::now(),
                 },
@@ -5030,6 +5036,17 @@ impl KomaState {
         }
     }
 
+    /// Cancels an active repeat-while-held keybind if it required the released mouse button.
+    pub fn cancel_keybind_repeat_if_mouse_button_released(&mut self, button_bit: u8) {
+        if let Some(cancelled) = self
+            .keybinds
+            .repeat
+            .cancel_if_mouse_button_released(button_bit)
+        {
+            self.drop_keybind_repeat_timer("mouse_button_released", cancelled.bind_id);
+        }
+    }
+
     /// Cancels a repeat because focus, workspace, grab or lock changed outside the repeated
     /// action itself; a repeat that causes the change keeps running.
     pub fn cancel_keybind_repeat_for_external_change(&mut self, reason: &'static str) {
@@ -5795,11 +5812,15 @@ impl KomaState {
         }
         let under = self.surface_under(pos);
         let serial = SERIAL_COUNTER.next_serial();
+        let slot = event.slot();
+        if let Ok(id) = u32::try_from(i32::from(slot)) {
+            self.active_physical_touch_slots.insert(id);
+        }
         touch.down(
             self,
             under,
             &TouchDownPayload {
-                slot: event.slot(),
+                slot,
                 location: pos,
                 serial,
                 time: event.time(),
@@ -5850,11 +5871,15 @@ impl KomaState {
         let Some(touch) = self.touch() else {
             return;
         };
+        let slot = event.slot();
+        if let Ok(id) = u32::try_from(i32::from(slot)) {
+            self.active_physical_touch_slots.remove(&id);
+        }
         let serial = SERIAL_COUNTER.next_serial();
         touch.up(
             self,
             &TouchUpPayload {
-                slot: event.slot(),
+                slot,
                 serial,
                 time: event.time(),
             },
@@ -5868,6 +5893,7 @@ impl KomaState {
     }
 
     pub fn handle_touch_cancel(&mut self) {
+        self.active_physical_touch_slots.clear();
         if let Some(touch) = self.touch() {
             touch.cancel(self);
         }
@@ -6740,6 +6766,7 @@ pub(crate) mod tests {
                 bind_id: koma_lua::BindHandleId(13),
                 keycode: 42,
                 mods: 1,
+                mouse_mods: 0,
                 action: koma_lua::ActionDescriptor::FocusDirection("left".to_owned()),
                 allow_when_locked: false,
             },

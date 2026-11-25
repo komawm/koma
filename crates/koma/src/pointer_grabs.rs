@@ -103,6 +103,16 @@ pub fn has_explicit_pointer_grab(
         .unwrap_or(false)
 }
 
+#[must_use]
+pub fn is_popup_grab_active(
+    _state: &KomaState,
+    pointer: &smithay::input::pointer::PointerHandle<KomaState>,
+) -> bool {
+    pointer
+        .with_grab(|_, grab| grab.is::<smithay::desktop::PopupPointerGrab<KomaState>>())
+        .unwrap_or(false)
+}
+
 /// Initiates a compositor-bound (`Mod + MouseLeft` or multi-button chord) interactive window
 /// move grab before forwarding the triggering `ButtonEvent` to `PointerHandle::button`.
 pub fn start_compositor_move_grab(state: &mut KomaState, button_code: u32, serial: Serial) -> bool {
@@ -788,7 +798,7 @@ impl PointerGrab<KomaState> for MoveWindowGrab {
         if !self
             .chord_buttons
             .iter()
-            .all(|btn| handle.current_pressed().contains(btn))
+            .all(|btn| data.keybinds.pressed_buttons.contains(btn))
         {
             handle.unset_grab(self, data, event.serial, event.time, true);
             return;
@@ -1141,8 +1151,7 @@ impl PointerGrab<KomaState> for ResizeWindowGrab {
         if !self
             .chord_buttons
             .iter()
-            .all(|btn| handle.current_pressed().contains(btn))
-            || handle.current_pressed().is_empty()
+            .all(|btn| data.keybinds.pressed_buttons.contains(btn))
         {
             handle.unset_grab(self, data, event.serial, event.time, true);
         }

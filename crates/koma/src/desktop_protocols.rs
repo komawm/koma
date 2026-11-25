@@ -783,11 +783,20 @@ impl KomaState {
                 self.pointer_location = clamped;
                 let origin = self
                     .surface_global_origin(&active.surface)
+                    .map(|root| root + active.subsurface_offset)
                     .unwrap_or(active.origin);
-                let min_x = active.surface_bounds.loc.x;
-                let max_x = min_x + active.surface_bounds.size.w.max(0.0);
-                let min_y = active.surface_bounds.loc.y;
-                let max_y = min_y + active.surface_bounds.size.h.max(0.0);
+                let live_bounds = surface_logical_bounds(&active.surface)
+                    .map(|r| {
+                        Rectangle::new(
+                            (f64::from(r.loc.x), f64::from(r.loc.y)).into(),
+                            (f64::from(r.size.w.max(1)), f64::from(r.size.h.max(1))).into(),
+                        )
+                    })
+                    .unwrap_or(active.surface_bounds);
+                let min_x = live_bounds.loc.x;
+                let max_x = min_x + live_bounds.size.w.max(0.0);
+                let min_y = live_bounds.loc.y;
+                let max_y = min_y + live_bounds.size.h.max(0.0);
                 let local = clamped - origin;
                 let clamped_local: Point<f64, Logical> =
                     (local.x.clamp(min_x, max_x), local.y.clamp(min_y, max_y)).into();
@@ -797,7 +806,7 @@ impl KomaState {
                         self,
                         Some((active.surface, origin)),
                         &TouchMotionPayload {
-                            slot: TouchSlot::from(Some(0)),
+                            slot: TouchSlot::from(Some(active.slot_id)),
                             location: touch_global,
                             time,
                         },

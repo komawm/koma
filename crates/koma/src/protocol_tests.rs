@@ -9315,4 +9315,170 @@ mod pointer_to_touch_emulation_tests {
             env.client.touch_events
         );
     }
+
+    #[test]
+    fn mouse_qualified_keyboard_bind_takes_precedence_and_stops_repeat_on_button_release() {
+        use crate::keybind_dispatcher::{process_keyboard_key_event, process_pointer_button_event};
+        use crate::pointer_grabs::BTN_LEFT;
+        use smithay::backend::input::{ButtonState, KeyState, Keycode};
+
+        let mut env = ClientEnv::new();
+        env.state
+            .lua_sandbox
+            .eval_init_lua(
+                r#"
+                koma.input({ mod_key = "Super", inherit_default_binds = true })
+                koma.bind("MouseLeft + Mod + H", koma.act.workspace.focus("9"))
+                koma.bind("MouseLeft + Mod + J", koma.act.focus.left())
+                "#,
+            )
+            .expect("eval config");
+        let snap = env.state.lua_sandbox.config_snapshot();
+        env.state.keybinds = crate::keybind_dispatcher::KeybindTable::compile_with_options(
+            &snap.binds,
+            &snap.unbinds,
+            snap.input.inherit_default_binds,
+            snap.input.mod_key.as_deref(),
+        )
+        .expect("compile keybinds");
+
+        let start_ws = env.state.active_ws_id.clone();
+        process_pointer_button_event(
+            &mut env.state,
+            BTN_LEFT,
+            ButtonState::Pressed,
+            InputTime::from_millis(10),
+            false,
+        );
+        process_keyboard_key_event(
+            &mut env.state,
+            Keycode::from(125_u32 + 8), // Super
+            KeyState::Pressed,
+            InputTime::from_millis(11),
+            false,
+        );
+        process_keyboard_key_event(
+            &mut env.state,
+            Keycode::from(35_u32 + 8), // KEY_H
+            KeyState::Pressed,
+            InputTime::from_millis(12),
+            false,
+        );
+        assert_ne!(
+            env.state.active_ws_id, start_ws,
+            "MouseLeft + Mod + H must take precedence over plain Mod + H"
+        );
+        assert_eq!(env.state.workspaces[&env.state.active_ws_id].name, "9");
+
+        // Trigger a repeating mouse-qualified bind and verify releasing MouseLeft stops it.
+        process_keyboard_key_event(
+            &mut env.state,
+            Keycode::from(35_u32 + 8), // KEY_H released
+            KeyState::Released,
+            InputTime::from_millis(13),
+            false,
+        );
+        process_keyboard_key_event(
+            &mut env.state,
+            Keycode::from(36_u32 + 8), // KEY_J (WhileHeld focus.left)
+            KeyState::Pressed,
+            InputTime::from_millis(14),
+            false,
+        );
+        assert!(
+            env.state.keybinds.repeat.is_active(),
+            "MouseLeft + Mod + J should arm keybind repeat while held"
+        );
+        process_pointer_button_event(
+            &mut env.state,
+            BTN_LEFT,
+            ButtonState::Released,
+            InputTime::from_millis(15),
+            false,
+        );
+        assert!(
+            !env.state.keybinds.repeat.is_active(),
+            "releasing MouseLeft must cancel active mouse-qualified repeat"
+        );
+    }
+
+    #[test]
+    fn left_first_multi_button_chord_works_over_touch_emulated_window_and_uses_disjoint_slot() {
+        use crate::keybind_dispatcher::process_pointer_button_event;
+        use crate::pointer_grabs::has_explicit_pointer_grab;
+        use smithay::backend::input::ButtonState;
+
+        let mut env = ClientEnv::new();
+        crate::config_watcher::reload_from_lua_source(
+            &mut env.state,
+            std::path::Path::new("/tmp/init.lua"),
+            std::path::Path::new("/tmp"),
+            r#"
+            koma.bind("MouseLeft + MouseRight", koma.act.window.drag_move())
+            koma.rule.window({
+                name = "touch-win",
+                matches = { { app_id = "^touch\\.chord$" } },
+                emulate_touch = true,
+            })
+            "#,
+            false,
+        )
+        .expect("apply config");
+
+        let (_surf, _xdg, _tl) = env.spawn_window("TouchChord", "touch.chord");
+        env.pump();
+        let rect = env.state.mapped_windows.last().expect("mapped").rect;
+        env.state.pointer_location =
+            Point::from((f64::from(rect.x) + 40.0, f64::from(rect.y) + 40.0));
+
+        // Simulate physical touch holding slot 0 before pointer touch emulation begins.
+        env.state.active_physical_touch_slots.insert(0);
+        process_pointer_button_event(
+            &mut env.state,
+            BTN_LEFT,
+            ButtonState::Pressed,
+            InputTime::from_millis(100),
+            false,
+        );
+        let active_emul = env
+            .state
+            .active_touch_emulation
+            .as_ref()
+            .expect("touch emulation active");
+        assert_ne!(
+            active_emul.slot_id, 0,
+            "emulated slot must not collide with active physical slot 0"
+        );
+
+        // Pressing MouseRight completes MouseLeft + MouseRight -> starts MoveWindowGrab cleanly.
+        process_pointer_button_event(
+            &mut env.state,
+            BTN_RIGHT,
+            ButtonState::Pressed,
+            InputTime::from_millis(110),
+            false,
+        );
+        let ptr = env.state.pointer_handle().expect("pointer");
+        assert!(
+            has_explicit_pointer_grab(&env.state, &ptr),
+            "left-first MouseLeft + MouseRight must hold MoveWindowGrab over touch-emulated window"
+        );
+
+        // Releasing MouseLeft ends the grab cleanly.
+        process_pointer_button_event(
+            &mut env.state,
+            BTN_LEFT,
+            ButtonState::Released,
+            InputTime::from_millis(120),
+            false,
+        );
+        assert!(!has_explicit_pointer_grab(&env.state, &ptr));
+        process_pointer_button_event(
+            &mut env.state,
+            BTN_RIGHT,
+            ButtonState::Released,
+            InputTime::from_millis(130),
+            false,
+        );
+    }
 }

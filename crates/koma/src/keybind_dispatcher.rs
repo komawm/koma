@@ -308,6 +308,7 @@ impl CompiledBind {
             bind_id: self.id,
             keycode,
             mods,
+            mouse_mods: self.chord.mouse_mods,
             action,
             allow_when_locked: self.options.allow_when_locked,
         })
@@ -1052,6 +1053,9 @@ pub fn process_pointer_button_event(
         }
         ButtonState::Released => {
             state.keybinds.pressed_buttons.remove(&button_code);
+            if let Some(btn_trigger) = MouseButtonTrigger::from_button_code(button_code) {
+                state.cancel_keybind_repeat_if_mouse_button_released(btn_trigger.bit());
+            }
         }
     }
 
@@ -1074,9 +1078,28 @@ pub fn process_pointer_button_event(
         return;
     };
 
-    // 1. Active explicit PointerGrab (`MoveWindowGrab` / `ResizeWindowGrab` / Popup / DnD) owns all buttons!
-    //    (Smithay's implicit `ClickGrab` while a client button is held still allows multi-button chords
-    //     such as `MouseLeft + MouseRight` to match on the second button's press.)
+    // 1. Active explicit PointerGrab (`MoveWindowGrab` / `ResizeWindowGrab` / Popup / DnD) owns all buttons,
+    //    unless a newly pressed button completes a higher-specificity multi-button chord (e.g. `Mod + MouseLeft + MouseRight`
+    //    pressed while default `Mod + MouseLeft` move grab is active).
+    if has_explicit_pointer_grab(state, &pointer)
+        && btn_state == ButtonState::Pressed
+        && state.dnd_drag.is_none()
+        && !crate::pointer_grabs::is_popup_grab_active(state, &pointer)
+        && let Some(btn_trigger) = MouseButtonTrigger::from_button_code(button_code)
+    {
+        let held_mask = state
+            .kb()
+            .map(|kb| modifiers_mask_from_smithay(&kb.modifier_state()))
+            .unwrap_or(0);
+        let held_mouse_mask = state.keybinds.pressed_mouse_buttons_mask(Some(button_code));
+        let phys_mod = state.keybinds.effective_mod_key(is_bare_metal_tty);
+        if let Some(idx) =
+            find_mouse_button_bind_idx(state, btn_trigger, held_mask, held_mouse_mask, phys_mod)
+            && state.keybinds.binds[idx].chord.mouse_mods != 0
+        {
+            let _ = crate::pointer_grabs::cancel_active_pointer_grab(state, serial, time);
+        }
+    }
     if has_explicit_pointer_grab(state, &pointer) {
         state.cancel_touch_emulation("pointer_grabbed");
         if btn_state == ButtonState::Released {
@@ -1089,13 +1112,13 @@ pub fn process_pointer_button_event(
     // 1b. Complete active pointer-to-touch emulation on BTN_LEFT release.
     if btn_state == ButtonState::Released
         && button_code == BTN_LEFT
-        && state.active_touch_emulation.take().is_some()
+        && let Some(active) = state.active_touch_emulation.take()
     {
         if let Some(touch) = state.touch() {
             touch.up(
                 state,
                 &TouchUpPayload {
-                    slot: TouchSlot::from(Some(0)),
+                    slot: TouchSlot::from(Some(active.slot_id)),
                     serial,
                     time,
                 },
@@ -1280,18 +1303,27 @@ pub fn process_pointer_button_event(
                     })
                     .unwrap_or_else(|| Rectangle::from_size((1.0, 1.0).into()))
             });
+        let subsurface_offset = state
+            .surface_global_origin(&surface)
+            .map(|root| origin - root)
+            .unwrap_or_default();
+        let slot_id = (0_u32..)
+            .find(|s| !state.active_physical_touch_slots.contains(s))
+            .unwrap_or(0);
         state.active_touch_emulation = Some(ActiveTouchEmulation {
             win_id,
             surface: surface.clone(),
             origin,
+            subsurface_offset,
             surface_bounds: bounds,
+            slot_id,
         });
         if let Some(touch) = state.touch() {
             touch.down(
                 state,
                 Some((surface, origin)),
                 &TouchDownPayload {
-                    slot: TouchSlot::from(Some(0)),
+                    slot: TouchSlot::from(Some(slot_id)),
                     location: cursor_pos,
                     serial,
                     time,
@@ -1590,6 +1622,8 @@ pub fn process_keyboard_key_event(
                         .is_some_and(|ws| ws.lease.is_human_preempted());
 
                     let mut matched_idx: Option<usize> = None;
+                    let mut fallback_plain_idx: Option<usize> = None;
+                    let held_mouse_mask = state.keybinds.pressed_mouse_buttons_mask(None);
                     'sym_loop: for (cand_sym, is_modified_level) in candidate_syms {
                         let norm_sym = normalize_candidate_sym(cand_sym);
                         for (idx, bind) in state.keybinds.binds.iter().enumerate() {
@@ -1622,19 +1656,21 @@ pub fn process_keyboard_key_event(
                             } else {
                                 held_mask == required_mask
                             };
-                            let mouse_mods_match = if bind.chord.mouse_mods != 0 {
-                                state.keybinds.pressed_mouse_buttons_mask(None)
-                                    == bind.chord.mouse_mods
-                            } else {
-                                true
-                            };
+                            if !mods_match {
+                                continue;
+                            }
 
-                            if mods_match && mouse_mods_match {
-                                matched_idx = Some(idx);
-                                break 'sym_loop;
+                            if bind.chord.mouse_mods != 0 {
+                                if held_mouse_mask == bind.chord.mouse_mods {
+                                    matched_idx = Some(idx);
+                                    break 'sym_loop;
+                                }
+                            } else if fallback_plain_idx.is_none() {
+                                fallback_plain_idx = Some(idx);
                             }
                         }
                     }
+                    let matched_idx = matched_idx.or(fallback_plain_idx);
 
                     let Some(idx) = matched_idx else {
                         if overlay_open {

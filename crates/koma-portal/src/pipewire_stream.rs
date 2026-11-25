@@ -22,12 +22,11 @@ mod linux_pw {
     use pipewire::spa::pod::serialize::PodSerializer;
     use pipewire::spa::pod::{self, ChoiceValue, Pod, Value};
     use pipewire::spa::sys::{
-        SPA_ID_INVALID, SPA_META_Header, SPA_PARAM_BUFFERS_blocks, SPA_PARAM_BUFFERS_buffers,
+        SPA_ID_INVALID, SPA_PARAM_BUFFERS_blocks, SPA_PARAM_BUFFERS_buffers,
         SPA_PARAM_BUFFERS_dataType, SPA_PARAM_BUFFERS_size, SPA_PARAM_BUFFERS_stride,
-        SPA_PARAM_META_size, SPA_PARAM_META_type, spa_meta_header,
     };
     use pipewire::spa::utils::{
-        Choice, ChoiceEnum, ChoiceFlags, Direction, Fraction, Id, Rectangle, SpaTypes,
+        Choice, ChoiceEnum, ChoiceFlags, Direction, Fraction, Rectangle, SpaTypes,
     };
     use pipewire::stream::{StreamFlags, StreamListener, StreamRc, StreamState};
 
@@ -95,8 +94,8 @@ mod linux_pw {
                 })
                 .map_err(|_| anyhow::anyhow!("pipewire channel closed"))?;
             reply_rx
-                .recv()
-                .context("pipewire thread dropped StartStream reply")?
+                .recv_timeout(Duration::from_secs(5))
+                .map_err(|err| anyhow::anyhow!("pipewire StartStream timed out or closed: {err}"))?
         }
 
         pub fn stop_stream(&self, node_id: u32) {
@@ -317,13 +316,10 @@ mod linux_pw {
                 let stride = (guard.width * 4) as i32;
                 let size = stride * guard.height as i32;
                 let buf_bytes = build_buffers_pod_bytes(size, stride);
-                let meta_bytes = build_meta_header_pod_bytes();
-                if let (Some(buf_pod), Some(meta_pod)) =
-                    (Pod::from_bytes(&buf_bytes), Pod::from_bytes(&meta_bytes))
-                {
-                    let mut params = [buf_pod, meta_pod];
+                if let Some(buf_pod) = Pod::from_bytes(&buf_bytes) {
+                    let mut params = [buf_pod];
                     if let Err(err) = stream.update_params(&mut params) {
-                        tracing::warn!(error = ?err, "failed to update PipeWire buffer/meta params");
+                        tracing::warn!(error = ?err, "failed to update PipeWire buffer params");
                     }
                 }
             })
@@ -381,19 +377,6 @@ mod linux_pw {
             ),
         );
         serialize_pod_object(buffers_obj)
-    }
-
-    fn build_meta_header_pod_bytes() -> Vec<u8> {
-        let meta_obj = pod::object!(
-            SpaTypes::ObjectParamMeta,
-            ParamType::Meta,
-            pod::Property::new(SPA_PARAM_META_type, Value::Id(Id(SPA_META_Header))),
-            pod::Property::new(
-                SPA_PARAM_META_size,
-                Value::Int(std::mem::size_of::<spa_meta_header>() as i32),
-            ),
-        );
-        serialize_pod_object(meta_obj)
     }
 
     fn build_format_pod_bytes(width: u32, height: u32) -> Vec<u8> {
@@ -487,34 +470,6 @@ mod linux_pw {
             assert_ne!(
                 prop(SPA_PARAM_BUFFERS_dataType),
                 &Value::Int(1 << SPA_DATA_MemPtr)
-            );
-        }
-
-        #[test]
-        fn meta_header_pod_has_expected_type_and_size() {
-            let bytes = build_meta_header_pod_bytes();
-            let (_, val) = PodDeserializer::deserialize_any_from(&bytes).expect("valid meta POD");
-            let Value::Object(obj) = val else {
-                panic!("expected Object POD, got {val:?}");
-            };
-            assert_eq!(obj.type_, SpaTypes::ObjectParamMeta.as_raw());
-            assert_eq!(obj.id, ParamType::Meta.as_raw());
-
-            let meta_type = obj
-                .properties
-                .iter()
-                .find(|p| p.key == SPA_PARAM_META_type)
-                .expect("SPA_PARAM_META_type");
-            assert_eq!(meta_type.value, Value::Id(Id(SPA_META_Header)));
-
-            let meta_size = obj
-                .properties
-                .iter()
-                .find(|p| p.key == SPA_PARAM_META_size)
-                .expect("SPA_PARAM_META_size");
-            assert_eq!(
-                meta_size.value,
-                Value::Int(std::mem::size_of::<spa_meta_header>() as i32)
             );
         }
 
