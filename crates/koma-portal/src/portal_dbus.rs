@@ -202,7 +202,11 @@ impl ScreenCastPortal {
         1 | 2 // Hidden | Embedded
     }
 
-    #[zbus(property)]
+    // The impl spec spells this property lowercase (`version`); zbus would
+    // otherwise auto-PascalCase it to `Version`, which xdg-desktop-portal never
+    // looks up — the frontend then reads 0, skips binding AvailableCursorModes
+    // and rejects every client's cursor_mode (OBS/Browser screen capture).
+    #[zbus(property, name = "version")]
     async fn version(&self) -> u32 {
         5
     }
@@ -261,7 +265,8 @@ impl RemoteDesktopPortal {
         1 | 2 | 4 // Keyboard | Pointer | Touchscreen
     }
 
-    #[zbus(property)]
+    // Same spec quirk as the ScreenCast interface: lowercase `version`.
+    #[zbus(property, name = "version")]
     async fn version(&self) -> u32 {
         2
     }
@@ -445,6 +450,49 @@ impl PortalSession {
 mod tests {
     use super::*;
     use crate::wayland_bridge::OutputInfo;
+
+    #[test]
+    fn portal_interfaces_export_lowercase_version_property() {
+        use zbus::object_server::Interface as _;
+
+        let (wayland, _rx) = WaylandBridge::for_test();
+        let pipewire = PipeWireManager::for_test();
+        let state = PortalState::new(wayland, pipewire);
+
+        assert_eq!(
+            ScreenCastPortal::name(),
+            "org.freedesktop.impl.portal.ScreenCast"
+        );
+        let sc = ScreenCastPortal {
+            state: state.clone(),
+        };
+        let mut sc_xml = String::new();
+        sc.introspect_to_writer(&mut sc_xml, 0);
+        assert!(
+            sc_xml.contains(r#"<property name="version" type="u" access="read"/>"#),
+            "ScreenCast introspection XML missing lowercase version property: {sc_xml}"
+        );
+        assert!(
+            !sc_xml.contains(r#"name="Version""#),
+            "ScreenCast introspection XML unexpectedly contains PascalCase Version: {sc_xml}"
+        );
+
+        assert_eq!(
+            RemoteDesktopPortal::name(),
+            "org.freedesktop.impl.portal.RemoteDesktop"
+        );
+        let rd = RemoteDesktopPortal { state };
+        let mut rd_xml = String::new();
+        rd.introspect_to_writer(&mut rd_xml, 0);
+        assert!(
+            rd_xml.contains(r#"<property name="version" type="u" access="read"/>"#),
+            "RemoteDesktop introspection XML missing lowercase version property: {rd_xml}"
+        );
+        assert!(
+            !rd_xml.contains(r#"name="Version""#),
+            "RemoteDesktop introspection XML unexpectedly contains PascalCase Version: {rd_xml}"
+        );
+    }
 
     #[test]
     fn portal_session_defaults_enable_embedded_cursor() {
