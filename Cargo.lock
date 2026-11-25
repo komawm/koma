@@ -778,7 +778,7 @@ checksum = "e2db585e1d738fc771bf08a151420d3ed193d9d895a36df7f6f8a9456b911ddc"
 
 [[package]]
 name = "koma"
-version = "0.0.13"
+version = "0.0.14"
 dependencies = [
  "anyhow",
  "base64",
@@ -806,7 +806,7 @@ dependencies = [
 
 [[package]]
 name = "koma-lua"
-version = "0.0.13"
+version = "0.0.14"
 dependencies = [
  "koma-model",
  "koma-proto",
@@ -821,7 +821,7 @@ dependencies = [
 
 [[package]]
 name = "koma-model"
-version = "0.0.13"
+version = "0.0.14"
 dependencies = [
  "koma-proto",
  "regex",
@@ -831,7 +831,7 @@ dependencies = [
 
 [[package]]
 name = "koma-overview"
-version = "0.0.13"
+version = "0.0.14"
 dependencies = [
  "calloop",
  "calloop-wayland-source",
@@ -847,7 +847,7 @@ dependencies = [
 
 [[package]]
 name = "koma-portal"
-version = "0.0.13"
+version = "0.0.14"
 dependencies = [
  "anyhow",
  "pipewire",
@@ -865,7 +865,7 @@ dependencies = [
 
 [[package]]
 name = "koma-proto"
-version = "0.0.13"
+version = "0.0.14"
 dependencies = [
  "bitflags",
  "libc",
@@ -877,7 +877,7 @@ dependencies = [
 
 [[package]]
 name = "koma-render"
-version = "0.0.13"
+version = "0.0.14"
 dependencies = [
  "anyhow",
  "koma-model",
@@ -888,14 +888,14 @@ dependencies = [
 
 [[package]]
 name = "koma-seat"
-version = "0.0.13"
+version = "0.0.14"
 dependencies = [
  "koma-proto",
 ]
 
 [[package]]
 name = "komactl"
-version = "0.0.13"
+version = "0.0.14"
 dependencies = [
  "koma-lua",
  "koma-proto",

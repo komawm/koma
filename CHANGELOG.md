@@ -6,6 +6,17 @@ incubation versions; `v0.1.0` will be the first independently accepted product
 release. A `0.0.x` tag is a development prerelease and does not claim a working
 desktop, hardware support, or security guarantees.
 
+## [0.0.14] - 2026-11-25
+
+### Fixed
+
+- **OBS Studio / PipeWire ScreenCast portal stream negotiation** (`komawm/koma#136`, `komawm/koma#137`):
+  fixes `xdg-desktop-portal-koma` PipeWire stream parameter negotiation with valid `SPA_PARAM_Buffers` (`MemFd` data type, `blocks`/`size`/`stride`/`dataType` range), non-zero stream caps, `start_stream` timeout handling, and proper `ScreenCast` stream error propagation and diagnostics (`komactl doctor`).
+- **Multi-mouse-button and mouse-qualified keyboard chords** (`komawm/koma#134`):
+  supports simultaneous mouse-button chords (e.g. `MouseLeft + MouseRight` and `MouseLeft + Mod + Key`) with higher-specificity precedence over single-button/plain-modifier fallbacks, cancels active move/resize grabs when a multi-button chord completes, and stops active mouse-qualified keybind repeats on button release.
+- **Pointer-to-touch emulation (`wl_touch`) accuracy and multi-slot safety** (`komawm/koma#135`):
+  preserves subsurface offsets and refreshes live `surface_bounds` during touch-emulation motion, allocates emulated touch slots disjoint from active physical touch slots, and handles `emulate_touch` windows cleanly alongside multi-button pointer chords.
+
 ## [0.0.13] - 2026-11-23
 
 ### Fixed
