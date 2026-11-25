@@ -114,6 +114,7 @@ pub struct DynamicWindowRules {
     pub clip_to_geometry: Option<bool>,
     pub focusable: Option<bool>,
     pub suppress_maximize: Option<bool>,
+    pub emulate_touch: Option<bool>,
     pub block_out_from: Option<BlockOutPolicy>,
 }
 
@@ -265,6 +266,9 @@ impl WindowRuleEngine {
             if let Some(v) = rule.dynamic.suppress_maximize {
                 out.suppress_maximize = Some(v);
             }
+            if let Some(v) = rule.dynamic.emulate_touch {
+                out.emulate_touch = Some(v);
+            }
             if let Some(v) = rule.dynamic.block_out_from {
                 out.block_out_from = Some(v);
             }
@@ -369,6 +373,7 @@ mod waydroid_rule_tests {
             dynamic: DynamicWindowRules {
                 immediate: Some(true),
                 suppress_maximize: Some(true),
+                emulate_touch: Some(true),
                 ..Default::default()
             },
         });
@@ -393,6 +398,7 @@ mod waydroid_rule_tests {
         let dyn_rules = engine.resolve_dynamic(&matching_ctx);
         assert_eq!(dyn_rules.immediate, Some(true));
         assert_eq!(dyn_rules.suppress_maximize, Some(true));
+        assert_eq!(dyn_rules.emulate_touch, Some(true));
 
         let non_startup_ctx = WindowMatchContext {
             at_startup: false,

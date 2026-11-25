@@ -645,6 +645,17 @@ pub struct MappedWindow {
     pub rect: LogicalRect,
     pub decoration_mode: DecorationMode,
     pub icon: Option<StoredToplevelIcon>,
+    /// Runtime per-window override for pointer-to-touch emulation (`koma.act.window.toggle_touch_emulation()`).
+    pub emulate_touch_override: Option<bool>,
+}
+
+/// Active pointer-to-touch (`BTN_LEFT` -> `wl_touch` slot 0) emulation state.
+#[derive(Debug, Clone)]
+pub struct ActiveTouchEmulation {
+    pub win_id: WindowId,
+    pub surface: WlSurface,
+    pub origin: Point<f64, Logical>,
+    pub surface_bounds: Rectangle<f64, Logical>,
 }
 
 /// A toplevel that left the layout while its `windows_close` spring is still settling: only its
@@ -907,6 +918,8 @@ pub struct KomaState {
     pub cursor_anim_generation: u64,
     /// Active client `wl_data_device` drag-and-drop grab, including its optional icon surface.
     pub dnd_drag: Option<ActiveDnd>,
+    /// Active pointer-to-touch (`BTN_LEFT` -> `wl_touch`) emulation session.
+    pub active_touch_emulation: Option<ActiveTouchEmulation>,
     /// Set when `SeatHandler::focus_changed` runs while `SeatHandle::Pointer` is locked
     /// (e.g. `PopupPointerGrab::unset` -> `unset_keyboard_grab` -> `keyboard.set_focus`) so
     /// pointer constraint reconciliation runs immediately once the outer pointer call exits.
@@ -1184,6 +1197,7 @@ impl KomaState {
             cursor_anim_timer_token: None,
             cursor_anim_generation: 0,
             dnd_drag: None,
+            active_touch_emulation: None,
             pending_pointer_constraint_break: false,
             output_layout: OutputLayout::new(),
             output_workspaces: HashMap::new(),
@@ -2401,6 +2415,7 @@ impl KomaState {
             pointer.frame(state);
         });
         self.clear_ime_state_for_lock();
+        self.cancel_touch_emulation("session_lock");
         if let Some(touch) = self.touch() {
             touch.cancel(self);
         }
@@ -2417,6 +2432,7 @@ impl KomaState {
     }
 
     pub fn change_vt(&mut self, vt: i32) {
+        self.cancel_touch_emulation("vt_switch");
         #[cfg(feature = "smithay-tty")]
         if let Some(ActiveBackend::Tty(tty)) = self.backend.as_mut() {
             tty.change_vt(vt);
@@ -2517,30 +2533,79 @@ impl KomaState {
         let Some(mapped) = self.mapped_windows.iter().find(|m| m.win_id == win_id) else {
             return false;
         };
+        let mut dyn_rules = self.window_dynamic_rules(mapped);
+        // `resolve_dynamic` above used `ws_id` from `mapped.ws_id`; keep exact same logic.
+        let _ = &mut dyn_rules;
+        dyn_rules.suppress_maximize.unwrap_or(false)
+    }
+
+    #[must_use]
+    pub fn window_dynamic_rules(&self, mapped: &MappedWindow) -> koma_model::DynamicWindowRules {
         let ws = self.workspaces.get(&mapped.ws_id);
         let is_agent_ws =
             ws.is_some_and(|w| matches!(w.presentation, PresentationTarget::Offscreen { .. }));
-        let is_focused = ws.is_some_and(|w| w.active_window() == Some(win_id));
+        let is_focused = ws.is_some_and(|w| w.active_window() == Some(mapped.win_id));
         let ws_name = ws.map(|w| w.name.as_str());
         let has_parent = mapped
             .window
             .toplevel()
             .is_some_and(|t| t.parent().is_some());
-        self.rules
-            .resolve_dynamic(&WindowMatchContext {
-                app_id: &mapped.app_id,
-                title: &mapped.title,
-                workspace: ws_name,
-                is_floating: mapped.is_floating,
-                is_focused,
-                is_xwayland: false,
-                is_modal_dialog: has_parent,
-                is_screencast_target: false,
-                is_agent_workspace: is_agent_ws,
-                at_startup: self.elapsed_ms() <= 5_000,
-            })
-            .suppress_maximize
+        self.rules.resolve_dynamic(&WindowMatchContext {
+            app_id: &mapped.app_id,
+            title: &mapped.title,
+            workspace: ws_name,
+            is_floating: mapped.is_floating,
+            is_focused,
+            is_xwayland: false,
+            is_modal_dialog: has_parent,
+            is_screencast_target: false,
+            is_agent_workspace: is_agent_ws,
+            at_startup: self.elapsed_ms() <= 5_000,
+        })
+    }
+
+    #[must_use]
+    pub fn window_emulates_touch(&self, win_id: WindowId) -> bool {
+        let Some(mapped) = self.mapped_windows.iter().find(|m| m.win_id == win_id) else {
+            return false;
+        };
+        if let Some(override_val) = mapped.emulate_touch_override {
+            return override_val;
+        }
+        self.window_dynamic_rules(mapped)
+            .emulate_touch
             .unwrap_or(false)
+    }
+
+    pub fn cancel_touch_emulation(&mut self, reason: &'static str) {
+        let Some(active) = self.active_touch_emulation.take() else {
+            return;
+        };
+        tracing::debug!(
+            win_id = %active.win_id,
+            reason,
+            "cancelling active pointer-to-touch emulation"
+        );
+        self.keybinds
+            .suppressed_buttons
+            .insert(crate::pointer_grabs::BTN_LEFT);
+        if let Some(touch) = self.touch() {
+            let origin = self
+                .surface_global_origin(&active.surface)
+                .unwrap_or(active.origin);
+            // Smithay's `TouchHandle::cancel` is a no-op unless `pending_frame` is populated by an
+            // in-progress touch event, so prime the frame before cancelling the active slot.
+            touch.motion(
+                self,
+                Some((active.surface, origin)),
+                &TouchMotionPayload {
+                    slot: smithay::backend::input::TouchSlot::from(Some(0)),
+                    location: self.pointer_location,
+                    time: smithay::backend::input::InputTime::now(),
+                },
+            );
+            touch.cancel(self);
+        }
     }
 
     pub(crate) fn is_maximize_suppressed_for_unmapped(&self, toplevel: &ToplevelSurface) -> bool {
@@ -2997,6 +3062,7 @@ impl KomaState {
             rect: wa,
             decoration_mode: unmapped.decoration_mode,
             icon: unmapped.icon,
+            emulate_touch_override: None,
         };
         info!(
             win_id = %mapped.win_id,
@@ -3422,6 +3488,18 @@ impl KomaState {
             KeyboardFocusSource::OnDemandLayer => ondemand_layer,
             KeyboardFocusSource::ActiveWindow => self.active_deck_wl_surface(),
         };
+
+        if let Some(active) = &self.active_touch_emulation {
+            let active_root = self
+                .mapped_windows
+                .iter()
+                .find(|m| m.win_id == active.win_id)
+                .and_then(|m| m.window.toplevel())
+                .map(|t| t.wl_surface().clone());
+            if target_surface != active_root {
+                self.cancel_touch_emulation("focus_lost");
+            }
+        }
 
         if self
             .kb()

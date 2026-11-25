@@ -124,6 +124,7 @@ pub fn start_compositor_move_grab_with_chord(
     // An interactive grab owns the pointer for the whole gesture: stop a pending keybind
     // repeat so the held chord cannot keep moving windows behind the user's back.
     state.cancel_keybind_repeat("pointer_grab");
+    state.cancel_touch_emulation("compositor_grab");
     state.break_active_pointer_constraints();
     let Some(pointer) = state.ptr() else {
         return false;
@@ -210,6 +211,7 @@ pub fn start_compositor_resize_grab_with_chord(
     // An interactive grab owns the pointer for the whole gesture: stop a pending keybind
     // repeat so the held chord cannot keep moving windows behind the user's back.
     state.cancel_keybind_repeat("pointer_grab");
+    state.cancel_touch_emulation("compositor_grab");
     state.break_active_pointer_constraints();
     let Some(pointer) = state.ptr() else {
         return false;
@@ -276,6 +278,7 @@ pub fn start_frame_edge_resize_grab(
     // An interactive grab owns the pointer for the whole gesture: stop a pending keybind
     // repeat so the held chord cannot keep moving windows behind the user's back.
     state.cancel_keybind_repeat("pointer_grab");
+    state.cancel_touch_emulation("compositor_grab");
     state.break_active_pointer_constraints();
     let Some(pointer) = state.ptr() else {
         return false;
@@ -416,6 +419,7 @@ pub fn start_csd_resize_grab(
 
 /// Cancels any active pointer grab on `Escape` press (`niri/src/input/mod.rs` lines 688-699).
 pub fn cancel_active_pointer_grab(state: &mut KomaState, serial: Serial, time: InputTime) -> bool {
+    state.cancel_touch_emulation("compositor_grab_cancel");
     let Some(pointer) = state.ptr() else {
         return false;
     };

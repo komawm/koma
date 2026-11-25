@@ -1803,6 +1803,11 @@ fn build_act_namespace<'gc>(
     );
     win.set_field(
         ctx,
+        "toggle_touch_emulation",
+        unit_act(ctx, ActionDescriptor::WindowToggleTouchEmulation),
+    );
+    win.set_field(
+        ctx,
         "swap",
         Callback::from_fn(&ctx, |ctx, _, mut stack| {
             let dir: std::string::String = stack.consume(ctx)?;
@@ -4118,6 +4123,29 @@ mod tests {
         // Lua typegen stub includes resolve_path
         let stubs = crate::generate_luals_stubs();
         assert!(stubs.contains("---@field resolve_path fun(path: string): string"));
+        assert!(stubs.contains("---@field emulate_touch? boolean"));
+        assert!(stubs.contains("toggle_touch_emulation: fun(): KomaAction"));
+
+        let mut touch_sb =
+            PhodopusSandbox::new(DEFAULT_HEAP_LIMIT_BYTES, None).expect("touch sandbox");
+        let touch_cfg = touch_sb
+            .eval_init_lua(
+                r##"
+                koma.rule.window({
+                    name = "waydroid-floating",
+                    matches = { { app_id = "^(Waydroid|waydroid\\..*)$" } },
+                    emulate_touch = true,
+                })
+                koma.bind("Mod + T", koma.act.window.toggle_touch_emulation())
+                "##,
+            )
+            .expect("emulate_touch rule and toggle_touch_emulation bind must parse");
+        assert_eq!(touch_cfg.window_rules.len(), 1);
+        assert_eq!(touch_cfg.window_rules[0].emulate_touch, Some(true));
+        assert_eq!(
+            touch_cfg.binds[0].action,
+            ActionDescriptor::WindowToggleTouchEmulation
+        );
 
         // Escaping require() paths are refused with access violation
         for bad in [

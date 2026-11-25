@@ -367,6 +367,9 @@ pub fn describe_action(action: &ActionDescriptor) -> String {
         ActionDescriptor::WindowPseudotileToggle => {
             "koma.act.window.pseudotile_toggle()".to_owned()
         }
+        ActionDescriptor::WindowToggleTouchEmulation => {
+            "koma.act.window.toggle_touch_emulation()".to_owned()
+        }
         ActionDescriptor::WindowDragMove => "koma.act.window.drag_move()".to_owned(),
         ActionDescriptor::WindowDragResize => "koma.act.window.drag_resize()".to_owned(),
         ActionDescriptor::WindowResizeDelta { width, height } => {
@@ -527,6 +530,7 @@ pub fn group_for_action(action: &ActionDescriptor) -> &'static str {
         | ActionDescriptor::WindowMaximizeToggle
         | ActionDescriptor::WindowFloatToggle
         | ActionDescriptor::WindowPseudotileToggle
+        | ActionDescriptor::WindowToggleTouchEmulation
         | ActionDescriptor::WindowDragMove
         | ActionDescriptor::WindowDragResize
         | ActionDescriptor::WindowResizeDelta { .. } => GROUP_WINDOWS,
@@ -919,5 +923,17 @@ mod tests {
         );
         assert!(is_valid_chord_modifier("MouseLeft"));
         assert!(!is_keyboard_modifier("MouseLeft"));
+    }
+
+    #[test]
+    fn describes_toggle_touch_emulation_action() {
+        assert_eq!(
+            describe_action(&ActionDescriptor::WindowToggleTouchEmulation),
+            "koma.act.window.toggle_touch_emulation()"
+        );
+        assert_eq!(
+            group_for_action(&ActionDescriptor::WindowToggleTouchEmulation),
+            GROUP_WINDOWS
+        );
     }
 }
