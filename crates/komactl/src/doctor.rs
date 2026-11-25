@@ -625,14 +625,14 @@ fn check_bind_chords(registry: &KomaConfigRegistry, report: &mut Report) {
             continue;
         }
         for modifier in modifiers {
-            if canonical_modifier_name(modifier).is_none() {
+            if !koma_lua::effective_keymap::is_valid_chord_modifier(modifier) {
                 report.push(
                     "binds",
                     "bind.chord",
                     Severity::Error,
                     format!(
                         "bind `{}` uses unknown modifier `{modifier}` \
-                         (valid: Mod, Super, Ctrl, Shift, Alt, Mod5)",
+                         (valid: Mod, Super, Ctrl, Shift, Alt, Mod5, or MouseLeft/Right/Middle/Back/Forward)",
                         spec.chord
                     ),
                 );
@@ -653,21 +653,9 @@ fn check_bind_chords(registry: &KomaConfigRegistry, report: &mut Report) {
     }
 }
 
-fn canonical_modifier_name(token: &str) -> Option<&'static str> {
-    match token.trim().to_ascii_lowercase().as_str() {
-        "mod" => Some("Mod"),
-        "ctrl" | "control" => Some("Ctrl"),
-        "shift" => Some("Shift"),
-        "alt" | "mod1" => Some("Alt"),
-        "super" | "win" | "logo" | "meta" | "mod4" => Some("Super"),
-        "mod5" | "altgr" | "iso_level3_shift" => Some("Mod5"),
-        _ => None,
-    }
-}
-
-/// `true` when the chord lists only modifiers (`Mod + Shift`), so the trigger token is missing.
+/// `true` when the chord lists only keyboard modifiers (`Mod + Shift`), so the trigger token is missing.
 fn modifier_only_chord(tokens: &[&str]) -> bool {
-    tokens.len() == 1 && canonical_modifier_name(tokens[0]).is_some()
+    tokens.len() == 1 && koma_lua::effective_keymap::is_keyboard_modifier(tokens[0])
 }
 
 fn check_unbinds(registry: &KomaConfigRegistry, report: &mut Report) {

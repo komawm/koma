@@ -2371,6 +2371,7 @@ impl KomaState {
         self.keybinds.pending_releases.clear();
         self.keybinds.pending_mouse_releases.clear();
         self.keybinds.suppressed_buttons.clear();
+        self.keybinds.pressed_buttons.clear();
         self.keybinds.active_mode = None;
         self.keybinds.reset_scroll_trackers();
         self.cancel_keybind_repeat("session_lock");
