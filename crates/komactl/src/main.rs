@@ -120,7 +120,7 @@ fn main() -> io::Result<()> {
         Some("validate") => {
             let target = args
                 .get(1)
-                .map(|raw| config_probe::resolve_cli_path(raw))
+                .map(config_probe::resolve_cli_path)
                 .unwrap_or_else(config_probe::default_init_lua_path);
             match validate_init_lua_offline(&target) {
                 Ok(summary) => println!(

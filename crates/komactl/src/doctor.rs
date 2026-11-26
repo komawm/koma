@@ -2109,7 +2109,7 @@ pub(crate) fn run(args: &[String]) -> i32 {
     }
     let path = parsed
         .path
-        .map(|p| config_probe::resolve_cli_path(&p.to_string_lossy()))
+        .map(config_probe::resolve_cli_path)
         .unwrap_or_else(config_probe::default_init_lua_path);
     let context = DoctorContext::detect();
     let mut report = diagnose(&path, &context);

@@ -1,7 +1,11 @@
-//! Pure, lexical path-resolution helpers for Koma configuration paths, spawn argvs,
+//! Path-resolution helpers for Koma configuration paths, spawn argvs,
 //! environment variables, and jailed `require()` module targets.
 
-use std::path::{Component, Path, PathBuf};
+use std::{
+    borrow::Cow,
+    ffi::OsStr,
+    path::{Component, Path, PathBuf},
+};
 
 const SHELL_INTERPRETERS: &[&str] = &[
     "sh", "bash", "fish", "zsh", "dash", "python", "python3", "env",
@@ -21,20 +25,38 @@ pub fn home_dir_from_env() -> Option<PathBuf> {
 /// returns `raw` unchanged.
 #[must_use]
 pub fn expand_tilde(raw: &str, home: Option<&Path>) -> String {
+    expand_tilde_path(Path::new(raw), home)
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn expand_tilde_path<'a>(raw: &'a Path, home: Option<&'a Path>) -> Cow<'a, Path> {
     let Some(home) = home.filter(|h| !h.as_os_str().is_empty()) else {
-        return raw.to_owned();
+        return Cow::Borrowed(raw);
     };
-    if raw == "~" {
-        return home.to_string_lossy().into_owned();
+    let spelling = raw.as_os_str();
+    if spelling == "~" {
+        return Cow::Borrowed(home);
     }
-    if let Some(rest) = raw.strip_prefix("~/") {
-        let trimmed = rest.trim_start_matches('/');
-        if trimmed.is_empty() {
-            return home.join("").to_string_lossy().into_owned();
-        }
-        return home.join(trimmed).to_string_lossy().into_owned();
+    if let Some(suffix) = tilde_path_suffix(spelling) {
+        return Cow::Owned(home.join(suffix));
     }
-    raw.to_owned()
+    Cow::Borrowed(raw)
+}
+
+#[cfg(unix)]
+fn tilde_path_suffix(raw: &OsStr) -> Option<&OsStr> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let suffix = raw.as_bytes().strip_prefix(b"~/")?;
+    let extra_slashes = suffix.iter().take_while(|&&byte| byte == b'/').count();
+    Some(OsStr::from_bytes(&suffix[extra_slashes..]))
+}
+
+#[cfg(not(unix))]
+fn tilde_path_suffix(raw: &OsStr) -> Option<&OsStr> {
+    let suffix = raw.to_str()?.strip_prefix("~/")?;
+    Some(OsStr::new(suffix.trim_start_matches('/')))
 }
 
 /// Convenience wrapper over [`expand_tilde`] reading `HOME` from the process environment.
@@ -95,6 +117,52 @@ pub fn resolve_config_path(raw: &str, config_dir: Option<&Path>, home: Option<&P
 #[must_use]
 pub fn resolve_config_path_from_env(raw: &str, config_dir: Option<&Path>) -> PathBuf {
     resolve_config_path(raw, config_dir, home_dir_from_env().as_deref())
+}
+
+/// Expands `~` and anchors a relative config file path without changing filesystem traversal.
+///
+/// The filesystem resolves `..` after following any preceding symlinks. Keep these components
+/// and the original path encoding intact when selecting a config file.
+#[must_use]
+pub fn resolve_config_file_path(
+    raw: impl AsRef<Path>,
+    config_dir: Option<&Path>,
+    home: Option<&Path>,
+) -> PathBuf {
+    let path = expand_tilde_path(raw.as_ref(), home);
+    if path.is_relative()
+        && !path.as_os_str().as_encoded_bytes().starts_with(b"~")
+        && let Some(dir) = config_dir
+    {
+        return dir.join(path.as_ref());
+    }
+    path.into_owned()
+}
+
+/// Convenience wrapper over [`resolve_config_file_path`] reading `HOME` from the environment.
+#[must_use]
+pub fn resolve_config_file_path_from_env(
+    raw: impl AsRef<Path>,
+    config_dir: Option<&Path>,
+) -> PathBuf {
+    resolve_config_file_path(raw, config_dir, home_dir_from_env().as_deref())
+}
+
+/// Selects the directory used for paths and jailed modules in a config.
+///
+/// When the file path has a parent traversal, resolve the directory before Lua applies its
+/// lexical path rules. Keep a symlink on the config file itself independent of this directory.
+#[must_use]
+pub fn config_file_directory(path: &Path) -> PathBuf {
+    let directory = path.parent().unwrap_or_else(|| Path::new("."));
+    if directory
+        .components()
+        .any(|part| part == Component::ParentDir)
+        && let Ok(resolved) = directory.canonicalize()
+    {
+        return resolved;
+    }
+    directory.to_path_buf()
 }
 
 fn resolve_spawn_arg_token(
@@ -426,6 +494,47 @@ mod tests {
             resolve_config_path("~/foo", Some(cfg), None),
             PathBuf::from("~/foo")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_file_lookup_follows_symlink_before_parent_component() {
+        let root = temp_root("config-symlink-parent");
+        let config_dir = root.join("config");
+        let real_dir = root.join("real");
+        fs::create_dir(&config_dir).expect("create config directory");
+        fs::create_dir_all(real_dir.join("subdir")).expect("create symlink target");
+        std::os::unix::fs::symlink("../real/subdir", config_dir.join("linked"))
+            .expect("create config symlink");
+        fs::write(config_dir.join("init.lua"), "wrong config").expect("write alternate config");
+        fs::write(real_dir.join("init.lua"), "expected config").expect("write expected config");
+
+        for (raw, home) in [
+            (Path::new("linked/../init.lua"), None),
+            (
+                Path::new("~//linked/../init.lua"),
+                Some(config_dir.as_path()),
+            ),
+        ] {
+            let resolved = resolve_config_file_path(raw, Some(&config_dir), home);
+            assert_eq!(resolved, config_dir.join("linked/../init.lua"));
+            assert_eq!(
+                fs::read_to_string(resolved).expect("read resolved config"),
+                "expected config"
+            );
+        }
+        fs::remove_dir_all(root).expect("remove config fixture");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_file_lookup_preserves_non_utf8_home_and_filename() {
+        use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+
+        let home = Path::new(OsStr::from_bytes(b"/home/config\xff"));
+        let raw = Path::new(OsStr::from_bytes(b"~/init\xfe.lua"));
+        let expected = Path::new(OsStr::from_bytes(b"/home/config\xff/init\xfe.lua"));
+        assert_eq!(resolve_config_file_path(raw, None, Some(home)), expected);
     }
 
     #[test]
