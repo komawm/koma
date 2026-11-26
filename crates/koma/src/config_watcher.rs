@@ -85,8 +85,8 @@ impl KomaConfigPath {
                 .filter(|v| !v.is_empty())
                 .map(PathBuf::from)
         }) {
-            return Self::Explicit(koma_lua::path_resolve::resolve_config_path(
-                &explicit.to_string_lossy(),
+            return Self::Explicit(koma_lua::path_resolve::resolve_config_file_path(
+                explicit,
                 cwd.as_deref(),
                 home.as_deref(),
             ));
@@ -95,11 +95,7 @@ impl KomaConfigPath {
         let user_config_base = env::var_os("XDG_CONFIG_HOME")
             .filter(|v| !v.is_empty())
             .map(|p| {
-                koma_lua::path_resolve::resolve_config_path(
-                    &p.to_string_lossy(),
-                    cwd.as_deref(),
-                    home.as_deref(),
-                )
+                koma_lua::path_resolve::resolve_config_file_path(p, cwd.as_deref(), home.as_deref())
             })
             .or_else(|| home.map(|h| h.join(".config")))
             .unwrap_or_else(|| PathBuf::from("/tmp"));
@@ -284,10 +280,7 @@ pub fn setup_config_watcher(state: &mut KomaState, config_path: KomaConfigPath) 
     if initial_init.exists() {
         match fs::read_to_string(&initial_init) {
             Ok(src) => {
-                let cfg_dir = initial_init
-                    .parent()
-                    .unwrap_or_else(|| Path::new("."))
-                    .to_path_buf();
+                let cfg_dir = koma_lua::path_resolve::config_file_directory(&initial_init);
                 if let Err(err) =
                     reload_from_lua_source(state, &initial_init, &cfg_dir, &src, false)
                 {
@@ -382,10 +375,7 @@ fn run_watcher_thread(
 
         if force_reload || snapshotter.poll_changed() {
             let init_path = snapshotter.config_path.active_init_path();
-            let config_dir = init_path
-                .parent()
-                .unwrap_or_else(|| Path::new("."))
-                .to_path_buf();
+            let config_dir = koma_lua::path_resolve::config_file_directory(&init_path);
             trace!(path = %init_path.display(), "detected init.lua / lua module modification");
             let source_res = fs::read_to_string(&init_path);
             if out_tx
@@ -1011,7 +1001,7 @@ pub fn reload_active_config_now(
 ) -> Result<ConfigReloadReport, String> {
     let explicit_path = explicit_path.map(|p| {
         let cwd = env::current_dir().ok();
-        koma_lua::path_resolve::resolve_config_path_from_env(&p.to_string_lossy(), cwd.as_deref())
+        koma_lua::path_resolve::resolve_config_file_path_from_env(p, cwd.as_deref())
     });
     if let Some(p) = &explicit_path {
         state.config_path = KomaConfigPath::Explicit(p.clone());
@@ -1022,10 +1012,7 @@ pub fn reload_active_config_now(
     let target = explicit_path.unwrap_or_else(|| state.config_path.active_init_path());
     let src = fs::read_to_string(&target)
         .map_err(|e| format!("failed reading `{}`: {e}", target.display()))?;
-    let cfg_dir = target
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .to_path_buf();
+    let cfg_dir = koma_lua::path_resolve::config_file_directory(&target);
     reload_from_lua_source(state, &target, &cfg_dir, &src, true)
 }
 
@@ -1083,6 +1070,10 @@ mod tests {
         assert_eq!(
             KomaConfigPath::resolve(Some(PathBuf::from("./examples/init.lua"))),
             KomaConfigPath::Explicit(cwd.join("examples/init.lua"))
+        );
+        assert_eq!(
+            KomaConfigPath::resolve(Some(PathBuf::from("link/../init.lua"))),
+            KomaConfigPath::Explicit(cwd.join("link/../init.lua"))
         );
         let expected_tilde = PathBuf::from(koma_lua::path_resolve::expand_tilde_from_env(
             "~/my/init.lua",

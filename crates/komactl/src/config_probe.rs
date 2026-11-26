@@ -132,9 +132,9 @@ pub(crate) fn summary_of(registry: &KomaConfigRegistry) -> ValidationSummary {
 
 /// Expands `~` / `~/...` and resolves relative CLI paths against the current working directory.
 #[must_use]
-pub(crate) fn resolve_cli_path(raw: &str) -> PathBuf {
+pub(crate) fn resolve_cli_path(raw: impl AsRef<Path>) -> PathBuf {
     let cwd = env::current_dir().ok();
-    koma_lua::path_resolve::resolve_config_path_from_env(raw, cwd.as_deref())
+    koma_lua::path_resolve::resolve_config_file_path_from_env(raw, cwd.as_deref())
 }
 
 /// Resolves the implicit configuration path: `$KOMA_CONFIG`, `$XDG_CONFIG_HOME/koma/init.lua`,
@@ -144,15 +144,15 @@ pub(crate) fn default_init_lua_path() -> PathBuf {
     let cwd = env::current_dir().ok();
     let home = koma_lua::path_resolve::home_dir_from_env();
     if let Some(explicit) = env::var_os("KOMA_CONFIG").filter(|v| !v.is_empty()) {
-        return koma_lua::path_resolve::resolve_config_path(
-            &explicit.to_string_lossy(),
+        return koma_lua::path_resolve::resolve_config_file_path(
+            explicit,
             cwd.as_deref(),
             home.as_deref(),
         );
     }
     if let Some(xdg) = env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
-        return koma_lua::path_resolve::resolve_config_path(
-            &xdg.to_string_lossy(),
+        return koma_lua::path_resolve::resolve_config_file_path(
+            xdg,
             cwd.as_deref(),
             home.as_deref(),
         )
@@ -192,13 +192,10 @@ pub(crate) fn template_report_at(init_lua: &Path) -> Value {
 
 /// Reads and evaluates `path` in a jailed shadow VM without touching the running compositor.
 pub(crate) fn evaluate(path: &Path) -> Result<ConfigEvaluation, String> {
-    let path = resolve_cli_path(&path.to_string_lossy());
+    let path = resolve_cli_path(path);
     let source = fs::read_to_string(&path)
         .map_err(|e| format!("failed reading `{}`: {e}", path.display()))?;
-    let config_root = path
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .to_path_buf();
+    let config_root = koma_lua::path_resolve::config_file_directory(&path);
     let mut vm = PhodopusSandbox::new(DEFAULT_HEAP_LIMIT_BYTES, Some(&config_root))?;
     let (registry, eval_error) = match vm.eval_init_lua(&source) {
         Ok(registry) => (Some(registry), None),
@@ -294,6 +291,43 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).expect("create fixture dir");
         dir
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn evaluate_reads_config_through_symlink_parent_with_non_utf8_filename() {
+        use std::{ffi::OsStr, os::unix::ffi::OsStrExt, os::unix::fs::symlink};
+
+        let root = temp_root("symlink-parent");
+        let real = root.join("real");
+        let filename = OsStr::from_bytes(b"init-\xff.lua");
+        fs::create_dir_all(real.join("subdir")).expect("create target directory");
+        symlink("real/subdir", root.join("link")).expect("make directory symlink");
+        fs::write(root.join(filename), "error('wrong config')").expect("write decoy config");
+        fs::create_dir(root.join("lua")).expect("create decoy module directory");
+        fs::write(root.join("lua/marker.lua"), "return 'decoy'").expect("write decoy module");
+        fs::create_dir(real.join("lua")).expect("create module directory");
+        let real_module = real.join("lua/marker.lua");
+        fs::write(&real_module, "return 'real'").expect("write expected module");
+        let real_module = real_module.canonicalize().expect("resolve real module");
+        let source = format!(
+            "local marker = require('./marker')\nassert(marker == 'real')\nassert(require({:?}) == marker)",
+            real_module.to_str().expect("UTF-8 test module path")
+        );
+        fs::write(real.join(filename), &source).expect("write expected config");
+
+        let evaluation = evaluate(&root.join("link/..").join(filename)).expect("read config");
+        assert_eq!(evaluation.source, source);
+        assert_eq!(
+            evaluation.config_root,
+            real.canonicalize().expect("resolve real root")
+        );
+        assert!(
+            evaluation.validated_summary().is_some(),
+            "{:?}",
+            evaluation.error_messages()
+        );
+        fs::remove_dir_all(root).expect("remove config fixture");
     }
 
     #[test]

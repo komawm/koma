@@ -565,7 +565,7 @@ pub(crate) fn run(args: &[String]) -> i32 {
         target = Some(PathBuf::from(active));
     }
     let path = target
-        .map(|p| config_probe::resolve_cli_path(&p.to_string_lossy()))
+        .map(config_probe::resolve_cli_path)
         .unwrap_or_else(config_probe::default_init_lua_path);
 
     let (mut listing, config_failed) = listing_from_path(&path, live, live_error);
